@@ -452,7 +452,7 @@ fun StreamsScreen(
             ?.let { resolved -> resolvedReleaseYear = resolved }
     }
 
-    val libraryTarget = remember(parentMetaId, parentMetaType, type, title, resolvedReleaseYear, poster, background) {
+    val libraryTarget = remember(parentMetaId, parentMetaType, type, title, resolvedReleaseYear, poster, background, videoId, isEpisode) {
         SeasonPackGrabService.Target(
             contentId = parentMetaId,
             contentType = parentMetaType.takeIf { it.isNotBlank() } ?: type,
@@ -460,6 +460,7 @@ fun StreamsScreen(
             year = resolvedReleaseYear,
             poster = poster,
             background = background,
+            videoId = videoId.takeIf { isEpisode },
         )
     }
     fun startSeasonDownload(stream: StreamItem, folder: LocalFolder) {
@@ -589,6 +590,7 @@ fun StreamsScreen(
                 existingFolderNames = LibraryDestinationFolders.existingFolderNames(
                     folder = folder,
                     contentId = parentMetaId,
+                    videoId = videoId.takeIf { isEpisode },
                 ),
             ) ?: return@resolvePlayableStreamThen
             SeasonPackGrabService.prepareLibraryMatch(folder, libraryTarget)
@@ -986,10 +988,16 @@ fun StreamsScreen(
                 // Which of them this title has been downloaded into before. The picker sorts those
                 // to the top and marks them, so filing a newly released episode beside its
                 // predecessors does not depend on the user remembering where they went.
-                foldersHoldingTitle = remember(downloadFolderCandidates, parentMetaId, localLibraryState.items) {
+                // Season-scoped for episodes: a drive holding only an anime's earlier seasons is not
+                // where this season's episodes went, even though both answer to the franchise id.
+                foldersHoldingTitle = remember(downloadFolderCandidates, parentMetaId, videoId, localLibraryState.items) {
                     downloadFolderCandidates
                         .filter { candidate ->
-                            LibraryDestinationFolders.holdsContent(candidate, parentMetaId)
+                            LibraryDestinationFolders.holdsContent(
+                                folder = candidate,
+                                contentId = parentMetaId,
+                                videoId = videoId.takeIf { isEpisode },
+                            )
                         }
                         .map(LocalFolder::id)
                         .toSet()

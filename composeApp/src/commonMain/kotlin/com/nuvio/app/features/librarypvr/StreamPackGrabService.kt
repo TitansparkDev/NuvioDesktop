@@ -223,9 +223,19 @@ internal object StreamPackGrabService {
         val episode = row.episode ?: return null
         val season = row.season
         val entryRelative = entryRelativeNumbering(target)
+        // Anime ids stay two-part (kitsu:id:ep); everything else addresses id:season:episode.
+        val videoId = if (entryRelative) {
+            "${target.contentId}:$episode"
+        } else {
+            "${target.contentId}:$season:$episode"
+        }
+        // A pack can span seasons, so each file is scoped by its own episode. An id too short to
+        // carry a season (entry-relative numbering under a franchise meta) falls back to the
+        // episode the grab was launched from.
         val existingFolderNames = LibraryDestinationFolders.existingFolderNames(
             folder = folder,
             contentId = target.contentId,
+            videoId = videoId.takeIf { it.split(':').size >= 3 } ?: target.videoId,
         )
         val relativePath = if (entryRelative) {
             LibraryFileNaming.animeEpisodeRelativePath(
@@ -246,13 +256,6 @@ internal object StreamPackGrabService {
                 existingFolderNames = existingFolderNames,
             )
         }
-        // Anime ids stay two-part (kitsu:id:ep); everything else addresses id:season:episode.
-        val videoId = if (entryRelative) {
-            "${target.contentId}:$episode"
-        } else {
-            "${target.contentId}:$season:$episode"
-        }
-
         val stream = StreamItem(
             name = session.source.providerName,
             title = row.fileName,

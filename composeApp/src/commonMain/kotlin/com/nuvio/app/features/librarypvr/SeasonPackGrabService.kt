@@ -43,6 +43,11 @@ internal object SeasonPackGrabService {
         val year: Int? = null,
         val poster: String? = null,
         val background: String? = null,
+        /**
+         * The episode the action was launched from. Scopes folder reuse to its season, so an anime
+         * whose seasons live in separate folders does not file this season into an earlier one's.
+         */
+        val videoId: String? = null,
     )
 
     /**
@@ -147,6 +152,7 @@ internal object SeasonPackGrabService {
                     existingFolderNames = LibraryDestinationFolders.existingFolderNames(
                         folder = folder,
                         contentId = target.contentId,
+                        videoId = target.videoId,
                     ),
                 ),
                 imdbId = id.takeIf { it.startsWith("tt", ignoreCase = true) },
@@ -190,6 +196,7 @@ internal object SeasonPackGrabService {
         val existingFolderNames = LibraryDestinationFolders.existingFolderNames(
             folder = folder,
             contentId = target.contentId,
+            videoId = row.video.id,
         )
         val relativePath = if (target.contentId.isAnimeNativeId()) {
             LibraryFileNaming.animeEpisodeRelativePath(

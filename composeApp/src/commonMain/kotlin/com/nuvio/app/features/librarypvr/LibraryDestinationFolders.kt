@@ -1,5 +1,6 @@
 package com.nuvio.app.features.librarypvr
 
+import com.nuvio.app.features.locallibrary.LocalAnimeEpisodeMatcher
 import com.nuvio.app.features.locallibrary.LocalFolder
 import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import com.nuvio.app.features.locallibrary.LocalMediaItem
@@ -30,14 +31,17 @@ object LibraryDestinationFolders {
      * Matched by content id rather than by title, so a rename, an alternate title, or a franchise
      * sibling id still finds the right folder — [LocalLibraryRepository.itemsForContentId] already
      * covers every id shape an item can carry, anime franchise mapping included.
+     *
+     * Pass [videoId] when the download is one episode: see [itemsFor] for why.
      */
-    fun existingFolderNames(folder: LocalFolder, contentId: String): List<String> {
-        if (contentId.isBlank()) return emptyList()
-        return LocalLibraryRepository.itemsForContentId(contentId)
-            .filter { item -> item.folderId == folder.id }
+    fun existingFolderNames(
+        folder: LocalFolder,
+        contentId: String,
+        videoId: String? = null,
+    ): List<String> =
+        itemsFor(folder, contentId, videoId)
             .mapNotNull { item -> item.topLevelFolderNameIn(folder) }
             .distinct()
-    }
 
     /**
      * Whether [folder] already holds files for [contentId].
@@ -45,10 +49,26 @@ object LibraryDestinationFolders {
      * Drives the folder picker's hint, so a user choosing where a new episode goes can see which
      * folder the earlier ones went to instead of having to remember.
      */
-    fun holdsContent(folder: LocalFolder, contentId: String): Boolean =
-        contentId.isNotBlank() &&
-            LocalLibraryRepository.itemsForContentId(contentId)
-                .any { item -> item.folderId == folder.id }
+    fun holdsContent(folder: LocalFolder, contentId: String, videoId: String? = null): Boolean =
+        itemsFor(folder, contentId, videoId).isNotEmpty()
+
+    /**
+     * Items in [folder] that are this title — and, given an episode [videoId], this title's season.
+     *
+     * Matching by content id alone is franchise-wide: a library filing each anime season as its own
+     * folder has every one of them answer to the same id, so a drive holding only Seasons 1 and 2
+     * would claim a Season 3 download, and that download would be filed into the Season 1 folder.
+     *
+     * Every caller that knows the episode must pass it, the scheduler included: a caller that
+     * leaves it out still reuses whichever season folder it finds first.
+     */
+    private fun itemsFor(folder: LocalFolder, contentId: String, videoId: String?): List<LocalMediaItem> {
+        if (contentId.isBlank()) return emptyList()
+        return LocalLibraryRepository.itemsForContentId(contentId).filter { item ->
+            item.folderId == folder.id &&
+                (videoId == null || LocalAnimeEpisodeMatcher.coversSeasonOf(item, videoId))
+        }
+    }
 
     /**
      * The first path segment below [folder]'s root that this item's files sit under.

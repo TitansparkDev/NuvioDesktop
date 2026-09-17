@@ -160,11 +160,18 @@ internal object ManualGrabService {
             ?: "mkv"
         val season = row.season
         val episode = row.episode
+        val videoId = when {
+            item.isMovie -> item.contentId
+            season == null -> "${item.contentId}:$episode"
+            else -> "${item.contentId}:$season:$episode"
+        }
         // Land beside whatever this title already occupies in the folder — see
-        // LibraryDestinationFolders for why the built name alone is not dependable.
+        // LibraryDestinationFolders for why the built name alone is not dependable. Scoped to the
+        // episode's season, so an anime kept one season per folder files into the right one.
         val existingFolderNames = LibraryDestinationFolders.existingFolderNames(
             folder = folder,
             contentId = item.contentId,
+            videoId = videoId.takeUnless { item.isMovie },
         )
         val relativePath = when {
             item.isMovie -> LibraryFileNaming.movieRelativePath(
@@ -191,12 +198,6 @@ internal object ManualGrabService {
                 existingFolderNames = existingFolderNames,
             )
         }
-        val videoId = when {
-            item.isMovie -> item.contentId
-            season == null -> "${item.contentId}:$episode"
-            else -> "${item.contentId}:$season:$episode"
-        }
-
         val stream = StreamItem(
             name = source.providerName,
             title = row.fileName,

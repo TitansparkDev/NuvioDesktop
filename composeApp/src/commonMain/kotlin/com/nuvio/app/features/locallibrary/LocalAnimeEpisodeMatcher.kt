@@ -48,6 +48,43 @@ internal object LocalAnimeEpisodeMatcher {
             (entry.tmdbTvId != null && entry.tmdbTvId == base.tmdbTvId)
     }
 
+    /**
+     * Whether [item] is the folder [videoId]'s episode is filed in.
+     *
+     * Anime libraries often keep each season (and each half of a split cour) as its own folder —
+     * its own kitsu/mal entry — yet all of them answer to the same franchise id. So when both the
+     * folder and the episode resolve to an anime-list entry, the entries must match. Anything this
+     * cannot decide keeps the folder, as before: a wrong "no" starts a duplicate folder.
+     */
+    fun coversSeasonOf(item: LocalMediaItem, videoId: String): Boolean {
+        if (!item.isAnime || item.type != LocalFolderType.SERIES) return true
+        // `Show/Season 01/…` holds the whole show, including seasons it has no episodes of yet.
+        if (item.files.any { it.isInSeasonSubfolder() }) return true
+        val base = item.mappingEntry() ?: return true
+        val requested = requestedEntry(base, videoId) ?: return true
+        return requested == base
+    }
+
+    /** The anime-list entry [videoId] addresses: `kitsu:<id>:…` directly, `tt…:<s>:<e>` via [base]'s franchise. */
+    private fun requestedEntry(base: AnimeIdMapping, videoId: String): AnimeIdMapping? {
+        val parts = videoId.split(':')
+        if (parts.size < 3) return null
+        val episode = parts.last().toIntOrNull() ?: return null
+        // Native ids may carry an entry-relative season too (`kitsu:<id>:1:<ep>`, as the PVR builds them).
+        nativeMetaIdRegex.find("${parts[0]}:${parts[1]}")?.let { match ->
+            return match.groupValues[2].toIntOrNull()?.let { id -> entryFor(match.groupValues[1], id) }
+        }
+        val season = parts[parts.lastIndex - 1].toIntOrNull() ?: return null
+        return AnimeIdMappingRepository.franchiseEntryFor(base, season, episode, animeMappingCoordinateSystemFor(videoId))
+    }
+
+    private fun LocalMediaFile.isInSeasonSubfolder(): Boolean {
+        val segments = path.split('/', '\\')
+        return segments.size >= 2 && seasonSubfolderRegex.matches(segments[segments.lastIndex - 1])
+    }
+
+    private val seasonSubfolderRegex = Regex("""(?i)(?:season|series|s)[ ._-]*\d{1,3}|specials""")
+
     /** The clicked episode expressed in both coordinate spaces (a side is null when unknowable). */
     private data class Target(
         val franchiseSeason: Int?,

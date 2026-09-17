@@ -2,6 +2,7 @@ package com.nuvio.app.features.locallibrary
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -62,6 +63,58 @@ class LocalAnimeEpisodeMatcherTest {
     }
 
     @Test
+    fun `a later season is not claimed by earlier season folders`() {
+        // Real anime-list entries for one franchise (seasons 1, 2 and 3), since the check depends
+        // on the mapping. Each season sits in its own folder.
+        val file = LocalMediaFile(path = "/anime/Show/Show - 01.mkv", episode = 1)
+        val seasonOne = splitSeasonItem(kitsuId = 42323, malId = 39535, file = file)
+        val seasonTwo = splitSeasonItem(kitsuId = 45950, malId = 51179, file = file)
+        val seasonThree = splitSeasonItem(kitsuId = 49002, malId = 59193, file = file)
+
+        // Entry-relative, PVR-shaped and franchise ids for the same season 3 episode.
+        for (request in listOf("kitsu:49002:12", "kitsu:49002:1:12", "tt13293588:3:12")) {
+            assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonOne, request), request)
+            assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonTwo, request), request)
+            assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonThree, request), request)
+        }
+    }
+
+    @Test
+    fun `split cour halves are separate titles`() {
+        // Real entries for a season 2 split into two cours, which TMDB also files under season 1.
+        val file = LocalMediaFile(path = "/anime/Show/Show - 01.mkv", episode = 1)
+        val seasonOne = splitSeasonItem(kitsuId = 11209, malId = 31240, file = file)
+        val firstHalf = splitSeasonItem(kitsuId = 42198, malId = 39587, file = file)
+        val secondHalf = splitSeasonItem(kitsuId = 43247, malId = 42203, file = file)
+
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonOne, "kitsu:42198:5"))
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(firstHalf, "kitsu:43247:3"))
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(secondHalf, "kitsu:42198:5"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(secondHalf, "kitsu:43247:3"))
+    }
+
+    @Test
+    fun `whole-show season subfolder layout takes every season`() {
+        // `Show/Season 01/…`, matched to the first season's entry, with only Season 1 on disk so far.
+        val showLayout = splitSeasonItem(
+            kitsuId = 42323,
+            malId = 39535,
+            file = LocalMediaFile(path = "D:\\Anime\\Show\\Season 01\\Show - S01E01.mkv", season = 1, episode = 1),
+        )
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(showLayout, "kitsu:49002:12"))
+    }
+
+    @Test
+    fun undecidableFoldersAreKept() {
+        // No mapping entry for the folder, no episode coordinates, or an entry the mapping lacks.
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(item, "kitsu:49002:12"))
+        val mapped = splitSeasonItem(kitsuId = 42323, malId = 39535, file = s1e1)
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped, "kitsu:49002"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped, "kitsu:999999999:1"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped.copy(isAnime = false), "kitsu:49002:12"))
+    }
+
+    @Test
     fun myAnimeListAliasMatchesAbsoluteFile() {
         val malItem = item.copy(malId = 123, files = listOf(abs12))
 
@@ -97,6 +150,22 @@ class LocalAnimeEpisodeMatcherTest {
         assertTrue(LocalAnimeEpisodeMatcher.matchFiles(xyz, "kitsu:11367:12").orEmpty().isEmpty())
         assertEquals(listOf(mapped), LocalAnimeEpisodeMatcher.matchFiles(xyz, "kitsu:11367:13"))
     }
+
+    private fun splitSeasonItem(
+        kitsuId: Int,
+        malId: Int,
+        file: LocalMediaFile,
+    ) = LocalMediaItem(
+        key = "folder:show-$kitsuId",
+        folderId = "folder",
+        type = LocalFolderType.SERIES,
+        isAnime = true,
+        title = "Some Show",
+        imdbId = "tt13293588",
+        kitsuId = kitsuId,
+        malId = malId,
+        files = listOf(file),
+    )
 
     private fun pokemonItem(
         kitsuId: Int,
