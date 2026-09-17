@@ -48,6 +48,36 @@ internal object LocalAnimeEpisodeMatcher {
             (entry.tmdbTvId != null && entry.tmdbTvId == base.tmdbTvId)
     }
 
+    /**
+     * The franchise season [videoId] addresses, or null when the id carries no episode coordinates
+     * or its native entry is absent from the mapping.
+     */
+    fun franchiseSeasonOf(videoId: String): Int? {
+        nativeEpisodeIdRegex.find(videoId)?.let { match ->
+            val id = match.groupValues[2].toIntOrNull() ?: return null
+            return entryFor(match.groupValues[1], id)?.franchiseSeason()
+        }
+        val parts = videoId.split(':')
+        if (parts.size < 3 || parts.last().toIntOrNull() == null) return null
+        return parts[parts.lastIndex - 1].toIntOrNull()
+    }
+
+    /**
+     * Whether [item] is where franchise [season] of its show lives on disk.
+     *
+     * Anime libraries usually keep each season as its own folder — its own kitsu/mal entry — yet
+     * every one of them resolves to the same franchise id, so "holds this title" alone cannot tell
+     * the Season 3 folder from the Season 1 folder beside it. Non-anime shows (and anime folders
+     * whose files already span several seasons) hold the whole show, so any season belongs there.
+     */
+    fun coversFranchiseSeason(item: LocalMediaItem, season: Int): Boolean {
+        if (!item.isAnime || item.type != LocalFolderType.SERIES) return true
+        if (item.mappingEntry()?.franchiseSeason() == season) return true
+        // Specials (season 0) sit beside any season and say nothing about the folder's scope.
+        val fileSeasons = item.files.mapNotNull { it.effectiveSeason }.filter { it > 0 }.toSet()
+        return season in fileSeasons || fileSeasons.size > 1
+    }
+
     /** The clicked episode expressed in both coordinate spaces (a side is null when unknowable). */
     private data class Target(
         val franchiseSeason: Int?,

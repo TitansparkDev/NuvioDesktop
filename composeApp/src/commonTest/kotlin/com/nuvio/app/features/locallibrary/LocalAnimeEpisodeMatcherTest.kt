@@ -2,6 +2,7 @@ package com.nuvio.app.features.locallibrary
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -59,6 +60,41 @@ class LocalAnimeEpisodeMatcherTest {
     @Test
     fun tmdbStyleFourPartIdsParse() {
         assertEquals(listOf(s2e1), LocalAnimeEpisodeMatcher.matchFiles(item, "tmdb:45782:2:1"))
+    }
+
+    @Test
+    fun franchiseSeasonIsReadFromFranchiseCoordinates() {
+        assertEquals(3, LocalAnimeEpisodeMatcher.franchiseSeasonOf("tt2250192:3:12"))
+        assertEquals(3, LocalAnimeEpisodeMatcher.franchiseSeasonOf("tmdb:45782:3:12"))
+        assertNull(LocalAnimeEpisodeMatcher.franchiseSeasonOf("tt2250192"))
+    }
+
+    @Test
+    fun perSeasonFolderOnlyCoversItsOwnSeason() {
+        // A drive filing each season as its own folder: the Season 1 folder answers to the same
+        // franchise id as Season 3, but is not where Season 3's episodes belong.
+        val seasonOne = item.copy(files = listOf(s1e1))
+        val seasonThree = item.copy(
+            files = listOf(LocalMediaFile(path = "/anime/SAO S3/SAO S03E01.mkv", season = 3, episode = 1)),
+        )
+        assertFalse(LocalAnimeEpisodeMatcher.coversFranchiseSeason(seasonOne, 3))
+        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(seasonThree, 3))
+    }
+
+    @Test
+    fun wholeShowFolderCoversANewSeason() {
+        // Files already span two seasons, so this is the show's folder and Season 3 joins it.
+        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(item, 3))
+        val specialsOnly = item.copy(
+            files = listOf(s1e1, LocalMediaFile(path = "/anime/SAO/SAO S00E01.mkv", season = 0, episode = 1)),
+        )
+        assertFalse(LocalAnimeEpisodeMatcher.coversFranchiseSeason(specialsOnly, 3))
+    }
+
+    @Test
+    fun nonAnimeShowFolderCoversEverySeason() {
+        val show = item.copy(isAnime = false, files = listOf(s1e1))
+        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(show, 3))
     }
 
     @Test

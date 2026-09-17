@@ -226,6 +226,7 @@ internal object StreamPackGrabService {
         val existingFolderNames = LibraryDestinationFolders.existingFolderNames(
             folder = folder,
             contentId = target.contentId,
+            videoId = target.videoId,
         )
         val relativePath = if (entryRelative) {
             LibraryFileNaming.animeEpisodeRelativePath(
