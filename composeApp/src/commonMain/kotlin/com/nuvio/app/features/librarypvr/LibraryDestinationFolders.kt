@@ -58,13 +58,15 @@ object LibraryDestinationFolders {
      * Matching by content id alone is franchise-wide: a library filing each anime season as its own
      * folder has every one of them answer to the same id, so a drive holding only Seasons 1 and 2
      * would claim a Season 3 download, and that download would be filed into the Season 1 folder.
+     *
+     * Every caller that knows the episode must pass it, the scheduler included: a caller that
+     * leaves it out still reuses whichever season folder it finds first.
      */
     private fun itemsFor(folder: LocalFolder, contentId: String, videoId: String?): List<LocalMediaItem> {
         if (contentId.isBlank()) return emptyList()
-        val season = videoId?.let(LocalAnimeEpisodeMatcher::franchiseSeasonOf)
         return LocalLibraryRepository.itemsForContentId(contentId).filter { item ->
             item.folderId == folder.id &&
-                (season == null || LocalAnimeEpisodeMatcher.coversFranchiseSeason(item, season))
+                (videoId == null || LocalAnimeEpisodeMatcher.coversSeasonOf(item, videoId))
         }
     }
 

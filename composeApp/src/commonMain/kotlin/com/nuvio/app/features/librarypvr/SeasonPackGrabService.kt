@@ -196,7 +196,7 @@ internal object SeasonPackGrabService {
         val existingFolderNames = LibraryDestinationFolders.existingFolderNames(
             folder = folder,
             contentId = target.contentId,
-            videoId = target.videoId,
+            videoId = row.video.id,
         )
         val relativePath = if (target.contentId.isAnimeNativeId()) {
             LibraryFileNaming.animeEpisodeRelativePath(

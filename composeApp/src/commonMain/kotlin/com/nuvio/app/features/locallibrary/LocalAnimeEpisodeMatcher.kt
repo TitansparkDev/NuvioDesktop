@@ -49,34 +49,41 @@ internal object LocalAnimeEpisodeMatcher {
     }
 
     /**
-     * The franchise season [videoId] addresses, or null when the id carries no episode coordinates
-     * or its native entry is absent from the mapping.
+     * Whether [item] is the folder [videoId]'s episode is filed in.
+     *
+     * Anime libraries often keep each season (and each half of a split cour) as its own folder —
+     * its own kitsu/mal entry — yet all of them answer to the same franchise id. So when both the
+     * folder and the episode resolve to an anime-list entry, the entries must match. Anything this
+     * cannot decide keeps the folder, as before: a wrong "no" starts a duplicate folder.
      */
-    fun franchiseSeasonOf(videoId: String): Int? {
-        nativeEpisodeIdRegex.find(videoId)?.let { match ->
-            val id = match.groupValues[2].toIntOrNull() ?: return null
-            return entryFor(match.groupValues[1], id)?.franchiseSeason()
-        }
-        val parts = videoId.split(':')
-        if (parts.size < 3 || parts.last().toIntOrNull() == null) return null
-        return parts[parts.lastIndex - 1].toIntOrNull()
+    fun coversSeasonOf(item: LocalMediaItem, videoId: String): Boolean {
+        if (!item.isAnime || item.type != LocalFolderType.SERIES) return true
+        // `Show/Season 01/…` holds the whole show, including seasons it has no episodes of yet.
+        if (item.files.any { it.isInSeasonSubfolder() }) return true
+        val base = item.mappingEntry() ?: return true
+        val requested = requestedEntry(base, videoId) ?: return true
+        return requested == base
     }
 
-    /**
-     * Whether [item] is where franchise [season] of its show lives on disk.
-     *
-     * Anime libraries usually keep each season as its own folder — its own kitsu/mal entry — yet
-     * every one of them resolves to the same franchise id, so "holds this title" alone cannot tell
-     * the Season 3 folder from the Season 1 folder beside it. Non-anime shows (and anime folders
-     * whose files already span several seasons) hold the whole show, so any season belongs there.
-     */
-    fun coversFranchiseSeason(item: LocalMediaItem, season: Int): Boolean {
-        if (!item.isAnime || item.type != LocalFolderType.SERIES) return true
-        if (item.mappingEntry()?.franchiseSeason() == season) return true
-        // Specials (season 0) sit beside any season and say nothing about the folder's scope.
-        val fileSeasons = item.files.mapNotNull { it.effectiveSeason }.filter { it > 0 }.toSet()
-        return season in fileSeasons || fileSeasons.size > 1
+    /** The anime-list entry [videoId] addresses: `kitsu:<id>:…` directly, `tt…:<s>:<e>` via [base]'s franchise. */
+    private fun requestedEntry(base: AnimeIdMapping, videoId: String): AnimeIdMapping? {
+        val parts = videoId.split(':')
+        if (parts.size < 3) return null
+        val episode = parts.last().toIntOrNull() ?: return null
+        // Native ids may carry an entry-relative season too (`kitsu:<id>:1:<ep>`, as the PVR builds them).
+        nativeMetaIdRegex.find("${parts[0]}:${parts[1]}")?.let { match ->
+            return match.groupValues[2].toIntOrNull()?.let { id -> entryFor(match.groupValues[1], id) }
+        }
+        val season = parts[parts.lastIndex - 1].toIntOrNull() ?: return null
+        return AnimeIdMappingRepository.franchiseEntryFor(base, season, episode, animeMappingCoordinateSystemFor(videoId))
     }
+
+    private fun LocalMediaFile.isInSeasonSubfolder(): Boolean {
+        val segments = path.split('/', '\\')
+        return segments.size >= 2 && seasonSubfolderRegex.matches(segments[segments.lastIndex - 1])
+    }
+
+    private val seasonSubfolderRegex = Regex("""(?i)(?:season|series|s)[ ._-]*\d{1,3}|specials""")
 
     /** The clicked episode expressed in both coordinate spaces (a side is null when unknowable). */
     private data class Target(

@@ -63,38 +63,55 @@ class LocalAnimeEpisodeMatcherTest {
     }
 
     @Test
-    fun franchiseSeasonIsReadFromFranchiseCoordinates() {
-        assertEquals(3, LocalAnimeEpisodeMatcher.franchiseSeasonOf("tt2250192:3:12"))
-        assertEquals(3, LocalAnimeEpisodeMatcher.franchiseSeasonOf("tmdb:45782:3:12"))
-        assertNull(LocalAnimeEpisodeMatcher.franchiseSeasonOf("tt2250192"))
+    fun `a later season is not claimed by earlier season folders`() {
+        // Real anime-list entries for one franchise (seasons 1, 2 and 3), since the check depends
+        // on the mapping. Each season sits in its own folder.
+        val file = LocalMediaFile(path = "/anime/Show/Show - 01.mkv", episode = 1)
+        val seasonOne = splitSeasonItem(kitsuId = 42323, malId = 39535, file = file)
+        val seasonTwo = splitSeasonItem(kitsuId = 45950, malId = 51179, file = file)
+        val seasonThree = splitSeasonItem(kitsuId = 49002, malId = 59193, file = file)
+
+        // Entry-relative, PVR-shaped and franchise ids for the same season 3 episode.
+        for (request in listOf("kitsu:49002:12", "kitsu:49002:1:12", "tt13293588:3:12")) {
+            assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonOne, request), request)
+            assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonTwo, request), request)
+            assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonThree, request), request)
+        }
     }
 
     @Test
-    fun perSeasonFolderOnlyCoversItsOwnSeason() {
-        // A drive filing each season as its own folder: the Season 1 folder answers to the same
-        // franchise id as Season 3, but is not where Season 3's episodes belong.
-        val seasonOne = item.copy(files = listOf(s1e1))
-        val seasonThree = item.copy(
-            files = listOf(LocalMediaFile(path = "/anime/SAO S3/SAO S03E01.mkv", season = 3, episode = 1)),
+    fun `split cour halves are separate titles`() {
+        // Real entries for a season 2 split into two cours, which TMDB also files under season 1.
+        val file = LocalMediaFile(path = "/anime/Show/Show - 01.mkv", episode = 1)
+        val seasonOne = splitSeasonItem(kitsuId = 11209, malId = 31240, file = file)
+        val firstHalf = splitSeasonItem(kitsuId = 42198, malId = 39587, file = file)
+        val secondHalf = splitSeasonItem(kitsuId = 43247, malId = 42203, file = file)
+
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(seasonOne, "kitsu:42198:5"))
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(firstHalf, "kitsu:43247:3"))
+        assertFalse(LocalAnimeEpisodeMatcher.coversSeasonOf(secondHalf, "kitsu:42198:5"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(secondHalf, "kitsu:43247:3"))
+    }
+
+    @Test
+    fun `whole-show season subfolder layout takes every season`() {
+        // `Show/Season 01/…`, matched to the first season's entry, with only Season 1 on disk so far.
+        val showLayout = splitSeasonItem(
+            kitsuId = 42323,
+            malId = 39535,
+            file = LocalMediaFile(path = "D:\\Anime\\Show\\Season 01\\Show - S01E01.mkv", season = 1, episode = 1),
         )
-        assertFalse(LocalAnimeEpisodeMatcher.coversFranchiseSeason(seasonOne, 3))
-        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(seasonThree, 3))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(showLayout, "kitsu:49002:12"))
     }
 
     @Test
-    fun wholeShowFolderCoversANewSeason() {
-        // Files already span two seasons, so this is the show's folder and Season 3 joins it.
-        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(item, 3))
-        val specialsOnly = item.copy(
-            files = listOf(s1e1, LocalMediaFile(path = "/anime/SAO/SAO S00E01.mkv", season = 0, episode = 1)),
-        )
-        assertFalse(LocalAnimeEpisodeMatcher.coversFranchiseSeason(specialsOnly, 3))
-    }
-
-    @Test
-    fun nonAnimeShowFolderCoversEverySeason() {
-        val show = item.copy(isAnime = false, files = listOf(s1e1))
-        assertTrue(LocalAnimeEpisodeMatcher.coversFranchiseSeason(show, 3))
+    fun undecidableFoldersAreKept() {
+        // No mapping entry for the folder, no episode coordinates, or an entry the mapping lacks.
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(item, "kitsu:49002:12"))
+        val mapped = splitSeasonItem(kitsuId = 42323, malId = 39535, file = s1e1)
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped, "kitsu:49002"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped, "kitsu:999999999:1"))
+        assertTrue(LocalAnimeEpisodeMatcher.coversSeasonOf(mapped.copy(isAnime = false), "kitsu:49002:12"))
     }
 
     @Test
@@ -133,6 +150,22 @@ class LocalAnimeEpisodeMatcherTest {
         assertTrue(LocalAnimeEpisodeMatcher.matchFiles(xyz, "kitsu:11367:12").orEmpty().isEmpty())
         assertEquals(listOf(mapped), LocalAnimeEpisodeMatcher.matchFiles(xyz, "kitsu:11367:13"))
     }
+
+    private fun splitSeasonItem(
+        kitsuId: Int,
+        malId: Int,
+        file: LocalMediaFile,
+    ) = LocalMediaItem(
+        key = "folder:show-$kitsuId",
+        folderId = "folder",
+        type = LocalFolderType.SERIES,
+        isAnime = true,
+        title = "Some Show",
+        imdbId = "tt13293588",
+        kitsuId = kitsuId,
+        malId = malId,
+        files = listOf(file),
+    )
 
     private fun pokemonItem(
         kitsuId: Int,

@@ -467,9 +467,10 @@ object LibraryPvrScheduler {
                 videoSize = link.sizeBytes ?: row.sizeBytes,
             ),
         )
+        val videoId = "${item.contentId}:$season:$episode"
         val result = DownloadsRepository.enqueueFromStream(
             contentType = item.contentType,
-            videoId = "${item.contentId}:$season:$episode",
+            videoId = videoId,
             parentMetaId = item.contentId,
             parentMetaType = item.contentType,
             title = item.title,
@@ -488,7 +489,7 @@ object LibraryPvrScheduler {
                     item.year,
                     episode,
                     extension,
-                    item.existingFolderNamesIn(folder),
+                    item.existingFolderNamesIn(folder, videoId),
                 )
             } else {
                 LibraryFileNaming.episodeRelativePath(
@@ -498,7 +499,7 @@ object LibraryPvrScheduler {
                     episode,
                     video.title,
                     extension,
-                    item.existingFolderNamesIn(folder),
+                    item.existingFolderNamesIn(folder, videoId),
                 )
             },
             bandwidthLimitMbps = settings.bandwidthLimitMbps,
@@ -619,7 +620,7 @@ object LibraryPvrScheduler {
                             item.year,
                             episode,
                             ext,
-                            item.existingFolderNamesIn(folder),
+                            item.existingFolderNamesIn(folder, streamVideoId),
                         )
                     } else {
                         LibraryFileNaming.episodeRelativePath(
@@ -629,7 +630,7 @@ object LibraryPvrScheduler {
                             episode,
                             video.title,
                             ext,
-                            item.existingFolderNamesIn(folder),
+                            item.existingFolderNamesIn(folder, streamVideoId),
                         )
                     },
                     bandwidthLimitMbps = bandwidthLimitMbps,
@@ -709,7 +710,7 @@ object LibraryPvrScheduler {
                         item.title,
                         item.year,
                         ext,
-                        item.existingFolderNamesIn(folder),
+                        item.existingFolderNamesIn(folder, videoId = null),
                     ),
                     bandwidthLimitMbps = bandwidthLimitMbps,
                     expectedSizeBytes = stream.knownDownloadSizeBytes(),
@@ -919,7 +920,11 @@ object LibraryPvrScheduler {
                         }
                     }
                     libraryRescanRequired =
-                        prepareLibraryMatch(mon, folders[mon.targetFolderId]) || libraryRescanRequired
+                        prepareLibraryMatch(
+                            item = mon,
+                            folder = folders[mon.targetFolderId],
+                            videoId = download.videoId.takeIf { mon.isSeries },
+                        ) || libraryRescanRequired
                     freedDownloadSlot = true
                 }
                 DownloadStatus.Failed -> {
@@ -953,7 +958,7 @@ object LibraryPvrScheduler {
      * Seeds the known ids as a MANUAL match override keyed on the scanner's future item key, then
      * rescans so the newly downloaded file attaches to the right title without a TMDB re-match.
      */
-    private fun prepareLibraryMatch(item: MonitoredItem, folder: LocalFolder?): Boolean {
+    private fun prepareLibraryMatch(item: MonitoredItem, folder: LocalFolder?, videoId: String?): Boolean {
         if (folder == null) return false
         LocalLibraryRepository.preseedMatchOverride(
             LocalMatchOverride(
@@ -961,7 +966,7 @@ object LibraryPvrScheduler {
                     folder = folder,
                     title = item.title,
                     year = item.year,
-                    existingFolderNames = item.existingFolderNamesIn(folder),
+                    existingFolderNames = item.existingFolderNamesIn(folder, videoId),
                 ),
                 imdbId = item.imdbId,
                 tmdbId = item.tmdbId,
@@ -1160,9 +1165,12 @@ object LibraryPvrScheduler {
      * A monitored item carries its own year, so the scheduler is not exposed to the cache-warmth
      * problem the manual route has — but it still has to land in the same folder a manual grab
      * created, which may not carry a year at all. See [LibraryDestinationFolders].
+     *
+     * [videoId] is the episode being filed (null for a movie), which scopes the answer to its
+     * season's folder when an anime keeps each season in a folder of its own.
      */
-    private fun MonitoredItem.existingFolderNamesIn(folder: LocalFolder): List<String> =
-        LibraryDestinationFolders.existingFolderNames(folder = folder, contentId = contentId)
+    private fun MonitoredItem.existingFolderNamesIn(folder: LocalFolder, videoId: String?): List<String> =
+        LibraryDestinationFolders.existingFolderNames(folder = folder, contentId = contentId, videoId = videoId)
 
     private val LibraryPvrSettings.postReleaseDelayMs: Long
         get() = postReleaseDelayHours.coerceIn(0, 168).toLong() * 60L * 60L * 1000L
