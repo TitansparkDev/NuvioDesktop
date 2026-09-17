@@ -33,26 +33,31 @@ internal class TransientImageErrorRetryInterceptor(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                if (attempt >= maxRetries || !isTransient(error)) throw error
+                if (attempt >= maxRetries || !isTransientImageError(error)) throw error
                 null
             }
             if (result != null) {
                 if (result !is ErrorResult) return result
-                if (attempt >= maxRetries || !isTransient(result.throwable)) return result
+                if (attempt >= maxRetries || !isTransientImageError(result.throwable)) return result
             }
             attempt++
             delay(retryDelayMillis)
         }
     }
+}
 
-    private fun isTransient(error: Throwable): Boolean = when (error) {
-        is HttpException -> {
-            val code = error.response.code
-            code == 408 || code == 429 || code >= 500
-        }
-        // Covers connect/read timeouts, resets, and DNS failures — the "never got a
-        // response" cases. Anything else (decode failures, null request data) is permanent.
-        is IOException -> true
-        else -> false
+/**
+ * Whether an image load failed for a reason that may not hold a moment from now: connection
+ * failures and timeouts (no response at all), HTTP 408/429, and 5xx responses. Anything else
+ * (404 for art that doesn't exist, decode failures, bad request data) is permanent.
+ */
+internal fun isTransientImageError(error: Throwable): Boolean = when (error) {
+    is HttpException -> {
+        val code = error.response.code
+        code == 408 || code == 429 || code >= 500
     }
+    // Covers connect/read timeouts, resets, and DNS failures — the "never got a
+    // response" cases.
+    is IOException -> true
+    else -> false
 }

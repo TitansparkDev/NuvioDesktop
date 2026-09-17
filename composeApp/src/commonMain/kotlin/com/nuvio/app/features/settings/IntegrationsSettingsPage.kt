@@ -3,6 +3,7 @@ package com.nuvio.app.features.settings
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CloudQueue
 import androidx.compose.material.icons.rounded.HighQuality
+import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.runtime.Composable
@@ -10,9 +11,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.features.discord.DiscordEpisodeArtwork
-import com.nuvio.app.features.discord.DiscordPresenceMode
-import com.nuvio.app.features.discord.DiscordPresenceSettings
 import com.nuvio.app.features.library.LibrarySourceMode
 import com.nuvio.app.features.tracking.CalendarSource
 import com.nuvio.app.features.tracking.CalendarSourceRepository
@@ -35,10 +33,6 @@ import nuvio.composeapp.generated.resources.compose_settings_root_trakt_descript
 import nuvio.composeapp.generated.resources.settings_integrations_mdblist_description
 import nuvio.composeapp.generated.resources.settings_integrations_debrid_description
 import nuvio.composeapp.generated.resources.settings_integrations_qualicache_description
-import nuvio.composeapp.generated.resources.settings_discord_episode_artwork
-import nuvio.composeapp.generated.resources.settings_discord_episode_artwork_description
-import nuvio.composeapp.generated.resources.settings_discord_episode_artwork_poster
-import nuvio.composeapp.generated.resources.settings_discord_episode_artwork_still
 import nuvio.composeapp.generated.resources.settings_integrations_section_title
 import nuvio.composeapp.generated.resources.settings_integrations_tmdb_description
 import nuvio.composeapp.generated.resources.settings_simkl_description
@@ -47,9 +41,6 @@ import org.jetbrains.compose.resources.stringResource
 
 internal fun LazyListScope.integrationsContent(
     isTablet: Boolean,
-    discordPresenceSettings: DiscordPresenceSettings,
-    onDiscordPresenceModeChange: (DiscordPresenceMode) -> Unit,
-    onDiscordEpisodeArtworkChange: (DiscordEpisodeArtwork) -> Unit,
     onTmdbClick: () -> Unit,
     onMdbListClick: () -> Unit,
     onQualiCacheClick: () -> Unit,
@@ -57,6 +48,8 @@ internal fun LazyListScope.integrationsContent(
     onTraktClick: () -> Unit,
     onSimklClick: () -> Unit,
     onYamtrackClick: () -> Unit,
+    onLightsClick: () -> Unit,
+    onDiscordClick: () -> Unit,
 ) {
     item {
         SettingsSection(
@@ -157,47 +150,23 @@ internal fun LazyListScope.integrationsContent(
                 )
                 if (isDesktop) {
                     SettingsGroupDivider(isTablet = isTablet)
-                    SettingsChoiceRow(
-                        title = stringResource(Res.string.settings_discord_presence),
-                        description = stringResource(Res.string.settings_discord_presence_description),
-                        iconPainter = integrationLogoPainter(IntegrationLogo.Discord),
-                        options = listOf(
-                            SettingsChoiceOption(DiscordPresenceMode.Disabled, stringResource(Res.string.settings_discord_presence_disabled)),
-                            SettingsChoiceOption(DiscordPresenceMode.Watching, stringResource(Res.string.settings_discord_presence_watching)),
-                            SettingsChoiceOption(DiscordPresenceMode.Full, stringResource(Res.string.settings_discord_presence_full)),
-                        ),
-                        selectedValue = discordPresenceSettings.mode,
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.compose_settings_page_lights),
+                        description = stringResource(Res.string.settings_integrations_lights_description),
+                        icon = Icons.Rounded.Lightbulb,
                         isTablet = isTablet,
-                        modifier = androidx.compose.ui.Modifier.settingsScrollAnchor(SettingsScrollAnchor.DiscordPresence),
-                        onSelected = onDiscordPresenceModeChange,
+                        onClick = onLightsClick,
                     )
-                    // Hidden while presence is off rather than disabled-but-visible: it is the only
-                    // control on this page whose subject does not exist yet when the mode above is
-                    // Disabled, and a greyed row invites a click that cannot do anything.
-                    if (discordPresenceSettings.mode != DiscordPresenceMode.Disabled) {
-                        SettingsGroupDivider(isTablet = isTablet)
-                        SettingsChoiceRow(
-                            title = stringResource(Res.string.settings_discord_episode_artwork),
-                            description = stringResource(Res.string.settings_discord_episode_artwork_description),
-                            iconPainter = integrationLogoPainter(IntegrationLogo.Discord),
-                            options = listOf(
-                                SettingsChoiceOption(
-                                    DiscordEpisodeArtwork.Poster,
-                                    stringResource(Res.string.settings_discord_episode_artwork_poster),
-                                ),
-                                SettingsChoiceOption(
-                                    DiscordEpisodeArtwork.EpisodeThumbnail,
-                                    stringResource(Res.string.settings_discord_episode_artwork_still),
-                                ),
-                            ),
-                            selectedValue = discordPresenceSettings.episodeArtwork,
-                            isTablet = isTablet,
-                            modifier = androidx.compose.ui.Modifier.settingsScrollAnchor(
-                                SettingsScrollAnchor.DiscordEpisodeArtwork,
-                            ),
-                            onSelected = onDiscordEpisodeArtworkChange,
-                        )
-                    }
+                }
+                if (isDesktop) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.compose_settings_page_discord_presence),
+                        description = stringResource(Res.string.settings_integrations_discord_description),
+                        iconPainter = integrationLogoPainter(IntegrationLogo.Discord),
+                        isTablet = isTablet,
+                        onClick = onDiscordClick,
+                    )
                 }
             }
         }

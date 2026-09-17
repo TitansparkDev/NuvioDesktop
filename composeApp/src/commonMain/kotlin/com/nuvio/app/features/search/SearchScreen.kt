@@ -315,7 +315,11 @@ fun SearchScreen(
                         val sections = uiState.sections
                         val navKey = event.navigationKey()
                         when {
-                            !isInRowNav && navKey == Key.DirectionDown && sections.isNotEmpty() -> {
+                            // Enter submits the query the way it does in any search box: results
+                            // already stream in as you type, so "submit" means take me to them.
+                            // Down does the same, and is what a keyboard user reaches for first.
+                            !isInRowNav && sections.isNotEmpty() &&
+                                (navKey == Key.DirectionDown || navKey == Key.Enter || navKey == Key.NumPadEnter) -> {
                                 isInRowNav = true
                                 focusedRowIndex = 0
                                 focusedItemIndex = 0

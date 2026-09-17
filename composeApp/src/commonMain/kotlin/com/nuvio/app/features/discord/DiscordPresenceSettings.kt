@@ -34,9 +34,41 @@ enum class DiscordEpisodeArtwork {
     EpisodeThumbnail,
 }
 
+/**
+ * Which Discord activity type playback is published as. Discord's own layouts make this a
+ * trade-off with no clean answer, so it is the user's call:
+ *
+ * - [Watching]: the honest verb ("Watching on Nuvio HTPC") with the media progress bar on the
+ *   profile card — but the friends-list "Active Now" panel only ever shows the header line for
+ *   this type; the title, episode and poster never appear there.
+ * - [Listening]: the same layout Spotify gets, and the *only* type that expands in "Active Now"
+ *   with artwork, title, episode and bar. Reads "Listening to Nuvio HTPC", which is the price.
+ *
+ * Playing (type 0) is not offered: it expands in "Active Now" too, but loses the progress bar.
+ * (Findings from codeine's Active Now report, 2026-09.)
+ */
+enum class DiscordActivityStyle {
+    Watching,
+    Listening,
+}
+
+/**
+ * What the activity's `name` carries, i.e. the header line after Discord's verb.
+ *
+ * - [AppName]: "Watching on Nuvio HTPC" / "Listening to Nuvio HTPC", with the title on the
+ *   details line beneath it. The default since codeine's layout change.
+ * - [Title]: "Watching Friends", the original output, where the title is also the details line.
+ */
+enum class DiscordActivityName {
+    AppName,
+    Title,
+}
+
 data class DiscordPresenceSettings(
     val mode: DiscordPresenceMode = DiscordPresenceMode.Disabled,
     val episodeArtwork: DiscordEpisodeArtwork = DiscordEpisodeArtwork.Poster,
+    val activityStyle: DiscordActivityStyle = DiscordActivityStyle.Watching,
+    val activityName: DiscordActivityName = DiscordActivityName.AppName,
 ) {
     /** Playback presence is shared in both Watching and Full. */
     val showPlaybackPresence: Boolean get() = mode != DiscordPresenceMode.Disabled
@@ -50,6 +82,10 @@ internal expect object DiscordPresenceSettingsStorage {
     fun saveMode(mode: DiscordPresenceMode)
     fun loadEpisodeArtwork(): DiscordEpisodeArtwork
     fun saveEpisodeArtwork(value: DiscordEpisodeArtwork)
+    fun loadActivityStyle(): DiscordActivityStyle
+    fun saveActivityStyle(value: DiscordActivityStyle)
+    fun loadActivityName(): DiscordActivityName
+    fun saveActivityName(value: DiscordActivityName)
 }
 
 object DiscordPresenceSettingsRepository {
@@ -59,12 +95,16 @@ object DiscordPresenceSettingsRepository {
     private var hasLoaded = false
     private var mode = DiscordPresenceMode.Disabled
     private var episodeArtwork = DiscordEpisodeArtwork.Poster
+    private var activityStyle = DiscordActivityStyle.Watching
+    private var activityName = DiscordActivityName.AppName
 
     fun ensureLoaded() {
         if (hasLoaded) return
         hasLoaded = true
         mode = DiscordPresenceSettingsStorage.loadMode()
         episodeArtwork = DiscordPresenceSettingsStorage.loadEpisodeArtwork()
+        activityStyle = DiscordPresenceSettingsStorage.loadActivityStyle()
+        activityName = DiscordPresenceSettingsStorage.loadActivityName()
         publish()
     }
 
@@ -87,10 +127,29 @@ object DiscordPresenceSettingsRepository {
         // it was assembled under the old preference and still carries the old URL.
     }
 
+    fun setActivityStyle(value: DiscordActivityStyle) {
+        ensureLoaded()
+        if (activityStyle == value) return
+        activityStyle = value
+        publish()
+        DiscordPresenceSettingsStorage.saveActivityStyle(value)
+        // As with the artwork preference: the player's effect keys on this and republishes.
+    }
+
+    fun setActivityName(value: DiscordActivityName) {
+        ensureLoaded()
+        if (activityName == value) return
+        activityName = value
+        publish()
+        DiscordPresenceSettingsStorage.saveActivityName(value)
+    }
+
     private fun publish() {
         _uiState.value = DiscordPresenceSettings(
             mode = mode,
             episodeArtwork = episodeArtwork,
+            activityStyle = activityStyle,
+            activityName = activityName,
         )
     }
 }

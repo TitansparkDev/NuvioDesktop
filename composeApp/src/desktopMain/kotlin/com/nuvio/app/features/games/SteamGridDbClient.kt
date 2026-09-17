@@ -131,14 +131,11 @@ private data class SteamGridDbAsset(
 )
 
 private fun selectGame(games: List<SearchGame>, requestedTitle: String): SearchGame? {
-    val requested = requestedTitle.normalizedTitle()
+    val requested = requestedTitle.normalizedGameTitle()
     return games
-        .filter { it.name.normalizedTitle() == requested }
+        .filter { it.name.normalizedGameTitle() == requested }
         .maxByOrNull { if (it.verified) 1 else 0 }
 }
-
-private fun String.normalizedTitle(): String =
-    lowercase().filter(Char::isLetterOrDigit)
 
 private fun String?.isPreferredEnglish(): Boolean =
     this?.trim()?.lowercase() in setOf("en", "eng", "english")

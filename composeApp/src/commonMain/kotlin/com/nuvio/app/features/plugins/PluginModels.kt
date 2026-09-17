@@ -83,6 +83,12 @@ data class PluginRuntimeResult(
 data class PluginsUiState(
     val pluginsEnabled: Boolean = true,
     val groupStreamsByRepository: Boolean = false,
+    /**
+     * Run one scraper per site when several installed repositories ship the same one. Repositories
+     * copy each other's scrapers wholesale, so a user with a few installed can have five copies of
+     * the same site queued for one search, each paying its own runtime slot and network time.
+     */
+    val skipDuplicateScrapers: Boolean = true,
     val repositories: List<PluginRepositoryItem> = emptyList(),
     val scrapers: List<PluginScraper> = emptyList(),
 )
@@ -96,6 +102,7 @@ sealed interface AddPluginRepositoryResult {
 internal data class StoredPluginsState(
     val pluginsEnabled: Boolean = true,
     val groupStreamsByRepository: Boolean = false,
+    val skipDuplicateScrapers: Boolean = true,
     val repositories: List<StoredPluginRepository> = emptyList(),
     val scrapers: List<StoredPluginScraper> = emptyList(),
 )

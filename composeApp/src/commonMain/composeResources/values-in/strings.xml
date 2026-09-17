@@ -849,8 +849,6 @@
     <string name="settings_playback_subtitle_show_preferred_only_description">Hanya tampilkan terjemahan yang sesuai dengan bahasa favorit Anda.</string>
     <string name="settings_playback_subtitle_size">Ukuran Terjemahan</string>
     <string name="settings_playback_subtitle_text_color">Warna Teks</string>
-    <string name="settings_playback_subtitle_use_forced">Gunakan Forced Subtitles</string>
-    <string name="settings_playback_subtitle_use_forced_description">Utamakan forced subtitles ketika mencocokkan pengaturan bahasa terjemahan.</string>
     <string name="settings_playback_subtitle_vertical_offset">Batas Vertikal</string>
     <string name="settings_playback_skip_intro_outro_recap">Lewati Intro</string>
     <string name="settings_playback_skip_intro_outro_recap_description">Gunakan introdb.app untuk mendeteksi intro dan rekap.</string>

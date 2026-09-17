@@ -34,7 +34,6 @@ import nuvio.composeapp.generated.resources.compose_settings_page_playback
 import nuvio.composeapp.generated.resources.random_play_title
 import nuvio.composeapp.generated.resources.compose_settings_page_qualicache
 import nuvio.composeapp.generated.resources.compose_settings_page_plugins
-import nuvio.composeapp.generated.resources.compose_settings_page_poster_customization
 import nuvio.composeapp.generated.resources.compose_settings_page_root
 import nuvio.composeapp.generated.resources.compose_settings_page_streams
 import nuvio.composeapp.generated.resources.compose_settings_page_stream_scoring
@@ -43,6 +42,9 @@ import nuvio.composeapp.generated.resources.compose_settings_page_tmdb_enrichmen
 import nuvio.composeapp.generated.resources.compose_settings_page_trakt
 import nuvio.composeapp.generated.resources.compose_settings_page_simkl
 import nuvio.composeapp.generated.resources.compose_settings_page_yamtrack
+import nuvio.composeapp.generated.resources.compose_settings_page_lights
+import nuvio.composeapp.generated.resources.compose_settings_page_discord_presence
+import nuvio.composeapp.generated.resources.compose_settings_page_screensaver
 import nuvio.composeapp.generated.resources.settings_account
 import org.jetbrains.compose.resources.StringResource
 
@@ -136,6 +138,11 @@ internal enum class SettingsPage(
         category = SettingsCategory.General,
         parentPage = Root,
     ),
+    Screensaver(
+        titleRes = Res.string.compose_settings_page_screensaver,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
     Advanced(
         titleRes = Res.string.compose_settings_page_advanced,
         category = SettingsCategory.Advanced,
@@ -150,11 +157,6 @@ internal enum class SettingsPage(
         titleRes = Res.string.compose_settings_page_continue_watching,
         category = SettingsCategory.General,
         parentPage = Root,
-    ),
-    PosterCustomization(
-        titleRes = Res.string.compose_settings_page_poster_customization,
-        category = SettingsCategory.General,
-        parentPage = Appearance,
     ),
     ContentDiscovery(
         titleRes = Res.string.compose_settings_page_content_discovery,
@@ -223,6 +225,16 @@ internal enum class SettingsPage(
     ),
     YamtrackAuthentication(
         titleRes = Res.string.compose_settings_page_yamtrack,
+        category = SettingsCategory.General,
+        parentPage = Integrations,
+    ),
+    Lights(
+        titleRes = Res.string.compose_settings_page_lights,
+        category = SettingsCategory.General,
+        parentPage = Integrations,
+    ),
+    DiscordPresence(
+        titleRes = Res.string.compose_settings_page_discord_presence,
         category = SettingsCategory.General,
         parentPage = Integrations,
     ),

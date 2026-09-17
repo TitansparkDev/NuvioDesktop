@@ -476,6 +476,8 @@
     <string name="downloads_status_downloading">Téléchargement • %1$s</string>
     <string name="downloads_status_failed">Échoué</string>
     <string name="downloads_status_paused">En pause • %1$s</string>
+    <string name="downloads_status_queued">En attente • %1$s</string>
+    <string name="downloads_status_eta">%1$s restant</string>
     <string name="episodes_cd_watched">Vu</string>
     <string name="episodes_season">Saison %1$d</string>
     <string name="episodes_specials">Spéciaux</string>
@@ -1695,6 +1697,8 @@
     <string name="plugins_error_unavailable_build">Les plugins ne sont pas disponibles dans cette version.</string>
     <string name="plugins_group_by_repo_desc">Dans Streams, affiche un fournisseur par dépôt au lieu d’un par source.</string>
     <string name="plugins_group_by_repo_title">Regrouper les fournisseurs par dépôt</string>
+    <string name="plugins_skip_duplicates_desc">Quand plusieurs dépôts fournissent le même scraper, n’exécute que le premier au lieu de chaque copie.</string>
+    <string name="plugins_skip_duplicates_title">Ignorer les scrapers en double</string>
     <string name="plugins_input_manifest_placeholder">URL du manifeste du plugin</string>
     <string name="plugins_manifest_error_name_missing">Nom du manifeste manquant.</string>
     <string name="plugins_manifest_error_no_providers">Le manifeste ne contient aucun fournisseur.</string>

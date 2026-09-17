@@ -14,6 +14,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -66,6 +67,7 @@ object MdbListMetadataService {
     private const val ERROR_TTL_MS = 30L * 60L * 1000L
     private const val RATE_LIMIT_BACKOFF_MS = 30L * 60L * 1000L
 
+    @kotlin.concurrent.Volatile
     private var cache: MutableMap<String, CachedRatings>? = null
     private var rateLimitedUntilMs: Long = 0L
     private val cacheMutex = Mutex()
@@ -138,6 +140,7 @@ object MdbListMetadataService {
     ): MdbListEnrichmentData {
         val cacheKey = "v$CACHE_VERSION:${lookup.provider}:$mediaType:${lookup.id}"
         val now = LibraryClock.nowEpochMs()
+        ensureCacheLoadedOffCaller()
         val pending = cacheMutex.withLock {
             val loaded = ensureCacheLoaded()
             loaded[cacheKey]?.let { entry ->
@@ -262,6 +265,16 @@ object MdbListMetadataService {
     /** Writes any pending changes now. For the exit path. */
     suspend fun flushPendingWrites() {
         persister.flush()
+    }
+
+    /**
+     * The first-touch parse of the ratings cache (2.7MB of JSON on a well-used install) on a
+     * worker, not on whichever dispatcher the caller is on — Home's hero calls this from Main
+     * during the launch overlay, and the parse was measured there on 2026-09-14.
+     */
+    private suspend fun ensureCacheLoadedOffCaller() {
+        if (cache != null) return
+        withContext(Dispatchers.Default) { cacheMutex.withLock { ensureCacheLoaded() } }
     }
 
     private fun ensureCacheLoaded(): MutableMap<String, CachedRatings> {

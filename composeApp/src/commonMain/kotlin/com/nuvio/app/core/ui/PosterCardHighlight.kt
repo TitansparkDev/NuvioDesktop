@@ -13,7 +13,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.toRect
 import androidx.compose.ui.graphics.BlendMode
@@ -83,6 +90,21 @@ private const val PosterHighlightShineGain = 0.25f
  * starting points, worth re-tuning against real artwork.
  */
 private const val PosterHighlightSweepGain = 0.35f
+
+/**
+ * Band length as a fraction of the card's long axis. 1.0 is a band exactly one card long - the
+ * original design, described as "a wide soft wash with a short plateau, not a hard streak".
+ *
+ * Briefly shipped at 0.2 while the poster-row flicker was thought to be the sweep's fault. It was
+ * not: the cause was the hero backdrop swapping in a single frame, which on a variable-refresh OLED
+ * is an instantaneous full-screen brightness step the panel answers with a dim. The sweep only ADDED
+ * to that step. With the backdrop crossfade in place, and the card now recorded into a GraphicsLayer
+ * once instead of re-rasterised every frame, a full-length band at full gain measured clean.
+ *
+ * The narrow band was a workaround for a misdiagnosis, and it looked like an xray scanner. Kept as a
+ * constant rather than inlined so it stays adjustable if a future effect needs the budget back.
+ */
+private const val PosterHighlightSweepBandFraction = 1f
 private const val PosterHighlightSweepDurationMillis = 650
 
 /**
@@ -108,6 +130,7 @@ internal fun Modifier.nuvioPosterHighlight(cornerRadius: Dp): Modifier {
     val colors = MaterialTheme.nuvio.colors
     // Fades with the magnification instead of snapping on, so a cursor swept across a row leaves a
     // trail of rings settling rather than a strobe.
+    val shineCache = rememberGraphicsLayer()
     val ringAlpha by animateFloatAsState(
         targetValue = if (highlighted) 1f else 0f,
         label = "posterHighlightRing",
@@ -121,7 +144,10 @@ internal fun Modifier.nuvioPosterHighlight(cornerRadius: Dp): Modifier {
 
     return when (mode) {
         PosterHighlightMode.Shine -> drawWithContent {
-            drawNuvioPosterShine(strength = PosterHighlightShineGain * ringAlpha)
+            drawNuvioPosterShine(
+                strength = PosterHighlightShineGain * ringAlpha,
+                cache = shineCache,
+            )
         }
         else -> drawWithContent {
             drawContent()
@@ -152,6 +178,7 @@ internal fun Modifier.nuvioPosterHighlight(cornerRadius: Dp): Modifier {
 @Composable
 internal fun Modifier.nuvioSweepHighlight(highlighted: Boolean, cornerRadius: Dp): Modifier {
     val progress = remember { Animatable(0f) }
+    val sweepCache = rememberGraphicsLayer()
     LaunchedEffect(highlighted) {
         // Parking at 0 on the way out leaves the band just off the leading edge, where it is
         // invisible, so an interrupted pass simply stops. Animating it back instead — what the CSS
@@ -160,12 +187,12 @@ internal fun Modifier.nuvioSweepHighlight(highlighted: Boolean, cornerRadius: Dp
         progress.snapTo(0f)
         if (!highlighted) return@LaunchedEffect
         progress.animateTo(
-            targetValue = 1f,
-            // Linear on purpose: eased, the band appears to slow down in the middle of the card,
-            // which reads as the animation calling attention to itself rather than as light
-            // crossing the artwork at a constant speed.
-            animationSpec = tween(PosterHighlightSweepDurationMillis, easing = LinearEasing),
-        )
+                targetValue = 1f,
+                // Linear on purpose: eased, the band appears to slow down in the middle of the card,
+                // which reads as the animation calling attention to itself rather than as light
+                // crossing the artwork at a constant speed.
+                animationSpec = tween(PosterHighlightSweepDurationMillis, easing = LinearEasing),
+            )
     }
     // The progress read belongs inside the draw lambda, not out here. Read during composition it
     // would recompose the card on every frame of the pass; deferred to the draw phase it
@@ -175,6 +202,7 @@ internal fun Modifier.nuvioSweepHighlight(highlighted: Boolean, cornerRadius: Dp
             progress = progress.value,
             strength = PosterHighlightSweepGain,
             cornerRadius = cornerRadius,
+            sweepCache = sweepCache,
         )
     }
 }
@@ -186,12 +214,51 @@ internal fun Modifier.nuvioSweepHighlight(highlighted: Boolean, cornerRadius: Dp
  * Extracted from the modifier so the gain can be rendered and measured offscreen without going
  * anywhere near the saved poster preferences.
  */
-internal fun ContentDrawScope.drawNuvioPosterShine(strength: Float) {
-    drawContent()
+internal fun ContentDrawScope.drawNuvioPosterShine(
+    strength: Float,
+    /**
+     * A recording of the card, so the additive copy is a texture composite rather than a second
+     * full rasterisation of the card's draw commands every frame.
+     *
+     * Shine does not animate - the brightened copy it produces is identical on every frame - so
+     * re-rendering the whole card 60 times a second to arrive at the same pixels is pure waste, and
+     * it is enough waste to overrun the frame budget. Null keeps the original behaviour.
+     */
+    cache: GraphicsLayer? = null,
+) {
+    if (strength <= 0f || cache == null) drawContent()
     if (strength <= 0f) return
     val paint = Paint().apply {
         alpha = strength
         blendMode = BlendMode.Plus
+    }
+    if (cache != null) {
+        // Re-record only when the card's size changes; its content is static for the life of a
+        // highlight, which is the whole reason this can be cached at all.
+        if (cache.size.width != size.width.toInt() || cache.size.height != size.height.toInt()) {
+            cache.record(size = IntSize(size.width.toInt(), size.height.toInt())) {
+                this@drawNuvioPosterShine.drawContent()
+            }
+        }
+        // ONE card-sized draw, not two. The additive form paints the card and then composites a
+        // second full-card copy over it, so the highlighted card costs twice the fill of an
+        // unhighlighted one - and painted area per frame is what tracks the flicker, independent of
+        // frame timing. A colour matrix on the recording produces the same result in a single pass:
+        // every channel scaled by 1+strength, so black stays black and bright pixels clip, which is
+        // exactly what the additive copy was for.
+        val gain = 1f + strength
+        cache.colorFilter = ColorFilter.colorMatrix(
+            ColorMatrix(
+                floatArrayOf(
+                    gain, 0f, 0f, 0f, 0f,
+                    0f, gain, 0f, 0f, 0f,
+                    0f, 0f, gain, 0f, 0f,
+                    0f, 0f, 0f, 1f, 0f,
+                ),
+            ),
+        )
+        drawLayer(cache)
+        return
     }
     drawIntoCanvas { canvas ->
         canvas.saveLayer(size.toRect(), paint)
@@ -213,16 +280,39 @@ internal fun ContentDrawScope.drawNuvioPosterSweep(
     progress: Float,
     strength: Float,
     cornerRadius: Dp,
+    /**
+     * Band length as a fraction of the card's long axis. 1.0 is the original: a band exactly one
+     * card long, which at mid-pass covers the whole card and repaints all of it every frame. That
+     * per-frame area is what triggers the row flicker - measured, by a variant that painted a flat
+     * translucent wash over the whole card (flickers) against one that painted a gradient over a
+     * fifth of it (clean). Shortening the band cuts the repainted area without changing anything
+     * else about how the effect is drawn.
+     */
+    bandFraction: Float = PosterHighlightSweepBandFraction,
+    /** Optional recording of the card; see [drawNuvioPosterShine]. */
+    sweepCache: GraphicsLayer? = null,
 ) {
     drawContent()
     if (progress <= 0f || progress >= 1f || strength <= 0f) return
+    drawSweepMaskedGain(progress, strength, cornerRadius, bandFraction, sweepCache)
+}
+
+/** The shipping sweep: a band-masked additive copy of the card. */
+private fun ContentDrawScope.drawSweepMaskedGain(
+    progress: Float,
+    strength: Float,
+    cornerRadius: Dp,
+    bandFraction: Float,
+    /** See [drawNuvioPosterShine]: the card recorded once, composited per frame. */
+    cache: GraphicsLayer? = null,
+) {
     // Along the card's long axis, so portrait posters wash top to bottom and landscape cards left
     // to right. Across the short axis the band would clear a wide card in a few tens of pixels.
     val vertical = size.height >= size.width
-    val extent = if (vertical) size.height else size.width
-    // The band is one card long and travels two card lengths: at 0 it sits entirely before the
-    // leading edge, at 1 entirely past the trailing one.
-    val head = extent * (2f * progress - 1f)
+    val axis = if (vertical) size.height else size.width
+    val extent = axis * bandFraction.coerceIn(0.05f, 1f)
+    // The band travels from entirely before the leading edge to entirely past the trailing one.
+    val head = (axis + extent) * progress - extent
     val band = Brush.linearGradient(
         // A wide soft wash with a short plateau, not a hard streak — the fade is most of the band.
         0f to Color.Transparent,
@@ -236,13 +326,34 @@ internal fun ContentDrawScope.drawNuvioPosterSweep(
         alpha = strength
         blendMode = BlendMode.Plus
     }
+    // The layer covers only the strip the band is currently over, not the whole card. Shortening
+    // the band alone changed nothing, because `drawContent()` still replayed the entire card into a
+    // full-card layer and the mask merely threw most of it away - the DRAWN area never shrank. That
+    // drawn area is what triggers the flicker: Shine, which is a full-card layer and replay with no
+    // band and no animation at all, flickers too, while White and Accent (which paint only a ring)
+    // do not. Clipping the layer to the band means the replay rasterises a strip instead of a card.
+    val start = head.coerceIn(0f, axis)
+    val end = (head + extent).coerceIn(0f, axis)
+    if (end - start <= 0f) return
+    val layerBounds = if (vertical) {
+        Rect(left = 0f, top = start, right = size.width, bottom = end)
+    } else {
+        Rect(left = start, top = 0f, right = end, bottom = size.height)
+    }
+    if (cache != null &&
+        (cache.size.width != size.width.toInt() || cache.size.height != size.height.toInt())
+    ) {
+        cache.record(size = IntSize(size.width.toInt(), size.height.toInt())) {
+            this@drawSweepMaskedGain.drawContent()
+        }
+    }
     drawIntoCanvas { canvas ->
-        canvas.saveLayer(size.toRect(), paint)
-        drawContent()
+        canvas.saveLayer(layerBounds, paint)
+        if (cache != null) drawLayer(cache) else drawContent()
         // Keeps only what the band covers. DstIn multiplies the layer's alpha by the gradient's, so
-        // the gain ramps in and out with the band instead of ending on a seam. Rounded to the
-        // card's own radius because this modifier runs ahead of the card's clip: a plain rect would
-        // paint the gain across the corners the clip is about to cut away.
+        // the gain ramps in and out with the band instead of ending on a seam. Still drawn over the
+        // whole card and still rounded to the card's own radius - the layer bounds clip it, and the
+        // rounding matters wherever the strip overlaps a corner the card's clip is about to cut.
         drawRoundRect(
             brush = band,
             cornerRadius = CornerRadius(cornerRadius.toPx()),
@@ -283,3 +394,8 @@ internal fun ContentDrawScope.drawNuvioPosterRing(
         style = Stroke(width = corePx),
     )
 }
+
+
+
+
+

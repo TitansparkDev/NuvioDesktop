@@ -27,6 +27,14 @@ data class MetaDetails(
     @kotlinx.serialization.SerialName("_tvdbId") val tvdbId: String? = null,
     val externalRatings: List<MetaExternalRating> = emptyList(),
     val mdblistKeywords: List<String> = emptyList(),
+    /**
+     * TMDB's own keyword list, appended to the details call so it costs no request. The same
+     * vocabulary MDBList passes through in [mdblistKeywords]; kept apart so the discovery badges'
+     * MDBList-only reading is unchanged, and unioned where both are wanted ([allKeywords]).
+     */
+    val tmdbKeywords: List<String> = emptyList(),
+    /** IMDb's sub-genre tags with their parent genre; the details page fetches them by IMDb id. */
+    val imdbInterests: List<ImdbInterest> = emptyList(),
     val genres: List<String> = emptyList(),
     val director: List<String> = emptyList(),
     val producer: List<String> = emptyList(),
@@ -65,12 +73,18 @@ internal fun MetaDetails.quarantineMismatchedImdbTmdbIdentity(): MetaDetails = c
     imdbRating = null,
     externalRatings = emptyList(),
     mdblistKeywords = emptyList(),
+    tmdbKeywords = emptyList(),
+    imdbInterests = emptyList(),
     moreLikeThis = emptyList(),
     moreLikeThisSource = null,
     collectionName = null,
     collectionItems = emptyList(),
     trailers = emptyList(),
 )
+
+/** Every keyword either enrichment source supplied, deduplicated case-insensitively, order kept. */
+internal fun MetaDetails.allKeywords(): List<String> =
+    (tmdbKeywords + mdblistKeywords).distinctBy { it.trim().lowercase() }
 
 enum class MoreLikeThisSource {
     TMDB,

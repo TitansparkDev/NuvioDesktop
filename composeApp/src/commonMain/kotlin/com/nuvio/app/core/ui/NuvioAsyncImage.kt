@@ -37,14 +37,13 @@ internal expect fun NuvioAsyncImage(
 )
 
 /**
- * Applies the same request size [NuvioAsyncImage] will use when it displays this artwork.
- *
- * Prefetches exist to have the bitmap ready before the card asks for it, which only works if they
- * warm the entry the card actually asks for. A builder left unsized falls back to
- * `SizeResolver.ORIGINAL` at `Precision.EXACT`, so the prefetch decoded the source at full
- * resolution — and because Coil validates a cached entry against the requested size rather than
- * keying on it, that oversized bitmap is what the display request then found and kept. Sixteen
- * prefetched posters could occupy a large share of the whole memory cache before the user had
- * scrolled anywhere.
+ * Prefetch at a known physical display size, or warm compressed disk data when layout is unknown.
+ * Unsized prefetch must not populate the bitmap cache with a full-resolution source.
  */
-internal expect fun ImageRequest.Builder.nuvioArtworkRequestSize(): ImageRequest.Builder
+
+
+
+internal expect fun ImageRequest.Builder.nuvioArtworkRequestSize(
+    widthPx: Int? = null,
+    heightPx: Int? = null,
+): ImageRequest.Builder

@@ -54,11 +54,31 @@ internal actual fun CollectionCardRemoteImage(
             .build()
     }
 
-    // Only worth a second request when there is a genuinely different still to show first.
-    val placeholderUrl = staticImageUrl
-        ?.takeIf { animateIfPossible && it.isNotBlank() && it != imageUrl }
+    // Frame one of the animation itself, decoded as an ordinary still.
+    //
+    // The cover was the wrong picture to hold underneath: it is a *different image*, so the card
+    // showed the cover and then cut to the animation's opening frame — a visible jump on every
+    // card, every time. The same URL with animation disabled decodes exactly the frame the
+    // animation is about to open on, so there is nothing to see when it takes over.
+    //
+    // It is also an ordinary bitmap, so unlike the animation it is allowed into Coil's memory cache
+    // (see DesktopArtworkMemoryCache) and comes back instantly on scroll-back. It shares its cache
+    // key with the non-animating surfaces above, so Search and Library have usually paid for it
+    // already.
+    val firstFrameRequest = remember(context, imageUrl, animateIfPossible) {
+        if (!animateIfPossible) {
+            null
+        } else {
+            ImageRequest.Builder(context)
+                .data(imageUrl)
+                .memoryCacheKey("home-collection-still:$imageUrl")
+                .diskCacheKey(imageUrl)
+                .disableAnimation()
+                .build()
+        }
+    }
 
-    if (placeholderUrl == null) {
+    if (firstFrameRequest == null) {
         AsyncImage(
             model = request,
             contentDescription = contentDescription,
@@ -68,33 +88,67 @@ internal actual fun CollectionCardRemoteImage(
         return
     }
 
-    // Keyed on the animation, so scrolling to a different folder starts from its own still rather
-    // than briefly showing the previous card's animation.
-    var animationReady by remember(imageUrl) { mutableStateOf(false) }
-    val placeholderRequest = remember(context, placeholderUrl) {
-        ImageRequest.Builder(context)
-            .data(placeholderUrl)
-            .memoryCacheKey("home-collection-static:$placeholderUrl")
-            .diskCacheKey(placeholderUrl)
-            .build()
+    // A separate cover, when the folder has one, sits under the first frame for the cold case only:
+    // the first frame still needs the animation's bytes off the network, where a cover is a small
+    // ordinary image. Once the frame is up the cover is torn down and never drawn again.
+    val coverRequest = remember(context, staticImageUrl, imageUrl) {
+        staticImageUrl
+            ?.takeIf { it.isNotBlank() && it != imageUrl }
+            ?.let { cover ->
+                ImageRequest.Builder(context)
+                    .data(cover)
+                    .memoryCacheKey("home-collection-static:$cover")
+                    .diskCacheKey(cover)
+                    .build()
+            }
     }
 
+    // Both re-armed on Loading rather than latched on Success. Latching left a hole: an animated
+    // image is deliberately excluded from Coil's memory cache to keep a single owner for its
+    // frames, so its request restarts whenever the card is recomposed from scratch or its size
+    // bucket drifts — and with the layer beneath already torn down, the card went
+    // picture -> GREY -> animation. Each layer now stays up until the one above it is really
+    // drawing.
+    var animationReady by remember(imageUrl) { mutableStateOf(false) }
+    var firstFrameReady by remember(imageUrl) { mutableStateOf(false) }
+
     Box(modifier = modifier) {
-        if (!animationReady) {
+        if (!firstFrameReady && coverRequest != null) {
             AsyncImage(
-                model = placeholderRequest,
-                contentDescription = contentDescription,
+                model = coverRequest,
+                contentDescription = null,
                 modifier = Modifier.matchParentSize(),
                 contentScale = contentScale,
             )
         }
+        // Composed unconditionally, never gated on the animation being ready.
+        //
+        // Gating it tore this layer out of the tree the moment the animation succeeded, and put it
+        // back the moment the animation restarted — and an animated image restarts constantly,
+        // because it is deliberately excluded from Coil's memory cache. Each re-entry was a NEW
+        // composable with an empty painter, so it began at Loading and drew nothing while it
+        // re-resolved: the grey. Leaving it composed costs one extra blit per animated card, which
+        // is far less than the per-frame texture upload removed from this path already, and it
+        // guarantees something is always drawn.
+        AsyncImage(
+            model = firstFrameRequest,
+            contentDescription = if (animationReady) null else contentDescription,
+            modifier = Modifier.matchParentSize(),
+            contentScale = contentScale,
+            onLoading = { firstFrameReady = false },
+            onSuccess = { firstFrameReady = true },
+            onError = { firstFrameReady = false },
+        )
         AsyncImage(
             model = request,
-            // Null while the still is carrying the description, so the card is not announced twice.
+            // Null while a layer below is carrying the description, so the card is not announced
+            // twice.
             contentDescription = if (animationReady) contentDescription else null,
             modifier = Modifier.matchParentSize(),
             contentScale = contentScale,
+            onLoading = { animationReady = false },
             onSuccess = { animationReady = true },
+            onError = { animationReady = false },
         )
     }
 }

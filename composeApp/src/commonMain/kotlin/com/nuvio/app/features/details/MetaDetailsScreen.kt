@@ -102,6 +102,9 @@ import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.rememberMouseActivityState
 import com.nuvio.app.features.details.components.DetailActionButtons
 import com.nuvio.app.features.details.components.DetailSecondaryAction
+import com.nuvio.app.features.discover.DiscoverAiSettingsRepository
+import com.nuvio.app.features.recap.RecapBoundary
+import com.nuvio.app.features.recap.RecapDialog
 import com.nuvio.app.features.librarypvr.AddToLibraryDialog
 import com.nuvio.app.features.librarypvr.LibraryPvrRepository
 import com.nuvio.app.features.librarypvr.MonitorTarget
@@ -213,6 +216,7 @@ fun MetaDetailsScreen(
     onPlayTrailer: ((PlayerLaunch) -> Unit)? = null,
     onCastClick: ((MetaPerson, String?) -> Unit)? = null,
     onCompanyClick: ((MetaCompany, String) -> Unit)? = null,
+    onBadgeClick: ((HeroDiscoveryFact) -> Unit)? = null,
     sharedTransitionScope: SharedTransitionScope? = null,
     animatedVisibilityScope: AnimatedVisibilityScope? = null,
     modifier: Modifier = Modifier,
@@ -264,6 +268,13 @@ fun MetaDetailsScreen(
     var observedOfflineState by remember(type, id) { mutableStateOf(false) }
     var selectedEpisodeForActions by remember(type, id) { mutableStateOf<MetaVideo?>(null) }
     var selectedSeasonForActions by remember(type, id) { mutableStateOf<Int?>(null) }
+    // The recap panel's boundary, and its open/closed state in one value: a recap is entirely
+    // described by where it stops.
+    var recapBoundary by remember(type, id) { mutableStateOf<RecapBoundary?>(null) }
+    val recapSettings by remember {
+        DiscoverAiSettingsRepository.ensureLoaded()
+        DiscoverAiSettingsRepository.uiState
+    }.collectAsStateWithLifecycle()
     val commentsEnabled by remember {
         TraktCommentsSettings.ensureLoaded()
         TraktCommentsSettings.enabled
@@ -1709,6 +1720,7 @@ fun MetaDetailsScreen(
                     showMonitorDialog ||
                     selectedEpisodeForActions != null ||
                     selectedSeasonForActions != null ||
+                    recapBoundary != null ||
                     selectedComment != null ||
                     // Only non-null while another trailer is being resolved/played elsewhere (the
                     // play-in-hero path clears it), so this never fights hero playback itself.
@@ -2132,6 +2144,7 @@ fun MetaDetailsScreen(
                                         ratingProviderName = ratingProviderName.takeIf { openRatingDialog != null },
                                         onCastClick = onCastClick,
                                         onCompanyClick = onCompanyClick,
+                                        onBadgeClick = onBadgeClick,
                                         onHeroTrailerMuteToggle = {
                                             HeroTrailerAudioState.toggleMuted()
                                         },
@@ -2484,6 +2497,16 @@ fun MetaDetailsScreen(
                                     progressByVideoId = progressByVideoId,
                                 )
                             }
+                            // Mirrors the builder's own contract: main-season episodes only, and
+                            // at least one of them carrying a synopsis. Gating on anything looser
+                            // shows a row that opens onto "nothing to recap".
+                            val canRecapBeforeEpisode = recapSettings.isRecapReady &&
+                                selectedSeasonNumber != null && selectedSeasonNumber > 0 &&
+                                selectedEpisodeNumber != null &&
+                                previousEpisodes.any { earlier ->
+                                    (earlier.effectiveSeasonNumber() ?: 0) > 0 &&
+                                        !earlier.overview.isNullOrBlank()
+                                }
                             EpisodeWatchedActionSheet(
                                 episode = selectedEpisode,
                                 seasonLabel = selectedEpisode.season?.let {
@@ -2494,6 +2517,16 @@ fun MetaDetailsScreen(
                                 arePreviousEpisodesWatched = arePreviousEpisodesWatched,
                                 isSeasonWatched = isSeasonWatched,
                                 onDismiss = { selectedEpisodeForActions = null },
+                                onRecap = if (canRecapBeforeEpisode) {
+                                    {
+                                        recapBoundary = RecapBoundary(
+                                            season = selectedSeasonNumber,
+                                            episode = selectedEpisodeNumber,
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
                                 onToggleWatched = {
                                     WatchingActions.toggleEpisodeWatched(
                                         meta = meta,
@@ -2566,11 +2599,22 @@ fun MetaDetailsScreen(
                                     )
                                 }
                             }
+                            // Offered only when there is earlier story *with synopses* to work
+                            // from. Season 1 has no earlier story, and an addon that supplies
+                            // episode titles but no descriptions has nothing a recap can be built
+                            // out of — in both cases the row is absent rather than failing on tap.
+                            val canRecap = recapSettings.isRecapReady &&
+                                previousSeasonEpisodes.any { !it.overview.isNullOrBlank() }
                             SeasonWatchedActionSheet(
                                 seasonLabel = seasonLabel,
                                 isSeasonWatched = isSeasonWatched,
                                 canMarkPreviousSeasons = canMarkPreviousSeasons,
                                 onDismiss = { selectedSeasonForActions = null },
+                                onRecap = if (canRecap) {
+                                    { recapBoundary = RecapBoundary(season = selectedSeason) }
+                                } else {
+                                    null
+                                },
                                 onToggleSeasonWatched = {
                                     WatchingActions.toggleSeasonWatched(
                                         meta = meta,
@@ -2585,6 +2629,15 @@ fun MetaDetailsScreen(
                                         areCurrentlyWatched = false,
                                     )
                                 },
+                            )
+                        }
+
+                        recapBoundary?.let { boundary ->
+                            RecapDialog(
+                                meta = meta,
+                                boundary = boundary,
+                                todayIsoDate = todayIsoDate,
+                                onDismiss = { recapBoundary = null },
                             )
                         }
 

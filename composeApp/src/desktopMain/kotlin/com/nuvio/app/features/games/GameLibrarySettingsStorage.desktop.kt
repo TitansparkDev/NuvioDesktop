@@ -8,6 +8,7 @@ internal actual object GameLibrarySettingsStorage {
     private const val igdbClientSecretKey = "games_igdb_client_secret"
     private const val steamGridDbApiKeyKey = "games_steamgriddb_api_key"
     private const val backdropStyleKey = "games_backdrop_style"
+    private const val metadataSourceKey = "games_metadata_source"
     private const val migratedKey = "games_settings_migrated_from_library_file"
     private val store = DesktopStorage.store("nuvio_games_settings")
 
@@ -19,6 +20,8 @@ internal actual object GameLibrarySettingsStorage {
     actual fun saveSteamGridDbApiKey(value: String) = save(steamGridDbApiKeyKey, value)
     actual fun loadBackdropStyle(): String? = load(backdropStyleKey)
     actual fun saveBackdropStyle(value: String) = save(backdropStyleKey, value)
+    actual fun loadMetadataSource(): String? = load(metadataSourceKey)
+    actual fun saveMetadataSource(value: String) = save(metadataSourceKey, value)
 
     private fun load(key: String): String? {
         migrateFromLibraryFileIfNeeded()
@@ -33,7 +36,7 @@ internal actual object GameLibrarySettingsStorage {
     }
 
     /**
-     * Lifts the credentials and presentation choice out of a pre-merge Umbra `library.json`.
+     * Lifts the credentials and presentation choice out of a pre-merge `library.json`.
      *
      * Runs at most once per profile and only fills keys that are still unset, so it cannot undo a
      * later edit. The library file keeps its `settings` block untouched — only

@@ -2,7 +2,6 @@ package com.nuvio.app.features.settings
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import com.nuvio.app.core.ui.ExtraLargePosterCardWidthDp
@@ -12,16 +11,13 @@ import com.nuvio.app.core.ui.CompactPosterCardWidthDp
 import com.nuvio.app.core.ui.DensePosterCardWidthDp
 import com.nuvio.app.core.ui.LargePosterCardWidthDp
 import com.nuvio.app.core.ui.StandardPosterCardWidthDp
-import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
 import com.nuvio.app.core.ui.PosterCardStyleRepository
 import com.nuvio.app.core.ui.PosterCardStyleUiState
 import com.nuvio.app.core.ui.PosterHighlightMode
 import com.nuvio.app.core.ui.PosterRatingBadgeScale
 import nuvio.composeapp.generated.resources.Res
-import nuvio.composeapp.generated.resources.action_reset
 import nuvio.composeapp.generated.resources.settings_poster_card_radius
-import nuvio.composeapp.generated.resources.settings_poster_card_style
 import nuvio.composeapp.generated.resources.settings_poster_card_width
 import nuvio.composeapp.generated.resources.settings_poster_description
 import nuvio.composeapp.generated.resources.settings_poster_hide_labels
@@ -68,59 +64,6 @@ import nuvio.composeapp.generated.resources.settings_poster_card_depth_posters
 import nuvio.composeapp.generated.resources.settings_poster_card_depth_sheen
 import nuvio.composeapp.generated.resources.settings_poster_card_depth_trailers
 import org.jetbrains.compose.resources.stringResource
-
-internal fun LazyListScope.posterCustomizationSettingsContent(
-    isTablet: Boolean,
-    uiState: PosterCardStyleUiState,
-) {
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_poster_card_style),
-            isTablet = isTablet,
-            actions = {
-                NuvioActionLabel(
-                    text = stringResource(Res.string.action_reset),
-                    onClick = PosterCardStyleRepository::resetToDefaults,
-                )
-            },
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                PosterCardStyleControls(
-                    isTablet = isTablet,
-                    widthDp = uiState.widthDp,
-                    cornerRadiusDp = uiState.cornerRadiusDp,
-                    catalogLandscapeModeEnabled = uiState.catalogLandscapeModeEnabled,
-                    collectionsPortraitPostersEnabled = uiState.collectionsPortraitPostersEnabled,
-                    landscapeTextTitlesEnabled = uiState.landscapeTextTitlesEnabled,
-                    landscapeRatingBadgeScale = uiState.landscapeRatingBadgeScale,
-                    posterHighlightMode = uiState.posterHighlightMode,
-                    hideLabelsEnabled = uiState.hideLabelsEnabled,
-                    zoomActionPreviewEnabled = uiState.zoomActionPreviewEnabled,
-                    onWidthSelected = PosterCardStyleRepository::setWidthDp,
-                    onCornerRadiusSelected = PosterCardStyleRepository::setCornerRadiusDp,
-                    onCatalogLandscapeModeChange = PosterCardStyleRepository::setCatalogLandscapeModeEnabled,
-                    onCollectionsPortraitPostersChange = PosterCardStyleRepository::setCollectionsPortraitPostersEnabled,
-                    onLandscapeTextTitlesChange = PosterCardStyleRepository::setLandscapeTextTitlesEnabled,
-                    onLandscapeRatingBadgeScaleChange = PosterCardStyleRepository::setLandscapeRatingBadgeScale,
-                    onHideLabelsChange = PosterCardStyleRepository::setHideLabelsEnabled,
-                )
-            }
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_poster_card_depth),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                CardDepthControls(
-                    isTablet = isTablet,
-                    uiState = uiState,
-                )
-            }
-        }
-    }
-}
 
 @Composable
 internal fun PosterCardStyleControls(

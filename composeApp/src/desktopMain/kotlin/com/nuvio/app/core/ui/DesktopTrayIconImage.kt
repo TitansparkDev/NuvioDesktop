@@ -16,6 +16,10 @@ private const val TrayIconContentMargin = 0.06f
 // Variants Windows can ask for as the shell scales: 100% through 300% of a 16px tray slot.
 private val TrayIconVariantSizes = intArrayOf(16, 20, 24, 32, 40, 48)
 
+// What a window gets asked for: ICON_SMALL (16px) and ICON_BIG (32px) at 100-300%, which is what
+// the taskbar and Alt-Tab draw from, plus the larger ones Task View and the shell's jump lists use.
+private val WindowIconVariantSizes = intArrayOf(16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+
 /**
  * Loads the app icon as a tray image.
  *
@@ -27,8 +31,7 @@ private val TrayIconVariantSizes = intArrayOf(16, 20, 24, 32, 40, 48)
  * Returns null when the resource cannot be decoded; the caller keeps whatever fallback it had.
  */
 internal fun loadDesktopTrayIconImage(url: URL, trayIconSize: Dimension): Image? {
-    val source = runCatching { ImageIO.read(url) }.getOrNull() ?: return null
-    val cropped = cropToContent(source)
+    val cropped = loadCroppedIconMaster(url) ?: return null
     val baseSize = trayIconSize.width.takeIf { it > 0 }?.coerceIn(16, 64) ?: 16
     val sizes = (intArrayOf(baseSize) + TrayIconVariantSizes)
         .filter { it >= baseSize }
@@ -39,15 +42,48 @@ internal fun loadDesktopTrayIconImage(url: URL, trayIconSize: Dimension): Image?
         .getOrElse { variants.firstOrNull() }
 }
 
+/**
+ * Loads the app icon as the per-size list for `Window.setIconImages`, smallest first.
+ *
+ * Compose's `Window(icon = painter)` renders the painter once at 192dp and hands AWT that single
+ * image; Windows then shrinks it — transparent margin included — to the 32px `ICON_BIG` the
+ * taskbar shows, so the glyph came out a size smaller than every neighbour's. With an exact
+ * variant for each size AWT asks for, nothing is rescaled by the shell at all.
+ *
+ * Empty when the resource cannot be decoded; the caller then keeps Compose's icon.
+ */
+internal fun loadDesktopWindowIconImages(url: URL): List<Image> {
+    val cropped = loadCroppedIconMaster(url) ?: return emptyList()
+    return WindowIconVariantSizes.map { size -> resampleTo(cropped, size) }
+}
+
+// The tray and the window both start from the same decode + crop, which is the expensive part;
+// the second caller gets it for free.
+private val croppedMasterLock = Any()
+private var croppedMaster: Pair<URL, BufferedImage>? = null
+
+private fun loadCroppedIconMaster(url: URL): BufferedImage? {
+    synchronized(croppedMasterLock) {
+        croppedMaster?.takeIf { it.first == url }?.let { return it.second }
+        val source = runCatching { ImageIO.read(url) }.getOrNull() ?: return null
+        val cropped = cropToContent(source)
+        croppedMaster = url to cropped
+        return cropped
+    }
+}
+
 /** The square crop around every non-transparent pixel, plus [TrayIconContentMargin] of breathing room. */
 private fun cropToContent(source: BufferedImage): BufferedImage {
     var minX = source.width
     var minY = source.height
     var maxX = -1
     var maxY = -1
+    // One bulk read: per-pixel getRGB on a 1080px master is a million calls through the raster.
+    val row = IntArray(source.width)
     for (y in 0 until source.height) {
-        for (x in 0 until source.width) {
-            if ((source.getRGB(x, y) ushr 24) == 0) continue
+        source.getRGB(0, y, source.width, 1, row, 0, source.width)
+        for (x in row.indices) {
+            if ((row[x] ushr 24) == 0) continue
             if (x < minX) minX = x
             if (x > maxX) maxX = x
             if (y < minY) minY = y

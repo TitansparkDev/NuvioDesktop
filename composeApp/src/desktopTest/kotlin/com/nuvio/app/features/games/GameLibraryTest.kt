@@ -32,7 +32,7 @@ class GameLibraryRepositoryTest {
     }
 
     @Test
-    fun migratesAStandaloneUmbraLibraryWhenNoneExistsYet() = runBlocking {
+    fun migratesAStandaloneLauncherLibraryWhenNoneExistsYet() = runBlocking {
         val directory = Files.createTempDirectory("nuvio-games-migration-test")
         val legacyFile = directory.resolve("umbra/library.json")
         val mergedFile = directory.resolve("nuvio/games/library.json")
@@ -76,6 +76,26 @@ class GameLauncherTest {
     @Test
     fun derivesReadableTitleFromExecutable() {
         assertEquals("Super game", executableDisplayName("C:\\Games\\Super_game.exe"))
+    }
+
+    @Test
+    fun recognisesProtocolUrlsButNotWindowsPaths() {
+        assertTrue(isProtocolLaunchTarget("steam://rungameid/620"))
+        assertTrue(isProtocolLaunchTarget("  STEAM://run/620  "))
+        assertTrue(isProtocolLaunchTarget("com.epicgames.launcher://apps/Fortnite?action=launch"))
+        assertFalse(isProtocolLaunchTarget("C:\\Games\\Super_game.exe"))
+        assertFalse(isProtocolLaunchTarget("D:/Steam/steamapps/common/Portal 2/portal2.exe"))
+        assertFalse(isProtocolLaunchTarget("\\\\nas\\games\\game.exe"))
+        assertFalse(isProtocolLaunchTarget("game.exe"))
+    }
+
+    @Test
+    fun protocolLaunchRefusesLooseArgumentsInsteadOfDroppingThem() {
+        val result = GameLauncher.launch(
+            GameEntry(id = "1", title = "Portal 2", executablePath = "steam://rungameid/620", arguments = listOf("-windowed")),
+        )
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("protocol URL"))
     }
 
     @Test
@@ -219,16 +239,342 @@ class ManualLogoTest {
     }
 }
 
-class GameLibraryNavigationTest {
+class GameShelfRowsTest {
+    private val installed = GameEntry(id = "a", title = "Installed one", executablePath = "C:\\g\\a.exe")
+    private val tracked = GameEntry(id = "b", title = "Tracked one")
+
     @Test
-    fun wheelDownMovesToUninstalledAndWheelUpMovesToInstalled() {
-        assertEquals(1, adjacentLibraryRow(0, 1, installedAvailable = true, uninstalledAvailable = true))
-        assertEquals(0, adjacentLibraryRow(1, -1, installedAvailable = true, uninstalledAvailable = true))
+    fun aLibraryWithoutRowsGetsInstalledThenUninstalled() {
+        val rows = ensureDefaultGameRows(emptyList())
+        assertEquals(listOf(GameInstalledRowId, GameUninstalledRowId), rows.map { it.id })
+        assertEquals(GameRowBucket.Installed, rows[0].defaultBucket)
+        assertEquals(GameRowBucket.Uninstalled, rows[1].defaultBucket)
     }
 
     @Test
-    fun missingRowsAreSkipped() {
-        assertEquals(0, adjacentLibraryRow(0, 1, installedAvailable = true, uninstalledAvailable = false))
-        assertEquals(1, adjacentLibraryRow(1, -1, installedAvailable = false, uninstalledAvailable = true))
+    fun aRenamedAndReorderedDefaultRowIsKeptWhereTheUserPutIt() {
+        val custom = listOf(
+            GameRow("uninstalled", "Wishlist", defaultBucket = GameRowBucket.Uninstalled),
+            GameRow("later", "Later"),
+            GameRow("installed", "Ready to play", defaultBucket = GameRowBucket.Installed),
+        )
+        assertEquals(custom, ensureDefaultGameRows(custom))
+    }
+
+    @Test
+    fun gamesFileIntoTheirBucketUntilMoved() {
+        val rows = ensureDefaultGameRows(listOf(GameRow("later", "Later")))
+        assertEquals(GameInstalledRowId, installed.effectiveRowId(rows))
+        assertEquals(GameUninstalledRowId, tracked.effectiveRowId(rows))
+        assertEquals("later", tracked.copy(rowId = "later").effectiveRowId(rows))
+        // A pin outlives its executable: adding one does not pull the game back to Installed.
+        assertEquals("later", installed.copy(rowId = "later").effectiveRowId(rows))
+    }
+
+    @Test
+    fun aPinToADeletedRowFallsBackToTheBucket() {
+        val rows = ensureDefaultGameRows(emptyList())
+        assertEquals(GameUninstalledRowId, tracked.copy(rowId = "gone").effectiveRowId(rows))
+    }
+
+    @Test
+    fun theShelfShowsRowsInOrderAndSkipsEmptyOnes() {
+        val rows = listOf(
+            GameRow("later", "Later"),
+            GameRow(GameInstalledRowId, "Installed", defaultBucket = GameRowBucket.Installed),
+            GameRow("empty", "Empty"),
+            GameRow(GameUninstalledRowId, "Uninstalled", defaultBucket = GameRowBucket.Uninstalled),
+        )
+        val shelf = gameShelfRows(listOf(installed, tracked, tracked.copy(id = "c", rowId = "later")), rows)
+        assertEquals(listOf("later", GameInstalledRowId, GameUninstalledRowId), shelf.map { it.row.id })
+        assertEquals(listOf("c"), shelf[0].games.map { it.id })
+        assertEquals(listOf("a"), shelf[1].games.map { it.id })
+        assertEquals(listOf("b"), shelf[2].games.map { it.id })
+    }
+
+    @Test
+    fun rowsRoundTripThroughTheLibraryFile() = runBlocking {
+        val directory = Files.createTempDirectory("nuvio-games-rows-test")
+        val repository = GameLibraryRepository(
+            dataFile = directory.resolve("library.json"),
+            legacyDataFiles = emptyList(),
+        )
+        val rows = ensureDefaultGameRows(emptyList()) + GameRow("later", "Later", color = 0xFF29B6F6)
+
+        repository.saveGames(listOf(tracked.copy(rowId = "later")))
+        repository.saveRows(rows)
+        val loaded = repository.load()
+
+        assertEquals(rows, loaded.rows)
+        assertEquals("later", loaded.games.single().rowId)
     }
 }
+
+class SteamArtworkTest {
+    @Test
+    fun readsAppIdFromASteamProtocolLaunchTarget() {
+        assertEquals(
+            620L,
+            steamAppIdFromLaunchTarget("steam://rungameid/620", emptyList()),
+        )
+        assertEquals(
+            570L,
+            steamAppIdFromLaunchTarget("C:\\Steam\\steam.exe", listOf("steam://run/570")),
+        )
+    }
+
+    @Test
+    fun readsAppIdFromAnApplaunchArgument() {
+        assertEquals(
+            292030L,
+            steamAppIdFromLaunchTarget("C:\\Steam\\steam.exe", listOf("-applaunch", "292030", "-skipStartScreen")),
+        )
+    }
+
+    @Test
+    fun ignoresAnApplaunchWithoutANumber() {
+        assertNull(steamAppIdFromLaunchTarget("C:\\Steam\\steam.exe", listOf("-applaunch")))
+        assertNull(steamAppIdFromLaunchTarget("C:\\Games\\game.exe", listOf("--windowed")))
+        assertNull(steamAppIdFromLaunchTarget(null, emptyList()))
+    }
+
+    @Test
+    fun findsTheInstallDirectoryAGameSitsUnder() {
+        assertEquals(
+            "Hades",
+            steamInstallDirectoryName("D:\\SteamLibrary\\steamapps\\common\\Hades\\x64\\Hades.exe"),
+        )
+        assertNull(steamInstallDirectoryName("D:\\Games\\Hades\\Hades.exe"))
+    }
+
+    @Test
+    fun matchesTheGameToItsSteamInstallManifest() {
+        val library = Files.createTempDirectory("nuvio-steam-library")
+        val steamApps = library.resolve("steamapps")
+        val installDirectory = steamApps.resolve("common/Hades/x64")
+        Files.createDirectories(installDirectory)
+        val executable = installDirectory.resolve("Hades.exe")
+        Files.writeString(executable, "")
+        // Two manifests, so the test proves it matches on installdir rather than on being first.
+        Files.writeString(
+            steamApps.resolve("appmanifest_1145360.acf"),
+            """
+            "AppState"
+            {
+            	"appid"		"1145360"
+            	"name"		"Hades"
+            	"installdir"		"Hades"
+            }
+            """.trimIndent(),
+        )
+        Files.writeString(
+            steamApps.resolve("appmanifest_620.acf"),
+            """
+            "AppState"
+            {
+            	"appid"		"620"
+            	"name"		"Portal 2"
+            	"installdir"		"Portal 2"
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(1145360L, steamAppIdFromInstallLocation(executable.toString()))
+    }
+
+    @Test
+    fun returnsNoAppIdForAGameOutsideASteamLibrary() {
+        val directory = Files.createTempDirectory("nuvio-steam-none")
+        val executable = directory.resolve("game.exe")
+        Files.writeString(executable, "")
+
+        assertNull(steamAppIdFromInstallLocation(executable.toString()))
+    }
+
+    @Test
+    fun takesOnlyAnExactTitleMatchFromTheStoreSearch() {
+        val results = listOf(
+            SteamSearchApp(appid = "1145365", name = "Hades Soundtrack"),
+            SteamSearchApp(appid = "1145360", name = "Hades"),
+        )
+
+        assertEquals("1145360", selectSteamApp(results, "hades")?.appid)
+        assertNull(selectSteamApp(results, "Hades II"))
+        assertNull(selectSteamApp(results, "Hades Sound"))
+    }
+
+    @Test
+    fun ignoresPunctuationWhenMatchingTitles() {
+        val results = listOf(SteamSearchApp(appid = "1817070", name = "Marvel's Spider-Man Remastered"))
+
+        assertEquals("1817070", selectSteamApp(results, "Marvel s Spider Man Remastered")?.appid)
+    }
+
+    @Test
+    fun buildsBothCdnHostsForAnAsset() {
+        assertEquals(
+            listOf(
+                "https://cdn.cloudflare.steamstatic.com/steam/apps/620/library_hero.jpg",
+                "https://shared.steamstatic.com/store_item_assets/steam/apps/620/library_hero.jpg",
+            ),
+            steamAssetUrls(620L, "library_hero.jpg"),
+        )
+    }
+
+    @Test
+    fun offersOneCandidatePerAssetChainSoAResolutionPairIsNotShownTwice() {
+        // A chain is one picture at descending sizes, so it yields one tile: the wide hero and the
+        // store-page background are two chains, every logo name is one.
+        assertEquals(2, STEAM_HERO_ASSETS.size)
+        assertEquals(1, STEAM_LOGO_ASSETS.size)
+        assertEquals(
+            listOf("library_hero_2x.jpg", "library_hero.jpg"),
+            STEAM_HERO_ASSETS.first().map(SteamAsset::fileName),
+        )
+        // logo.png is the name that actually resolves on the CDN, so it must be tried first.
+        assertEquals("logo.png", STEAM_LOGO_ASSETS.first().first().fileName)
+    }
+
+    @Test
+    fun readsLogoDimensionsFromAPngHeader() {
+        val header = ByteArray(24)
+        byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A).copyInto(header)
+        // Width 640, height 360, big-endian, at the fixed IHDR offsets.
+        byteArrayOf(0, 0, 0x02, 0x80.toByte()).copyInto(header, 16)
+        byteArrayOf(0, 0, 0x01, 0x68).copyInto(header, 20)
+
+        assertEquals(640 to 360, pngDimensions(header))
+    }
+
+    @Test
+    fun measuresNothingThatIsNotAPng() {
+        assertNull(pngDimensions(ByteArray(24)))
+        assertNull(pngDimensions(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)))
+    }
+
+    @Test
+    fun labelsSteamLogosByTheirSourceWhenTheyCarryNoLanguage() {
+        val logo = LogoCandidate(
+            url = "https://cdn.cloudflare.steamstatic.com/steam/apps/620/library_logo.png",
+            width = 0,
+            height = 0,
+            score = 0,
+            source = ArtworkSource.STEAM,
+        )
+
+        assertEquals("Steam", logo.source.label)
+        assertNull(logo.languageLabel)
+        assertEquals("Resolution unknown", logo.resolutionLabel)
+    }
+}
+
+class SteamMetadataTest {
+    @Test
+    fun readsTheStoreDisplayDateInEitherOrder() {
+        // Steam has no timestamp field, only the string its store page prints.
+        assertEquals(1600300800L, parseSteamReleaseDate("17 Sep, 2020"))
+        assertEquals(1600300800L, parseSteamReleaseDate("Sep 17, 2020"))
+        assertEquals(1600300800L, parseSteamReleaseDate("17 September, 2020"))
+        assertEquals(911433600L, parseSteamReleaseDate("19 Nov, 1998"))
+    }
+
+    @Test
+    fun fallsBackToTheMonthOrTheYearWhenThatIsAllThereIs() {
+        assertEquals(1598918400L, parseSteamReleaseDate("Sep 2020"))
+        assertEquals(1577836800L, parseSteamReleaseDate("2020"))
+    }
+
+    @Test
+    fun refusesToGuessAtAnUnreleasedDate() {
+        // All legal values of the field. A guess here would print a wrong year in the editor.
+        assertNull(parseSteamReleaseDate("Coming soon"))
+        assertNull(parseSteamReleaseDate("To be announced"))
+        assertNull(parseSteamReleaseDate("Q4 2026"))
+        assertNull(parseSteamReleaseDate("Fall 2026"))
+        assertNull(parseSteamReleaseDate(""))
+        assertNull(parseSteamReleaseDate(null))
+    }
+
+    @Test
+    fun entriesWrittenBeforeTheSettingExistedCountAsIgdb() {
+        // Anything else would re-fetch the whole library on the first launch after the upgrade.
+        assertEquals(
+            GameMetadataSource.Igdb,
+            GameEntry(id = "1", title = "Hades", igdbId = 100L).effectiveMetadataSource,
+        )
+        assertEquals(
+            GameMetadataSource.Steam,
+            GameEntry(
+                id = "2",
+                title = "Hades",
+                metadataSource = GameMetadataSource.Steam,
+            ).effectiveMetadataSource,
+        )
+    }
+
+    @Test
+    fun aMatchIsCheckedAgainstItsOwnProvidersIdSpace() {
+        val entry = GameEntry(id = "1", title = "Hades", igdbId = 1145360L, steamAppId = 620L)
+        val igdb = { id: Long -> steamlessMetadata(id, GameMetadataSource.Igdb) }
+        val steam = { id: Long -> steamlessMetadata(id, GameMetadataSource.Steam) }
+
+        assertTrue(entry.matchesMetadata(igdb(1145360L)))
+        assertTrue(entry.matchesMetadata(steam(620L)))
+        // The same number in the other provider's id space is a different game.
+        assertFalse(entry.matchesMetadata(steam(1145360L)))
+        assertFalse(entry.matchesMetadata(igdb(620L)))
+    }
+
+    @Test
+    fun theSteamMatchAndItsSourceRoundTripThroughTheLibraryFile() = runBlocking {
+        val directory = Files.createTempDirectory("nuvio-games-steam-source-test")
+        val repository = GameLibraryRepository(
+            dataFile = directory.resolve("library.json"),
+            legacyDataFiles = emptyList(),
+        )
+        val game = GameEntry(
+            id = "steam-1",
+            title = "Hades",
+            steamAppId = 1145360L,
+            metadataSource = GameMetadataSource.Steam,
+        )
+
+        repository.saveGames(listOf(game))
+
+        assertEquals(listOf(game), repository.load().games)
+    }
+
+    @Test
+    fun steamIsAlwaysConfiguredAndIgdbNeedsBothHalves() {
+        val noKeys = GameLibrarySettings()
+
+        assertFalse(noKeys.metadataConfigured)
+        assertTrue(noKeys.copy(metadataSource = GameMetadataSource.Steam).metadataConfigured)
+        assertTrue(
+            noKeys.copy(igdbClientId = "id", igdbClientSecret = "secret").metadataConfigured,
+        )
+    }
+
+    @Test
+    fun coversAreProbedLargestFirstAndNeverFallBackToLandscapeArt() {
+        assertEquals(1, STEAM_COVER_ASSETS.size)
+        assertEquals(
+            listOf("library_600x900_2x.jpg", "library_600x900.jpg"),
+            STEAM_COVER_ASSETS.first().map(SteamAsset::fileName),
+        )
+    }
+}
+
+private fun steamlessMetadata(id: Long, source: GameMetadataSource) = GameMetadata(
+    id = id,
+    source = source,
+    title = "Hades",
+    coverUrl = null,
+    backdropUrl = null,
+    logoUrl = null,
+    summary = null,
+    releaseDateEpochSeconds = null,
+    genres = emptyList(),
+    platforms = emptyList(),
+    rating = null,
+)

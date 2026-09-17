@@ -13,6 +13,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.Dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.ui.NuvioShelfSection
+import com.nuvio.app.core.ui.RecompositionProbe
+import com.nuvio.app.core.ui.frameBudgetProbe
 import com.nuvio.app.core.ui.NuvioViewAllPillSize
 import com.nuvio.app.core.ui.rememberHomePosterCardStyleUiState
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
@@ -47,6 +49,7 @@ fun HomeCatalogRowSection(
     rowNumber: Int? = null,
     // TV Mode's row-jump dots, rendered on the header line next to the title. Null everywhere else.
     headerTrailingContent: (@Composable () -> Unit)? = null,
+    bodyModifier: Modifier = Modifier,
     // Discover's clickable catalog/genre segments replace the header title, and its picker panel
     // draws over the faded posters. Null on every ordinary catalog row.
     titleContent: (@Composable () -> Unit)? = null,
@@ -59,7 +62,7 @@ fun HomeCatalogRowSection(
             section = section,
             entries = entries,
             watchedKeys = watchedKeys,
-            modifier = modifier.fillMaxWidth(),
+            modifier = modifier.fillMaxWidth().frameBudgetProbe("row"),
             sectionPadding = sectionPadding,
             basePosterWidthDpOverride = basePosterWidthDpOverride,
             focusedItemIndex = focusedItemIndex,
@@ -76,6 +79,7 @@ fun HomeCatalogRowSection(
             onPosterLongClick = onPosterLongClick,
             rowNumber = rowNumber,
             headerTrailingContent = headerTrailingContent,
+            bodyModifier = bodyModifier,
             titleContent = titleContent,
             bodyAlpha = bodyAlpha,
             bodyOverlay = bodyOverlay,
@@ -86,7 +90,7 @@ fun HomeCatalogRowSection(
                 section = section,
                 entries = entries,
                 watchedKeys = watchedKeys,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().frameBudgetProbe("row"),
                 sectionPadding = homeSectionHorizontalPaddingForWidth(maxWidth.value),
                 basePosterWidthDpOverride = basePosterWidthDpOverride,
                 focusedItemIndex = focusedItemIndex,
@@ -103,6 +107,7 @@ fun HomeCatalogRowSection(
                 onPosterLongClick = onPosterLongClick,
                 rowNumber = rowNumber,
                 headerTrailingContent = headerTrailingContent,
+                bodyModifier = bodyModifier,
                 titleContent = titleContent,
                 bodyAlpha = bodyAlpha,
                 bodyOverlay = bodyOverlay,
@@ -133,10 +138,12 @@ private fun HomeCatalogRowSectionContent(
     onPosterLongClick: ((MetaPreview) -> Unit)?,
     rowNumber: Int?,
     headerTrailingContent: (@Composable () -> Unit)?,
+    bodyModifier: Modifier,
     titleContent: (@Composable () -> Unit)?,
     bodyAlpha: Float,
     bodyOverlay: (@Composable BoxScope.() -> Unit)?,
 ) {
+    RecompositionProbe("row")
     val posterCardStyle = rememberHomePosterCardStyleUiState()
     val homeCatalogSettings by remember {
         HomeCatalogSettingsRepository.snapshot()
@@ -167,13 +174,16 @@ private fun HomeCatalogRowSectionContent(
         isKeyboardNavigation = isKeyboardNavigation,
         viewAllPillSize = NuvioViewAllPillSize.Compact,
         headerTrailingContent = headerTrailingContent,
+        bodyModifier = bodyModifier,
         titleContent = titleContent,
         bodyAlpha = bodyAlpha,
         bodyOverlay = bodyOverlay,
         key = { item -> item.stableKey() },
         rowState = rowState,
     ) { item ->
+        RecompositionProbe("card")
         HomePosterCard(
+            modifier = Modifier.frameBudgetProbe("card"),
             item = item,
             useLandscapeBackdropMode = posterCardStyle.catalogLandscapeModeEnabled,
             basePosterWidthDpOverride = basePosterWidthDpOverride,

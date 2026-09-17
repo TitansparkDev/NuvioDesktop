@@ -18,6 +18,8 @@ internal actual object DiscoverAiSettingsStorage {
     private const val consentKey = "discover_ai_consent"
     private const val enabledKey = "discover_ai_enabled"
     private const val dailyRefreshKey = "discover_ai_daily_refresh"
+    private const val recapEnabledKey = "discover_ai_recap_enabled"
+    private const val recapModelKnowledgeKey = "discover_ai_recap_model_knowledge"
 
     /**
      * What a sync round trip replaces. [apiKeyKey] is **not** here and must not be added — see the
@@ -31,6 +33,8 @@ internal actual object DiscoverAiSettingsStorage {
         consentKey,
         enabledKey,
         dailyRefreshKey,
+        recapEnabledKey,
+        recapModelKnowledgeKey,
     )
     private val store = DesktopStorage.store("nuvio_discover_ai_settings")
 
@@ -48,6 +52,11 @@ internal actual object DiscoverAiSettingsStorage {
     actual fun saveEnabled(value: Boolean) = saveBoolean(enabledKey, value)
     actual fun loadDailyRefresh(): Boolean? = loadBoolean(dailyRefreshKey)
     actual fun saveDailyRefresh(value: Boolean) = saveBoolean(dailyRefreshKey, value)
+    actual fun loadRecapEnabled(): Boolean? = loadBoolean(recapEnabledKey)
+    actual fun saveRecapEnabled(value: Boolean) = saveBoolean(recapEnabledKey, value)
+    actual fun loadRecapUseModelKnowledge(): Boolean? = loadBoolean(recapModelKnowledgeKey)
+    actual fun saveRecapUseModelKnowledge(value: Boolean) =
+        saveBoolean(recapModelKnowledgeKey, value)
 
     private fun loadString(key: String): String? = store.getString(ProfileScopedKey.of(key))
     private fun saveString(key: String, value: String) = store.putString(ProfileScopedKey.of(key), value)
@@ -61,6 +70,8 @@ internal actual object DiscoverAiSettingsStorage {
         loadConsentGiven()?.let { put(consentKey, encodeSyncBoolean(it)) }
         loadEnabled()?.let { put(enabledKey, encodeSyncBoolean(it)) }
         loadDailyRefresh()?.let { put(dailyRefreshKey, encodeSyncBoolean(it)) }
+        loadRecapEnabled()?.let { put(recapEnabledKey, encodeSyncBoolean(it)) }
+        loadRecapUseModelKnowledge()?.let { put(recapModelKnowledgeKey, encodeSyncBoolean(it)) }
     }
 
     actual fun replaceFromSyncPayload(payload: JsonObject) {
@@ -71,5 +82,7 @@ internal actual object DiscoverAiSettingsStorage {
         payload.decodeSyncBoolean(consentKey)?.let(::saveConsentGiven)
         payload.decodeSyncBoolean(enabledKey)?.let(::saveEnabled)
         payload.decodeSyncBoolean(dailyRefreshKey)?.let(::saveDailyRefresh)
+        payload.decodeSyncBoolean(recapEnabledKey)?.let(::saveRecapEnabled)
+        payload.decodeSyncBoolean(recapModelKnowledgeKey)?.let(::saveRecapUseModelKnowledge)
     }
 }

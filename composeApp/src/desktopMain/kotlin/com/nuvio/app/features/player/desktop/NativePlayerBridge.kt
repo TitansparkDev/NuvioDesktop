@@ -139,6 +139,32 @@ internal object NativePlayerBridge {
     external fun toggleStatsOverlay(handle: Long)
     external fun forceVideoRedraw(handle: Long)
 
+    /**
+     * Polls the XInput controller slots selected by [slotMask] (bit N = slot N) and returns a
+     * bitmask of the slots that answered. [out] must hold at least `4 * 8` ints and is filled per
+     * slot with `[buttons, leftTrigger, rightTrigger, thumbLX, thumbLY, thumbRX, thumbRY,
+     * packetNumber]`; untouched slots keep their previous contents, so read only the slots whose
+     * bit is set in the return value.
+     *
+     * Nothing about the player — it lives here because this is the process's only JNI surface, and
+     * XInput needs no more than a symbol lookup that the bridge already knows how to do.
+     */
+    external fun pollGamepads(slotMask: Int, out: IntArray): Int
+
+    /**
+     * Milliseconds since the last keyboard or mouse input anywhere on the desktop (Windows'
+     * `GetLastInputInfo`), or -1 if that could not be read. Controllers are not included; see
+     * `DesktopScreensaver` for how they are folded in. Same reason for living here as
+     * [pollGamepads].
+     */
+    external fun systemIdleMs(): Long
+
+    /**
+     * Whether the foreground window belongs to this process. AWT's `Window.isActive` cannot be
+     * trusted for this while focus sits in the WebView2 HUD (a non-AWT child of the frame).
+     */
+    external fun isForegroundProcess(): Boolean
+
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
 

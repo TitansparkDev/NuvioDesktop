@@ -27,10 +27,14 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopVerboseMpvLoggingEnabled(enabled: Boolean)
     fun loadDesktopUiScalePercent(): Int?
     fun saveDesktopUiScalePercent(percent: Int)
+    fun loadDesktopControlIconScalePercent(): Int?
+    fun saveDesktopControlIconScalePercent(percent: Int)
     fun loadSeekStepSeconds(): Int?
     fun saveSeekStepSeconds(seconds: Int)
     fun loadDesktopSourceNotchPosition(): String?
     fun saveDesktopSourceNotchPosition(position: String)
+    fun loadDesktopSourceNotchHoverEnabled(): Boolean?
+    fun saveDesktopSourceNotchHoverEnabled(enabled: Boolean)
     fun loadDesktopPlayerNotificationPosition(): String?
     fun saveDesktopPlayerNotificationPosition(position: String)
     fun loadExternalPlayerEnabled(): Boolean?
@@ -49,8 +53,11 @@ internal expect object PlayerSettingsStorage {
     fun saveSecondaryPreferredSubtitleLanguage(language: String?)
     fun loadDualSubtitlesEnabled(): Boolean?
     fun saveDualSubtitlesEnabled(enabled: Boolean)
-    fun loadPreferHearingImpairedSubtitles(): Boolean?
-    fun savePreferHearingImpairedSubtitles(enabled: Boolean)
+    fun loadPreferredSubtitleTrackKind(): String?
+    fun savePreferredSubtitleTrackKind(kind: String)
+    /** Pre-1.14 switches, read only to fold into the track kind. See [PlayerSettingsRepository]. */
+    fun loadLegacyPreferHearingImpairedSubtitles(): Boolean?
+    fun loadLegacySubtitleUseForcedSubtitles(): Boolean?
     fun loadSubtitleTextColor(): String?
     fun saveSubtitleTextColor(colorHex: String)
     fun loadSubtitleBackgroundColor(): String?
@@ -83,8 +90,6 @@ internal expect object PlayerSettingsStorage {
     fun saveSubtitleAssStyleMode(mode: String)
     fun loadSubtitleAssScalePercent(): Int?
     fun saveSubtitleAssScalePercent(percent: Int)
-    fun loadSubtitleUseForcedSubtitles(): Boolean?
-    fun saveSubtitleUseForcedSubtitles(enabled: Boolean)
     fun loadSubtitleShowOnlyPreferredLanguages(): Boolean?
     fun saveSubtitleShowOnlyPreferredLanguages(enabled: Boolean)
     fun loadAddonSubtitleStartupMode(): String?
@@ -129,6 +134,8 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopCustomShaderSelectedPath(path: String)
     fun loadDesktopAudioPassthroughEnabled(): Boolean?
     fun saveDesktopAudioPassthroughEnabled(enabled: Boolean)
+    fun loadDesktopSeekThumbnailsEnabled(): Boolean?
+    fun saveDesktopSeekThumbnailsEnabled(enabled: Boolean)
     fun loadDesktopCustomMpvOptions(): String?
     fun saveDesktopCustomMpvOptions(options: String)
     fun loadDesktopMpvConfigMode(): String?
@@ -168,6 +175,8 @@ internal expect object PlayerSettingsStorage {
     fun saveIntroSubmitEnabled(enabled: Boolean)
     fun loadStreamAutoPlayNextEpisodeEnabled(): Boolean?
     fun saveStreamAutoPlayNextEpisodeEnabled(enabled: Boolean)
+    fun loadStreamAutoPlayManualNextEpisode(): Boolean?
+    fun saveStreamAutoPlayManualNextEpisode(enabled: Boolean)
     fun loadStreamAutoPlayPreferBingeGroup(): Boolean?
     fun saveStreamAutoPlayPreferBingeGroup(enabled: Boolean)
     fun loadStreamAutoPlayReuseBingeGroup(): Boolean?
@@ -220,10 +229,20 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopHdrMode(mode: String)
     fun loadDesktopColorProfile(): String?
     fun saveDesktopColorProfile(profile: String)
+    fun loadDesktopColorContrast(): Int?
+    fun saveDesktopColorContrast(value: Int)
+    fun loadDesktopColorBrightness(): Int?
+    fun saveDesktopColorBrightness(value: Int)
+    fun loadDesktopColorSaturation(): Int?
+    fun saveDesktopColorSaturation(value: Int)
+    fun loadDesktopColorGamma(): Int?
+    fun saveDesktopColorGamma(value: Int)
     fun loadDesktopBufferPreset(): String?
     fun saveDesktopBufferPreset(preset: String)
     fun loadDesktopRendererApi(): String?
     fun saveDesktopRendererApi(api: String)
+    fun loadDesktopPerformanceLogging(): Boolean?
+    fun saveDesktopPerformanceLogging(enabled: Boolean)
     fun loadDesktopLowVramMode(): String?
     fun saveDesktopLowVramMode(mode: String)
     fun loadDesktopAnimeMode(): String?

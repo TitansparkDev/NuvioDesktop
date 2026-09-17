@@ -22,3 +22,15 @@ sealed class HomeContentMode {
         val sections: List<HomeCatalogSection>,
     ) : HomeContentMode()
 }
+
+/**
+ * Short, stable name for telemetry lines. Deliberately not `toString()`: [Catalogs] carries its
+ * whole section list, which would put a catalog dump in every log line.
+ */
+internal fun HomeContentMode.telemetryName(): String = when (this) {
+    is HomeContentMode.Normal -> "home"
+    is HomeContentMode.Search -> "search"
+    is HomeContentMode.Library -> "library"
+    is HomeContentMode.Discover -> "discover"
+    is HomeContentMode.Catalogs -> "catalog"
+}

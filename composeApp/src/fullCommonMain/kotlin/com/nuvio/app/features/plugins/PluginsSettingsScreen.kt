@@ -88,6 +88,9 @@ import nuvio.composeapp.generated.resources.plugins_enable_globally_title
 import nuvio.composeapp.generated.resources.plugins_error_enter_repo_url
 import nuvio.composeapp.generated.resources.plugins_group_by_repo_desc
 import nuvio.composeapp.generated.resources.plugins_group_by_repo_title
+import nuvio.composeapp.generated.resources.plugins_skip_duplicates
+import nuvio.composeapp.generated.resources.plugins_skip_duplicates_desc
+import nuvio.composeapp.generated.resources.plugins_skip_duplicates_title
 import nuvio.composeapp.generated.resources.plugins_input_manifest_placeholder
 import nuvio.composeapp.generated.resources.plugins_message_installed
 import nuvio.composeapp.generated.resources.plugins_provider_disabled_by_repo
@@ -305,6 +308,35 @@ fun PluginsSettingsPageContent(
                 Switch(
                     checked = uiState.groupStreamsByRepository,
                     onCheckedChange = { PluginRepository.setGroupStreamsByRepository(it) },
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(Res.string.plugins_skip_duplicates_title),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = stringResource(Res.string.plugins_skip_duplicates_desc),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Switch(
+                    checked = uiState.skipDuplicateScrapers,
+                    onCheckedChange = { PluginRepository.setSkipDuplicateScrapers(it) },
                 )
             }
         }
@@ -1068,6 +1100,11 @@ private fun DesktopPluginProvidersHeader(
             label = stringResource(Res.string.plugins_group_by_repo),
             active = uiState.groupStreamsByRepository,
             onClick = { PluginRepository.setGroupStreamsByRepository(!uiState.groupStreamsByRepository) },
+        )
+        DesktopPluginDotSetting(
+            label = stringResource(Res.string.plugins_skip_duplicates),
+            active = uiState.skipDuplicateScrapers,
+            onClick = { PluginRepository.setSkipDuplicateScrapers(!uiState.skipDuplicateScrapers) },
         )
         DesktopPluginStatusIndicator(
             label = if (hasTmdbApiKey) {

@@ -52,6 +52,8 @@ import com.nuvio.app.core.ui.NuvioPosterHoverTooltip
 import com.nuvio.app.features.downloads.DownloadItem
 import com.nuvio.app.features.downloads.DownloadStatus
 import com.nuvio.app.features.downloads.DownloadsRepository
+import com.nuvio.app.features.downloads.formatDownloadDuration
+import com.nuvio.app.features.downloads.formatDownloadSpeed
 import com.nuvio.app.features.locallibrary.LocalFolder
 import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import com.nuvio.app.features.settings.SettingsChoiceOption
@@ -381,56 +383,19 @@ private fun LibraryDownloadsMonitoredSection(isTablet: Boolean) {
 private fun LibraryDownloadsActivitySection(isTablet: Boolean) {
     val pvr by LibraryPvrRepository.uiState.collectAsStateWithLifecycle()
     val downloads by DownloadsRepository.uiState.collectAsStateWithLifecycle()
-    val monitoredById = remember(pvr.monitoredItems) {
-        pvr.monitoredItems.associateBy(MonitoredItem::id)
-    }
-    val grabDownloadIds = remember(pvr.grabHistory) {
-        pvr.grabHistory.mapNotNullTo(hashSetOf()) { it.downloadId }
-    }
-    // Right-click stream/season actions are automatic library transfers but intentionally do not
-    // create a monitored title. Keep their active queue visible in this activity section too.
-    val directAutomaticDownloads = remember(downloads.items, grabDownloadIds) {
-        downloads.items.filter {
-            it.isAutomaticDownload &&
-                it.status != DownloadStatus.Completed &&
-                it.id !in grabDownloadIds
-        }
+    val rows = remember(pvr.grabHistory, pvr.monitoredItems, downloads.items) {
+        activityRows(pvr.grabHistory, pvr.monitoredItems, downloads.items)
     }
 
     SettingsSection(title = stringResource(Res.string.library_downloads_section_activity), isTablet = isTablet) {
-        if (pvr.grabHistory.isEmpty() && directAutomaticDownloads.isEmpty()) {
+        if (rows.isEmpty()) {
             EmptyStateRow(stringResource(Res.string.library_downloads_activity_empty))
         } else {
             SettingsGroup(isTablet = isTablet) {
-                pvr.grabHistory.take(30).forEachIndexed { index, grab ->
+                rows.forEachIndexed { index, row ->
                     if (index > 0) SettingsGroupDivider(isTablet = isTablet)
-                    val monitored = monitoredById[grab.monitoredItemId]
-                    val download = if (
-                        grab.status == GrabStatus.DOWNLOADING ||
-                        grab.status == GrabStatus.QUEUED
-                    ) {
-                        downloads.items.firstOrNull { candidate ->
-                            (grab.downloadId != null && candidate.id == grab.downloadId) ||
-                                (
-                                    monitored != null &&
-                                        candidate.parentMetaId == monitored.contentId &&
-                                        candidate.seasonNumber == grab.season &&
-                                        candidate.episodeNumber == grab.episode
-                                    )
-                        }
-                    } else {
-                        null
-                    }
-                    GrabRow(grab, download)
+                    GrabRow(row.grab, row.download, directDownloadOnly = row.isDirect)
                 }
-                directAutomaticDownloads
-                    .take((30 - pvr.grabHistory.size).coerceAtLeast(0))
-                    .forEach { download ->
-                        if (pvr.grabHistory.isNotEmpty() || download != directAutomaticDownloads.first()) {
-                            SettingsGroupDivider(isTablet = isTablet)
-                        }
-                        GrabRow(download.asDirectGrabRecord(), download, directDownloadOnly = true)
-                    }
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsNavigationRow(
                     title = stringResource(Res.string.library_downloads_clear_activity),
@@ -441,6 +406,79 @@ private fun LibraryDownloadsActivitySection(isTablet: Boolean) {
             }
         }
     }
+}
+
+private class ActivityRow(
+    val grab: GrabRecord,
+    val download: DownloadItem?,
+    /** A right-click stream/season transfer with no grab record behind it. */
+    val isDirect: Boolean,
+) {
+    val isTransferring: Boolean get() = download?.status == DownloadStatus.Downloading
+    val isWaiting: Boolean
+        get() = !isTransferring &&
+            (
+                download?.status == DownloadStatus.Paused ||
+                    grab.status == GrabStatus.QUEUED ||
+                    grab.status == GrabStatus.DOWNLOADING
+                )
+    val isInFlight: Boolean get() = isTransferring || isWaiting
+}
+
+/** Rows finished history keeps once the in-flight rows have taken their share of the list. */
+private const val ACTIVITY_ROW_BUDGET = 30
+private const val ACTIVITY_TERMINAL_ROW_FLOOR = 10
+
+/**
+ * Grab history and direct automatic transfers merged into one list: live transfers first, then
+ * everything queued or paused, then finished rows newest-first. A pack of 50 episodes used to
+ * land newest-first (last episode on top) and then hit a 30-row cap, so the episodes actually
+ * transferring — the first ones — were the ones cut off. In-flight rows are never capped: the
+ * whole queue is the point of this section. Only finished history is trimmed.
+ */
+private fun activityRows(
+    grabHistory: List<GrabRecord>,
+    monitoredItems: List<MonitoredItem>,
+    downloads: List<DownloadItem>,
+): List<ActivityRow> {
+    val monitoredById = monitoredItems.associateBy(MonitoredItem::id)
+    val grabDownloadIds = grabHistory.mapNotNullTo(hashSetOf()) { it.downloadId }
+
+    val grabRows = grabHistory.map { grab ->
+        val monitored = monitoredById[grab.monitoredItemId]
+        val download = if (grab.status == GrabStatus.DOWNLOADING || grab.status == GrabStatus.QUEUED) {
+            downloads.firstOrNull { candidate ->
+                (grab.downloadId != null && candidate.id == grab.downloadId) ||
+                    (
+                        monitored != null &&
+                            candidate.parentMetaId == monitored.contentId &&
+                            candidate.seasonNumber == grab.season &&
+                            candidate.episodeNumber == grab.episode
+                        )
+            }
+        } else {
+            null
+        }
+        ActivityRow(grab, download, isDirect = false)
+    }
+    // Right-click stream/season actions are automatic library transfers but intentionally do not
+    // create a monitored title. Keep their queue visible in this activity section too.
+    val directRows = downloads
+        .filter { it.isAutomaticDownload && it.status != DownloadStatus.Completed && it.id !in grabDownloadIds }
+        .map { ActivityRow(it.asDirectGrabRecord(), it, isDirect = true) }
+
+    val (inFlight, terminal) = (grabRows + directRows).partition { it.isInFlight }
+    val orderedInFlight = inFlight.sortedWith(
+        compareBy<ActivityRow> { if (it.isTransferring) 0 else 1 }
+            .thenBy { it.grab.title.trim().lowercase() }
+            .thenBy { it.grab.season ?: Int.MAX_VALUE }
+            .thenBy { it.grab.episode ?: Int.MAX_VALUE }
+            .thenByDescending { it.grab.updatedAtEpochMs },
+    )
+    val orderedTerminal = terminal
+        .sortedByDescending { it.grab.updatedAtEpochMs }
+        .take((ACTIVITY_ROW_BUDGET - orderedInFlight.size).coerceAtLeast(ACTIVITY_TERMINAL_ROW_FLOOR))
+    return orderedInFlight + orderedTerminal
 }
 
 @Composable
@@ -659,23 +697,35 @@ private fun GrabRow(
     download: DownloadItem?,
     directDownloadOnly: Boolean = false,
 ) {
-    val activityLabel = download?.fileName
+    // The title and episode lead: a stream label is often just the addon's tag ("2160p",
+    // "topcartoons") and a file name says nothing about which show it belongs to. Whichever of
+    // those exists goes on a muted second line, with the full text in the hover tooltip.
+    val titleLine = grab.displayLine()
+    val sourceLine = download?.fileName
         ?.takeIf { it.isNotBlank() }
-        ?: grab.streamLabel?.takeIf { it.isNotBlank() }
-        ?: grab.displayLine()
+        ?: grab.streamLabel?.takeIf { it.isNotBlank() && !it.equals(titleLine, ignoreCase = true) }
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            NuvioPosterHoverTooltip(title = activityLabel) {
-                Text(
-                    text = activityLabel,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            Text(
+                text = titleLine,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            sourceLine?.let {
+                NuvioPosterHoverTooltip(title = it) {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             grab.failReason?.takeIf { it.isNotBlank() }?.let {
                 Text(
@@ -700,8 +750,14 @@ private fun GrabRow(
         // Keyed off the transfer state rather than a null download, so an unrelated finished
         // transfer for the same episode cannot strand the row without a cancel control.
         val isQueued = grab.status == GrabStatus.QUEUED && !isTransferring
+        // A pack episode parked until a slot frees up was never paused by the user.
+        val statusLabel = when {
+            download?.isQueuedForSlot == true -> GrabStatus.QUEUED.name
+            transferPaused -> "PAUSED"
+            else -> grab.status.name
+        }
         Text(
-            text = if (transferPaused) "PAUSED" else grab.status.name,
+            text = statusLabel,
             style = MaterialTheme.typography.labelSmall,
             color = if (transferPaused) MaterialTheme.colorScheme.onSurfaceVariant else grabStatusColor(grab.status),
         )
@@ -823,50 +879,10 @@ private fun GrabRecord.displayLine(): String = buildString {
 }
 
 private fun downloadProgressLine(download: DownloadItem): String {
-    val percent = download.totalBytes
-        ?.takeIf { it > 0L }
-        ?.let { total -> (download.downloadedBytes * 100L / total).coerceIn(0L, 100L) }
-        ?.let { "$it%" }
-        ?: "—%"
+    val percent = download.progressPercent?.let { "$it%" } ?: "—%"
     val speed = download.bytesPerSecond?.takeIf { it > 0L }?.let(::formatDownloadSpeed) ?: "—"
-    val eta = downloadEta(download)
+    val eta = download.etaSeconds?.let { "${formatDownloadDuration(it)} left" }
     return if (eta != null) "$percent  •  $speed  •  $eta" else "$percent  •  $speed"
-}
-
-/**
- * Time-remaining estimate from the live speed sample. Null whenever it would be a guess — no known
- * total, no speed sample yet, or the remaining bytes are already covered — so the line just drops
- * back to percent + speed instead of showing a nonsense figure.
- */
-private fun downloadEta(download: DownloadItem): String? {
-    val total = download.totalBytes?.takeIf { it > 0L } ?: return null
-    val speed = download.bytesPerSecond?.takeIf { it > 0L } ?: return null
-    val remaining = (total - download.downloadedBytes).takeIf { it > 0L } ?: return null
-    return "${formatDuration(remaining / speed)} left"
-}
-
-private fun formatDuration(totalSeconds: Long): String {
-    val seconds = totalSeconds.coerceAtLeast(1L)
-    val hours = seconds / 3600L
-    val minutes = (seconds % 3600L) / 60L
-    return when {
-        hours > 0L -> "${hours}h ${minutes}m"
-        minutes > 0L -> "${minutes}m ${seconds % 60L}s"
-        else -> "${seconds}s"
-    }
-}
-
-private fun formatDownloadSpeed(bytesPerSecond: Long): String = when {
-    bytesPerSecond >= 125_000L ->
-        "${formatOneDecimal(bytesPerSecond * 8.0 / 1_000_000.0)} Mbps"
-    bytesPerSecond >= 125L ->
-        "${formatOneDecimal(bytesPerSecond * 8.0 / 1_000.0)} Kbps"
-    else -> "${bytesPerSecond * 8L} bps"
-}
-
-private fun formatOneDecimal(value: Double): String {
-    val roundedTenths = (value * 10.0).toLong()
-    return "${roundedTenths / 10}.${roundedTenths % 10}"
 }
 
 @Composable

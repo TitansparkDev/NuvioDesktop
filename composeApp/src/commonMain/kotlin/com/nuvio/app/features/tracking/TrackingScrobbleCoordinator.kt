@@ -30,6 +30,28 @@ data class TrackingScrobbleDispatch(
         get() = sentCount == 0 && failures.isEmpty()
 }
 
+/**
+ * The progress below which no provider records a stop as a watch (Trakt and SIMKL both use 80%).
+ * Also the floor for believing a reply that says one did.
+ */
+internal const val TrackingScrobbleWatchedProgressThresholdPercent = 80.0
+
+/**
+ * Whether a provider reply to this request could describe *this* scrobble marking the item watched.
+ *
+ * The reply parser is deliberately loose — `status: completed`, `watched: true`, any `watched_at` —
+ * because each provider words it differently. That looseness has a cost: a provider that echoes the
+ * item's existing state answers a pause, or a seek's stop at 11%, with a body that reads as a fresh
+ * mark, and the player then announced "marked watched" a few minutes into an episode. Neither request
+ * can have caused one: a pause is not a completion, and a stop below the providers' own threshold is
+ * resumable progress. So a watched claim is only believed where the request itself could have earned
+ * it. Above the threshold the reply stays authoritative, including for a deliberate seek to the end.
+ */
+internal fun canConfirmWatched(action: TrackingScrobbleAction, event: TrackingScrobbleEvent): Boolean =
+    action == TrackingScrobbleAction.STOP &&
+        !event.isPauseRatherThanStop &&
+        event.progressPercent >= TrackingScrobbleWatchedProgressThresholdPercent
+
 object TrackingScrobbleCoordinator {
     private val log = Logger.withTag("TrackingScrobble")
 
@@ -167,10 +189,11 @@ internal suspend fun dispatchTrackingScrobble(
             }
         }
     }.awaitAll()
+    val watchedPossible = canConfirmWatched(action, event)
     TrackingScrobbleDispatch(
         sentCount = results.count { (result, _) -> result.handled },
         watchedProviderIds = results.mapIndexedNotNull { index, (result, _) ->
-            scrobblers.elementAt(index).providerId.takeIf { result.confirmsWatched }
+            scrobblers.elementAt(index).providerId.takeIf { watchedPossible && result.confirmsWatched }
         },
         failures = results.mapNotNull { (_, failure) -> failure },
     )

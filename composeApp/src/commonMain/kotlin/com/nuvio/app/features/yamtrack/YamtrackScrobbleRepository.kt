@@ -164,7 +164,7 @@ internal object YamtrackScrobbleRepository {
                 return TrackingScrobbleResult.Declined
             }
 
-            log.d { "Yamtrack scrobble $action response: ${response.status}" }
+            log.d { "Yamtrack scrobble $action response: ${response.status} ${response.body.take(300)}" }
 
             when (response.status) {
                 in 200..299 -> {

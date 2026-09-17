@@ -242,7 +242,7 @@ internal fun LazyListScope.appearanceSettingsContent(
                         value = desktopAppUiScalePercent,
                         valueText = "${if (desktopAppUiScalePercent > 0) "+" else ""}$desktopAppUiScalePercent%",
                         valueTextForValue = { "${if (it > 0) "+" else ""}$it%" },
-                        valueRange = -25..25,
+                        valueRange = -50..50,
                         step = 5,
                         isTablet = isTablet,
                         onValueChange = onDesktopAppUiScalePercentChange,
@@ -726,6 +726,13 @@ private fun CustomThemeColorField(
         isTablet = isTablet,
         normalize = { draft ->
             draft.trim().removePrefix("#").let { cleaned -> "#$cleaned" }
+        },
+        trailingContent = { draft, onDraftChange ->
+            HexColorPickerSwatch(
+                currentHex = draft,
+                dialogTitle = label,
+                onPicked = onDraftChange,
+            )
         },
         onSave = { next ->
             if (next.isValidThemeHexInput()) onValidHex(next)

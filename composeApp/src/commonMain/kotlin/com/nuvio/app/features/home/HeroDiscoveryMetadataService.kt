@@ -15,7 +15,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 object HeroDiscoveryMetadataService {
-    const val CACHE_VERSION = 17
+    const val CACHE_VERSION = 18
 
     /**
      * Turns a saved priority string into the slot list to evaluate.
@@ -214,9 +214,15 @@ object HeroDiscoveryMetadataService {
             meta.externalRatings.isMetacriticMustSee()
         val discoveryConfig = HeroDiscoveryConfigRepository.snapshot()
 
+        // Keep the company's TMDB id next to the label: the studio badge is clickable and opens
+        // the same company browse screen as the production-company logo on the details page.
         val matchedStudios = meta.productionCompanies
-            .mapNotNull { discoveryConfig.studios[it.name] }
-            .distinct()
+            .mapNotNull { company ->
+                discoveryConfig.studios[company.name]?.let { label ->
+                    MatchedStudio(label = label, tmdbId = company.tmdbId?.takeIf { it > 0 })
+                }
+            }
+            .distinctBy { it.label }
 
         val matchedDirectors = meta.director
             .mapNotNull { discoveryConfig.directors[it] }
@@ -349,7 +355,15 @@ object HeroDiscoveryMetadataService {
                 val type = SASH_TYPES[slot] ?: "info"
                 // Only add if we don't already have a fact with this label
                 if (facts.none { it.label == label }) {
-                    facts.add(HeroDiscoveryFact(label, type, factCategory(slot, meta, label)))
+                    facts.add(
+                        HeroDiscoveryFact(
+                            label = label,
+                            type = type,
+                            category = factCategory(slot, meta, label),
+                            companyTmdbId = if (slot == "studio") meta.matchedStudios.firstOrNull()?.tmdbId else null,
+                            directorName = if (slot == "director") meta.matchedDirectors.firstOrNull() else null,
+                        ),
+                    )
                 }
             }
         }
@@ -392,7 +406,7 @@ object HeroDiscoveryMetadataService {
                 if (lang.isNullOrBlank() || lang.isEnglishLanguage()) null
                 else "${lang.languageDisplayName()} Film"
             }
-            "studio" -> meta.matchedStudios.firstOrNull()
+            "studio" -> meta.matchedStudios.firstOrNull()?.label
             "director" -> meta.matchedDirectors.firstOrNull()?.let { "Directed by $it" }
             "trending" -> if (meta.isTrending) "Trending" else null
             "new_release", "digital_release" -> if (meta.isNewRelease) "New" else null
@@ -621,7 +635,7 @@ object HeroDiscoveryMetadataService {
 data class DiscoveryMeta(
     val awardWins: List<String>,
     val awardNoms: List<String>,
-    val matchedStudios: List<String>,
+    val matchedStudios: List<MatchedStudio>,
     val matchedDirectors: List<String>,
     val festivalLabel: String?,
     val isShortFilm: Boolean,
@@ -638,8 +652,18 @@ data class DiscoveryMeta(
     val releaseStatus: String?
 )
 
+/** A production company that matched hero_discovery.json: the badge label plus the TMDB id behind it. */
+data class MatchedStudio(
+    val label: String,
+    val tmdbId: Int?,
+)
+
 data class HeroDiscoveryFact(
     val label: String,
     val type: String,
-    val category: String = type
+    val category: String = type,
+    /** Set on the `studio` slot only: the matched company's TMDB id, so the badge can open its browse screen. */
+    val companyTmdbId: Int? = null,
+    /** Set on the `director` slot only: the matched director's name as written in hero_discovery.json. */
+    val directorName: String? = null,
 )

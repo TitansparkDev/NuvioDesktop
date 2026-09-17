@@ -6,9 +6,11 @@ private const val NuvioWindowBackgroundRgb = 0x0D0D0D
 private const val NuvioWindowTextRgb = 0xF5F7F8
 
 /**
- * Publishes the process AppUserModelID and a Start Menu shortcut carrying it, so the Windows
- * media flyout shows "Nuvio" and the app icon instead of "Unknown app". The shortcut is rewritten
- * only when its target drifts, which lets a moved portable copy heal itself on the next launch.
+ * Publishes the process AppUserModelID and a "Nuvio HTPC" Start Menu shortcut carrying it, so the
+ * Windows media flyout shows the app name and icon instead of "Unknown app". The shortcut is
+ * rewritten only when its target, AUMID or icon drifts, which lets a moved portable copy heal
+ * itself on the next launch and undoes the official Nuvio Desktop's icon picker, which re-icons
+ * any "Nuvio.lnk" it finds regardless of what the shortcut launches.
  */
 internal fun registerDesktopAppIdentity() {
     if (DesktopHostOs.current != DesktopHostOs.WINDOWS) return

@@ -3,6 +3,7 @@ package com.nuvio.app.core.ui
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.TooltipArea
 import androidx.compose.foundation.TooltipPlacement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -19,9 +20,10 @@ import androidx.compose.ui.unit.dp
 actual fun NuvioPosterHoverTooltip(
     title: String,
     modifier: Modifier,
+    subtitle: String,
     content: @Composable () -> Unit,
 ) {
-    if (title.isBlank()) {
+    if (title.isBlank() && subtitle.isBlank()) {
         content()
         return
     }
@@ -37,12 +39,23 @@ actual fun NuvioPosterHoverTooltip(
                 border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)),
                 shadowElevation = 16.dp,
             ) {
-                Text(
-                    text = title,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    if (title.isNotBlank()) {
+                        Text(
+                            text = title,
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    if (subtitle.isNotBlank()) {
+                        Text(
+                            text = subtitle,
+                            modifier = Modifier.padding(top = if (title.isNotBlank()) 2.dp else 0.dp),
+                            color = Color.White.copy(alpha = 0.62f),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
             }
         },
         modifier = modifier,

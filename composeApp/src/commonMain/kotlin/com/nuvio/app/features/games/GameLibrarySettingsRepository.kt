@@ -14,6 +14,7 @@ object GameLibrarySettingsRepository {
     private var igdbClientSecret = ""
     private var steamGridDbApiKey = ""
     private var backdropStyle = GameBackdropStyle.BlackShelf
+    private var metadataSource = GameMetadataSource.Igdb
 
     fun ensureLoaded() {
         if (hasLoaded) return
@@ -62,6 +63,14 @@ object GameLibrarySettingsRepository {
         GameLibrarySettingsStorage.saveBackdropStyle(value.name)
     }
 
+    fun setMetadataSource(value: GameMetadataSource) {
+        ensureLoaded()
+        if (metadataSource == value) return
+        metadataSource = value
+        publish()
+        GameLibrarySettingsStorage.saveMetadataSource(value.name)
+    }
+
     private fun loadFromDisk() {
         hasLoaded = true
         igdbClientId = GameLibrarySettingsStorage.loadIgdbClientId().orEmpty().trim()
@@ -70,6 +79,9 @@ object GameLibrarySettingsRepository {
         backdropStyle = GameLibrarySettingsStorage.loadBackdropStyle()
             ?.let { stored -> GameBackdropStyle.entries.firstOrNull { it.name == stored } }
             ?: GameBackdropStyle.BlackShelf
+        metadataSource = GameLibrarySettingsStorage.loadMetadataSource()
+            ?.let { stored -> GameMetadataSource.entries.firstOrNull { it.name == stored } }
+            ?: GameMetadataSource.Igdb
         publish()
     }
 
@@ -79,6 +91,7 @@ object GameLibrarySettingsRepository {
             igdbClientSecret = igdbClientSecret,
             steamGridDbApiKey = steamGridDbApiKey,
             backdropStyle = backdropStyle,
+            metadataSource = metadataSource,
         )
     }
 }

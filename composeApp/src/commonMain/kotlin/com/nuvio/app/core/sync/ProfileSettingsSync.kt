@@ -105,6 +105,18 @@ object ProfileSettingsSync {
 
     suspend fun pull(profileId: Int): Boolean {
         ensureRepositoriesLoaded()
+        val applied = pullLocked(profileId)
+        // The observer refuses to push while a sync is in flight; a change made during the pull
+        // is still marked pending, so send it now instead of leaving it for the next pull to
+        // discover (and by then possibly revert).
+        if (ProfileRepository.activeProfileId == profileId && hasPendingLocalChange(profileId)) {
+            log.i { "pull(profileId=$profileId) — pushing settings edited while the pull was in flight" }
+            pushCurrentProfileToRemote()
+        }
+        return applied
+    }
+
+    private suspend fun pullLocked(profileId: Int): Boolean {
         return syncMutex.withLock {
             isServerSyncInFlight = true
             try {
@@ -129,6 +141,20 @@ object ProfileSettingsSync {
                     return@withLock false
                 }
 
+                // A local edit that never reached the server (push failed, was dropped while
+                // another sync was in flight, or was made while the session was signed-out-but-
+                // cached) must not be silently reverted by the remote copy. This pull is most often
+                // the blocking one after a fresh sign-in — e.g. the first launch after a Windows
+                // restart — which is exactly when users reported a saved custom theme vanishing.
+                if (hasPendingLocalChange(profileId)) {
+                    log.i {
+                        "pull(profileId=$profileId) — local settings changed since the last successful " +
+                            "push; pushing local instead of applying remote"
+                    }
+                    pushToRemoteLocked(profileId, exportSettingsBlob(profileId))
+                    return@withLock false
+                }
+
                 isApplyingRemoteBlob = true
                 try {
                     val remoteBlob = runCatching {
@@ -146,6 +172,19 @@ object ProfileSettingsSync {
                     if (remoteSignature == localSignature) {
                         log.d { "pull(profileId=$profileId) — remote matches local" }
                         return@withLock false
+                    }
+
+                    if (preferences.appearanceEnabled) {
+                        // Name the theme swap explicitly: "my theme reset" reports otherwise have
+                        // nothing in the log to distinguish a sync overwrite from a storage failure.
+                        val localTheme = localBlob.features.themeSettings
+                        val remoteTheme = remoteBlob.features.themeSettings
+                        if (localTheme != remoteTheme) {
+                            log.i {
+                                "pull(profileId=$profileId) — remote theme settings replace local: " +
+                                    "local=$localTheme remote=$remoteTheme"
+                            }
+                        }
                     }
 
                     applyRemoteBlob(profileId, remoteBlob)
@@ -205,13 +244,17 @@ object ProfileSettingsSync {
                 .drop(1)
                 .debounce(PUSH_DEBOUNCE_MS)
                 .collect { signature ->
-                    val authState = AuthRepository.state.value
-                    if (authState !is AuthState.Authenticated || authState.isAnonymous) return@collect
-                    if (isApplyingRemoteBlob || isServerSyncInFlight) return@collect
+                    if (isApplyingRemoteBlob) return@collect
                     if (signature == skipNextPushSignature) {
                         skipNextPushSignature = null
                         return@collect
                     }
+                    // Past this point the change is the user's own. Record it before anything can
+                    // refuse the push, so it survives until a push actually succeeds.
+                    markLocalChangePending()
+                    val authState = AuthRepository.state.value
+                    if (authState !is AuthState.Authenticated || authState.isAnonymous) return@collect
+                    if (isServerSyncInFlight) return@collect
                     pushCurrentProfileToRemote()
                 }
         }
@@ -225,8 +268,46 @@ object ProfileSettingsSync {
             put("p_settings_json", json.encodeToJsonElement(MobileProfileSettingsBlob.serializer(), blobToPush))
         }
         SupabaseProvider.client.postgrest.rpc("sync_push_profile_settings_blob", params)
+        clearPendingLocalChange(profileId)
         log.d { "pushToRemoteLocked(profileId=$profileId) — success" }
     }
+
+    /**
+     * Records that the active profile's settings differ from what the server last received.
+     * Anonymous (local-only) accounts have no server copy to reconcile, so they never mark. A
+     * Loading/Unauthenticated session falls back to the cached profile owner: a session that dies
+     * mid-use keeps the user inside the app, and edits made there are still theirs.
+     */
+    private fun markLocalChangePending() {
+        val authState = AuthRepository.state.value
+        if (authState is AuthState.Authenticated && authState.isAnonymous) return
+        val userId = (authState as? AuthState.Authenticated)?.userId
+            ?: ProfileRepository.cachedUserId
+            ?: return
+        val marker = pendingMarker(userId, ProfileRepository.activeProfileId)
+        if (SynchronizationPreferencesStorage.loadPendingPushMarker() == marker) return
+        SynchronizationPreferencesStorage.savePendingPushMarker(marker)
+    }
+
+    private fun hasPendingLocalChange(profileId: Int): Boolean {
+        val marker = SynchronizationPreferencesStorage.loadPendingPushMarker() ?: return false
+        val userId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return false
+        return marker == pendingMarker(userId, profileId)
+    }
+
+    private fun clearPendingLocalChange(profileId: Int) {
+        val marker = SynchronizationPreferencesStorage.loadPendingPushMarker() ?: return
+        // Only the marker for the profile just pushed is settled; a stale marker for another
+        // account/profile still describes an unsent edit.
+        if (marker.endsWith("|$profileId")) {
+            SynchronizationPreferencesStorage.savePendingPushMarker(null)
+        }
+    }
+
+    private fun pendingMarker(userId: String, profileId: Int): String = "$userId|$profileId"
 
     private fun exportSettingsBlob(profileId: Int = ProfileRepository.activeProfileId): MobileProfileSettingsBlob {
         ensureRepositoriesLoaded()

@@ -45,6 +45,51 @@ enum class AddonSubtitleStartupMode {
     ALL_SUBTITLES,
 }
 
+/**
+ * The kind of subtitle track automatic selection reaches for first *within* a language.
+ *
+ * Language is the hard constraint and this is the tiebreaker inside it, so the cascade is always
+ * "primary language, preferred kind → primary language, any kind → secondary language, ...". It
+ * never jumps languages to satisfy the kind, and it never leaves subtitles off because the kind is
+ * missing: a release with no forced track still gets the full translation.
+ *
+ * The three are one choice rather than independent switches because they name different viewers.
+ * Forced is for someone who understands the audio and wants only the foreign lines; SDH is for
+ * someone who cannot hear it and wants everything plus the sound cues. No release ships a track
+ * that is both, so a preference for both has no track to point at.
+ */
+enum class SubtitleTrackKind(val storageValue: String) {
+    /** A plain translation: neither forced nor captioned. Avoids the other two when it can. */
+    STANDARD("standard"),
+
+    /** SDH / CC / HI / HOH tracks, read from the track name. */
+    SDH("sdh"),
+
+    /** Forced tracks, read from the container flag or the track name. */
+    FORCED("forced"),
+    ;
+
+    /**
+     * Where [kind] lands when this is the preference. The preferred kind wins outright; a plain
+     * track is always the next-best because it at least covers the whole dialogue; SDH then
+     * outranks forced because a captioned full translation still serves someone who wanted a
+     * plain one, while a forced-only track leaves most of the dialogue untranslated.
+     */
+    fun rankOf(kind: SubtitleTrackKind): Int = when {
+        kind == this -> 0
+        kind == STANDARD -> 1
+        kind == SDH -> 2
+        else -> 3
+    }
+
+    companion object {
+        val DEFAULT = STANDARD
+
+        fun fromStorage(value: String?): SubtitleTrackKind? =
+            entries.firstOrNull { it.storageValue.equals(value, ignoreCase = true) }
+    }
+}
+
 const val SUBTITLE_DELAY_MIN_MS = -60_000
 const val SUBTITLE_DELAY_MAX_MS = 60_000
 const val SUBTITLE_DELAY_STEP_MS = 100
@@ -73,7 +118,6 @@ data class SubtitleStyleState(
     // Subtitle font family. Empty = player default. Values are resolved by the platform's
     // font system (mpv/libass on desktop), so only widely-available families are offered.
     val fontFamily: String = "",
-    val useForcedSubtitles: Boolean = false,
     val showOnlyPreferredLanguages: Boolean = false,
     // How much of the above applies to ASS/SSA tracks, which carry their own styling. See
     // [SubtitleAssStyleMode].

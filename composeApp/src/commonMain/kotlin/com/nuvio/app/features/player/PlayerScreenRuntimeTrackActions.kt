@@ -254,11 +254,7 @@ internal fun PlayerScreenRuntime.refreshTracks() {
 
     if (!preferredSubtitleSelectionApplied && trackPreferenceRestoreApplied) {
         val preferredSubtitleTargets = resolvePreferredSubtitleLanguageTargets(
-            preferredSubtitleLanguage = if (subtitleStyle.useForcedSubtitles) {
-                SubtitleLanguageOption.FORCED
-            } else {
-                playerSettingsUiState.preferredSubtitleLanguage
-            },
+            preferredSubtitleLanguage = playerSettingsUiState.preferredSubtitleLanguage,
             secondaryPreferredSubtitleLanguage = if (playerSettingsUiState.dualSubtitlesEnabled) {
                 null
             } else {
@@ -281,7 +277,7 @@ internal fun PlayerScreenRuntime.refreshTracks() {
                 tracks = subtitleTracks,
                 targets = preferredSubtitleTargets,
                 isRejected = { track -> playerSettingsUiState.rejectsSubtitleTrack(track) },
-                preferHearingImpaired = playerSettingsUiState.preferHearingImpairedSubtitles,
+                trackKind = playerSettingsUiState.preferredSubtitleTrackKind,
             )
             val nativePreferredSelectionConfirmed = preferredSubtitleIndex >= 0 &&
                 subtitleTracks.firstOrNull { it.index == preferredSubtitleIndex }?.isSelected == true
@@ -298,15 +294,12 @@ internal fun PlayerScreenRuntime.refreshTracks() {
                 }
             } else if (
                 preferredSubtitleIndex < 0 &&
-                (subtitleStyle.useForcedSubtitles ||
-                    normalizeLanguageCode(playerSettingsUiState.preferredSubtitleLanguage) ==
-                    SubtitleLanguageOption.FORCED ||
-                    // Nothing acceptable matched and mpv's own slang pass left a rejected track
-                    // showing (a signs/songs or forced track). Turning subtitles off is the honest
-                    // outcome — the alternative is displaying exactly what was ruled out.
-                    subtitleTracks.any {
-                        it.isSelected && playerSettingsUiState.rejectsSubtitleTrack(it)
-                    })
+                // Nothing acceptable matched and mpv's own slang pass left a rejected track
+                // showing (a signs/songs or forced track). Turning subtitles off is the honest
+                // outcome — the alternative is displaying exactly what was ruled out.
+                subtitleTracks.any {
+                    it.isSelected && playerSettingsUiState.rejectsSubtitleTrack(it)
+                }
             ) {
                 if (selectedSubtitleIndex != -1 || subtitleTracks.any { it.isSelected }) {
                     playerController?.selectSubtitleTrack(-1)
@@ -350,16 +343,6 @@ internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
     }
     if (completedAutoAddonSubtitleFetchForKey != fetchKey || isLoadingAddonSubtitles) return
 
-    // "Use Forced Subtitles" asks for forced tracks specifically, and no addon serves those. A
-    // fallback here would put a full translation on screen for someone who asked to see only the
-    // lines the release itself marked as needing one.
-    if (subtitleStyle.useForcedSubtitles ||
-        normalizeLanguageCode(playerSettingsUiState.preferredSubtitleLanguage) == SubtitleLanguageOption.FORCED
-    ) {
-        preferredSubtitleSelectionApplied = true
-        return
-    }
-
     val targets = primarySubtitleTargetsForSettings(
         settings = playerSettingsUiState,
         originalLanguage = OriginalLanguageCache.languageFor(args.parentMetaId),
@@ -374,7 +357,7 @@ internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
             tracks = subtitleTracks,
             targets = targets,
             isRejected = { track -> playerSettingsUiState.rejectsSubtitleTrack(track) },
-            preferHearingImpaired = playerSettingsUiState.preferHearingImpairedSubtitles,
+            trackKind = playerSettingsUiState.preferredSubtitleTrackKind,
         ) >= 0
     ) {
         preferredSubtitleSelectionApplied = true
@@ -384,7 +367,7 @@ internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
         subtitles = addonSubtitles,
         targets = targets,
         isRejected = { subtitle -> playerSettingsUiState.rejectsAddonSubtitle(subtitle) },
-        preferHearingImpaired = playerSettingsUiState.preferHearingImpairedSubtitles,
+        trackKind = playerSettingsUiState.preferredSubtitleTrackKind,
     )
     if (addon != null) {
         selectedAddonSubtitleId = addon.id.ifBlank { addon.url }
@@ -431,7 +414,7 @@ internal fun PlayerScreenRuntime.applySecondarySubtitleSelectionIfNeeded() {
         tracks = candidates,
         targets = listOf(secondaryLanguage),
         isRejected = { track -> playerSettingsUiState.rejectsSubtitleTrack(track) },
-        preferHearingImpaired = playerSettingsUiState.preferHearingImpairedSubtitles,
+        trackKind = playerSettingsUiState.preferredSubtitleTrackKind,
     )
     val secondaryTrack = candidates.getOrNull(candidatePosition)
     controller.selectSecondarySubtitleTrack(secondaryTrack?.index ?: -1)

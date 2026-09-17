@@ -5,7 +5,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListScope
@@ -159,6 +161,10 @@ private fun StreamScoringHeaderGroup(isTablet: Boolean) {
             MinimumScoreRow(profile, isTablet)
         }
     }
+
+    // Both sections share this lazy item (they read one profile state), so the list's own
+    // section spacing does not apply between them.
+    Spacer(modifier = Modifier.height(SettingsSectionGap))
 
     SettingsSection(title = stringResource(Res.string.settings_stream_scoring_section_apply), isTablet = isTablet) {
         SettingsGroup(isTablet = isTablet) {

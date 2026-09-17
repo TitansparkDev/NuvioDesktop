@@ -1,0 +1,33 @@
+From e78d359e6dccc3a78427084b1e0933be78424e1c Mon Sep 17 00:00:00 2001
+From: Nuvio Desktop <nuviodesktop@local>
+Date: Sat, 12 Sep 2026 01:10:16 +0100
+Subject: [PATCH] desktop: rolling selection ceiling 15 MiB -> 1 GiB; the app
+ sizes the window via memory cache capacity per buffer preset
+
+---
+ src/torrent/libtorrent_stream_bridge.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/torrent/libtorrent_stream_bridge.cpp b/src/torrent/libtorrent_stream_bridge.cpp
+index a41a6bd..449cd90 100644
+--- a/src/torrent/libtorrent_stream_bridge.cpp
++++ b/src/torrent/libtorrent_stream_bridge.cpp
+@@ -40,7 +40,14 @@ namespace {
+ constexpr std::size_t maximum_http_commands = 4096;
+ constexpr std::size_t stream_worker_count = 8;
+ constexpr std::chrono::seconds piece_wait_timeout{60};
+-constexpr std::uint64_t rolling_selection_limit = 15 * 1024 * 1024;
++// Nuvio desktop tuning: the rolling selection is the download window ahead of the reader, and
++// with it at 15 MiB a 16 MiB-piece release (the norm for 4K remuxes and BTM WEB-DLs) has less
++// than one piece in flight - every piece is fetched serially and waits on its slowest block.
++// Measured on a 160-peer WEB-DL: 1 MB/s with 13 seeds and the request queue emptying at every
++// piece boundary. This is only a ceiling: the effective window is min(this, memory cache
++// capacity), and the desktop app sets the cache per the user's playback buffer preset
++// (64 MiB metered ... 512 MiB resilient).
++constexpr std::uint64_t rolling_selection_limit = 1024 * 1024 * 1024;
+ constexpr std::uint64_t critical_front_limit = 1024 * 1024;
+ 
+ std::string torrent_id(const lt::torrent_handle& handle) {
+-- 
+2.54.0.windows.1
+

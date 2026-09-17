@@ -38,6 +38,10 @@ object DiscoverAiGenerator {
             return Result.failure(DiscoverAiException(DiscoverAiError.NoHistorySlice))
         }
         val settings = DiscoverAiSettingsRepository.snapshot()
+        // The client only checks that a request is possible; Discover's own switch is checked here.
+        if (!settings.isReady) {
+            return Result.failure(DiscoverAiException(DiscoverAiError.NotConfigured))
+        }
         val prompt = buildDiscoverAiPrompt(
             preset = row.promptPreset,
             customInstruction = row.customInstruction,

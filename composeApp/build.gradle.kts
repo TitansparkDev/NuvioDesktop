@@ -556,6 +556,10 @@ val windowsPlayerBridgeCommand = if (missingWindowsPlayerBridgeInputs.isNotEmpty
         // shortcut that carries the AppUserModelID Windows needs to name the media session.
         "Shell32.lib",
         "Propsys.lib",
+        // HidD_/HidP_ + SetupDi enumeration, for reading a DualSense directly. Unlike XInput these
+        // are single-name core Windows DLLs present on every install, so a hard import is safe.
+        "Hid.lib",
+        "SetupAPI.lib",
     ).joinToString(" ")
     val powershellCompileCommand = compileCommand.replace("\"", "__DQ__")
     val powershellCommand = """
@@ -611,6 +615,145 @@ val buildWindowsPlayerBridge = tasks.register<Exec>("buildWindowsPlayerBridge") 
     outputs.file(windowsPlayerBridgeImportLib)
     outputs.file(windowsPlayerBridgePdb)
     commandLine(windowsPlayerBridgeCommand)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Nuvio Engine (NuvioMedia/nuvio-engine): the in-process libtorrent P2P engine, built as one DLL
+// that also carries the JNI bridge (see src/desktopMain/native/nuvio-engine/CMakeLists.txt).
+//
+// Upstream builds this with llvm-mingw inside Docker. Here it is the MSYS2 UCRT64 GCC toolchain
+// plus the CMake that ships with Visual Studio Build Tools, both of which the player bridge
+// already needs on a dev box. Nothing is downloaded at build time once the sibling checkout has
+// fetched Boost/libtorrent (the first configure does that, ~200MB).
+//
+// The task is best-effort by design: without the engine checkout or the toolchain it logs why
+// and produces nothing, and the app then falls back to TorrServer at runtime (the P2P settings
+// row shows "not installed"). Only createDistributable treats a missing DLL as an error, so a
+// release never silently ships without it.
+// ---------------------------------------------------------------------------------------------
+val nuvioEngineSourceDir = providers.gradleProperty("nuvio.engine.sourceDir").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let(::File)
+    ?: rootProject.projectDir.resolve("../nuvio-engine")
+val nuvioEngineCMakeProject = layout.projectDirectory.dir("src/desktopMain/native/nuvio-engine")
+val nuvioEngineBuildDir = layout.buildDirectory.dir("native/nuvio-engine/build")
+val nuvioEngineOutput = layout.buildDirectory.file("native/windows/nuvio_engine.dll")
+val nuvioEngineMsys2Root = providers.gradleProperty("nuvio.windows.msys2.ucrt64").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let(::File)
+    ?: File("C:/msys64/ucrt64")
+val nuvioEngineConfiguredCMake = providers.gradleProperty("nuvio.windows.cmake").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let(::File)
+val nuvioEngineJniIncludeDir = File(providers.systemProperty("java.home").get()).resolve("include")
+
+// Resolved at execution time: vswhere is a process launch, which the configuration cache forbids
+// during configuration.
+fun resolveNuvioEngineCMake(): File? {
+    nuvioEngineConfiguredCMake?.let { return it.takeIf(File::isFile) }
+    if (!windowsVsWhere.isFile) return null
+    val vsRoot = runCatching {
+        val process = ProcessBuilder(
+            windowsVsWhere.absolutePath, "-latest", "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.CMake.Project",
+            "-property", "installationPath",
+        ).redirectErrorStream(true).start()
+        process.inputStream.bufferedReader().readText().trim().lines().firstOrNull()?.trim()
+    }.getOrNull()?.takeIf { it.isNotBlank() }?.let(::File) ?: return null
+    return vsRoot.resolve("Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe").takeIf(File::isFile)
+}
+
+fun missingNuvioEngineInputs(cmake: File?): List<String> = listOfNotNull(
+    "engine checkout ${nuvioEngineSourceDir.absolutePath} (clone NuvioMedia/nuvio-engine beside NuvioDesktop or pass -Pnuvio.engine.sourceDir)"
+        .takeUnless { nuvioEngineSourceDir.resolve("CMakeLists.txt").isFile },
+    "MSYS2 UCRT64 g++ under ${nuvioEngineMsys2Root.absolutePath} (pass -Pnuvio.windows.msys2.ucrt64)"
+        .takeUnless { nuvioEngineMsys2Root.resolve("bin/g++.exe").isFile },
+    "static OpenSSL in MSYS2 (pacman -S mingw-w64-ucrt-x86_64-openssl)"
+        .takeUnless { nuvioEngineMsys2Root.resolve("lib/libssl.a").isFile },
+    "CMake (Visual Studio 'C++ CMake tools' component, or -Pnuvio.windows.cmake=C:/path/cmake.exe)"
+        .takeUnless { cmake?.isFile == true },
+    "jni.h under ${nuvioEngineJniIncludeDir.absolutePath}"
+        .takeUnless { nuvioEngineJniIncludeDir.resolve("jni.h").isFile },
+)
+
+val buildWindowsNuvioEngine = tasks.register("buildWindowsNuvioEngine") {
+    notCompatibleWithConfigurationCache("Builds the host-local Nuvio Engine DLL with the MSYS2 toolchain.")
+    enabled = isWindowsHost
+    inputs.dir(nuvioEngineCMakeProject)
+    if (nuvioEngineSourceDir.resolve("src").isDirectory) {
+        inputs.dir(nuvioEngineSourceDir.resolve("src"))
+        inputs.dir(nuvioEngineSourceDir.resolve("include"))
+        inputs.dir(nuvioEngineSourceDir.resolve("cmake"))
+        inputs.file(nuvioEngineSourceDir.resolve("CMakeLists.txt"))
+    }
+    outputs.file(nuvioEngineOutput)
+    doLast {
+        val output = nuvioEngineOutput.get().asFile
+        val cmake = resolveNuvioEngineCMake()
+        val missing = missingNuvioEngineInputs(cmake)
+        if (missing.isNotEmpty()) {
+            logger.warn(
+                "Skipping Nuvio Engine build; P2P will use TorrServer. Missing: " + missing.joinToString("; "),
+            )
+            output.delete()
+            return@doLast
+        }
+        checkNotNull(cmake)
+        val buildDir = nuvioEngineBuildDir.get().asFile.apply { mkdirs() }
+        val msysBin = nuvioEngineMsys2Root.resolve("bin")
+        val msysForward = nuvioEngineMsys2Root.absolutePath.replace('\\', '/')
+        val environment = System.getenv().toMutableMap().apply {
+            this["PATH"] = "${msysBin.absolutePath};${this["PATH"] ?: this["Path"].orEmpty()}"
+        }
+        fun run(vararg command: String) {
+            val process = ProcessBuilder(*command)
+                .directory(buildDir)
+                .redirectErrorStream(true)
+                .apply { environment().putAll(environment) }
+                .start()
+            val log = process.inputStream.bufferedReader().readText()
+            val code = process.waitFor()
+            if (code != 0) {
+                throw GradleException("Nuvio Engine build step failed (exit $code): ${command.joinToString(" ")}\n${log.takeLast(6000)}")
+            }
+        }
+        val commonFlags = "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -ffunction-sections -fdata-sections"
+        run(
+            cmake.absolutePath,
+            "-S", nuvioEngineCMakeProject.asFile.absolutePath,
+            "-B", buildDir.absolutePath,
+            "-G", "Ninja",
+            "-DCMAKE_C_COMPILER=${msysBin.resolve("gcc.exe").absolutePath.replace('\\', '/')}",
+            "-DCMAKE_CXX_COMPILER=${msysBin.resolve("g++.exe").absolutePath.replace('\\', '/')}",
+            "-DCMAKE_MAKE_PROGRAM=${msysBin.resolve("ninja.exe").absolutePath.replace('\\', '/')}",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_C_FLAGS=$commonFlags",
+            "-DCMAKE_CXX_FLAGS=$commonFlags",
+            // Fully static so the DLL carries its own libstdc++/winpthread; the JVM must not
+            // need MSYS2 on PATH to load it.
+            "-DCMAKE_SHARED_LINKER_FLAGS=-static -Wl,--dynamicbase,--nxcompat,--high-entropy-va,--gc-sections,--exclude-all-symbols",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            "-DNUVIO_ENGINE_ROOT=${nuvioEngineSourceDir.absolutePath.replace('\\', '/')}",
+            "-DNUVIO_JNI_INCLUDE_DIR=${nuvioEngineJniIncludeDir.absolutePath.replace('\\', '/')}",
+            "-DOPENSSL_ROOT_DIR=$msysForward",
+            "-DOPENSSL_INCLUDE_DIR=$msysForward/include",
+            "-DOPENSSL_SSL_LIBRARY=$msysForward/lib/libssl.a",
+            "-DOPENSSL_CRYPTO_LIBRARY=$msysForward/lib/libcrypto.a",
+            "-DOPENSSL_USE_STATIC_LIBS=TRUE",
+        )
+        run(cmake.absolutePath, "--build", buildDir.absolutePath, "--parallel")
+        val built = buildDir.resolve("nuvio-engine-core/nuvio_engine.dll")
+        check(built.isFile) { "Nuvio Engine build finished but ${built.absolutePath} is missing" }
+        output.parentFile.mkdirs()
+        built.copyTo(output, overwrite = true)
+        // Symbols roughly triple the size; strip is best-effort because the DLL is complete without it.
+        val strip = msysBin.resolve("strip.exe")
+        if (strip.isFile) {
+            runCatching { run(strip.absolutePath, "--strip-unneeded", output.absolutePath) }
+                .onFailure { logger.warn("Could not strip ${output.name}: ${it.message}") }
+        }
+        logger.lifecycle("Nuvio Engine DLL: ${output.absolutePath} (${output.length() / (1024 * 1024)} MB)")
+    }
 }
 
 val windowsPlaybackStartupTestSource = layout.projectDirectory.file("src/desktopTest/native/windows/playback_startup_test.cpp")
@@ -871,6 +1014,7 @@ if (isWindowsHost) {
     tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
         dependsOn(
             buildWindowsPlayerBridge,
+            buildWindowsNuvioEngine,
             prepareWindowsPlayerRuntime,
             generateWindowsPlayerRuntimeIndex,
             prepareWindowsPythonLib,
@@ -893,6 +1037,9 @@ if (isWindowsHost) {
     ).forEach { (taskName, relativeImagePath) ->
         tasks.matching { it.name == taskName }.configureEach {
             notCompatibleWithConfigurationCache("Stages and verifies the Windows native runtime in the jpackage app image.")
+            // The engine DLL is staged beside Nuvio.exe only (not via the jar), so it must be an
+            // input here or a rebuilt DLL never reaches an otherwise up-to-date app image.
+            inputs.files(nuvioEngineOutput).optional()
             doLast {
                 val imageDir = layout.buildDirectory.dir("compose/binaries/$relativeImagePath").get().asFile
                 check(imageDir.resolve("Nuvio.exe").isFile) {
@@ -901,7 +1048,12 @@ if (isWindowsHost) {
                 copy {
                     from(windowsPlayerBridgeOutput)
                     from(windowsPlayerRuntimeOutput)
+                    from(nuvioEngineOutput)
                     into(imageDir)
+                }
+                check(nuvioEngineOutput.get().asFile.isFile) {
+                    "Nuvio Engine DLL was not built; a distributable must not ship without it. " +
+                        "Missing inputs: ${missingNuvioEngineInputs(resolveNuvioEngineCMake()).joinToString("; ").ifBlank { "(build failed, see buildWindowsNuvioEngine output)" }}"
                 }
                 copy {
                     from(windowsPythonLibOutput)
@@ -1139,6 +1291,16 @@ kotlin {
             freeCompilerArgs.addAll(
                 "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi",
                 "-opt-in=androidx.compose.ui.ExperimentalComposeUiApi",
+                // Lambdas and string concatenation as ordinary classes and bytecode rather than
+                // invokedynamic. Measured 2026-09-14 on the launch overlay: with every class
+                // already preloaded (StartupClassPreloader), over half of the remaining ~1s UI-thread
+                // stall was the JVM spinning a hidden proxy class per lambda call site the first
+                // time Home executed it (InnerClassLambdaMetafactory / LambdaForm /
+                // StringConcatFactory). Real classes can be learned and preloaded off the UI
+                // thread; indy proxies only exist once the site runs. Costs jar size, not runtime.
+                "-Xlambdas=class",
+                "-Xsam-conversions=class",
+                "-Xstring-concat=inline",
             )
         }
     }
@@ -1201,17 +1363,40 @@ kotlin {
     }
 }
 
+// Two input tests need a real focused window (see GamepadInjectionRouteTest). Focus is global, so
+// they briefly steal keystrokes from whatever the developer is typing into. They are therefore
+// opt-in: run them with `-Pnuvio.focusTests` before shipping input changes, and on CI where nobody
+// is at the keyboard.
+tasks.withType<Test>().configureEach {
+    systemProperty(
+        "nuvio.focusTests",
+        (providers.gradleProperty("nuvio.focusTests").orNull ?: "false").ifBlank { "true" },
+    )
+    // Opt-in live-swarm probe for the P2P engine (NuvioEngineNetworkProbeTest); off by default.
+    systemProperty("nuvio.p2pProbeHash", providers.gradleProperty("nuvio.p2pProbeHash").orNull ?: "")
+    systemProperty("nuvio.p2pProbePreloadMb", providers.gradleProperty("nuvio.p2pProbePreloadMb").orNull ?: "")
+    systemProperty("nuvio.p2pSeekProbeHash", providers.gradleProperty("nuvio.p2pSeekProbeHash").orNull ?: "")
+    systemProperty("nuvio.p2pSeekProbeOffsetsMb", providers.gradleProperty("nuvio.p2pSeekProbeOffsetsMb").orNull ?: "")
+    // Engine-side diagnostics for the probes (read by nuvio_engine.dll via getenv).
+    providers.gradleProperty("nuvio.engineEnv").orNull?.split(';')?.forEach { pair ->
+        val (k, v) = pair.split('=', limit = 2).let { it[0] to it.getOrElse(1) { "1" } }
+        environment(k, v)
+    }
+}
+
 compose.desktop {
     application {
         mainClass = "com.nuvio.app.MainKt"
         val smokePlayerUrl = providers.gradleProperty("nuvio.desktop.smokePlayerUrl").orNull
             ?: System.getenv("NUVIO_DESKTOP_SMOKE_PLAYER_URL")
-        // Windows-only experiment: run Compose's own Skia rendering on Direct3D instead of
-        // OpenGL so it shares one graphics API with mpv's D3D11 video surface (currently the
-        // app mixes OpenGL-rendered UI with a D3D11 embedded video child window in the same
-        // top-level window — testing whether that mismatch is what's causing poor DWM/driver
-        // composition behavior on certain GPUs in borderless fullscreen).
-        val skikoRenderApi = if (isWindowsHost) "DIRECT3D" else "OPENGL"
+        // OpenGL everywhere, matching DesktopRendererApi's default and what Settings shows.
+        // This was DIRECT3D on Windows as an experiment (sharing one graphics API with mpv's D3D11
+        // video surface), but it silently won on any install that had never saved the renderer
+        // setting, so new users ran Direct3D while the UI told them OpenGL. Measured 2026-09-07:
+        // D3D is not a win anyway — it helps the expensive display modes and hurts the cheap ones,
+        // and has a ~3 ms per-frame floor OpenGL does not. It remains selectable in Settings as the
+        // compatibility option it is described as.
+        val skikoRenderApi = "OPENGL"
         jvmArgs += listOfNotNull(
             "-Dapple.awt.application.appearance=NSAppearanceNameDarkAqua",
             "-Dskiko.renderApi=$skikoRenderApi",
@@ -1286,6 +1471,19 @@ compose.desktop {
             "-XX:G1PeriodicGCInterval=900000",
             "-XX:G1PeriodicGCSystemLoadThreshold=0",
             "-XX:-G1PeriodicGCInvokesConcurrent",
+            // Explicit System.gc() calls run concurrently instead of as a stop-the-world Full GC.
+            // Measured: two Full GCs per session, 30s apart, 52-75ms each, against 1-15ms for every
+            // natural collection - and a 52-75ms pause is a frame gap, which on a variable-refresh
+            // display collapses the refresh rate and dims the panel. This must live here, not in a
+            // hand-edited Nuvio.cfg: createDistributable regenerates that file and has already
+            // silently voided this experiment once.
+            //
+            // Trade-off, deliberate and worth revisiting: the line above forces PERIODIC GCs to stay
+            // full and compacting because that is what returns memory to the OS. This makes the
+            // EXPLICIT one in DesktopIdleHeapTrim (window hidden) concurrent too, so it compacts
+            // less. That pause is invisible - nobody is looking at a hidden window - so if the heap
+            // no longer shrinks on hide, prefer fixing the unintended 30s callers instead.
+            "-XX:+ExplicitGCInvokesConcurrent",
             "-XX:MinHeapFreeRatio=10",
             "-XX:MaxHeapFreeRatio=30",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
@@ -1296,11 +1494,19 @@ compose.desktop {
             packageName = "Nuvio"
             packageVersion = desktopReleasePackageVersion
             vendor = "Nuvio Media"
+            // Becomes the exe's FileDescription, which is the name Explorer shows for a pin made
+            // straight from Nuvio.exe (and the taskbar tooltip). The exe itself stays Nuvio.exe:
+            // the in-place updater, taskbar pins and the official app's shortcut-name checks all
+            // key on that filename.
+            description = "Nuvio HTPC"
             // jdk.management is here for one call: the decoded-animation cache budget is a fraction
             // of physical RAM (see animatedImageCacheBudgetBytes), and OperatingSystemMXBean is the
             // only way to read that without going native. Measured cost of the module in a jlink
             // image: 2 MB.
-            modules("java.net.http", "jdk.httpserver", "jdk.management")
+            // jdk.jfr: the sampling profiler FrameProfiler starts in bench mode. Small
+            // addition to the runtime image, and the only way to attribute UI-thread CPU
+            // that Compose draw probes cannot see.
+            modules("java.net.http", "jdk.httpserver", "jdk.management", "jdk.jfr")
             macOS {
                 bundleID = "com.nuvio.media.desktop"
                 iconFile.set(project.file("src/desktopMain/resources/icons/nuvio-app-icon.icns"))

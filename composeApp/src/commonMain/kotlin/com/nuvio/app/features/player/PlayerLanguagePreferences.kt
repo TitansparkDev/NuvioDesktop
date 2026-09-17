@@ -580,6 +580,8 @@ fun resolvePreferredSubtitleLanguageTargets(
         return when (normalized) {
             null,
             SubtitleLanguageOption.NONE,
+            // Pre-1.14 stores used the language slot for the forced switch; not a language.
+            SubtitleLanguageOption.FORCED,
             -> null
             AudioLanguageOption.DEFAULT -> null
             ORIGINAL_LANGUAGE_OPTION -> normalizeLanguageCode(originalLanguage)

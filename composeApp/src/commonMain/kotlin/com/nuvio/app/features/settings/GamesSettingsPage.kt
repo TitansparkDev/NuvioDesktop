@@ -1,5 +1,6 @@
 package com.nuvio.app.features.settings
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyListScope
@@ -11,6 +12,8 @@ import androidx.compose.ui.unit.dp
 import com.nuvio.app.features.games.GameBackdropStyle
 import com.nuvio.app.features.games.GameLibrarySettings
 import com.nuvio.app.features.games.GameLibrarySettingsRepository
+import com.nuvio.app.features.games.GameMetadataSource
+import com.nuvio.app.features.games.GameRowsSettingsSection
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.settings_games_backdrop_black_shelf
 import nuvio.composeapp.generated.resources.settings_games_backdrop_full
@@ -20,10 +23,16 @@ import nuvio.composeapp.generated.resources.settings_games_igdb_client_id
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_id_description
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_secret
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_secret_description
+import nuvio.composeapp.generated.resources.settings_games_metadata_source
+import nuvio.composeapp.generated.resources.settings_games_metadata_source_description
+import nuvio.composeapp.generated.resources.settings_games_metadata_source_igdb
+import nuvio.composeapp.generated.resources.settings_games_metadata_source_steam
+import nuvio.composeapp.generated.resources.settings_games_metadata_steam_hint
 import nuvio.composeapp.generated.resources.settings_games_missing_credentials
 import nuvio.composeapp.generated.resources.settings_games_section_artwork
-import nuvio.composeapp.generated.resources.settings_games_section_igdb
+import nuvio.composeapp.generated.resources.settings_games_section_metadata
 import nuvio.composeapp.generated.resources.settings_games_section_presentation
+import nuvio.composeapp.generated.resources.settings_games_section_rows
 import nuvio.composeapp.generated.resources.settings_games_shortcut_hint
 import nuvio.composeapp.generated.resources.settings_games_steamgriddb_key
 import nuvio.composeapp.generated.resources.settings_games_steamgriddb_key_description
@@ -60,16 +69,45 @@ internal fun LazyListScope.gamesSettingsContent(
 
     item {
         SettingsSection(
-            title = stringResource(Res.string.settings_games_section_igdb),
+            title = stringResource(Res.string.settings_games_section_metadata),
             isTablet = isTablet,
         ) {
             SettingsGroup(
                 isTablet = isTablet,
                 modifier = Modifier.settingsSearchAnchors(
+                    "games-metadata-source",
                     "games-igdb-client-id",
                     "games-igdb-client-secret",
                 ),
             ) {
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.settings_games_metadata_source),
+                    description = stringResource(Res.string.settings_games_metadata_source_description),
+                    options = listOf(
+                        SettingsChoiceOption(
+                            value = GameMetadataSource.Igdb,
+                            label = stringResource(Res.string.settings_games_metadata_source_igdb),
+                        ),
+                        SettingsChoiceOption(
+                            value = GameMetadataSource.Steam,
+                            label = stringResource(Res.string.settings_games_metadata_source_steam),
+                        ),
+                    ),
+                    selectedValue = settings.metadataSource,
+                    isTablet = isTablet,
+                    onSelected = GameLibrarySettingsRepository::setMetadataSource,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                if (settings.metadataSource == GameMetadataSource.Steam) {
+                    GamesInfoRow(
+                        isTablet = isTablet,
+                        text = stringResource(Res.string.settings_games_metadata_steam_hint),
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                }
+                // The Twitch rows stay visible with Steam selected: hiding them would strand the
+                // settings-search entries that scroll to them, and they are what the user comes
+                // back to when Steam turns out not to know half their library.
                 SettingsTextInputRow(
                     title = stringResource(Res.string.settings_games_igdb_client_id),
                     description = stringResource(Res.string.settings_games_igdb_client_id_description),
@@ -91,7 +129,7 @@ internal fun LazyListScope.gamesSettingsContent(
                     secret = true,
                     onSave = GameLibrarySettingsRepository::setIgdbClientSecret,
                 )
-                if (!settings.igdbConfigured) {
+                if (!settings.igdbConfigured && settings.metadataSource == GameMetadataSource.Igdb) {
                     SettingsGroupDivider(isTablet = isTablet)
                     GamesInfoRow(
                         isTablet = isTablet,
@@ -129,6 +167,16 @@ internal fun LazyListScope.gamesSettingsContent(
                     onSelected = GameLibrarySettingsRepository::setBackdropStyle,
                 )
             }
+        }
+    }
+
+    item {
+        // Row management lives with the library (desktop-only), so the section body is an actual.
+        Box(Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("games-rows"))) {
+            GameRowsSettingsSection(
+                isTablet = isTablet,
+                title = stringResource(Res.string.settings_games_section_rows),
+            )
         }
     }
 

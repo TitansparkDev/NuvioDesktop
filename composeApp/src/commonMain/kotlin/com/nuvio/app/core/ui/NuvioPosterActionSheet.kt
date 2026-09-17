@@ -67,6 +67,7 @@ fun NuvioPosterZoomActionSheet(
     onStartRewatch: (() -> Unit)? = null,
     rewatchLabel: String = "",
     onOpenInLocalLibrary: (() -> Unit)? = null,
+    onOpenLibraryPicker: (() -> Unit)? = null,
 ) {
     if (item == null) return
     NuvioPosterZoomActionOverlay(
@@ -85,6 +86,7 @@ fun NuvioPosterZoomActionSheet(
                     icon = if (isSaved) Icons.Default.Check else Icons.Default.Add,
                     label = stringResource(if (isSaved) Res.string.hero_remove_from_library else Res.string.hero_add_to_library),
                     onSelected = onToggleLibrary,
+                    onSecondarySelected = onOpenLibraryPicker,
                 ),
             )
             onStartRewatch?.let { startRewatch ->
@@ -134,6 +136,11 @@ fun NuvioPosterActionSheet(
      * row is only offered for titles that are actually on disk.
      */
     onOpenInLocalLibrary: (() -> Unit)? = null,
+    /**
+     * Right-click on the library row. Mirrors the details page: a plain click toggles the title in
+     * the active library provider, the secondary click opens the list picker instead.
+     */
+    onOpenLibraryPicker: (() -> Unit)? = null,
     zoomAnchor: PosterZoomAnchor? = null,
     zoomHazeState: HazeState? = null,
 ) {
@@ -152,6 +159,7 @@ fun NuvioPosterActionSheet(
             onStartRewatch = onStartRewatch,
             rewatchLabel = rewatchLabel,
             onOpenInLocalLibrary = onOpenInLocalLibrary,
+            onOpenLibraryPicker = onOpenLibraryPicker,
         )
         return
     }
@@ -191,6 +199,18 @@ fun NuvioPosterActionSheet(
                             sheetState = sheetState,
                             onDismiss = onDismiss,
                         )
+                    }
+                },
+                onSecondaryClick = onOpenLibraryPicker?.let { openPicker ->
+                    {
+                        openPicker()
+                        coroutineScope.launch {
+                            dismissNuvioBottomSheet(
+                                sheetState = sheetState,
+                                onDismiss = onDismiss,
+                            )
+                        }
+                        Unit
                     }
                 },
             )

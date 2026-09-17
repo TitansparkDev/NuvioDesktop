@@ -53,6 +53,26 @@ expect suspend fun httpRequestRaw(
     body: String,
     followRedirects: Boolean = true,
     allowLargeResponse: Boolean = false,
+    /**
+     * A ceiling on the *whole* call, in milliseconds; 0 keeps the shared client's behaviour.
+     *
+     * The default connect/read/write timeouts are per-operation and are refreshed by any traffic,
+     * so a server that dribbles bytes — or holds a connection open while it queues work — is never
+     * timed out by them. Worse, a coroutine `withTimeout` around this cannot help either: the call
+     * underneath blocks a thread, and cancellation is only delivered at a suspension point, so the
+     * timeout does not fire until the blocking call has already returned on its own.
+     *
+     * Opt-in rather than a default on the shared client, because streaming and large-media traffic
+     * legitimately runs long and a blanket ceiling would break it.
+     */
+    callTimeoutMs: Long = 0,
+    /**
+     * Connect-phase ceiling in milliseconds; 0 keeps the shared client's 60 s. Separate from
+     * [callTimeoutMs] because a dead host is the common failure, not a slow one: the OS spends
+     * ~21 s per SYN attempt before reporting "connection timed out", and a caller fanning out over
+     * many hosts wants those to fail well before a healthy transfer would.
+     */
+    connectTimeoutMs: Long = 0,
 ): RawHttpResponse
 
 /** True when this body was cut short by the response size cap; see [RAW_HTTP_TRUNCATION_MARKER]. */

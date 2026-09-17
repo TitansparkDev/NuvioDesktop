@@ -201,12 +201,54 @@ class TrackingScrobbleCoordinatorTest {
         assertEquals(2, dispatch.sentCount)
     }
 
-    private fun movieEvent(progressPercent: Double = 42.5) = TrackingScrobbleEvent(
+    @Test
+    fun `a watched reply is not believed for a pause or a stop below the threshold`() = runBlocking {
+        val confirming = listOf(FakeScrobbler(TrackingProviderId.YAMTRACK, confirmsWatched = true))
+
+        val pause = dispatchTrackingScrobble(
+            scrobblers = confirming,
+            profileId = 2,
+            action = TrackingScrobbleAction.STOP,
+            event = movieEvent(progressPercent = 11.9, isPauseRatherThanStop = true),
+        )
+        val earlyStop = dispatchTrackingScrobble(
+            scrobblers = confirming,
+            profileId = 2,
+            action = TrackingScrobbleAction.STOP,
+            event = movieEvent(progressPercent = 11.1),
+        )
+        val start = dispatchTrackingScrobble(
+            scrobblers = confirming,
+            profileId = 2,
+            action = TrackingScrobbleAction.START,
+            event = movieEvent(progressPercent = 92.0),
+        )
+        val realStop = dispatchTrackingScrobble(
+            scrobblers = confirming,
+            profileId = 2,
+            action = TrackingScrobbleAction.STOP,
+            event = movieEvent(progressPercent = 92.0),
+        )
+
+        assertEquals(emptyList(), pause.watchedProviderIds)
+        assertEquals(emptyList(), earlyStop.watchedProviderIds)
+        assertEquals(emptyList(), start.watchedProviderIds)
+        assertEquals(listOf(TrackingProviderId.YAMTRACK), realStop.watchedProviderIds)
+        // The requests were still sent; only the claim is discounted.
+        assertEquals(1, pause.sentCount)
+        assertEquals(1, earlyStop.sentCount)
+    }
+
+    private fun movieEvent(
+        progressPercent: Double = 42.5,
+        isPauseRatherThanStop: Boolean = false,
+    ) = TrackingScrobbleEvent(
         media = TrackingMediaReference(
             kind = TrackingMediaKind.MOVIE,
             ids = TrackingExternalIds(imdb = "tt0111161"),
         ),
         progressPercent = progressPercent,
+        isPauseRatherThanStop = isPauseRatherThanStop,
     )
 
     private class FakeScrobbler(

@@ -19,6 +19,9 @@ expect fun ensurePlayerShortcutBindingsLoaded()
 /** Restores every rebindable player shortcut to its default key. */
 expect fun resetAllPlayerShortcuts()
 
+/** Restores just [actions] to their default keys — one section of the shortcuts page. */
+expect fun resetPlayerShortcuts(actions: Collection<PlayerShortcutAction>)
+
 /** Reloads bindings for the newly active profile (bindings are profile-scoped). */
 expect fun onPlayerShortcutsProfileChanged()
 

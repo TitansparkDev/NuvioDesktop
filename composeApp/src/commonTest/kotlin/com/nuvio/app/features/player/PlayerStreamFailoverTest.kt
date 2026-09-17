@@ -1,7 +1,12 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamAddonData
+import com.nuvio.app.features.streams.StreamScoreContext
+import com.nuvio.app.features.streams.StreamScoreProfile
+import com.nuvio.app.features.streams.StreamScoreTrait
+import com.nuvio.app.features.streams.StreamSizeBand
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -181,6 +186,54 @@ class PlayerStreamFailoverTest {
                 activeIdentityKey = active.playerSourceIdentityKey(),
                 triedIdentityKeys = setOfNotNull(active.playerSourceIdentityKey()),
                 preferredAudioLanguages = listOf("en", "ja"),
+            ),
+        )
+    }
+
+    @Test
+    fun `scored failover does not let a language tag outrank an untagged better release`() {
+        // Friends S01E01, 2026-09-14: after a TorBox 429 the 4K remuxes carried no language tag,
+        // the 1080p HONE said "English" in its title, and the language tier handed it the win
+        // over every 1500-point remux. With scoring driving failover, untagged and matched share
+        // a tier and the score decides.
+        val active = stream("active")
+        val remux = scoredStream("Friends.S01E01.UHD.BluRay.2160p.DTS-HD.MA.5.1.DV.HEVC.REMUX-FraMeSToR", sizeGb = 8.0)
+        val hone = scoredStream(
+            "Friends.S01E01.1080p.AMZN.WEB-DL.H265.SDR.DDP.5.1.English-HONE",
+            sizeGb = 1.2,
+            audioLanguages = listOf("eng"),
+        )
+        val polish = scoredStream("Friends.S01E01.2160p.REMUX-PL", sizeGb = 8.0, audioLanguages = listOf("pl"))
+        val scored = StreamScoreProfile(
+            enabled = true,
+            useForFailover = true,
+            points = mapOf(
+                StreamScoreTrait.QUALITY_2160P_REMUX.id to 1500,
+                StreamScoreTrait.QUALITY_1080P_WEB_DL.id to 400,
+            ),
+        )
+
+        assertEquals(
+            remux,
+            nextFailoverStream(
+                streams = listOf(active, hone, remux, polish),
+                activeIdentityKey = active.playerSourceIdentityKey(),
+                triedIdentityKeys = setOfNotNull(active.playerSourceIdentityKey()),
+                preferredAudioLanguages = listOf("en"),
+                scoreProfile = scored,
+                scoreContext = StreamScoreContext.EPISODE,
+            ),
+        )
+        // An explicit mismatch still sits behind both, however well it scores.
+        assertEquals(
+            hone,
+            nextFailoverStream(
+                streams = listOf(active, hone, polish),
+                activeIdentityKey = active.playerSourceIdentityKey(),
+                triedIdentityKeys = setOfNotNull(active.playerSourceIdentityKey()),
+                preferredAudioLanguages = listOf("en"),
+                scoreProfile = scored,
+                scoreContext = StreamScoreContext.EPISODE,
             ),
         )
     }
@@ -374,6 +427,22 @@ class PlayerStreamFailoverTest {
             ),
         )
     }
+
+    private fun scoredStream(
+        name: String,
+        sizeGb: Double,
+        audioLanguages: List<String> = emptyList(),
+    ) = StreamItem(
+        name = name,
+        url = "https://example.com/${name.hashCode()}.mkv",
+        audioLanguages = audioLanguages,
+        addonName = "addon",
+        addonId = "addon:x",
+        behaviorHints = StreamBehaviorHints(
+            filename = name,
+            videoSize = (sizeGb * StreamSizeBand.BYTES_PER_GB).toLong(),
+        ),
+    )
 
     private fun stream(
         id: String,

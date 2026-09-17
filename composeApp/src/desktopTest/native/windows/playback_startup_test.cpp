@@ -315,8 +315,404 @@ struct PlaybackStartupTest {
             assert(p->ensureSvpPrerollStartPosition());
             assert(commands.empty());
         }
-        std::cout << "22 native playback startup scenarios passed\n";
+        // Passthrough rejected by the output device (wasapi exclusive open fails): the audio
+        // chain is rebuilt as PCM by clearing audio-spdif and reselecting the same track — in
+        // that order, so the reselected decoder never sees the spdif list. One shot per load.
+        {
+            auto p = player();
+            p->audioPassthroughRequested = true;
+            properties["aid"] = "2";
+            properties["audio-spdif"] = "ac3,dts,eac3";
+            assert(p->tryRecoverFromPassthroughAoFailure("error", "ao", "Failed to initialize audio driver 'wasapi'"));
+            assert(properties["audio-spdif"].empty());
+            assert(writes.size() == 3);
+            assert(writes[0] == "audio-spdif" && writes[1] == "aid" && writes[2] == "aid");
+            assert(properties["aid"] == "2");
+            assert(p->audioPassthroughFallbackApplied);
+            // A second AO failure on the same load (PCM itself broken) must not cycle again.
+            assert(!p->tryRecoverFromPassthroughAoFailure("error", "ao", "Failed to initialize audio driver 'wasapi'"));
+            assert(writes.size() == 3);
+        }
+        // Without passthrough requested, an AO failure is mpv's own problem — no track cycling,
+        // and the same for AO lines that are not the init failure.
+        {
+            auto p = player();
+            properties["aid"] = "1";
+            assert(!p->tryRecoverFromPassthroughAoFailure("error", "ao", "Failed to initialize audio driver 'wasapi'"));
+            p->audioPassthroughRequested = true;
+            assert(!p->tryRecoverFromPassthroughAoFailure("warn", "ao", "Failed to initialize audio driver 'wasapi'"));
+            assert(!p->tryRecoverFromPassthroughAoFailure("error", "ao/wasapi", "Received failure from audio thread"));
+            assert(writes.empty());
+        }
+        // No selected track (aid=no) still drops the spdif list so a later manual track pick
+        // starts as PCM, but there is nothing to reselect.
+        {
+            auto p = player();
+            p->audioPassthroughRequested = true;
+            properties["aid"] = "no";
+            assert(p->tryRecoverFromPassthroughAoFailure("fatal", "ao", "Failed to initialize audio driver 'wasapi'"));
+            assert(writes.size() == 1 && writes[0] == "audio-spdif");
+            assert(properties["aid"] == "no");
+        }
+        std::cout << "25 native playback startup scenarios passed\n";
     }
 };
 }
-int main() { PlaybackStartupTest::run(); }
+
+// Exercises the DualSense report decoder against synthetic reports.
+//
+// Byte offsets, the hat table, the inverted Y axes and the face-button bit order are the parts of
+// controller support most likely to be silently wrong, and the only parts that can be checked
+// without the hardware in hand — a mistake here shows up as "the pad works but up goes down", which
+// is far cheaper to catch as an assertion than in the living room.
+namespace {
+using nuvio_gamepad_hid::PadState;
+
+constexpr USHORT kUsbLength = nuvio_gamepad_hid::kUsbInputReportLength;
+constexpr USHORT kBtLength = nuvio_gamepad_hid::kBluetoothInputReportLength;
+
+// A centred, nothing-pressed report in each of the three layouts the decoder understands.
+std::vector<unsigned char> usbReport() {
+    std::vector<unsigned char> report(kUsbLength, 0);
+    report[0] = 0x01;
+    report[1] = report[2] = report[3] = report[4] = 128; // axes
+    report[5] = report[6] = 0;                           // triggers
+    report[8] = 0x08;                                    // hat centred, no face buttons
+    return report;
+}
+
+std::vector<unsigned char> btFullReport() {
+    std::vector<unsigned char> report(kBtLength, 0);
+    report[0] = 0x31;
+    report[2] = report[3] = report[4] = report[5] = 128;
+    report[6] = report[7] = 0;
+    report[9] = 0x08;
+    return report;
+}
+
+std::vector<unsigned char> btSimpleReport() {
+    std::vector<unsigned char> report(kBtLength, 0);
+    report[0] = 0x01;
+    report[1] = report[2] = report[3] = report[4] = 128;
+    report[5] = 0x08;
+    report[8] = report[9] = 0;
+    return report;
+}
+
+using nuvio_gamepad_hid::PadModel;
+
+PadState decode(
+    const std::vector<unsigned char> &report,
+    USHORT inputReportLength,
+    PadModel model = PadModel::DualSense
+) {
+    PadState state;
+    const bool ok = nuvio_gamepad_hid::decodeReport(
+        report.data(), static_cast<DWORD>(report.size()), inputReportLength, model, state);
+    assert(ok);
+    return state;
+}
+
+void runDualSenseDecodeTests() {
+    using namespace nuvio_gamepad_hid;
+
+    // A resting pad must read as dead centre in every layout. If this drifts, the UI scrolls on its
+    // own before the user has touched anything.
+    for (auto &&[report, length] : {
+             std::pair{usbReport(), kUsbLength},
+             std::pair{btFullReport(), kBtLength},
+             std::pair{btSimpleReport(), kBtLength},
+         }) {
+        const PadState state = decode(report, length);
+        assert(state.buttons == 0);
+        assert(state.leftTrigger == 0 && state.rightTrigger == 0);
+        assert(std::abs(static_cast<int>(state.thumbLX)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbLY)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbRX)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbRY)) <= 257);
+    }
+
+    // Face buttons. Cross must land on A and Circle on B, or "select" and "back" are swapped.
+    {
+        auto report = usbReport();
+        report[8] = 0x08 | 0x20; // Cross
+        assert(decode(report, kUsbLength).buttons == kBtnA);
+        report[8] = 0x08 | 0x40; // Circle
+        assert(decode(report, kUsbLength).buttons == kBtnB);
+        report[8] = 0x08 | 0x10; // Square
+        assert(decode(report, kUsbLength).buttons == kBtnX);
+        report[8] = 0x08 | 0x80; // Triangle
+        assert(decode(report, kUsbLength).buttons == kBtnY);
+    }
+
+    // Shoulders, Create/Options and the stick clicks.
+    {
+        auto report = usbReport();
+        report[9] = 0x01; assert(decode(report, kUsbLength).buttons == kBtnLeftShoulder);
+        report[9] = 0x02; assert(decode(report, kUsbLength).buttons == kBtnRightShoulder);
+        report[9] = 0x10; assert(decode(report, kUsbLength).buttons == kBtnBack);   // Create
+        report[9] = 0x20; assert(decode(report, kUsbLength).buttons == kBtnStart);  // Options
+        report[9] = 0x40; assert(decode(report, kUsbLength).buttons == kBtnLeftThumb);
+        report[9] = 0x80; assert(decode(report, kUsbLength).buttons == kBtnRightThumb);
+    }
+
+    // The PS button, touchpad click and mute are deliberately unbound, and must stay that way:
+    // a touchpad press is easy to trigger just by holding the pad.
+    {
+        auto report = usbReport();
+        report[10] = 0x01 | 0x02 | 0x04;
+        assert(decode(report, kUsbLength).buttons == 0);
+    }
+
+    // The hat, all eight positions plus centre. Diagonals must report both axes.
+    {
+        auto report = usbReport();
+        const std::pair<unsigned char, USHORT> expected[] = {
+            {0, kBtnDpadUp},
+            {1, static_cast<USHORT>(kBtnDpadUp | kBtnDpadRight)},
+            {2, kBtnDpadRight},
+            {3, static_cast<USHORT>(kBtnDpadDown | kBtnDpadRight)},
+            {4, kBtnDpadDown},
+            {5, static_cast<USHORT>(kBtnDpadDown | kBtnDpadLeft)},
+            {6, kBtnDpadLeft},
+            {7, static_cast<USHORT>(kBtnDpadUp | kBtnDpadLeft)},
+            {8, 0},
+        };
+        for (const auto &[hat, buttons] : expected) {
+            report[8] = hat;
+            assert(decode(report, kUsbLength).buttons == buttons);
+        }
+    }
+
+    // Stick direction. HID counts Y downward and XInput counts it upward, so pushing the stick up
+    // must come back positive — this is the inversion that makes menus scroll backwards if missed.
+    {
+        auto report = usbReport();
+        report[1] = 255; // full right
+        report[2] = 0;   // full up
+        const PadState state = decode(report, kUsbLength);
+        assert(state.thumbLX > 30000);
+        assert(state.thumbLY > 30000);
+
+        report[1] = 0;   // full left
+        report[2] = 255; // full down
+        const PadState flipped = decode(report, kUsbLength);
+        assert(flipped.thumbLX < -30000);
+        assert(flipped.thumbLY < -30000);
+    }
+
+    // Triggers pass through as 0..255, matching what XInput reports.
+    {
+        auto report = usbReport();
+        report[5] = 200;
+        report[6] = 17;
+        const PadState state = decode(report, kUsbLength);
+        assert(state.leftTrigger == 200);
+        assert(state.rightTrigger == 17);
+    }
+
+    // The two Bluetooth layouts put the same controls in different places. Decoding a BT report
+    // with the USB offsets (or the reverse) is the single most likely way this breaks, so each
+    // layout is checked to produce the same answer for the same physical input.
+    {
+        auto full = btFullReport();
+        full[2] = 255;      // LX full right
+        full[6] = 200;      // L2
+        full[9] = 0x08 | 0x20; // Cross
+        full[10] = 0x02;    // R1
+        const PadState state = decode(full, kBtLength);
+        assert(state.thumbLX > 30000);
+        assert(state.leftTrigger == 200);
+        assert(state.buttons == (kBtnA | kBtnRightShoulder));
+    }
+    {
+        auto simple = btSimpleReport();
+        simple[1] = 255;        // LX full right
+        simple[8] = 200;        // L2
+        simple[5] = 0x08 | 0x20; // Cross
+        simple[6] = 0x02;       // R1
+        const PadState state = decode(simple, kBtLength);
+        assert(state.thumbLX > 30000);
+        assert(state.leftTrigger == 200);
+        assert(state.buttons == (kBtnA | kBtnRightShoulder));
+    }
+
+    // Reports the decoder does not recognise are refused rather than parsed as garbage. A stray
+    // feature or audio report must not be read as a fistful of held buttons.
+    {
+        PadState state;
+        auto report = usbReport();
+        report[0] = 0x05; // not an input report this code knows
+        assert(!decodeReport(report.data(), static_cast<DWORD>(report.size()), kUsbLength, PadModel::DualSense, state));
+
+        std::vector<unsigned char> truncated(6, 0);
+        truncated[0] = 0x01;
+        assert(!decodeReport(truncated.data(), static_cast<DWORD>(truncated.size()), kUsbLength, PadModel::DualSense, state));
+        assert(state.buttons == 0);
+    }
+
+    std::cout << "16 native DualSense decode scenarios passed\n";
+}
+} // namespace
+
+
+// Exercises the DualShock 4 report layouts.
+//
+// A DS4 puts its buttons where a DualSense puts its triggers, so decoding one as the other reads
+// held buttons out of trigger travel and vice versa. Nobody here has a DS4 to plug in, which makes
+// these assertions the only thing standing between "supported" and "confidently wrong".
+namespace {
+
+// Nothing pressed, sticks centred, in each DualShock 4 layout.
+std::vector<unsigned char> ds4UsbReport() {
+    std::vector<unsigned char> report(kUsbLength, 0);
+    report[0] = 0x01;
+    report[1] = report[2] = report[3] = report[4] = 128; // axes
+    report[5] = 0x08;                                    // hat centred, no face buttons
+    report[8] = report[9] = 0;                           // L2 / R2
+    return report;
+}
+
+std::vector<unsigned char> ds4BluetoothReport() {
+    std::vector<unsigned char> report(kBtLength, 0);
+    report[0] = 0x11;
+    report[3] = report[4] = report[5] = report[6] = 128;
+    report[7] = 0x08;
+    report[10] = report[11] = 0;
+    return report;
+}
+
+void runDualShock4DecodeTests() {
+    using namespace nuvio_gamepad_hid;
+
+    // Resting pad reads as dead centre on both transports.
+    for (auto &&[report, length] : {
+             std::pair{ds4UsbReport(), kUsbLength},
+             std::pair{ds4BluetoothReport(), kBtLength},
+         }) {
+        const PadState state = decode(report, length, PadModel::DualShock4);
+        assert(state.buttons == 0);
+        assert(state.leftTrigger == 0 && state.rightTrigger == 0);
+        assert(std::abs(static_cast<int>(state.thumbLX)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbLY)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbRX)) <= 257);
+        assert(std::abs(static_cast<int>(state.thumbRY)) <= 257);
+    }
+
+    // Face buttons sit in the same bits as the DualSense, one byte earlier.
+    {
+        auto report = ds4UsbReport();
+        report[5] = 0x08 | 0x20; // Cross
+        assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnA);
+        report[5] = 0x08 | 0x40; // Circle
+        assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnB);
+        report[5] = 0x08 | 0x10; // Square
+        assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnX);
+        report[5] = 0x08 | 0x80; // Triangle
+        assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnY);
+    }
+
+    // Shoulders, Share/Options and the stick clicks.
+    {
+        auto report = ds4UsbReport();
+        report[6] = 0x01; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnLeftShoulder);
+        report[6] = 0x02; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnRightShoulder);
+        report[6] = 0x10; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnBack);  // Share
+        report[6] = 0x20; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnStart); // Options
+        report[6] = 0x40; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnLeftThumb);
+        report[6] = 0x80; assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == kBtnRightThumb);
+    }
+
+    // PS and touchpad stay unbound, as on the DualSense.
+    {
+        auto report = ds4UsbReport();
+        report[7] = 0x01 | 0x02;
+        assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == 0);
+    }
+
+    // The hat, including diagonals.
+    {
+        auto report = ds4UsbReport();
+        const std::pair<unsigned char, USHORT> expected[] = {
+            {0, kBtnDpadUp},
+            {2, kBtnDpadRight},
+            {4, kBtnDpadDown},
+            {6, kBtnDpadLeft},
+            {1, static_cast<USHORT>(kBtnDpadUp | kBtnDpadRight)},
+            {5, static_cast<USHORT>(kBtnDpadDown | kBtnDpadLeft)},
+            {8, 0},
+        };
+        for (const auto &[hat, buttons] : expected) {
+            report[5] = hat;
+            assert(decode(report, kUsbLength, PadModel::DualShock4).buttons == buttons);
+        }
+    }
+
+    // Sticks, including the Y inversion that makes menus scroll the right way.
+    {
+        auto report = ds4UsbReport();
+        report[1] = 255; // full right
+        report[2] = 0;   // full up
+        const PadState state = decode(report, kUsbLength, PadModel::DualShock4);
+        assert(state.thumbLX > 30000);
+        assert(state.thumbLY > 30000);
+    }
+
+    // Triggers live after the buttons on a DS4, which is the whole reason the model matters.
+    {
+        auto report = ds4UsbReport();
+        report[8] = 200;
+        report[9] = 17;
+        const PadState state = decode(report, kUsbLength, PadModel::DualShock4);
+        assert(state.leftTrigger == 200);
+        assert(state.rightTrigger == 17);
+    }
+
+    // The Bluetooth report is the same payload behind two extra header bytes: the same physical
+    // input must decode identically on both transports.
+    {
+        auto bt = ds4BluetoothReport();
+        bt[3] = 255;            // LX full right
+        bt[7] = 0x08 | 0x20;    // Cross
+        bt[8] = 0x02;           // R1
+        bt[10] = 200;           // L2
+        const PadState state = decode(bt, kBtLength, PadModel::DualShock4);
+        assert(state.thumbLX > 30000);
+        assert(state.leftTrigger == 200);
+        assert(state.buttons == (kBtnA | kBtnRightShoulder));
+    }
+
+    // Reading a DS4 report with the DualSense layout must not quietly produce the same answer —
+    // if it did, the model plumbing would be untested decoration. Trigger travel would be read as
+    // a fistful of held buttons.
+    {
+        auto report = ds4UsbReport();
+        report[8] = 255; // L2 fully pressed
+        report[9] = 255; // R2 fully pressed
+        const PadState correct = decode(report, kUsbLength, PadModel::DualShock4);
+        const PadState wrong = decode(report, kUsbLength, PadModel::DualSense);
+        assert(correct.leftTrigger == 255 && correct.rightTrigger == 255);
+        assert(correct.buttons == 0);
+        assert(wrong.buttons != correct.buttons);
+    }
+
+    // A DualSense Bluetooth report id is not a DualShock 4 one, and must be refused rather than
+    // parsed at whatever offsets happen to be in range.
+    {
+        PadState state;
+        auto report = ds4BluetoothReport();
+        report[0] = 0x31; // DualSense full-Bluetooth id
+        assert(!decodeReport(report.data(), static_cast<DWORD>(report.size()), kBtLength, PadModel::DualShock4, state));
+    }
+
+    std::cout << "10 native DualShock 4 decode scenarios passed\n";
+}
+} // namespace
+
+int main() {
+    PlaybackStartupTest::run();
+    runDualSenseDecodeTests();
+    runDualShock4DecodeTests();
+}
+
+

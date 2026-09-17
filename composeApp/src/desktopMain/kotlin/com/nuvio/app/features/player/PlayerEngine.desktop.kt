@@ -14,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.awt.SwingPanel
@@ -31,9 +32,14 @@ import com.nuvio.app.features.player.desktop.DesktopWindowGeometryDiagnostics
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
+import com.nuvio.app.features.input.GamepadContext
+import com.nuvio.app.features.screensaver.DesktopScreensaver
 import com.nuvio.app.features.player.desktop.NativePlayerHost
+import com.nuvio.app.features.player.desktop.PlaybackRedirectResolution
+import com.nuvio.app.features.player.desktop.PlaybackRedirectResolver
 import com.nuvio.app.features.player.desktop.desktopAppFullscreenState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.drop
 import java.awt.KeyEventDispatcher
@@ -139,6 +145,19 @@ private fun NativePlayerSurface(
     // file load. Null until the first report.
     val displayHdrEnabled = remember { mutableStateOf<Boolean?>(null) }
     val videoProfileRefreshToken = remember { mutableIntStateOf(0) }
+    // The attempt whose source was last handed to the controller, and the attempt whose file has
+    // rendered its first frame. The snapshot loop below publishes nothing real until the second
+    // equals the current attempt — see the comment there for what went wrong without it.
+    val attachedAttemptId = remember { mutableStateOf<Long?>(null) }
+    val startedAttemptId = remember { mutableStateOf<Long?>(null) }
+    // Redirect resolutions for this surface's lifetime, keyed by the stream's source URL. A
+    // re-attach of the same stream (RTX/settings toggles re-key the attach effect) must hand the
+    // controller the *same* pinned URL: its carried-position logic compares URLs, and a fresh
+    // resolve would mint a different CDN token and restart the file from initialPositionMs.
+    val redirectResolutions = remember { mutableMapOf<String, PlaybackRedirectResolution>() }
+    // Last real playhead this surface reported, for resuming after a pinned link is re-resolved.
+    val lastKnownPositionMs = remember { mutableStateOf(0L) }
+    val surfaceScope = rememberCoroutineScope()
     LaunchedEffect(playbackAttemptId, sourceUrl) {
         DesktopPlayerLaunchShield.showForActiveWindow()
     }
@@ -266,6 +285,10 @@ private fun NativePlayerSurface(
                     // visible. This event is the frame-accurate signal the fallback was standing in
                     // for. Harmless on a first load, where both paths simply restart the same timer.
                     DesktopPlayerLaunchShield.hideAfter()
+                    // Attribute the frame to the attempt that issued the attach, not to whatever
+                    // attempt is current: the controller drops events from superseded handles, so
+                    // this restart can only have come from the most recent attach.
+                    startedAttemptId.value = attachedAttemptId.value
                     latestOnPlayerControlsEvent.value(type, value)
                     true
                 } else {
@@ -279,6 +302,12 @@ private fun NativePlayerSurface(
 
     DisposableEffect(controller) {
         PlayerShortcutsRepository.ensureLoaded()
+        // Tells the gamepad poller which of a button's two meanings applies. Scoped to this
+        // effect so it tracks the dispatcher exactly: while the player owns the keys, the pad
+        // uses its player layout.
+        GamepadContext.playerActive = true
+        // The screensaver's "during playback" switch keys off the same fact.
+        DesktopScreensaver.playerActive = true
         val dispatcher = KeyEventDispatcher { event ->
             if (event.id != KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
             if (event.isMetaDown || event.isControlDown || event.isAltDown || event.isShiftDown) {
@@ -347,6 +376,9 @@ private fun NativePlayerSurface(
         }
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
         onDispose {
+            GamepadContext.playerActive = false
+            DesktopScreensaver.playerActive = false
+            GamepadContext.animeShaderActive = false
             KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(dispatcher)
         }
     }
@@ -384,43 +416,113 @@ private fun NativePlayerSurface(
         }
         delay(16L)
         PlaybackStartTrace.mark("playerAttach")
+        // Follow the addon's redirect chain once here rather than letting FFmpeg re-walk it on
+        // every seek (see PlaybackRedirectResolver). The source URL stays the stream's identity;
+        // only what mpv opens changes.
+        val resolution = redirectResolutions[sourceUrl]
+            ?: PlaybackRedirectResolver.resolve(sourceUrl, playbackHeaders)
+                .also { redirectResolutions[sourceUrl] = it }
+        PlaybackStartTrace.mark("redirect:${resolution.outcome.name.lowercase()}")
         // Logged so a binge/next-episode stall can be diagnosed: if the common layer reports it
         // set a new activeSourceUrl (see BingeAdvance "switchToEpisodeStream" log) but this line
         // never follows while the window is minimized, that confirms the attach is waiting on a
-        // paused recomposition rather than something in stream selection.
+        // paused recomposition rather than something in stream selection. The hosts are what a
+        // 429 report needs: which resolver handed out the link, and which host mpv is actually
+        // hammering with range requests.
         BingeAdvanceLog.i {
-            "desktop attach firing attemptId=$playbackAttemptId sourceUrl=${sourceUrl.takeLast(48)}"
+            "desktop attach firing attemptId=$playbackAttemptId" +
+                " sourceHost=${PlaybackRedirectResolver.hostOf(sourceUrl)}" +
+                " playbackHost=${PlaybackRedirectResolver.hostOf(resolution.playbackUrl)}" +
+                " redirect=${resolution.outcome.name.lowercase()}/${resolution.hops}" +
+                " sourceUrl=${sourceUrl.takeLast(48)}"
         }
-        controller.attach(
+        fun attachWith(
+            playbackUrl: String,
+            positionMs: Long,
+            progressFraction: Float,
+            tracePlaybackStart: Boolean,
+            onError: (String?) -> Unit,
+        ) {
+            controller.attach(
+                tracePlaybackStart = tracePlaybackStart,
+                sourceUrl = playbackUrl,
+                sourceAudioUrl = sourceAudioUrl,
+                sourceHeaders = playbackHeaders,
+                mediaTitle = preferredMpvMediaTitle(
+                    streamTitle = playerControlsState.streamTitle,
+                    title = playerControlsState.title,
+                    episodeText = playerControlsState.episodeText,
+                ),
+                playWhenReady = playWhenReady,
+                initialPositionMs = positionMs,
+                initialProgressFraction = progressFraction,
+                // Apply the configured speed before mpv initializes. In particular, this prevents
+                // the SVP/VapourSynth graph from being constructed at 1x only to be torn down when
+                // the common player layer applies a >= 1.5x default speed after the first snapshot.
+                initialPlaybackSpeed = initialPlaybackSpeed,
+                // Native code defers this until MPV_EVENT_FILE_LOADED, then installs it before the
+                // first PLAYBACK_RESTART. That avoids probing/HLS startup crashes while also avoiding
+                // a visible/audio-disrupting filter rebuild after playback has already begun.
+                animeSvpEnabled = initialAnimeSvpRequested,
+                isAnimeContent = isAnimeContent,
+                nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled &&
+                    playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
+                nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled &&
+                    playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
+                enableUserMpvOptions = true,
+                restoreVolume = true,
+                onError = onError,
+            )
+        }
+        // A pinned CDN link can outlive its token where the resolver's own hop would have been
+        // re-resolved by FFmpeg for free. On the first 401/403/404/410 from a pinned attach,
+        // resolve again and re-attach at the last playhead instead of surfacing the error; a
+        // second failure, or anything else (429 included), goes to the common layer as before.
+        var pinnedLinkRefreshUsed = false
+        val onSurfaceError = object : (String?) -> Unit {
+            override fun invoke(message: String?) {
+                val current = redirectResolutions[sourceUrl]
+                val refreshable = message != null &&
+                    current?.pinned == true &&
+                    !pinnedLinkRefreshUsed &&
+                    looksLikeExpiredPinnedLink(message)
+                if (!refreshable) {
+                    latestOnError.value(message)
+                    return
+                }
+                pinnedLinkRefreshUsed = true
+                val retryErrorHandler = this
+                surfaceScope.launch {
+                    val fresh = PlaybackRedirectResolver.resolve(sourceUrl, playbackHeaders)
+                    if (attachedAttemptId.value != playbackAttemptId) return@launch
+                    if (!fresh.pinned || fresh.playbackUrl == current.playbackUrl) {
+                        latestOnError.value(message)
+                        return@launch
+                    }
+                    redirectResolutions[sourceUrl] = fresh
+                    BingeAdvanceLog.i {
+                        "desktop pinned link refreshed attemptId=$playbackAttemptId" +
+                            " playbackHost=${PlaybackRedirectResolver.hostOf(fresh.playbackUrl)}" +
+                            " resumeMs=${lastKnownPositionMs.value} after: $message"
+                    }
+                    attachWith(
+                        playbackUrl = fresh.playbackUrl,
+                        positionMs = lastKnownPositionMs.value,
+                        progressFraction = 0f,
+                        tracePlaybackStart = false,
+                        onError = retryErrorHandler,
+                    )
+                }
+            }
+        }
+        attachWith(
+            playbackUrl = resolution.playbackUrl,
+            positionMs = initialPositionMs,
+            progressFraction = initialProgressFraction ?: 0f,
             tracePlaybackStart = true,
-            sourceUrl = sourceUrl,
-            sourceAudioUrl = sourceAudioUrl,
-            sourceHeaders = playbackHeaders,
-            mediaTitle = preferredMpvMediaTitle(
-                streamTitle = playerControlsState.streamTitle,
-                title = playerControlsState.title,
-                episodeText = playerControlsState.episodeText,
-            ),
-            playWhenReady = playWhenReady,
-            initialPositionMs = initialPositionMs,
-            initialProgressFraction = initialProgressFraction ?: 0f,
-            // Apply the configured speed before mpv initializes. In particular, this prevents
-            // the SVP/VapourSynth graph from being constructed at 1x only to be torn down when
-            // the common player layer applies a >= 1.5x default speed after the first snapshot.
-            initialPlaybackSpeed = initialPlaybackSpeed,
-            // Native code defers this until MPV_EVENT_FILE_LOADED, then installs it before the
-            // first PLAYBACK_RESTART. That avoids probing/HLS startup crashes while also avoiding
-            // a visible/audio-disrupting filter rebuild after playback has already begun.
-            animeSvpEnabled = initialAnimeSvpRequested,
-            isAnimeContent = isAnimeContent,
-            nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled &&
-                playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
-            nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled &&
-                playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
-            enableUserMpvOptions = true,
-            restoreVolume = true,
-            onError = { message -> latestOnError.value(message) },
+            onError = onSurfaceError,
         )
+        attachedAttemptId.value = playbackAttemptId
         onPlayerAttached()
     }
 
@@ -505,6 +607,7 @@ private fun NativePlayerSurface(
                 System.out.println(
                     "Desktop video profile: detectedHdr=${isHdr ?: "unknown"}, " +
                         "hdrMode=${settings.desktopHdrMode.name}, colorProfile=${settings.desktopColorProfile.name}, " +
+                        "colorGrade=${settings.desktopColorGrade()}, " +
                         "bufferPreset=${settings.desktopBufferPreset.name}, " +
                         "animeMode=${settings.desktopAnimeMode.name}, " +
                         "animeAuto=${settings.desktopAnimeModeAutoEnabled}, " +
@@ -518,6 +621,7 @@ private fun NativePlayerSurface(
                         controller = controller,
                         hdrMode = settings.desktopHdrMode,
                         colorProfile = settings.desktopColorProfile,
+                        customGrade = settings.desktopColorGrade(),
                         isHdr = isHdr,
                     )
                     controller.applyDesktopBufferPreset(settings.desktopBufferPreset)
@@ -606,7 +710,27 @@ private fun NativePlayerSurface(
 
     LaunchedEffect(controller, playbackAttemptId, sourceUrl) {
         while (true) {
-            latestOnSnapshot.value(controller.snapshot())
+            // Until this attempt's file has rendered, the controller's handle is still the
+            // *outgoing* player's: a new attempt begins before the attach effect above has run,
+            // and the attach itself only swaps the handle on a later Swing turn. This loop
+            // restarts on the new attempt id and samples immediately, so its first tick used to
+            // hand the previous episode's position — playing at 92%, or ended at 100% — to the
+            // common layer under the new attempt id, where nothing could tell it apart from the
+            // new episode's own progress. The next flush (a pause, or the pause mpv makes while
+            // the startup profile renders) then reported that position for the new episode:
+            // Continue Watching marked it complete and the tracker got a stop scrobble at 92%,
+            // so the "marked watched" toast appeared at the *start* of the following episode.
+            // Reporting only a loading placeholder until the first rendered frame keeps every
+            // sample the runtime sees attributable to the attempt it is published under.
+            val snapshot = if (startedAttemptId.value == playbackAttemptId) {
+                controller.snapshot()
+            } else {
+                PlayerPlaybackSnapshot(isLoading = true)
+            }
+            if (!snapshot.isLoading && snapshot.positionMs > 0L && !snapshot.isEnded) {
+                lastKnownPositionMs.value = snapshot.positionMs
+            }
+            latestOnSnapshot.value(snapshot)
             delay(500L)
         }
     }
@@ -697,6 +821,38 @@ private fun desktopColorProfileInfoLabel(
     colorProfile.label
 }
 
+/**
+ * The offsets a profile stands for. [custom] supplies Custom's four values; every other profile
+ * ignores it. Shared with the HUD's grade panel, which seeds a fresh Custom grade from whichever
+ * preset was on screen — grading from Cinematic should start at Cinematic, not at neutral.
+ */
+internal fun DesktopColorProfile.presetGrade(
+    custom: DesktopColorGrade = DesktopColorGrade(0, 0, 0, 0),
+): DesktopColorGrade = when (this) {
+    DesktopColorProfile.Neutral -> DesktopColorGrade(0, 0, 0, 0)
+    DesktopColorProfile.Cinematic -> DesktopColorGrade(contrast = 2, brightness = -6, saturation = 2, gamma = 2)
+    DesktopColorProfile.Vivid -> DesktopColorGrade(contrast = 5, brightness = -4, saturation = 15, gamma = -2)
+    DesktopColorProfile.Custom -> custom
+}
+
+/**
+ * The [DesktopColorProfile.Custom] equalizer offsets, in mpv's own units. Only read when Custom is
+ * the active profile; the presets carry their own hardcoded values.
+ */
+internal data class DesktopColorGrade(
+    val contrast: Int,
+    val brightness: Int,
+    val saturation: Int,
+    val gamma: Int,
+)
+
+internal fun PlayerSettingsUiState.desktopColorGrade(): DesktopColorGrade = DesktopColorGrade(
+    contrast = desktopColorContrast,
+    brightness = desktopColorBrightness,
+    saturation = desktopColorSaturation,
+    gamma = desktopColorGamma,
+)
+
 private data class DesktopVideoProfileState(
     val isHdr: Boolean?,
     val displayHdr: Boolean?,
@@ -712,6 +868,7 @@ private fun applyDesktopVideoProfile(
     controller: NativePlayerController,
     hdrMode: DesktopHdrMode,
     colorProfile: DesktopColorProfile,
+    customGrade: DesktopColorGrade,
     isHdr: Boolean?,
 ) {
     when (hdrMode) {
@@ -762,10 +919,10 @@ private fun applyDesktopVideoProfile(
     val forceNeutral = isHdr != false && hdrMode != DesktopHdrMode.AlwaysTonemap
     val (contrast, brightness, saturation, gamma) = when {
         forceNeutral -> listOf(0, 0, 0, 0)
-        else -> when (colorProfile) {
-            DesktopColorProfile.Neutral -> listOf(0, 0, 0, 0)
-            DesktopColorProfile.Cinematic -> listOf(2, -6, 2, 2)
-            DesktopColorProfile.Vivid -> listOf(5, -4, 15, -2)
+        // Custom goes through the same gate as the presets: hand-dialled numbers are no less
+        // SDR-tuned than ours, and a custom grade on a PQ signal crushes shadows the same way.
+        else -> colorProfile.presetGrade(customGrade).let {
+            listOf(it.contrast, it.brightness, it.saturation, it.gamma)
         }
     }
     controller.setMpvProperty("contrast", contrast.toString())
@@ -1126,3 +1283,15 @@ private class DesktopStubPlayerController : PlayerEngineController {
     override fun clearExternalSubtitle() = Unit
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) = Unit
 }
+
+/**
+ * An HTTP status that means "this link is no longer good", as mpv reports it
+ * (`https: HTTP error 403 Forbidden`, possibly followed by `; Seek failed ...`). Deliberately
+ * excludes 429: a rate limit is the provider refusing *any* link, and re-resolving would be one
+ * more request at the host that is already saying no.
+ */
+private val EXPIRED_PINNED_LINK_STATUS =
+    Regex("""http error (401|403|404|410)\b""", RegexOption.IGNORE_CASE)
+
+private fun looksLikeExpiredPinnedLink(message: String): Boolean =
+    EXPIRED_PINNED_LINK_STATUS.containsMatchIn(message)

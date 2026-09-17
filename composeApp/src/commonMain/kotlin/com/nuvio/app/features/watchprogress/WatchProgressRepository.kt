@@ -14,9 +14,14 @@ import com.nuvio.app.features.metadata.animeMovieTmdbFallbackId
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.simkl.SIMKL_CW_DAYS_CAP_ALL
+import com.nuvio.app.features.simkl.SIMKL_NO_CW_CUTOFF
 import com.nuvio.app.features.simkl.SimklAuthRepository
 import com.nuvio.app.features.simkl.simklContinueWatchingCutoffMs
 import com.nuvio.app.features.simkl.SimklCalendarRepository
+import com.nuvio.app.features.home.CalendarAiring
+import com.nuvio.app.features.home.indexCalendarAiringsByContent
+import com.nuvio.app.features.home.nextAiringAfterSeed
+import com.nuvio.app.features.trakt.TraktCalendarEntry
 import com.nuvio.app.features.mdblist.MdbListCalendarRepository
 import com.nuvio.app.features.mdblist.MdbListProgressRepository
 import com.nuvio.app.features.tracking.ContinueWatchingSource
@@ -69,6 +74,9 @@ private const val WATCH_PROGRESS_DELTA_PAGE_SIZE = 900
 private const val WATCH_PROGRESS_DELTA_OPERATION_UPSERT = "upsert"
 private const val WATCH_PROGRESS_DELTA_OPERATION_DELETE = "delete"
 private const val WATCH_PROGRESS_REMOTE_STOP_REFRESH_DELAY_MS = 2_500L
+private const val WATCH_PROGRESS_REMOTE_POLL_INTERVAL_MS = 5 * 60_000L
+private const val WATCH_PROGRESS_REMOTE_POLL_MIN_WAIT_MS = 30_000L
+private const val WATCH_PROGRESS_FOREGROUND_POLL_MIN_INTERVAL_MS = 60_000L
 
 private data class RemoteMetadataResolutionResult(
     val key: Pair<String, String>,
@@ -157,6 +165,7 @@ object WatchProgressRepository {
     private var deltaCursorEventId = 0L
     private var deltaInitialized = false
     private var lastAddonMetadataReadyFingerprint: String? = null
+    private var lastRemoteContinueWatchingPullAtMs = 0L
     internal var syncAdapter: ProgressSyncAdapter = SupabaseProgressSyncAdapter
 
     init {
@@ -218,6 +227,7 @@ object WatchProgressRepository {
         syncScope.launch {
             SimklProgressRepository.uiState.collectLatest { state ->
                 if (shouldUseSimklProgress()) {
+                    ensureSimklCalendarForContinueWatchingWindow()
                     publish()
                     // When SIMKL entries load with missing images, reset the addon fingerprint
                     // so resolveRemoteMetadata() runs again once addons are ready.
@@ -301,6 +311,7 @@ object WatchProgressRepository {
             SimklSettingsRepository.uiState.collectLatest {
                 val useSimkl = shouldUseSimklProgress()
                 if (useSimkl) {
+                    ensureSimklCalendarForContinueWatchingWindow()
                     runCatching { SimklProgressRepository.refreshNow() }
                         .onFailure { e ->
                             if (e is CancellationException) throw e
@@ -312,11 +323,100 @@ object WatchProgressRepository {
         }
 
         syncScope.launch {
+            // The SIMKL window reads next-episode dates from the SIMKL calendar; a calendar that
+            // lands after the rows did has to re-run the window or a returning show stays out.
+            SimklCalendarRepository.uiState.collectLatest { state ->
+                if (shouldUseSimklProgress() && state.entriesByDate.isNotEmpty()) publish()
+            }
+        }
+
+        syncScope.launch {
             AddonRepository.uiState.collectLatest { state ->
                 retryMetadataResolutionWhenAddonMetaProvidersReady(state)
             }
         }
 
+        // Every other Continue Watching trigger is a *local* event: startup, a settings change, or
+        // playback on this machine. Nothing asks the remote source whether anything changed while
+        // the app sat there, so an episode watched on a phone or a TV stayed invisible until the
+        // next restart — the single most-reported symptom of a remote CW source. Foreground events
+        // cover an app the user came back to; this covers the HTPC that never lost focus.
+        syncScope.launch {
+            while (true) {
+                delay(nextRemoteContinueWatchingPollDelayMs())
+                runCatching {
+                    pullRemoteContinueWatching(
+                        reason = "poll",
+                        // Measured from the last pull of any kind, so a foreground refresh that has
+                        // just done this work makes the tick a no-op instead of repeating it. The
+                        // first build shipped a blind delay and the logs showed exactly that: a
+                        // foreground pull and a poll ten seconds apart, both full round trips.
+                        minIntervalMs = WATCH_PROGRESS_REMOTE_POLL_INTERVAL_MS,
+                    )
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
+                    log.w { "Scheduled Continue Watching poll failed: ${error.message}" }
+                }
+            }
+        }
+    }
+
+    /**
+     * How long until the next poll is actually due, given whatever pulled last.
+     *
+     * Floored, so a tick that declines to do anything (nothing loaded yet, a local source) cannot
+     * turn the loop into a spin.
+     */
+    private fun nextRemoteContinueWatchingPollDelayMs(): Long {
+        val last = lastRemoteContinueWatchingPullAtMs
+        if (last == 0L) return WATCH_PROGRESS_REMOTE_POLL_INTERVAL_MS
+        val elapsed = WatchProgressClock.nowEpochMs() - last
+        return (WATCH_PROGRESS_REMOTE_POLL_INTERVAL_MS - elapsed)
+            .coerceIn(WATCH_PROGRESS_REMOTE_POLL_MIN_WAIT_MS, WATCH_PROGRESS_REMOTE_POLL_INTERVAL_MS)
+    }
+
+    /**
+     * Re-reads the remote Continue Watching source because the app came back to the foreground.
+     *
+     * Rate-limited on its own account: Windows delivers focus events in pairs, and a resume can
+     * land next to the scheduled poll.
+     */
+    suspend fun refreshContinueWatchingOnForeground() {
+        pullRemoteContinueWatching(
+            reason = "foreground",
+            minIntervalMs = WATCH_PROGRESS_FOREGROUND_POLL_MIN_INTERVAL_MS,
+        )
+    }
+
+    /**
+     * Re-reads the selected remote source *and* the watched history that seeds Up Next.
+     *
+     * Both halves are needed. The source supplies the in-progress rows; the history import supplies
+     * the episode ticks that Details shows and that Up Next seeds off — and it has its own request
+     * budget (see [WatchedRepository.pullConnectedProviderHistory]), so it is asked unforced here
+     * and simply declines when it was already read recently.
+     */
+    private suspend fun pullRemoteContinueWatching(reason: String, minIntervalMs: Long = 0L) {
+        if (!hasLoaded) return
+        val source = activeContinueWatchingSource()
+        if (source == ContinueWatchingSource.LOCAL) return
+        val now = WatchProgressClock.nowEpochMs()
+        if (minIntervalMs > 0L && now - lastRemoteContinueWatchingPullAtMs < minIntervalMs) return
+        lastRemoteContinueWatchingPullAtMs = now
+        val profileId = ProfileRepository.activeProfileId
+        log.d { "Continue Watching $reason pull: source=$source profile=$profileId" }
+        when (source) {
+            ContinueWatchingSource.MDBLIST -> MdbListProgressRepository.refreshNow()
+            ContinueWatchingSource.SIMKL -> SimklProgressRepository.refreshNow()
+            ContinueWatchingSource.TRAKT -> TraktProgressRepository.refreshNow()
+            // Already imports the connected provider's history on its own, so it is not asked twice.
+            ContinueWatchingSource.YAMTRACK -> WatchedRepository.pullFromServer(profileId)
+            ContinueWatchingSource.LOCAL -> return
+        }
+        if (source != ContinueWatchingSource.YAMTRACK) {
+            WatchedRepository.pullConnectedProviderHistory(profileId)
+        }
+        publish()
     }
 
     fun ensureLoaded() {
@@ -341,12 +441,32 @@ object WatchProgressRepository {
      * ordinary ensureLoaded path can run before profile-scoped integration settings finish loading,
      * leaving cross-device progress stale until a profile switch happens to trigger another pull.
      */
-    suspend fun forceContinueWatchingSync(profileId: Int) {
+    suspend fun forceContinueWatchingSync(
+        profileId: Int,
+        reimportProviderHistory: Boolean = true,
+    ) {
         ensureLoaded()
+        // Counts as a pull for the foreground rate limit: the startup sync and the window's first
+        // focus event land within a second of each other, and refreshing twice on launch is the
+        // one thing this whole change must not turn into.
+        lastRemoteContinueWatchingPullAtMs = WatchProgressClock.nowEpochMs()
         // A manual resync is the user asking for everything to be re-read, artwork included, so
         // Up Next cards that are still missing an episode thumbnail get re-resolved past the meta
         // LRU rather than repainting from the cached blank.
         ContinueWatchingEnrichmentCache.requestArtworkRefresh()
+        // The provider's watched history is re-read too: it is what Details ticks and Up Next seeds
+        // come from, and refreshing only the source left a resync answering half the question — the
+        // row moved on but the episode list behind it did not. Forced, because a user-initiated
+        // resync is precisely the case the request budget should not silently swallow.
+        // [reimportProviderHistory] is off for the startup call, which has already imported.
+        if (reimportProviderHistory) {
+            runCatching {
+                WatchedRepository.pullConnectedProviderHistory(profileId, force = true)
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                log.w { "Failed to re-import provider watched history during resync: ${error.message}" }
+            }
+        }
         when {
             shouldUseMdbListProgress() -> {
                 log.d { "Force refreshing MDBList Continue Watching for profile $profileId" }
@@ -797,11 +917,16 @@ object WatchProgressRepository {
             .filter {
                 it.poster.isNullOrBlank() ||
                     it.background.isNullOrBlank() ||
-                    // Matches the MDBList/SIMKL filters below: an episode still often lands well
-                    // after the episode airs, and without this the card keeps its launch-time blank
-                    // until the entry is replaced. Costs nothing when the still never arrives —
-                    // the apply below is a no-op and skips the publish.
-                    (it.contentType == "series" && it.episodeThumbnail.isNullOrBlank())
+                    // An episode still often lands well after the episode airs, and without this
+                    // the card keeps its launch-time blank until the entry is replaced. Costs
+                    // nothing when the still never arrives — the apply below is a no-op and skips
+                    // the publish.
+                    //
+                    // "Missing" is deliberately the Up Next rule and not just `isNullOrBlank`: a
+                    // provider that answered with the show backdrop, or a URL that will not load,
+                    // leaves a card that looks finished and is not. The MDBList/SIMKL filters below
+                    // stay on episodeTitle because those stores are enriched, not resolved.
+                    it.needsEpisodeStillRefresh()
             }
         val mdbListMissing = if (shouldUseMdbListProgress()) {
             MdbListProgressRepository.uiState.value.entries
@@ -1339,7 +1464,7 @@ object WatchProgressRepository {
         val isFirstEntryForVideo = previousEntry == null
         val completedNow = entry.isCompleted && previousEntry?.isCompleted != true
         // Mirrors the series clause in resolveRemoteMetadata()'s own filter; keep the two in step.
-        val missingEpisodeStill = entry.contentType == "series" && entry.episodeThumbnail.isNullOrBlank()
+        val missingEpisodeStill = entry.needsEpisodeStillRefresh()
         if (
             entry.poster.isNullOrBlank() ||
             entry.background.isNullOrBlank() ||
@@ -1524,15 +1649,28 @@ object WatchProgressRepository {
                     .withNuvioSyncEntries()
 
             ContinueWatchingSource.SIMKL -> {
-                // Apply the user's day cap and sort most-recently-watched first.
-                val cutoffMs = simklContinueWatchingCutoffMs(
-                    daysCap = SimklSettingsRepository.simklContinueWatchingDaysCap(),
-                    nowEpochMs = WatchProgressClock.nowEpochMs(),
-                )
-                return SimklProgressRepository.uiState.value.entries
-                    .filter { cutoffMs == 0L || it.lastUpdatedEpochMs >= cutoffMs }
+                // Apply the user's day cap and sort most-recently-watched first. The window also
+                // admits a seed whose next episode airs inside it, so a show returning from a long
+                // hiatus surfaces for its premiere — see isWithinContinueWatchingWindow.
+                val nowEpochMs = WatchProgressClock.nowEpochMs()
+                val daysCap = SimklSettingsRepository.simklContinueWatchingDaysCap()
+                val cutoffMs = simklContinueWatchingCutoffMs(daysCap = daysCap, nowEpochMs = nowEpochMs)
+                val (kept, dropped) = SimklProgressRepository.uiState.value.entries
+                    .withSimklCalendarNextAirDate(windowActive = cutoffMs != SIMKL_NO_CW_CUTOFF)
+                    .partition { it.isWithinContinueWatchingWindow(cutoffMs, nowEpochMs) }
+                if (cutoffMs != SIMKL_NO_CW_CUTOFF) {
+                    NextUpDiagnostics.logSourceWindow(
+                        source = "SIMKL",
+                        daysCap = daysCap,
+                        kept = kept,
+                        dropped = dropped,
+                        cutoffMs = cutoffMs,
+                        nowEpochMs = nowEpochMs,
+                    )
+                }
+                return kept
                     .sortedByDescending { it.lastUpdatedEpochMs }
-                    .withNuvioSyncEntries(cutoffMs)
+                    .withNuvioSyncEntries(cutoffMs, nowEpochMs)
             }
 
             ContinueWatchingSource.TRAKT ->
@@ -1571,6 +1709,58 @@ object WatchProgressRepository {
     }
 
     /**
+     * Fills in a seed's next-episode air date from the SIMKL calendar when the watching list did
+     * not supply one.
+     *
+     * `next_watch_info=yes` only describes an episode that has already aired: a show whose next
+     * episode is still to come — the returning-show case the window exemption exists for — comes
+     * back with no `next_to_watch_info` at all (verified 2026-09-16: every populated date on the
+     * account was in the past, and a premiere due the next day had none). The calendar lists the
+     * unaired ones, so it is the fallback; it hydrates from disk and is only asked for while a
+     * window is on.
+     */
+    private fun List<WatchProgressEntry>.withSimklCalendarNextAirDate(
+        windowActive: Boolean,
+    ): List<WatchProgressEntry> {
+        if (!windowActive) return this
+        val airings = simklCalendarAirings()
+        if (airings.isEmpty()) return this
+        return map { entry ->
+            if (!entry.isCompleted || entry.nextEpisodeAirEpochMs != null) return@map entry
+            val season = entry.seasonNumber ?: return@map entry
+            val episode = entry.episodeNumber ?: return@map entry
+            val airEpochMs = nextAiringAfterSeed(airings[entry.parentMetaId], season, episode)
+                ?: return@map entry
+            entry.copy(nextEpisodeAirEpochMs = airEpochMs)
+        }
+    }
+
+    // The calendar is bucketed by day; the by-show index is rebuilt only when the calendar
+    // publishes a new map. A race between two callers costs one duplicate index build, nothing
+    // else, so no lock.
+    @Volatile
+    private var simklCalendarIndexSource: Map<String, List<TraktCalendarEntry>>? = null
+
+    @Volatile
+    private var simklCalendarIndex: Map<String, List<CalendarAiring>> = emptyMap()
+
+    private fun simklCalendarAirings(): Map<String, List<CalendarAiring>> {
+        val entriesByDate = SimklCalendarRepository.uiState.value.entriesByDate
+        if (entriesByDate !== simklCalendarIndexSource) {
+            simklCalendarIndex = indexCalendarAiringsByContent(entriesByDate)
+            simklCalendarIndexSource = entriesByDate
+        }
+        return simklCalendarIndex
+    }
+
+    /** A finite window needs the calendar's dates; "All history" never asks and should not pay for it. */
+    private fun ensureSimklCalendarForContinueWatchingWindow() {
+        if (SimklSettingsRepository.simklContinueWatchingDaysCap() > SIMKL_CW_DAYS_CAP_ALL) {
+            SimklCalendarRepository.ensureLoaded()
+        }
+    }
+
+    /**
      * Adds the Nuvio Sync rows the selected provider cannot hold — native anime namespaces and
      * addon-specific ids — when the user has asked for it.
      *
@@ -1580,6 +1770,7 @@ object WatchProgressRepository {
      */
     private fun List<WatchProgressEntry>.withNuvioSyncEntries(
         cutoffMs: Long = 0L,
+        nowEpochMs: Long = WatchProgressClock.nowEpochMs(),
     ): List<WatchProgressEntry> {
         if (!ContinueWatchingPreferencesRepository.uiState.value.seedNextUpFromNuvioSync) return this
         val remoteKeys = mapTo(mutableSetOf()) { it.videoId }
@@ -1589,7 +1780,7 @@ object WatchProgressRepository {
                 // Appended after the source's own day-cap filter, so without this they ignored the
                 // Continue Watching window entirely — turning on Nuvio Sync seeding brought local
                 // history of any age back alongside a 30-day remote list.
-                (cutoffMs == 0L || entry.lastUpdatedEpochMs >= cutoffMs)
+                entry.isWithinContinueWatchingWindow(cutoffMs, nowEpochMs)
         }
         return if (extra.isEmpty()) this else this + extra
     }
@@ -1629,3 +1820,20 @@ object WatchProgressRepository {
                 (resource.idPrefixes.isEmpty() || resource.idPrefixes.any { prefix -> id.startsWith(prefix) })
         }
 }
+
+/**
+ * The Up Next staleness rule, applied to an in-progress entry.
+ *
+ * Series only: a movie has no episode still to be missing. Kept next to its callers rather than
+ * inlined at both of them because [resolveRemoteMetadata]'s filter and the trigger in [upsert] have
+ * to stay in step — the trigger firing for a case the filter then discards would restart the
+ * resolution job on every progress tick and never finish one.
+ */
+internal fun WatchProgressEntry.needsEpisodeStillRefresh(): Boolean =
+    contentType == "series" &&
+        needsEpisodeStillRefresh(
+            episodeThumbnail = episodeThumbnail,
+            poster = poster,
+            background = background,
+            contentId = parentMetaId,
+        )

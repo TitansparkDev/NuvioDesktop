@@ -85,7 +85,7 @@ internal fun SimklAllItemsResponse.episodeBackfillTargets(): List<SimklEpisodeBa
                 if (entry.seasons.isNotEmpty()) return@forEach
                 val watched = entry.watchedEpisodesCount ?: 0
                 if (watched <= 0) return@forEach
-                val show = (if (isAnime) entry.anime else entry.show) ?: return@forEach
+                val show = entry.showMedia ?: return@forEach
                 val simklId = show.ids.simkl ?: return@forEach
                 add(
                     SimklEpisodeBackfillTarget(

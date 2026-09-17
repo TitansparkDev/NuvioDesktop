@@ -2,6 +2,8 @@ package com.nuvio.app.features.player
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.features.lights.LightsController
+import com.nuvio.app.features.lights.LightsPlaybackSource
 import java.awt.Desktop
 import java.io.File
 import java.net.URI
@@ -330,10 +332,15 @@ internal actual object ExternalPlayerPlatform {
                 .start()
         }.onSuccess { process ->
             externalPlayerLog.i { "External process started $diagnosticContext pid=${process.pid()}" }
+            // The process is the only playback signal an external player gives us: alive means
+            // playing, so the lights go down now and come back when it exits. (The system-handler
+            // fallback in [openUri] has no process to watch and so never touches the room.)
+            LightsController.playing(LightsPlaybackSource.External)
             process.onExit().thenAccept { completed ->
                 externalPlayerLog.i {
                     "External process exited $diagnosticContext pid=${completed.pid()} exitCode=${completed.exitValue()}"
                 }
+                LightsController.ended(LightsPlaybackSource.External)
             }
         }.onFailure { error ->
             externalPlayerLog.e(error) {

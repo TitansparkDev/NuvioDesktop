@@ -33,9 +33,14 @@ object NextUpDiagnostics {
     @Volatile
     private var lastLineByKey: Map<String, String> = emptyMap()
 
+    /** Last [logSourceWindow] verdict, appended to the funnel line so the two stages read together. */
+    @Volatile
+    private var sourceWindowSummary: String? = null
+
     fun reset() {
         if (!ENABLED) return
         lastLineByKey = emptyMap()
+        sourceWindowSummary = null
     }
 
     /** Stage 1: which stores are allowed to seed Up Next at all. */
@@ -61,6 +66,50 @@ object NextUpDiagnostics {
         )
     }
 
+    /**
+     * The window a source applies to its own rows before Home ever sees them.
+     *
+     * SIMKL rows are windowed in `WatchProgressRepository.currentEntries()`, so a seed outside it
+     * never reaches [logSeedFunnel] — whose "(day cap)" stage then reported nothing dropped while
+     * most of the provider's seeds were already gone. Recorded here, per seed, and summarised on
+     * the funnel line. Only Up Next seeds are listed; an in-progress row the window drops was never
+     * going to become a card.
+     */
+    fun logSourceWindow(
+        source: String,
+        daysCap: Int,
+        kept: List<WatchProgressEntry>,
+        dropped: List<WatchProgressEntry>,
+        cutoffMs: Long,
+        nowEpochMs: Long,
+    ) {
+        if (!ENABLED) return
+        val droppedSeeds = dropped.filter { it.isCompleted }
+        val exemptSeeds = kept.filter { it.isCompleted && it.lastUpdatedEpochMs < cutoffMs }
+        sourceWindowSummary = "$source windowed ${droppedSeeds.size} seeds out at source " +
+            "(${daysCap}d), kept ${exemptSeeds.size} on an upcoming episode"
+        droppedSeeds.forEach { entry ->
+            emit(
+                key = "source-window:${entry.parentMetaId}",
+                line = "DROPPED@source-window ${entry.parentMetaId} " +
+                    "seed=S${entry.seasonNumber}E${entry.episodeNumber} " +
+                    "markedAt=${entry.lastUpdatedEpochMs} (${daysAgo(entry.lastUpdatedEpochMs, nowEpochMs)}d ago) " +
+                    "nextAir=${entry.nextEpisodeAirEpochMs?.let { "${daysUntil(it, nowEpochMs)}d" } ?: "unknown"} " +
+                    "— outside the ${daysCap}d $source window before reaching Home, so no Up Next card and no badge",
+            )
+        }
+        exemptSeeds.forEach { entry ->
+            emit(
+                key = "source-window:${entry.parentMetaId}",
+                line = "KEPT@window-exempt ${entry.parentMetaId} " +
+                    "seed=S${entry.seasonNumber}E${entry.episodeNumber} " +
+                    "watched ${daysAgo(entry.lastUpdatedEpochMs, nowEpochMs)}d ago, " +
+                    "next episode airs in ${daysUntil(entry.nextEpisodeAirEpochMs ?: 0L, nowEpochMs)}d " +
+                    "— inside the ${daysCap}d $source window on its air date",
+            )
+        }
+    }
+
     /** Stage 2: the provider day-cap, and stage 3, in-progress suppression. */
     internal fun logSeedFunnel(
         allSeeds: List<CompletedSeriesCandidate>,
@@ -78,7 +127,8 @@ object NextUpDiagnostics {
             line = "seeds: ${allSeeds.size} -> ${afterDayCap.size} (day cap) -> " +
                 "${afterSuppression.size} (in-progress suppression) | " +
                 "traktActive=$traktActive traktCap=${traktDaysCap}d " +
-                "simklActive=$simklActive simklCap=${simklDaysCap}d",
+                "simklActive=$simklActive simklCap=${simklDaysCap}d" +
+                (sourceWindowSummary?.let { " | $it" } ?: ""),
         )
 
         val keptAfterCap = afterDayCap.mapTo(mutableSetOf()) { it.content.id }
@@ -200,6 +250,9 @@ object NextUpDiagnostics {
 
     private fun daysAgo(thenEpochMs: Long, nowEpochMs: Long): Long =
         if (thenEpochMs <= 0L) -1L else (nowEpochMs - thenEpochMs) / 86_400_000L
+
+    private fun daysUntil(thenEpochMs: Long, nowEpochMs: Long): Long =
+        if (thenEpochMs <= 0L) -1L else (thenEpochMs - nowEpochMs) / 86_400_000L
 
     private fun emit(key: String, line: String) {
         if (lastLineByKey[key] == line) return

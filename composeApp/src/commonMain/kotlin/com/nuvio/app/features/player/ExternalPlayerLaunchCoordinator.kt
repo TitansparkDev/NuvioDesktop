@@ -2,25 +2,15 @@ package com.nuvio.app.features.player
 
 /**
  * The languages an external player launch should be handed subtitles for, in priority order.
- *
- * Empty means "forward nothing", which covers three cases: no language preference resolves at all,
- * and forced-subtitle mode — addons do not serve forced tracks, and external players select an
- * external subtitle file as soon as it is passed to them, so forwarding a full translation to
- * someone who asked for forced-only would put exactly the wrong thing on screen.
+ * Empty means "forward nothing": no language preference resolves at all.
  */
 fun externalPlayerSubtitleTargets(
     settings: PlayerSettingsUiState,
     originalLanguage: String? = OriginalLanguageCache.current,
-): List<String> {
-    if (settings.subtitleStyle.useForcedSubtitles) return emptyList()
-    if (normalizeLanguageCode(settings.preferredSubtitleLanguage) == SubtitleLanguageOption.FORCED) {
-        return emptyList()
-    }
-    return preferredSubtitleTargetsForSettings(
-        settings = settings,
-        originalLanguage = originalLanguage,
-    )
-}
+): List<String> = preferredSubtitleTargetsForSettings(
+    settings = settings,
+    originalLanguage = originalLanguage,
+)
 
 /**
  * Orchestrates the full external player launch flow:
@@ -49,7 +39,7 @@ suspend fun prepareExternalPlayerLaunch(
         // The keyword rejections name a track kind, not a language, so they apply here exactly as
         // they do to the internal player's own lists.
         isRejected = { subtitle -> settings.rejectsAddonSubtitle(subtitle) },
-        preferHearingImpaired = settings.preferHearingImpairedSubtitles,
+        trackKind = settings.preferredSubtitleTrackKind,
     )
 
     if (subtitles != null) {

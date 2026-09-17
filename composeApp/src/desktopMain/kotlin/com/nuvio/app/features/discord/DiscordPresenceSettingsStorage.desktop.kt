@@ -7,6 +7,8 @@ internal actual object DiscordPresenceSettingsStorage {
     private const val legacyEnabledKey = "enabled"
     private const val modeKey = "mode"
     private const val episodeArtworkKey = "episode_artwork"
+    private const val activityStyleKey = "activity_style"
+    private const val activityNameKey = "activity_name"
     private val store = DesktopStorage.store("nuvio_discord_presence")
 
     actual fun loadMode(): DiscordPresenceMode {
@@ -35,5 +37,24 @@ internal actual object DiscordPresenceSettingsStorage {
 
     actual fun saveEpisodeArtwork(value: DiscordEpisodeArtwork) {
         store.putString(episodeArtworkKey, value.name)
+    }
+
+    // Watching is what every install published before this setting existed.
+    actual fun loadActivityStyle(): DiscordActivityStyle =
+        store.getString(activityStyleKey)
+            ?.let { stored -> runCatching { DiscordActivityStyle.valueOf(stored) }.getOrNull() }
+            ?: DiscordActivityStyle.Watching
+
+    actual fun saveActivityStyle(value: DiscordActivityStyle) {
+        store.putString(activityStyleKey, value.name)
+    }
+
+    actual fun loadActivityName(): DiscordActivityName =
+        store.getString(activityNameKey)
+            ?.let { stored -> runCatching { DiscordActivityName.valueOf(stored) }.getOrNull() }
+            ?: DiscordActivityName.AppName
+
+    actual fun saveActivityName(value: DiscordActivityName) {
+        store.putString(activityNameKey, value.name)
     }
 }

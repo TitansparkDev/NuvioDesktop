@@ -4,7 +4,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 internal const val PosterLandscapeAspectRatio = 1.77f
-private const val PosterLandscapeWidthScale = 180f / 110f
+internal const val PosterLandscapeWidthScale = 180f / 110f
 
 internal fun landscapePosterWidth(basePosterWidthDp: Int): Dp =
     (basePosterWidthDp * PosterLandscapeWidthScale).dp

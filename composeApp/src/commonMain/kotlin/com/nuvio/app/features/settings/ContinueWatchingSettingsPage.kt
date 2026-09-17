@@ -61,6 +61,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -357,16 +359,31 @@ private fun ContinueWatchingStyleSelector(
     selectedStyle: ContinueWatchingSectionStyle,
     onStyleSelected: (ContinueWatchingSectionStyle) -> Unit,
 ) {
+    // Inside a section card the three options are segments of the card itself: no gap between
+    // them, square where they meet each other and the heading band, and rounded only where the
+    // outer two follow the card's own bottom corners.
+    val segmented = isTablet && LocalSettingsSectionCards.current
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(if (isTablet) 12.dp else 8.dp),
+        horizontalArrangement = when {
+            segmented -> Arrangement.Start
+            isTablet -> Arrangement.spacedBy(12.dp)
+            else -> Arrangement.spacedBy(8.dp)
+        },
     ) {
-        ContinueWatchingSectionStyle.entries.forEach { style ->
+        val styles = ContinueWatchingSectionStyle.entries
+        styles.forEachIndexed { index, style ->
             Box(modifier = Modifier.weight(1f)) {
                 ContinueWatchingStyleOption(
                     style = style,
                     selected = selectedStyle == style,
                     isTablet = isTablet,
+                    shape = when {
+                        !segmented -> RoundedCornerShape(12.dp)
+                        index == 0 -> RoundedCornerShape(bottomStart = 12.dp)
+                        index == styles.lastIndex -> RoundedCornerShape(bottomEnd = 12.dp)
+                        else -> RectangleShape
+                    },
                     onClick = { onStyleSelected(style) },
                 )
             }
@@ -379,6 +396,7 @@ private fun ContinueWatchingStyleOption(
     style: ContinueWatchingSectionStyle,
     selected: Boolean,
     isTablet: Boolean,
+    shape: Shape,
     onClick: () -> Unit,
 ) {
     Surface(
@@ -390,7 +408,7 @@ private fun ContinueWatchingStyleOption(
         } else {
             MaterialTheme.colorScheme.surface
         },
-        shape = RoundedCornerShape(12.dp),
+        shape = shape,
     ) {
         Column(
             modifier = Modifier
@@ -623,7 +641,13 @@ private fun ContinueWatchingWindowRow(isTablet: Boolean) {
     SettingsGroupDivider(isTablet = isTablet)
     SettingsChoiceRow(
         title = stringResource(Res.string.settings_cw_window_title),
-        description = continueWatchingWindowLabel(selectedDays),
+        // Literal rather than a new string key: freshly added keys sometimes fail to resolve as
+        // Res.string.* even though the accessor is generated (see the font-picker precedent).
+        description = if (selectedDays == TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL) {
+            continueWatchingWindowLabel(selectedDays)
+        } else {
+            "$selectedDays days — watched within this time, or the next episode airs within it"
+        },
         options = TraktContinueWatchingDaysOptions.map { days ->
             val normalized = if (source == ContinueWatchingSource.TRAKT) {
                 normalizeTraktContinueWatchingDaysCap(days)

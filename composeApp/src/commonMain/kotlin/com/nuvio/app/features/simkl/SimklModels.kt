@@ -301,11 +301,48 @@ internal data class SimklAllItemsEntry(
     @SerialName("watched_episodes_count") val watchedEpisodesCount: Int? = null,
     @SerialName("total_episodes_count") val totalEpisodesCount: Int? = null,
     @SerialName("not_aired_episodes_count") val notAiredEpisodesCount: Int? = null,
+    // Only present when the request carries `next_watch_info=yes`.
+    @SerialName("next_to_watch_info") val nextToWatchInfo: SimklNextToWatchInfo? = null,
     val show: SimklShowMedia? = null,
     val movie: SimklMovieMedia? = null,
     val anime: SimklShowMedia? = null,
     val seasons: List<SimklWatchedSeason> = emptyList(),
 )
+
+/**
+ * The next unwatched episode of an all-items entry, attached by `next_watch_info=yes`.
+ *
+ * [date] is the air date with SIMKL's offset (`2023-08-07T00:00:00-05:00`) and is null when the
+ * episode is announced but unscheduled.
+ */
+@Serializable
+internal data class SimklNextToWatchInfo(
+    val title: String? = null,
+    val season: Int? = null,
+    val episode: Int? = null,
+    val date: String? = null,
+)
+
+/**
+ * The show media on an all-items entry, whichever key SIMKL used for it.
+ *
+ * `/sync/all-items` (both the full response and the per-status ones) returns **anime under `show`**
+ * — inside the `anime` array, but never under an `anime` key. Only `/sync/playback` uses an `anime`
+ * node. Verified against a live account on 2026-09-09: every entry in the `anime` array carried
+ * `show`, and none carried `anime`.
+ *
+ * Reading `entry.anime` for those entries therefore yields null and silently discards the whole
+ * entry, which is what wiped every anime row out of imported watched history — an account with
+ * 14k watched rows had exactly zero in the anime id namespace. Worse, the seed path inferred
+ * "is this anime" from `anime != null`, so an anime resolved down the *non*-anime branch and came
+ * back with a TVDB/IMDb id while `/sync/playback` gave the same show a Kitsu one. One show, two
+ * ids, and the two halves of Continue Watching could never line up.
+ *
+ * Which array an entry came from is the only reliable anime signal in an all-items response; it is
+ * passed explicitly wherever it matters. This accessor exists so no caller has to guess the key.
+ */
+internal val SimklAllItemsEntry.showMedia: SimklShowMedia?
+    get() = anime ?: show
 
 @Serializable
 internal data class SimklWatchedSeason(
@@ -463,12 +500,32 @@ internal data class SimklEpisodeRef(
     @SerialName("tvdb_number") val tvdbNumber: Int? = null,
 )
 
-/** Parses SIMKL's "S05E16" episode marker into (season, episode). */
+private val SimklSeasonEpisodeMarker = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
+private val SimklEpisodeOnlyMarker = Regex("""^\s*E(\d+)\s*$""", RegexOption.IGNORE_CASE)
+
+/**
+ * Parses SIMKL's `last_watched` marker into (season, episode).
+ *
+ * Two forms. Series send `S05E16`. **Anime send a bare `E2`** — an anime entry is scoped to one
+ * anime-list entry, whose season is always 1 (the same premise `episodeCoordinatesFor` is built
+ * on), so SIMKL omits the season rather than writing `S01`. Only the first form was accepted, so
+ * every anime marker failed to parse and the entry was dropped: no up-next seed, and the title
+ * silently absent from Continue Watching however recently it was watched.
+ *
+ * The bare form resolves to season 1 — entry-local, which is what the caller expects and what
+ * `episodeCoordinatesFor` converts to franchise numbering when the content id calls for it.
+ */
 internal fun parseSimklEpisodeMarker(marker: String): Pair<Int, Int>? {
-    val m = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE).find(marker) ?: return null
-    val s = m.groupValues[1].toIntOrNull() ?: return null
-    val e = m.groupValues[2].toIntOrNull() ?: return null
-    return s to e
+    SimklSeasonEpisodeMarker.find(marker)?.let { m ->
+        val s = m.groupValues[1].toIntOrNull() ?: return null
+        val e = m.groupValues[2].toIntOrNull() ?: return null
+        return s to e
+    }
+    // Anchored, unlike the form above: an unanchored E-only match would read the "E16" out of any
+    // marker the first pattern had already rejected as malformed and invent a season for it.
+    val episodeOnly = SimklEpisodeOnlyMarker.find(marker) ?: return null
+    val e = episodeOnly.groupValues[1].toIntOrNull() ?: return null
+    return 1 to e
 }
 
 @Serializable

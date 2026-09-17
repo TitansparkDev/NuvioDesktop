@@ -1,0 +1,7 @@
+# generated: run extract.py then export_g.py (see README.md)
+__pycache__/
+final/
+up_ios_1024.png
+official_1024_rgba.png
+variant_*.png
+sheet*.png

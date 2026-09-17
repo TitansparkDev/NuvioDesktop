@@ -1,8 +1,16 @@
 package com.nuvio.app.features.home.components
 
+import coil3.SingletonImageLoader
+import coil3.compose.LocalPlatformContext
+import coil3.request.ImageRequest
+import coil3.size.Scale
+import com.nuvio.app.core.ui.RecompositionProbe
+import com.nuvio.app.core.ui.nuvioArtworkRequestSize
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import co.touchlab.kermit.Logger
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.verticalScroll
@@ -52,6 +60,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.collectAsState
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.settings.DesktopNavigationLayout
@@ -85,6 +96,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -111,7 +123,12 @@ import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaExternalRating
 import com.nuvio.app.features.details.components.RatingsRow
 import com.nuvio.app.features.details.formatRuntimeForDisplay
+import com.nuvio.app.features.details.GenreSubgenres
+import com.nuvio.app.features.details.ImdbInterest
+import com.nuvio.app.features.details.ImdbInterestsService
+import com.nuvio.app.core.ui.NuvioPosterHoverTooltip
 import com.nuvio.app.features.qualicache.QualiCacheQualityService
+import com.nuvio.app.features.qualicache.QualityBadgeArt
 import com.nuvio.app.features.qualicache.QualityHighlight
 import com.nuvio.app.features.qualicache.QualityInlineBadges
 import com.nuvio.app.features.qualicache.rememberQualityBadgesEnabled
@@ -121,6 +138,7 @@ import com.nuvio.app.features.home.randomPlayCategoryOrNull
 import com.nuvio.app.features.home.HeroCastMember
 import com.nuvio.app.features.home.HeroBadgePlacement
 import com.nuvio.app.features.home.HeroDiscoveryFact
+import com.nuvio.app.features.home.browseTarget
 import com.nuvio.app.features.home.HeroDiscoveryMetadataService
 import com.nuvio.app.features.home.heroBundledBadgeModel
 import com.nuvio.app.features.home.heroCustomBadgeModel
@@ -138,6 +156,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import nuvio.composeapp.generated.resources.*
@@ -192,6 +213,31 @@ private val heroTrailerLog = Logger.withTag("HomeHeroTrailer")
 private const val HERO_TRAILER_PREFETCH_DWELL_MS = 1_200L
 private val IMMERSIVE_HERO_CONTENT_MIN_HEIGHT = 300.dp
 private val IMMERSIVE_HERO_CONTENT_MAX_HEIGHT = 420.dp
+/**
+ * Smallest logo slot TV Mode's metadata column will shrink to before it starts dropping synopsis
+ * lines instead. The column's box is a fraction of the viewport, but everything inside it is fixed
+ * dp, so raising the UI scale (which shrinks the viewport in dp) used to push the footer out of the
+ * box and under the shelf's first row. The logo is the one element that can give: it is decorative,
+ * and a 156dp slot at +20% scale is already larger on screen than at 0%.
+ */
+// Shared with the game library, which lays its hero out on the same immersive geometry.
+internal val IMMERSIVE_HERO_LOGO_SLOT_MIN_HEIGHT = 64.dp
+private const val IMMERSIVE_HERO_SYNOPSIS_MIN_LINES = 2
+/**
+ * The people panel (Starring / Production) hangs from the top of TV Mode's hero and the metadata
+ * column from the shelf; nothing stopped them meeting as the UI scale rises. The column's box is
+ * now capped at the panel's bottom edge, and when that would leave it less than
+ * [IMMERSIVE_HERO_CONTENT_COMFORTABLE_HEIGHT] — the column at its smallest logo slot and three
+ * synopsis lines — the panel drops to a single row (two people rather than four) first.
+ */
+private val IMMERSIVE_HERO_PEOPLE_PANEL_TOP = 30.dp
+private val IMMERSIVE_HERO_PEOPLE_PANEL_TABS_GAP = 18.dp
+private val IMMERSIVE_HERO_PEOPLE_CHIP_SIZE = 52.dp
+private val IMMERSIVE_HERO_PEOPLE_ROW_GAP = 18.dp
+private val IMMERSIVE_HERO_PEOPLE_CONTENT_GAP = 16.dp
+private const val IMMERSIVE_HERO_PEOPLE_MAX_COUNT = 4
+private const val IMMERSIVE_HERO_PEOPLE_COMPACT_COUNT = 2
+private val IMMERSIVE_HERO_CONTENT_COMFORTABLE_HEIGHT = 250.dp
 private val IMMERSIVE_HERO_CONTENT_BOTTOM_PADDING = 44.dp
 private val IMMERSIVE_HERO_CONTENT_MIN_OFFSET_Y = 16.dp
 private val IMMERSIVE_HERO_CONTENT_MAX_OFFSET_Y = 42.dp
@@ -265,6 +311,8 @@ fun HomeHeroSection(
     onResumePromptDismiss: (() -> Unit)? = null,
     onActiveItemChanged: ((MetaPreview) -> Unit)? = null,
     onCastClick: ((HeroCastMember) -> Unit)? = null,
+    /** A discovery badge with a browse target was clicked, on this hero item. Desktop frame only. */
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onItemClick: ((MetaPreview) -> Unit)? = null,
     // See HomeHeroTrailerSurface's onSurfaceDisposed doc: reclaim keyboard focus for the caller
     // when the native trailer surface disposes, so scrolling away from the hero mid-playback
@@ -273,6 +321,7 @@ fun HomeHeroSection(
 ) {
     if (items.isEmpty()) return
 
+    RecompositionProbe("hero")
     val pagerState = rememberPagerState(pageCount = { items.size })
     val coroutineScope = rememberCoroutineScope()
 
@@ -384,6 +433,12 @@ fun HomeHeroSection(
         }
 
         val ratingsCache = remember { mutableStateMapOf<String, List<MetaExternalRating>>() }
+        // Filled from the same MDBList response as the ratings — the keyword list rides along on
+        // that payload, so the genre hover cards cost no request of their own.
+        val keywordsCache = remember { mutableStateMapOf<String, List<String>>() }
+        // IMDb's sub-genres for the same hover cards; one GraphQL call per `tt` item, cached for
+        // the session by [ImdbInterestsService] so the details page reuses it.
+        val interestsCache = remember { mutableStateMapOf<String, List<ImdbInterest>>() }
         val discoveryCache = remember { mutableStateMapOf<String, List<HeroDiscoveryFact>>() }
         val productionCache = remember { mutableStateMapOf<String, List<HeroProductionCredit>>() }
         val discoveryPriority = remember(heroInfoPriority) {
@@ -436,6 +491,18 @@ fun HomeHeroSection(
                         }
                     }
                 }
+                if (!interestsCache.containsKey(key) && target.type != "collection") {
+                    val imdbId = target.metadataId.takeIf { it.startsWith("tt", ignoreCase = true) }
+                    if (imdbId == null) {
+                        interestsCache[key] = emptyList()
+                    } else {
+                        launch {
+                            prefetchSlots.withPermit {
+                                interestsCache[key] = ImdbInterestsService.fetch(imdbId)
+                            }
+                        }
+                    }
+                }
                 if (ratingsCache.containsKey(key)) continue
                 if (target.type == "collection") {
                     ratingsCache[key] = emptyList()
@@ -452,12 +519,13 @@ fun HomeHeroSection(
                 }
                 launch {
                     prefetchSlots.withPermit {
-                        val ratings = MdbListMetadataService.enrichMeta(
+                        val enriched = MdbListMetadataService.enrichMeta(
                             meta = baseMeta,
                             fallbackItemId = target.metadataId,
                             settings = settings,
-                        ).externalRatings
-                        ratingsCache[key] = ratings
+                        )
+                        keywordsCache[key] = enriched.mdblistKeywords
+                        ratingsCache[key] = enriched.externalRatings
                     }
                 }
             }
@@ -511,9 +579,12 @@ fun HomeHeroSection(
                     onResumePromptAction = onResumePromptAction,
                     onResumePromptDismiss = onResumePromptDismiss,
                     ratingsCache = ratingsCache,
+                    keywordsCache = keywordsCache,
+                    interestsCache = interestsCache,
                     discoveryCache = discoveryCache,
                     productionCache = productionCache,
                     onCastClick = onCastClick,
+                    onBadgeClick = onBadgeClick,
                     onItemClick = onItemClick,
                     onHeroTrailerSurfaceDisposed = onHeroTrailerSurfaceDisposed,
                 )
@@ -690,6 +761,181 @@ private fun HeroBackdropImage(
     val model = item.banner?.takeIf(String::isNotBlank)
         ?: item.poster?.takeIf(String::isNotBlank)
 
+    val homeCatalogSettings by HomeCatalogSettingsRepository.uiState.collectAsStateWithLifecycle()
+    val crossfadeMillis = homeCatalogSettings.heroBackdropCrossfadeMillis
+    if (crossfadeMillis > 0) {
+        HeroBackdropCrossfade(
+            model = model,
+            durationMillis = crossfadeMillis,
+            modifier = modifier,
+        ) { current, onResolved ->
+            HeroBackdropImageLayer(
+                model = current,
+                contentDescription = contentDescription,
+                modifier = Modifier.fillMaxSize(),
+                alignment = alignment,
+                contentScale = contentScale,
+                onImageLoaded = onImageLoaded,
+                onResolved = onResolved,
+            )
+        }
+        return
+    }
+    HeroBackdropImageLayer(model, contentDescription, modifier, alignment, contentScale, onImageLoaded)
+}
+
+/**
+ * Fades each backdrop in over the one before it, every fade running its full [durationMillis]
+ * however many changes land on top of each other.
+ *
+ * Not `Crossfade`: that drives every layer off one [androidx.compose.animation.core.Transition],
+ * whose clock keeps running across an interruption. A fade that starts partway through an unfinished
+ * one inherits the elapsed time and gets only what is left of the original budget — measured at
+ * roughly 180ms of a 600ms fade for the second change, less again for the third, which is the
+ * "A -> B -> C while B is still fading just cuts" the hero was reported for. A row scrolled with a
+ * held arrow key is nothing but interruptions, so it hit this constantly.
+ *
+ * Here every backdrop owns its own [Animatable], started when its layer is added, so an
+ * interruption costs the incoming fade nothing. Layers stack in arrival order and a layer that
+ * reaches full opacity drops everything beneath it, which is what keeps the stack short while the
+ * user is still moving.
+ */
+@Composable
+internal fun HeroBackdropCrossfade(
+    model: String?,
+    durationMillis: Int,
+    modifier: Modifier = Modifier,
+    content: @Composable (model: String?, onResolved: (hasArtwork: Boolean) -> Unit) -> Unit,
+) {
+    val layers = remember { mutableStateListOf<HeroBackdropLayer>() }
+    val nextLayerId = remember { HeroBackdropLayerIds() }
+
+    LaunchedEffect(model) {
+        val top = layers.lastOrNull()
+        when {
+            // First backdrop of the session: it has nothing to fade over, so it starts opaque -
+            // the same as the old Crossfade, which showed its initial content at full alpha.
+            top == null -> layers.add(HeroBackdropLayer(nextLayerId.next(), model, initialAlpha = 1f))
+            top.model != model -> layers.add(HeroBackdropLayer(nextLayerId.next(), model))
+            else -> return@LaunchedEffect
+        }
+        // Drop the backdrops the user has already scrolled past *before* their artwork arrived.
+        // They have never been seen - a layer with nothing to draw is invisible - and letting one
+        // fade in whenever its download eventually lands would put a backdrop on screen that the
+        // hero moved off several items ago. Dropping them is also what bounds the stack while
+        // scrolling through uncached items, where every layer is waiting on a network fetch.
+        for (index in layers.lastIndex - 1 downTo 1) {
+            if (!layers[index].resolved) layers.removeAt(index)
+        }
+        // Only reachable while scrolling faster than one fade duration with the artwork already
+        // cached; the layers below the cap are all but covered by then, so finishing the oldest
+        // fade early costs nothing visible and is what stops a held arrow key from stacking a
+        // dozen live images.
+        while (layers.size > MAX_HERO_BACKDROP_LAYERS) {
+            layers[1].alpha.snapTo(1f)
+            layers.removeAt(0)
+        }
+    }
+
+    Box(modifier) {
+        layers.forEach { layer ->
+            key(layer.id) {
+                LaunchedEffect(layer.id) {
+                    if (layer.alpha.value < 1f) {
+                        // Wait for the artwork. A backdrop Coil has not seen draws nothing at all
+                        // while it loads, so a fade started on the url alone spends itself on an
+                        // empty layer and the picture then lands at whatever alpha the clock has
+                        // reached - a hard cut whenever the download outlasts the fade. Nothing
+                        // times this out: until the artwork exists, the right thing to have on
+                        // screen is the backdrop underneath.
+                        snapshotFlow { layer.resolved }.first { it }
+                        if (layer.hasArtwork) {
+                            layer.alpha.animateTo(1f, tween(durationMillis))
+                        } else {
+                            // Resolved with nothing to draw: artwork that 404s, or an item that has
+                            // none. Raising this layer would do nothing at all, since it paints
+                            // nothing, so the fade has to be the one underneath going out - or the
+                            // hero sits on the previous item's picture under the new item's title
+                            // until something else happens to change it.
+                            fadeOutBelow(layers, layer.id, durationMillis)
+                        }
+                    }
+                    // Fully opaque, or covering nothing: either way what is under this layer can no
+                    // longer be seen.
+                    while (layers.isNotEmpty() && layers.first().id != layer.id) {
+                        layers.removeAt(0)
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { alpha = layer.alpha.value },
+                ) {
+                    content(layer.model) { hasArtwork ->
+                        layer.hasArtwork = hasArtwork
+                        layer.resolved = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * How many backdrops may be on screen at once.
+ *
+ * Every layer past the first is a live image being composited every frame, so the stack is capped
+ * rather than left to grow with however fast the user is scrolling. Four leaves room for three
+ * overlapping fades, which is more than a settled hero ever needs.
+ */
+private const val MAX_HERO_BACKDROP_LAYERS = 4
+
+/**
+ * Every layer under [id] fades out together, for a backdrop that resolved with nothing to draw.
+ *
+ * Concurrently, not one after another: they are stacked, so fading them in sequence would uncover
+ * each one in turn and walk backwards through the last few items on the way out.
+ */
+private suspend fun fadeOutBelow(layers: List<HeroBackdropLayer>, id: Long, durationMillis: Int) {
+    val below = layers.takeWhile { it.id != id }
+    coroutineScope {
+        below.forEach { under -> launch { under.alpha.animateTo(0f, tween(durationMillis)) } }
+    }
+}
+
+/** One backdrop on the stack, with the fade-in that brought it there. */
+private class HeroBackdropLayer(val id: Long, val model: String?, initialAlpha: Float = 0f) {
+    val alpha = Animatable(initialAlpha)
+
+    /** Set once this layer's artwork has loaded, or has failed and never will. */
+    var resolved by mutableStateOf(false)
+
+    /** Whether [resolved] came with a picture. A layer without one never covers anything. */
+    var hasArtwork = false
+}
+
+/** Ids are per-layer rather than per-model so returning to a still-fading backdrop fades it back. */
+private class HeroBackdropLayerIds {
+    private var next = 0L
+
+    fun next(): Long = next++
+}
+
+@Composable
+private fun HeroBackdropImageLayer(
+    model: String?,
+    contentDescription: String?,
+    modifier: Modifier,
+    alignment: Alignment,
+    contentScale: ContentScale,
+    onImageLoaded: ((coil3.Image) -> Unit)?,
+    onResolved: (hasArtwork: Boolean) -> Unit = {},
+) {
+    // A backdrop with no url draws nothing and will never report, so it resolves the moment it is
+    // asked for - otherwise the fade would wait on a load that is never going to run.
+    LaunchedEffect(model) {
+        if (model == null) onResolved(false)
+    }
     AsyncImage(
         model = model,
         contentDescription = contentDescription,
@@ -701,8 +947,14 @@ private fun HeroBackdropImage(
             if (model != null) {
                 heroImageLog.w { "Hero artwork failed: ${model.safeImageUrlForLog()}" }
             }
+            // A backdrop that failed is as resolved as one that loaded: the fade has to run
+            // either way, or the hero waits on a picture that is never coming.
+            onResolved(false)
         },
-        onSuccess = { state -> onImageLoaded?.invoke(state.result.image) },
+        onSuccess = { state ->
+            onImageLoaded?.invoke(state.result.image)
+            onResolved(true)
+        },
     )
 }
 
@@ -734,9 +986,12 @@ private fun DesktopHomeHeroFrame(
     onResumePromptAction: (() -> Unit)?,
     onResumePromptDismiss: (() -> Unit)?,
     ratingsCache: Map<String, List<MetaExternalRating>>,
+    keywordsCache: Map<String, List<String>> = emptyMap(),
+    interestsCache: Map<String, List<ImdbInterest>> = emptyMap(),
     discoveryCache: Map<String, List<HeroDiscoveryFact>>,
     productionCache: Map<String, List<HeroProductionCredit>>,
     onCastClick: ((HeroCastMember) -> Unit)?,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)?,
     onItemClick: ((MetaPreview) -> Unit)?,
     onHeroTrailerSurfaceDisposed: () -> Unit = {},
 ) {
@@ -1113,19 +1368,51 @@ private fun DesktopHomeHeroFrame(
                 ),
         )
 
+        // Where the metadata column's box ends and how tall it would naturally be; the people
+        // panel above it decides how much of that it actually gets.
+        val immersiveContentBottom = layout.heroHeight - immersiveContentBottomPadding +
+            immersiveHeroContentOffsetY(layout.heroHeight)
+        val immersiveNaturalContentHeight = immersiveHeroContentHeight(layout.heroHeight)
+        val immersiveCompactPeoplePanel = immersiveMode &&
+            immersiveContentBottom - immersiveHeroPeoplePanelBottom(rows = 2) <
+            IMMERSIVE_HERO_CONTENT_COMFORTABLE_HEIGHT
+        val immersivePeopleMaxCount =
+            if (immersiveCompactPeoplePanel) IMMERSIVE_HERO_PEOPLE_COMPACT_COUNT else IMMERSIVE_HERO_PEOPLE_MAX_COUNT
+        val immersiveContentHeight = if (immersiveMode) {
+            val people = maxOf(
+                heroDisplayCast(currentItem, maxCount = immersivePeopleMaxCount).size,
+                productionCache["${currentItem.type}:${currentItem.id}"].orEmpty()
+                    .size.coerceAtMost(immersivePeopleMaxCount),
+            )
+            val rows = (people + 1) / 2
+            val roomBelowPanel = if (rows == 0) {
+                immersiveNaturalContentHeight
+            } else {
+                immersiveContentBottom - immersiveHeroPeoplePanelBottom(rows)
+            }
+            minOf(immersiveNaturalContentHeight, roomBelowPanel).coerceAtLeast(0.dp)
+        } else {
+            immersiveNaturalContentHeight
+        }
+
         if (immersiveMode && !heroTrailerReady) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(start = contentHorizontalPadding, top = 30.dp, end = contentHorizontalPadding)
+                    .padding(
+                        start = contentHorizontalPadding,
+                        top = IMMERSIVE_HERO_PEOPLE_PANEL_TOP,
+                        end = contentHorizontalPadding,
+                    )
                     .fillMaxWidth(0.32f)
                     .widthIn(max = 600.dp),
                 contentAlignment = Alignment.TopStart,
             ) {
                 visiblePages.forEach { layer ->
                     val item = items[layer.page]
-                    val cast = heroDisplayCast(item, maxCount = 4)
+                    val cast = heroDisplayCast(item, maxCount = immersivePeopleMaxCount)
                     val production = productionCache["${item.type}:${item.id}"].orEmpty()
+                        .take(immersivePeopleMaxCount)
                     if (cast.isNotEmpty() || production.isNotEmpty()) {
                         Box(
                             modifier = Modifier
@@ -1157,7 +1444,7 @@ private fun DesktopHomeHeroFrame(
                         if (immersiveMode) {
                             Modifier
                                 .padding(bottom = immersiveContentBottomPadding)
-                                .height(immersiveHeroContentHeight(layout.heroHeight))
+                                .height(immersiveContentHeight)
                                 .offset(y = immersiveHeroContentOffsetY(layout.heroHeight))
                         } else {
                             // Anchor to a fixed top baseline so cast/genre/ratings/synopsis stay
@@ -1198,6 +1485,8 @@ private fun DesktopHomeHeroFrame(
                             showExtendedMetadata = immersiveMode,
                             showReleaseMetadata = immersiveMode || adaptiveHeroMode,
                             ratingsCache = ratingsCache,
+                            keywords = keywordsCache["${items[layer.page].type}:${items[layer.page].id}"].orEmpty(),
+                            interests = interestsCache["${items[layer.page].type}:${items[layer.page].id}"].orEmpty(),
                             onCastClick = onCastClick,
                             production = if (adaptiveHeroMode) productionCache["${items[layer.page].type}:${items[layer.page].id}"].orEmpty() else emptyList(),
                             peoplePanelTab = peoplePanelTab,
@@ -1237,6 +1526,7 @@ private fun DesktopHomeHeroFrame(
                     val discoveryKey = "$itemKey:heroDiscoveryV${HeroDiscoveryMetadataService.CACHE_VERSION}"
                     val facts = discoveryCache[discoveryKey].orEmpty()
                     if (facts.isNotEmpty()) {
+                        val pageItem = items[layer.page]
                         HeroDiscoveryBadgeStrip(
                             facts = facts,
                             maxCount = heroInfoLines,
@@ -1245,7 +1535,8 @@ private fun DesktopHomeHeroFrame(
                                 .graphicsLayer {
                                     alpha = layer.visibility
                                     translationX = -layer.offset * heroWidthPx * HERO_CONTENT_PARALLAX
-                                }
+                                },
+                            onBadgeClick = onBadgeClick?.let { handler -> { fact -> handler(fact, pageItem) } },
                         )
                     }
                 }
@@ -1326,17 +1617,30 @@ private fun Modifier.immersiveHeroExtraMask(backgroundColor: Color): Modifier =
         )
     }
 
-private fun immersiveHeroContentHeight(heroHeight: Dp): Dp =
+internal fun immersiveHeroContentHeight(heroHeight: Dp): Dp =
     (heroHeight * 0.38f).coerceIn(
         IMMERSIVE_HERO_CONTENT_MIN_HEIGHT,
         IMMERSIVE_HERO_CONTENT_MAX_HEIGHT,
     )
 
-private fun immersiveHeroContentOffsetY(heroHeight: Dp): Dp =
+internal fun immersiveHeroContentOffsetY(heroHeight: Dp): Dp =
     (heroHeight * 0.04f).coerceIn(
         IMMERSIVE_HERO_CONTENT_MIN_OFFSET_Y,
         IMMERSIVE_HERO_CONTENT_MAX_OFFSET_Y,
     )
+
+/**
+ * Bottom edge of the people panel with [rows] rows of chips, plus the gap the metadata column
+ * keeps from it. Mirrors [HeroPeopleBlock] / [HeroCastGrid]: tab row, gap, then 52dp chips at
+ * 18dp spacing.
+ */
+private fun immersiveHeroPeoplePanelBottom(rows: Int): Dp =
+    IMMERSIVE_HERO_PEOPLE_PANEL_TOP +
+        HERO_PEOPLE_TAB_HEIGHT +
+        IMMERSIVE_HERO_PEOPLE_PANEL_TABS_GAP +
+        IMMERSIVE_HERO_PEOPLE_CHIP_SIZE * rows +
+        IMMERSIVE_HERO_PEOPLE_ROW_GAP * (rows - 1).coerceAtLeast(0) +
+        IMMERSIVE_HERO_PEOPLE_CONTENT_GAP
 
 internal fun immersiveHeroBackdropHeight(
     heroHeight: Dp,
@@ -1529,6 +1833,9 @@ private fun DesktopHeroContentBlock(
     showExtendedMetadata: Boolean,
     showReleaseMetadata: Boolean = showExtendedMetadata,
     ratingsCache: Map<String, List<MetaExternalRating>>,
+    /** The item's TMDB keyword tags, for the genre hover cards; empty when nothing is known. */
+    keywords: List<String> = emptyList(),
+    interests: List<ImdbInterest> = emptyList(),
     onCastClick: ((HeroCastMember) -> Unit)?,
     production: List<HeroProductionCredit> = emptyList(),
     peoplePanelTab: HeroPeoplePanelTab = HeroPeoplePanelTab.Starring,
@@ -1584,177 +1891,255 @@ private fun DesktopHeroContentBlock(
         else -> null
     }
     val secondaryClickAction: (() -> Unit)? = onResumePromptDismiss.takeIf { resumePromptActive }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(
-                if (primaryClick != null) {
-                    Modifier.clickable(
-                        interactionSource = interactionSource,
-                        indication = null,
-                        onClick = primaryClick,
-                    )
-                } else {
-                    Modifier
-                },
+    // Looked up once: a second call site would issue its own poll while the server warms a
+    // title up.
+    val qualityBadgesEnabled = rememberQualityBadgesEnabled()
+    val qualityHighlights = rememberQualityHighlights(
+        type = item.metadataType,
+        id = item.metadataId,
+        releaseDate = item.rawReleaseDate,
+    )
+    val ratings = ratingsCache["${item.type}:${item.id}"].orEmpty()
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        // TV Mode hands this block a box of fixed height (a fraction of the viewport) while every row
+        // in it is fixed dp, so at a raised UI scale the rows no longer fit. Budget them: the logo slot
+        // becomes the flexible element (weighted, between its min and its natural height), and when
+        // even the smallest slot would not make room, the synopsis window gives up lines. The
+        // estimates here only decide the line count; the weighted slot absorbs whatever they are off by.
+        val immersiveBudget = if (showExtendedMetadata && maxHeight.value.isFinite()) {
+            immersiveHeroColumnBudget(
+                availableHeight = maxHeight,
+                hasGenreLine = desktopHeroGenreText(
+                    item = item,
+                    showExtendedMetadata = true,
+                    showReleaseMetadata = !qualityBadgesEnabled,
+                    includeAgeRating = false,
+                ).isNotBlank() || !item.ageRating.isNullOrBlank(),
+                hasRatings = ratings.isNotEmpty(),
+                hasSynopsis = !item.description.isNullOrBlank(),
+                hasFooter = qualityHighlights.isNotEmpty() ||
+                    (qualityBadgesEnabled && (!item.releaseInfo.isNullOrBlank() || item.runtime != null)),
             )
-            .secondaryClick(secondaryClickAction),
-        horizontalAlignment = Alignment.Start,
-    ) {
-        val cast = heroDisplayCast(
-            item = item,
-            maxCount = 3,
-        )
-
-        if (logoUrl != null) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(desktopHeroLogoSlotHeight(layout)),
-                contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
-            ) {
-                AsyncImage(
-                    model = logoUrl,
-                    contentDescription = item.name,
-                    modifier = Modifier
-                        .fillMaxWidth(desktopHeroLogoWidthFraction(layout))
-                        .fillMaxHeight(),
-                    alignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
-                    contentScale = ContentScale.Fit,
-                    clipToBounds = false,
-                    onError = { state ->
-                        heroImageLog.w(state.result.throwable) {
-                            "Hero logo failed; showing title: ${logoUrl.safeImageUrlForLog()}"
-                        }
-                        logoLoadError = true
+        } else {
+            null
+        }
+        val synopsisMaxLines = immersiveBudget?.synopsisMaxLines ?: HeroSynopsisMaxLines
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (immersiveBudget != null) Modifier.fillMaxHeight() else Modifier)
+                .then(
+                    if (primaryClick != null) {
+                        Modifier.clickable(
+                            interactionSource = interactionSource,
+                            indication = null,
+                            onClick = primaryClick,
+                        )
+                    } else {
+                        Modifier
                     },
                 )
-            }
-        } else {
-            // Same fixed-height slot and alignment as the logo branch above (including the
-            // showExtendedMetadata-based alignment switch) — otherwise the title's vertical
-            // position shifts depending on whether this item has a logo, dragging everything
-            // below it (cast, genre line, description) along with it.
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(desktopHeroLogoSlotHeight(layout)),
-                contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
-            ) {
-                // Third state: the item is a pre-enrichment copy whose logo has not been decided
-                // yet, so the title would only be painted for the moment it takes the logo to
-                // arrive and then replaced. Hold the slot empty instead. The slot keeps its height
-                // either way, so resolving into a logo or into the title causes no layout shift.
-                if (!item.heroMetadataPending) {
-                    Text(
-                        text = item.name,
-                        modifier = Modifier.fillMaxWidth(),
-                        style = MaterialTheme.typography.displayMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        fontWeight = FontWeight.Black,
-                        textAlign = TextAlign.Start,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-
-        // The metadata column below is withheld in one piece while the item is a pre-enrichment
-        // placeholder — see [MetaPreview.heroMetadataPending]. Revealing these rows as each field
-        // arrives is what read as a flash: the row would paint with a bare episode label and no
-        // genres, ratings or synopsis, then repaint complete a few frames later. The backdrop, the
-        // fixed-height logo slot and the action buttons are outside the gate and always render, so
-        // the hero is never empty and never changes height.
-        if (!item.heroMetadataPending &&
-            !showExtendedMetadata &&
-            (cast.isNotEmpty() || production.isNotEmpty())
+                .secondaryClick(secondaryClickAction),
+            horizontalAlignment = Alignment.Start,
         ) {
-            Spacer(modifier = Modifier.height(14.dp))
-            if (
-                allowProductionHotkeySwap &&
-                peoplePanelTab == HeroPeoplePanelTab.Production &&
-                production.isNotEmpty()
-            ) {
-                HeroProductionRow(production)
-            } else {
-                HeroCastRow(cast, onCastClick = onCastClick)
-            }
-            Spacer(modifier = Modifier.height(2.dp))
-        }
-
-        // Looked up once: a second call site would issue its own poll while the server warms a
-        // title up.
-        val qualityBadgesEnabled = rememberQualityBadgesEnabled()
-        val qualityHighlights = rememberQualityHighlights(
-            type = item.metadataType,
-            id = item.metadataId,
-            releaseDate = item.rawReleaseDate,
-        )
-        // With the quality badges on, the meta line splits in two the way the streaming apps lay it
-        // out: genres and the age rating lead above the synopsis, while year, runtime and the
-        // quality sit underneath it as a footer. Keeping all of that on one row was tried and
-        // overran the line on titles with three genres, a long release string and a quality set
-        // beside them. With the badges off there is nothing to make room for, so the year and
-        // runtime stay on the genre line and the footer disappears entirely.
-        val ageRating = item.ageRating?.trim()?.takeIf { it.isNotBlank() }
-        val genreText = desktopHeroGenreText(
-            item = item,
-            showExtendedMetadata = showExtendedMetadata,
-            showReleaseMetadata = showReleaseMetadata && !qualityBadgesEnabled,
-            includeAgeRating = false,
-        )
-        if (!item.heroMetadataPending && (genreText.isNotBlank() || ageRating != null)) {
-            Spacer(modifier = Modifier.height(14.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                if (genreText.isNotBlank()) {
-                    Text(
-                        text = genreText,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.76f),
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false),
-                    )
-                }
-                ageRating?.let { rating -> HeroAgeRatingBadge(text = rating) }
-            }
-        }
-
-        if (!item.heroMetadataPending) {
-            HomeHeroRatingsRow(item = item, ratingsCache = ratingsCache)
-
-            item.description
-                ?.replace(Regex("\\s+"), " ")
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
-                ?.let { description ->
-                    Spacer(modifier = Modifier.height(16.dp))
-                    HeroSynopsis(
-                        text = description,
-                        resetKey = "${item.type}:${item.id}",
-                        autoScroll = synopsisAutoScroll,
-                    )
-                }
-
-            HeroReleaseFooter(
+            val cast = heroDisplayCast(
                 item = item,
-                highlights = qualityHighlights,
-                // Nothing to put down here when the badges are off: the year and runtime went back
-                // onto the genre line above.
-                showReleaseMetadata = showReleaseMetadata && qualityBadgesEnabled,
+                maxCount = 3,
             )
-        }
+            val logoSlotModifier = if (immersiveBudget != null) {
+                // The weight hands the slot whatever the fixed rows leave; heightIn caps that at the
+                // natural slot height, and fillMaxHeight takes all of the capped room — without it
+                // the slot wraps a two-line title and leaves the leftover blank (measured: 64dp
+                // slot, 57dp unused). fill = false so the slot can stop short of the leftover at
+                // its natural height; the min is soft on purpose — a hard one is exactly the
+                // overflow this exists to prevent.
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .heightIn(
+                        min = IMMERSIVE_HERO_LOGO_SLOT_MIN_HEIGHT,
+                        max = desktopHeroLogoSlotHeight(layout),
+                    )
+                    .fillMaxHeight()
+            } else {
+                Modifier
+                    .fillMaxWidth()
+                    .height(desktopHeroLogoSlotHeight(layout))
+            }
 
+            if (logoUrl != null) {
+                Box(
+                    modifier = logoSlotModifier,
+                    contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                ) {
+                    AsyncImage(
+                        model = logoUrl,
+                        contentDescription = item.name,
+                        modifier = Modifier
+                            .fillMaxWidth(desktopHeroLogoWidthFraction(layout))
+                            .fillMaxHeight(),
+                        alignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                        contentScale = ContentScale.Fit,
+                        clipToBounds = false,
+                        onError = { state ->
+                            heroImageLog.w(state.result.throwable) {
+                                "Hero logo failed; showing title: ${logoUrl.safeImageUrlForLog()}"
+                            }
+                            logoLoadError = true
+                        },
+                    )
+                }
+            } else {
+                // Same fixed-height slot and alignment as the logo branch above (including the
+                // showExtendedMetadata-based alignment switch) — otherwise the title's vertical
+                // position shifts depending on whether this item has a logo, dragging everything
+                // below it (cast, genre line, description) along with it.
+                Box(
+                    modifier = logoSlotModifier,
+                    contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                ) {
+                    // Third state: the item is a pre-enrichment copy whose logo has not been decided
+                    // yet, so the title would only be painted for the moment it takes the logo to
+                    // arrive and then replaced. Hold the slot empty instead. The slot keeps its height
+                    // either way, so resolving into a logo or into the title causes no layout shift.
+                    if (!item.heroMetadataPending) {
+                        Text(
+                            text = item.name,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.displayMedium,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            fontWeight = FontWeight.Black,
+                            textAlign = TextAlign.Start,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+
+            // The metadata column below is withheld in one piece while the item is a pre-enrichment
+            // placeholder — see [MetaPreview.heroMetadataPending]. Revealing these rows as each field
+            // arrives is what read as a flash: the row would paint with a bare episode label and no
+            // genres, ratings or synopsis, then repaint complete a few frames later. The backdrop, the
+            // fixed-height logo slot and the action buttons are outside the gate and always render, so
+            // the hero is never empty and never changes height.
+            if (!item.heroMetadataPending &&
+                !showExtendedMetadata &&
+                (cast.isNotEmpty() || production.isNotEmpty())
+            ) {
+                Spacer(modifier = Modifier.height(14.dp))
+                if (
+                    allowProductionHotkeySwap &&
+                    peoplePanelTab == HeroPeoplePanelTab.Production &&
+                    production.isNotEmpty()
+                ) {
+                    HeroProductionRow(production)
+                } else {
+                    HeroCastRow(cast, onCastClick = onCastClick)
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+            }
+
+            // With the quality badges on, the meta line splits in two the way the streaming apps lay it
+            // out: genres and the age rating lead above the synopsis, while year, runtime and the
+            // quality sit underneath it as a footer. Keeping all of that on one row was tried and
+            // overran the line on titles with three genres, a long release string and a quality set
+            // beside them. With the badges off there is nothing to make room for, so the year and
+            // runtime stay on the genre line and the footer disappears entirely.
+            val ageRating = item.ageRating?.trim()?.takeIf { it.isNotBlank() }
+            val genreParts = desktopHeroGenreParts(
+                item = item,
+                showExtendedMetadata = showExtendedMetadata,
+                showReleaseMetadata = showReleaseMetadata && !qualityBadgesEnabled,
+                includeAgeRating = false,
+            )
+            if (!item.heroMetadataPending && (genreParts.isNotEmpty() || ageRating != null)) {
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    if (genreParts.isNotEmpty()) {
+                        HeroGenreLine(
+                            parts = genreParts,
+                            keywords = keywords,
+                            interests = interests,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                    }
+                    ageRating?.let { rating -> HeroAgeRatingBadge(text = rating) }
+                }
+            }
+
+            if (!item.heroMetadataPending) {
+                HomeHeroRatingsRow(ratings = ratings)
+
+                item.description
+                    ?.replace(Regex("\\s+"), " ")
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { description ->
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HeroSynopsis(
+                            text = description,
+                            resetKey = "${item.type}:${item.id}",
+                            autoScroll = synopsisAutoScroll,
+                            maxLines = synopsisMaxLines,
+                        )
+                    }
+
+                HeroReleaseFooter(
+                    item = item,
+                    highlights = qualityHighlights,
+                    // Nothing to put down here when the badges are off: the year and runtime went back
+                    // onto the genre line above.
+                    showReleaseMetadata = showReleaseMetadata && qualityBadgesEnabled,
+                )
+            }
+
+        }
     }
 }
 
 /** Lines of synopsis the hero shows before the rest has to be scrolled into view. */
 private const val HeroSynopsisMaxLines = 5
+
+private class ImmersiveHeroColumnBudget(val synopsisMaxLines: Int)
+
+/**
+ * How many synopsis lines TV Mode's metadata column can show in [availableHeight] once the logo
+ * slot is down to [IMMERSIVE_HERO_LOGO_SLOT_MIN_HEIGHT]. Row heights are the theme's nominal line
+ * heights plus the spacers [DesktopHeroContentBlock] puts between them; the logo slot is weighted,
+ * so a nominal-vs-real line box difference lands there rather than below the footer.
+ */
+@Composable
+private fun immersiveHeroColumnBudget(
+    availableHeight: Dp,
+    hasGenreLine: Boolean,
+    hasRatings: Boolean,
+    hasSynopsis: Boolean,
+    hasFooter: Boolean,
+): ImmersiveHeroColumnBudget {
+    if (!hasSynopsis) return ImmersiveHeroColumnBudget(HeroSynopsisMaxLines)
+    val typography = MaterialTheme.typography
+    val density = LocalDensity.current
+    fun TextStyle.lineHeightDp(): Dp = with(density) {
+        if (lineHeight.isSpecified) lineHeight.toDp() else fontSize.toDp() * 1.5f
+    }
+    // Rows the synopsis competes with, in the order the column lays them out.
+    var fixed = IMMERSIVE_HERO_LOGO_SLOT_MIN_HEIGHT
+    if (hasGenreLine) fixed += 14.dp + typography.titleMedium.lineHeightDp()
+    if (hasRatings) fixed += 14.dp + typography.titleSmall.lineHeightDp()
+    fixed += 16.dp
+    if (hasFooter) {
+        fixed += 14.dp + maxOf(typography.labelLarge.lineHeightDp(), QualityBadgeArt.INLINE_HEIGHT)
+    }
+    val synopsisLine = typography.bodyLarge.lineHeightDp()
+    val lines = ((availableHeight - fixed) / synopsisLine).toInt()
+    return ImmersiveHeroColumnBudget(
+        lines.coerceIn(IMMERSIVE_HERO_SYNOPSIS_MIN_LINES, HeroSynopsisMaxLines),
+    )
+}
 
 /** Layer visibility above which a hero page counts as settled rather than mid-transition. */
 private const val HeroSettledVisibility = 0.99f
@@ -2166,19 +2551,23 @@ private fun HeroCastPortraitPreloader(cast: List<HeroCastMember>) {
         .take(24)
     if (photoUrls.isEmpty()) return
 
-    Row(
-        modifier = Modifier
-            .size(1.dp)
-            .graphicsLayer { alpha = 0f },
-    ) {
-        photoUrls.forEach { photoUrl ->
-            AsyncImage(
-                model = photoUrl,
-                contentDescription = null,
-                modifier = Modifier.size(1.dp),
-                contentScale = ContentScale.Crop,
-            )
+    val context = LocalPlatformContext.current
+    val density = LocalDensity.current
+    // Both hero layouts use one of these portrait sizes. Match their requests, including DPI,
+    // without retaining hidden image components or decoding the original portrait resolution.
+    val portraitSizes = with(density) { listOf(34.dp.roundToPx(), 52.dp.roundToPx()).distinct() }
+    DisposableEffect(context, photoUrls, portraitSizes) {
+        val loader = SingletonImageLoader.get(context)
+        val requests = photoUrls.flatMap { url ->
+            portraitSizes.map { size ->
+                loader.enqueue(ImageRequest.Builder(context)
+                    .data(url)
+                    .scale(Scale.FILL)
+                    .nuvioArtworkRequestSize(size, size)
+                    .build())
+            }
         }
+        onDispose { requests.forEach { it.dispose() } }
     }
 }
 
@@ -2439,16 +2828,14 @@ private fun HeroReleaseFooter(
 }
 
 @Composable
-private fun HomeHeroRatingsRow(item: MetaPreview, ratingsCache: Map<String, List<MetaExternalRating>>) {
-    val ratings = ratingsCache["${item.type}:${item.id}"].orEmpty()
-
+private fun HomeHeroRatingsRow(ratings: List<MetaExternalRating>) {
     if (ratings.isNotEmpty()) {
         Spacer(modifier = Modifier.height(14.dp))
         RatingsRow(ratings = ratings)
     }
 }
 
-private fun desktopHeroLogoWidthFraction(layout: HomeHeroLayout): Float {
+internal fun desktopHeroLogoWidthFraction(layout: HomeHeroLayout): Float {
     val base = when {
         layout.contentMaxWidth >= 640.dp -> 0.74f
         layout.contentMaxWidth >= 520.dp -> 0.74f
@@ -2460,7 +2847,7 @@ private fun desktopHeroLogoWidthFraction(layout: HomeHeroLayout): Float {
     return scaled.coerceIn(0.4f, 0.95f)
 }
 
-private fun desktopHeroLogoSlotHeight(layout: HomeHeroLayout): Dp {
+internal fun desktopHeroLogoSlotHeight(layout: HomeHeroLayout): Dp {
     val base = when {
         layout.contentMaxWidth >= 640.dp -> 156.dp
         layout.contentMaxWidth >= 520.dp -> 136.dp
@@ -2490,31 +2877,94 @@ private fun desktopHeroGenreText(
     item: MetaPreview,
     showExtendedMetadata: Boolean,
     showReleaseMetadata: Boolean = showExtendedMetadata,
+    includeAgeRating: Boolean = true,
+): String = desktopHeroGenreParts(item, showExtendedMetadata, showReleaseMetadata, includeAgeRating)
+    .joinToString(" • ") { it.text }
+
+/** One entry of the hero's genre line; [genre] is set on the entries that are genres. */
+private data class HeroGenrePart(val text: String, val genre: String? = null)
+
+/**
+ * The genre line as separate parts so each genre can carry its own hover card. Genres first,
+ * then (optionally) the release year, runtime and age rating; a bare media type when there is
+ * nothing else to say.
+ */
+private fun desktopHeroGenreParts(
+    item: MetaPreview,
+    showExtendedMetadata: Boolean,
+    showReleaseMetadata: Boolean = showExtendedMetadata,
     /** False when the caller draws the rating as its own badge rather than as text in this line. */
     includeAgeRating: Boolean = true,
-): String {
+): List<HeroGenrePart> {
     val values = buildList {
-        addAll(item.genres.take(3))
+        item.genres.take(3).filter(String::isNotBlank).forEach { add(HeroGenrePart(it, genre = it)) }
         if (showReleaseMetadata) {
             item.releaseInfo
                 ?.takeIf(String::isNotBlank)
                 ?.let(::formatReleaseDateForDisplay)
                 ?.takeIf(String::isNotBlank)
-                ?.let(::add)
+                ?.let { add(HeroGenrePart(it)) }
             formatRuntimeForDisplay(item.runtime)
                 ?.takeIf(String::isNotBlank)
-                ?.let(::add)
+                ?.let { add(HeroGenrePart(it)) }
             if (includeAgeRating) {
                 item.ageRating
                     ?.trim()
                     ?.takeIf(String::isNotBlank)
-                    ?.let(::add)
+                    ?.let { add(HeroGenrePart(it)) }
             }
         }
     }
-    if (values.isEmpty() && (item.type == "collection" || item.randomPlayCategoryOrNull() != null)) return ""
+    if (values.isEmpty() && (item.type == "collection" || item.randomPlayCategoryOrNull() != null)) return emptyList()
     // metadataType, not type: see [compactHeroMetaParts].
-    return values.joinToString(" • ").ifBlank { item.metadataType.replaceFirstChar(Char::uppercase) }
+    return values.ifEmpty { listOf(HeroGenrePart(item.metadataType.replaceFirstChar(Char::uppercase))) }
+}
+
+/**
+ * The genre line, drawn part by part so each genre opens the title's sub-genre card (the same
+ * [GenreSubgenres.card] as the details page). The last part is the one that ellipsises
+ * when the line runs long, as the single joined string used to; the parts before it keep their
+ * own width.
+ */
+@Composable
+private fun HeroGenreLine(
+    parts: List<HeroGenrePart>,
+    keywords: List<String>,
+    interests: List<ImdbInterest>,
+    modifier: Modifier = Modifier,
+) {
+    val card = GenreSubgenres.card(parts.mapNotNull { it.genre }, interests, keywords)
+    val style = MaterialTheme.typography.titleMedium
+    val color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.76f)
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        parts.forEachIndexed { index, part ->
+            if (index > 0) {
+                Text(
+                    text = " • ",
+                    style = style,
+                    color = color,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+            }
+            // Renders its content unchanged when both lines are blank, so a title with nothing to
+            // say costs no hover affordance; non-genre parts (year, runtime) never get one.
+            NuvioPosterHoverTooltip(
+                title = if (part.genre != null) card.headline else "",
+                subtitle = if (part.genre != null) card.themeLine else "",
+                modifier = if (index == parts.lastIndex) Modifier.weight(1f, fill = false) else Modifier,
+            ) {
+                Text(
+                    text = part.text,
+                    style = style,
+                    color = color,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -2777,9 +3227,13 @@ internal fun HeroDiscoveryBadgeStrip(
     maxCount: Int,
     placement: HeroBadgePlacement,
     modifier: Modifier = Modifier,
+    /** Invoked for badges that have a browse target; badges without one stay hover-only. */
+    onBadgeClick: ((HeroDiscoveryFact) -> Unit)? = null,
 ) {
     val visibleFacts = facts.heroVisibleAwardFacts(maxCount)
     if (visibleFacts.isEmpty()) return
+    fun clickFor(fact: HeroDiscoveryFact): (() -> Unit)? =
+        onBadgeClick?.takeIf { fact.browseTarget() != null }?.let { handler -> { handler(fact) } }
 
     // Badge size scaler (for TV viewing from a distance) — see Homescreen settings.
     val badgeScale = HomeCatalogSettingsRepository.uiState.collectAsState().value.heroBadgeScale
@@ -2792,7 +3246,7 @@ internal fun HeroDiscoveryBadgeStrip(
             verticalArrangement = Arrangement.spacedBy(medalGap),
         ) {
             visibleFacts.forEach { fact ->
-                HeroDiscoveryAwardMedal(fact = fact, scale = badgeScale)
+                HeroDiscoveryAwardMedal(fact = fact, scale = badgeScale, onClick = clickFor(fact))
             }
         }
 
@@ -2803,7 +3257,7 @@ internal fun HeroDiscoveryBadgeStrip(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             visibleFacts.forEach { fact ->
-                HeroDiscoveryAwardMedal(fact = fact, scale = badgeScale)
+                HeroDiscoveryAwardMedal(fact = fact, scale = badgeScale, onClick = clickFor(fact))
             }
         }
     }
@@ -2814,9 +3268,21 @@ private fun HeroDiscoveryAwardMedal(
     fact: HeroDiscoveryFact,
     modifier: Modifier = Modifier,
     scale: Float = 1f,
+    onClick: (() -> Unit)? = null,
 ) {
     val awardLabel = fact.heroDiscoveryAwardLabel()
     var hoverPosition by remember { mutableStateOf<Offset?>(null) }
+    // Same affordance as the cast avatars: no ripple, a soft highlight while hovered — and only
+    // on medals that actually go somewhere, so an inert badge doesn't invite a click.
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val highlightAlpha by animateFloatAsState(
+        targetValue = if (isHovered && onClick != null) 0.16f else 0f,
+        label = "hero_discovery_medal_highlight",
+    )
+    val clickModifier = onClick
+        ?.let { handler -> Modifier.clickable(interactionSource = interactionSource, indication = null, onClick = handler) }
+        ?: Modifier
     val customBadgeModel = remember(awardLabel, fact.category) {
         heroCustomBadgeModel(label = awardLabel, category = fact.category)
             ?: heroCustomBadgeModel(label = fact.label, category = fact.category)
@@ -2837,8 +3303,9 @@ private fun HeroDiscoveryAwardMedal(
                     hoverPosition = null
                 }
                 .clip(CircleShape)
+                .then(clickModifier)
                 .background(Color.Black.copy(alpha = 0.78f))
-                .border(1.dp, Color.White.copy(alpha = 0.20f), CircleShape),
+                .border(1.dp, Color.White.copy(alpha = 0.20f + highlightAlpha), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
             HeroDiscoveryAwardIcon(
@@ -2849,6 +3316,13 @@ private fun HeroDiscoveryAwardMedal(
                     .fillMaxSize()
                     .padding(8.dp * scale),
             )
+            if (highlightAlpha > 0f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.White.copy(alpha = highlightAlpha * 0.5f)),
+                )
+            }
         }
 
         hoverPosition?.let { position ->
@@ -2994,7 +3468,7 @@ private fun List<HeroDiscoveryFact>.heroVisibleAwardFacts(maxCount: Int): List<H
     }
 }
 
-private fun HeroDiscoveryFact.heroDiscoveryAwardLabel(): String =
+internal fun HeroDiscoveryFact.heroDiscoveryAwardLabel(): String =
     when (category) {
         "award:best_picture" -> "Best Picture"
         "award:best_picture_nom" -> "Best Picture Nominee"
@@ -3181,3 +3655,4 @@ private fun String.isUnavailableReleaseStatusLabel(): Boolean =
     trim().let { status ->
         status.equals("Cinema", ignoreCase = true) || status.equals("Production", ignoreCase = true)
     }
+

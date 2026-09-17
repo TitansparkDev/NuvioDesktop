@@ -74,6 +74,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -103,6 +104,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.max
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.Lifecycle
@@ -136,6 +138,8 @@ import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.sync.AppForegroundMonitor
 import com.nuvio.app.core.sync.ProfileSettingsSync
 import com.nuvio.app.core.sync.SyncManager
+import com.nuvio.app.core.ui.nuvioLaunchBackdrop
+import com.nuvio.app.core.ui.rememberNuvioLaunchDrift
 import com.nuvio.app.core.ui.NuvioNavigationBar
 import com.nuvio.app.core.ui.NuvioContinueWatchingActionSheet
 import com.nuvio.app.core.ui.NuvioPosterActionSheet
@@ -168,6 +172,7 @@ import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import com.nuvio.app.features.auth.AuthScreen
 import com.nuvio.app.features.addons.AddonRepository
+import com.nuvio.app.features.calendar.CalendarPrewarm
 import com.nuvio.app.features.calendar.CalendarScreen
 import com.nuvio.app.features.catalog.CatalogRepository
 import com.nuvio.app.features.catalog.CatalogScreen
@@ -198,10 +203,18 @@ import com.nuvio.app.features.details.MetaDetailsScreen
 import com.nuvio.app.features.details.MetaPerson
 import com.nuvio.app.features.details.PersonDetailScreen
 import com.nuvio.app.features.details.resolveSeriesEpisodePosition
+import com.nuvio.app.features.details.HeroBadgeBrowseScreen
 import com.nuvio.app.features.details.TmdbEntityBrowseScreen
 import com.nuvio.app.features.metadata.MediaIdResolver
 import com.nuvio.app.features.tmdb.TmdbEntityKind
 import com.nuvio.app.features.home.HeroCastMember
+import com.nuvio.app.features.home.HeroDiscoveryBadgeTarget
+import com.nuvio.app.features.home.HeroDiscoveryFact
+import com.nuvio.app.features.home.browseTarget
+import com.nuvio.app.features.home.browseTitle
+import com.nuvio.app.features.home.decodeHeroDiscoveryBadgeTarget
+import com.nuvio.app.features.home.encodeForRoute
+import com.nuvio.app.features.home.components.heroDiscoveryAwardLabel
 import com.nuvio.app.features.home.HomeCatalogSection
 import com.nuvio.app.features.home.HomeScreen
 import com.nuvio.app.features.games.GameModeController
@@ -376,7 +389,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import nuvio.composeapp.generated.resources.*
-import nuvio.composeapp.generated.resources.app_logo_wordmark
+import nuvio.composeapp.generated.resources.app_wordmark_text
 import nuvio.composeapp.generated.resources.compose_catalog_subtitle_library
 import nuvio.composeapp.generated.resources.compose_catalog_subtitle_trakt_library
 import nuvio.composeapp.generated.resources.compose_nav_home
@@ -416,6 +429,18 @@ data class EntityBrowseRoute(
     val entityId: Int,
     val entityName: String,
     val sourceType: String = "tv",
+)
+
+/**
+ * A hero discovery badge's browse screen. [targetKind]/[targetValue] are the encoded
+ * [HeroDiscoveryBadgeTarget]; [title] is the badge's display name, shown in the rail titles.
+ */
+@Serializable
+data class BadgeBrowseRoute(
+    val targetKind: String,
+    val targetValue: String,
+    val title: String,
+    val sourceType: String = "movie",
 )
 
 private data class PendingP2pStreamOpen(
@@ -744,11 +769,21 @@ private suspend fun warmProfileDeferredRepositories() {
     withContext(Dispatchers.Default) {
         val startedAt = System.currentTimeMillis()
         appStartupLog.i { "deferred profile warm started" }
-        startupWarmStep("downloads load", rethrow = false) { DownloadsRepository.ensureLoaded() }
+        // The two loads that touch the library drive (downloads stat their files; the local
+        // library reads its store and kicks off the folder scan) run on IO so a sleeping HDD
+        // parks an IO thread rather than a Default worker the rest of the warm needs. Neither is
+        // called from composition any more, so this is where they first load.
+        startupWarmStep("downloads load", rethrow = false) {
+            withContext(Dispatchers.IO) { DownloadsRepository.ensureLoaded() }
+        }
+        startupWarmStep("local library load", rethrow = false) {
+            withContext(Dispatchers.IO) { LocalLibraryRepository.ensureLoaded() }
+        }
         startupWarmStep("library pvr load", rethrow = false) { com.nuvio.app.features.librarypvr.LibraryPvrRepository.ensureLoaded() }
         startupWarmStep("episode notifications load", rethrow = false) { EpisodeReleaseNotificationsRepository.ensureLoaded() }
         startupWarmStep("library load", rethrow = false) { LibraryRepository.ensureLoaded() }
         startupWarmStep("discord presence settings load", rethrow = false) { DiscordPresenceSettingsRepository.ensureLoaded() }
+        startupWarmStep("lights settings load", rethrow = false) { com.nuvio.app.features.lights.LightsController.ensureLoaded() }
         startupWarmStep("simkl settings load", rethrow = false) { SimklSettingsRepository.ensureLoaded() }
         startupWarmStep("simkl auth load", rethrow = false) { SimklAuthRepository.ensureLoaded() }
         startupWarmStep("simkl rewatches load", rethrow = false) {
@@ -787,7 +822,12 @@ private suspend fun warmProfileDeferredRepositories() {
         }
         val continueWatchingSyncStartedAt = System.currentTimeMillis()
         runCatching {
-            WatchProgressRepository.forceContinueWatchingSync(ProfileRepository.activeProfileId)
+            WatchProgressRepository.forceContinueWatchingSync(
+                profileId = ProfileRepository.activeProfileId,
+                // The step above already imported it; a second forced pull here would only spend
+                // another request against the provider's daily budget.
+                reimportProviderHistory = false,
+            )
         }.onSuccess {
             appStartupLog.i {
                 "continue watching startup sync completed in " +
@@ -801,6 +841,11 @@ private suspend fun warmProfileDeferredRepositories() {
             }
         }
         appStartupLog.i { "deferred profile warm completed in ${System.currentTimeMillis() - startedAt}ms" }
+        // Not a warm step: it waits for the app to settle and then fetches the whole calendar,
+        // so it runs on its own scope rather than inside this timed sequence. Sits here rather
+        // than at the launch site so a profile switch (which resets the calendar repositories)
+        // prewarms the new profile's calendar too.
+        CalendarPrewarm.scheduleAsync()
     }
 }
 
@@ -1318,14 +1363,12 @@ private fun MainAppContent(
         var pickerError by remember { mutableStateOf<String?>(null) }
         val addonsUiState by AddonRepository.uiState.collectAsStateWithLifecycle()
     val libraryUiState by LibraryRepository.uiState.collectAsStateWithLifecycle()
-    val localLibraryUiState by remember {
-        LocalLibraryRepository.ensureLoaded()
-        LocalLibraryRepository.uiState
-    }.collectAsStateWithLifecycle()
-    val downloadsUiState by remember {
-        DownloadsRepository.ensureLoaded()
-        DownloadsRepository.uiState
-    }.collectAsStateWithLifecycle()
+    // Loaded by warmProfileDeferredRepositories on a background thread, not here: both loads open
+    // a store file, and the downloads load used to stat every completed file on the library
+    // drive — inside composition that put a sleeping HDD's spin-up on the UI thread at launch.
+    // The flows are safe to collect before either repository has loaded (empty until then).
+    val localLibraryUiState by LocalLibraryRepository.uiState.collectAsStateWithLifecycle()
+    val downloadsUiState by DownloadsRepository.uiState.collectAsStateWithLifecycle()
         val authState by AuthRepository.state.collectAsStateWithLifecycle()
         val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
     val playerSettingsUiState by PlayerSettingsRepository.uiState.collectAsStateWithLifecycle()
@@ -1349,6 +1392,9 @@ private fun MainAppContent(
     val cloudLibraryPlayNotConnectedText = stringResource(Res.string.cloud_library_play_not_connected)
     val isRemoteLibrarySource = libraryUiState.sourceMode != LibrarySourceMode.LOCAL
     var initialHomeReady by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(initialHomeReady) {
+        if (initialHomeReady) com.nuvio.app.core.build.StartupReadySignal.notifyHomeReady()
+    }
     var networkToastBaselineReady by rememberSaveable { mutableStateOf(false) }
     var lastNetworkToastCondition by rememberSaveable { mutableStateOf(NetworkCondition.Unknown.name) }
 
@@ -1569,6 +1615,21 @@ private fun MainAppContent(
         val activeProfileId = profileState.activeProfile?.profileIndex ?: return@LaunchedEffect
         AppForegroundMonitor.events().collect {
             SyncManager.requestForegroundPull(activeProfileId, force = true)
+        }
+    }
+
+    // Separate from the pull above, and deliberately not auth-gated: a connected tracking service
+    // is the user's own account, unrelated to whether they signed into Nuvio. `requestForegroundPull`
+    // returns early for anonymous and signed-out users and only ever reads Nuvio-account state, so
+    // for anyone running SIMKL, Trakt or MDBList as their Continue Watching source it does nothing
+    // at all.
+    LaunchedEffect(Unit) {
+        AppForegroundMonitor.events().collect {
+            runCatching { WatchProgressRepository.refreshContinueWatchingOnForeground() }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    appStartupLog.w(error) { "Continue Watching foreground refresh failed" }
+                }
         }
     }
     var profileSwitchLoading by remember { mutableStateOf(false) }
@@ -2098,6 +2159,47 @@ private fun MainAppContent(
                 )
             }
         }
+        // A discovery badge click. Studio and director badges reuse the screens the details page
+        // already has for companies and people; everything else opens the badge browse.
+        val onHeroBadgeClick: (HeroDiscoveryFact, String) -> Unit = { fact, sourceType ->
+            when (val target = fact.browseTarget()) {
+                null -> Unit
+                is HeroDiscoveryBadgeTarget.Company -> navController.navigateIfResumed(
+                    EntityBrowseRoute(
+                        entityKind = TmdbEntityKind.COMPANY.routeValue,
+                        entityId = target.tmdbId,
+                        entityName = target.name,
+                        sourceType = sourceType,
+                    ),
+                )
+                is HeroDiscoveryBadgeTarget.Director -> coroutineScope.launch {
+                    // The badge only carries the name hero_discovery.json matched on; TMDB's
+                    // person search resolves it, and an exact name match keeps "Ridley Scott"
+                    // from opening the first Scott it finds.
+                    val person = TmdbService.searchPeople(target.name)
+                        .firstOrNull { it.name.equals(target.name, ignoreCase = true) }
+                    if (person != null && person.id > 0) {
+                        navController.navigateIfResumed(
+                            PersonDetailRoute(
+                                personId = person.id,
+                                personName = person.name.ifBlank { target.name },
+                                preferCrew = true,
+                            ),
+                        )
+                    }
+                }
+                else -> target.encodeForRoute()?.let { (kind, value) ->
+                    navController.navigateIfResumed(
+                        BadgeBrowseRoute(
+                            targetKind = kind,
+                            targetValue = value,
+                            title = target.browseTitle(fact.heroDiscoveryAwardLabel()),
+                            sourceType = sourceType,
+                        ),
+                    )
+                }
+            }
+        }
 
         val librarySectionSubtitle = if (libraryUiState.sourceMode == LibrarySourceMode.TRAKT) {
             stringResource(Res.string.compose_catalog_subtitle_trakt_library)
@@ -2452,6 +2554,7 @@ private fun MainAppContent(
                                         onContinueWatchingHeroDismiss = { continueWatchingHeroDismissed = true },
                                         onCatalogClick = onCatalogClick,
                                         onCastClick = onHeroCastClick,
+                                        onBadgeClick = { fact, item -> onHeroBadgeClick(fact, item.type) },
                                         onPosterClick = posterClick@{ meta ->
                                             val randomCategory = meta.randomPlayCategoryOrNull()
                                             if (randomCategory != null) {
@@ -2764,6 +2867,7 @@ private fun MainAppContent(
                                 )
                             }
                         },
+                        onBadgeClick = { fact -> onHeroBadgeClick(fact, route.type) },
                         sharedTransitionScope = this@SharedTransitionLayout,
                         animatedVisibilityScope = this,
                             modifier = Modifier.fillMaxSize(),
@@ -2811,6 +2915,43 @@ private fun MainAppContent(
                         entityKind = TmdbEntityKind.fromRouteValue(route.entityKind),
                         entityId = route.entityId,
                         entityName = route.entityName,
+                        sourceType = route.sourceType,
+                        onBack = { navController.popBackStack() },
+                        onOpenMeta = { preview ->
+                            coroutineScope.launch {
+                                val resolvedId = if (preview.id.startsWith("tmdb:")) {
+                                    val tmdbId = preview.id.removePrefix("tmdb:").toIntOrNull()
+                                    tmdbId?.let {
+                                        TmdbService.tmdbToImdb(
+                                            tmdbId = it,
+                                            mediaType = preview.type,
+                                        )
+                                    } ?: preview.id
+                                } else {
+                                    preview.id
+                                }
+                                navController.navigateIfResumed(
+                                    DetailRoute(
+                                        type = preview.type,
+                                        id = resolvedId,
+                                    ),
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                composable<BadgeBrowseRoute> { backStackEntry ->
+                    val route = backStackEntry.toRoute<BadgeBrowseRoute>()
+                    val target = remember(route) { decodeHeroDiscoveryBadgeTarget(route.targetKind, route.targetValue) }
+                    if (target == null) {
+                        // Only reachable from a stale back stack after the encoding changes.
+                        LaunchedEffect(route) { navController.popBackStack() }
+                        return@composable
+                    }
+                    HeroBadgeBrowseScreen(
+                        target = target,
+                        title = route.title,
                         sourceType = route.sourceType,
                         onBack = { navController.popBackStack() },
                         onOpenMeta = { preview ->
@@ -3840,6 +3981,7 @@ private fun MainAppContent(
                         },
                         onCatalogClick = onCatalogClick,
                         onCastClick = onHeroCastClick,
+                        onBadgeClick = { fact, item -> onHeroBadgeClick(fact, item.type) },
                         onPosterClick = { meta ->
                             navController.navigateIfResumed(DetailRoute(type = meta.type, id = meta.id))
                         },
@@ -3909,31 +4051,38 @@ private fun MainAppContent(
                                 LibraryRepository.remove(libraryItem.id)
                             }
                         } else {
-                            if (!isRemoteLibrarySource) {
-                                LibraryRepository.toggleSaved(libraryItem)
-                            } else {
-                                pickerItem = libraryItem
-                                pickerTitle = preview.name
-                                pickerTabs = LibraryRepository.libraryListTabs()
-                                pickerMembership = pickerTabs.associate { it.key to false }
-                                pickerPending = true
-                                pickerError = null
-                                showLibraryListPicker = true
-                                coroutineScope.launch {
-                                    runCatching {
-                                        val snapshot = LibraryRepository.getMembershipSnapshot(libraryItem)
-                                        val tabs = LibraryRepository.libraryListTabs()
-                                        pickerTabs = tabs
-                                        pickerMembership = tabs.associate { tab ->
-                                            tab.key to (snapshot[tab.key] == true)
-                                        }
-                                    }.onFailure { error ->
-                                        pickerError = error.message ?: getString(Res.string.trakt_lists_load_failed)
-                                    }
-                                    pickerPending = false
-                                }
-                            }
+                            // Same as the details page save button: a plain click adds the title
+                            // to the active provider's default list; picking a specific list is
+                            // the right-click path below.
+                            LibraryRepository.toggleSaved(libraryItem)
                         }
+                    }
+                },
+                onOpenLibraryPicker = selectedPosterActionTarget?.let { target ->
+                    {
+                        val preview = target.preview
+                        val libraryItem = target.libraryItem ?: preview.toLibraryItem(savedAtEpochMs = 0L)
+                        pickerItem = libraryItem
+                        pickerTitle = preview.name
+                        pickerTabs = LibraryRepository.libraryListTabs()
+                        pickerMembership = pickerTabs.associate { it.key to false }
+                        pickerPending = true
+                        pickerError = null
+                        showLibraryListPicker = true
+                        coroutineScope.launch {
+                            runCatching {
+                                val snapshot = LibraryRepository.getMembershipSnapshot(libraryItem)
+                                val tabs = LibraryRepository.libraryListTabs()
+                                pickerTabs = tabs
+                                pickerMembership = tabs.associate { tab ->
+                                    tab.key to (snapshot[tab.key] == true)
+                                }
+                            }.onFailure { error ->
+                                pickerError = error.message ?: getString(Res.string.trakt_lists_load_failed)
+                            }
+                            pickerPending = false
+                        }
+                        Unit
                     }
                 },
                 onStartRewatch = selectedPosterActionTarget?.preview
@@ -4366,6 +4515,13 @@ private fun NavBackStackEntry.toDiscordBrowsingActivity(
                 subtitle = "Discovery",
             )
         }
+        destination.hasRoute<BadgeBrowseRoute>() -> {
+            val route = routeOrNull<BadgeBrowseRoute>()
+            browsingActivity(
+                title = route?.title?.let { "Browsing $it" } ?: "Browsing titles",
+                subtitle = "Discovery",
+            )
+        }
         destination.hasRoute<StreamRoute>() -> {
             val launch = routeOrNull<StreamRoute>()?.let { StreamLaunchStore.get(it.launchId) }
             browsingActivity(
@@ -4466,6 +4622,7 @@ private fun AppTabHost(
     onContinueWatchingHeroDismiss: () -> Unit = {},
     onCatalogClick: ((HomeCatalogSection) -> Unit)? = null,
     onCastClick: ((HeroCastMember) -> Unit)? = null,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onPosterClick: ((MetaPreview) -> Unit)? = null,
     onPosterLongClick: ((MetaPreview) -> Unit)? = null,
     onLibraryPosterClick: ((LibraryItem) -> Unit)? = null,
@@ -4561,6 +4718,7 @@ private fun AppTabHost(
                         // render a capped preview whose arrow opens the full catalog.
                         onCatalogClick = onCatalogClick,
                         onCastClick = onCastClick,
+                        onBadgeClick = onBadgeClick,
                         onPosterClick = { meta ->
                             if (meta.type.equals(CloudLibraryContentType, ignoreCase = true)) {
                                 meta.findCloudLibraryItemForPreview()?.let { item ->
@@ -4623,6 +4781,7 @@ private fun AppTabHost(
                         onNavigateToSearch = onNavigateToSearchTab,
                         onNavigateToLibrary = onNavigateToLibrary,
                         onNavigateToDiscover = onNavigateToDiscover,
+                        onNavigateToCalendar = onNavigateToCalendar,
                     )
                 }
             }
@@ -5522,30 +5681,94 @@ private fun TabletTopPillItem(
     }
 }
 
+/**
+ * How the frames actually flowed while the launch overlay was up, as one log line when it goes:
+ * how long it was visible, how many frames it drew, the worst gap, and every gap of 50ms or more
+ * with its offset from the first frame. The overlay sits over the app's first composition, so its
+ * animation only moves when that composition yields a frame — this is the record of when it did.
+ *
+ * Bounded to the overlay's lifetime, so it is not a permanent frame-clock awaiter (the overlay's
+ * own drift keeps the clock awake for exactly as long anyway).
+ */
+@Composable
+private fun LaunchOverlayFrameGapProbe() {
+    LaunchedEffect(Unit) {
+        val shownAt = TimeSource.Monotonic.markNow()
+        val stalls = com.nuvio.app.core.ui.LaunchStallSampler()
+        var frames = 0
+        var firstNanos = -1L
+        var firstFrameEpochMs = 0L
+        var lastNanos = -1L
+        var worstGapMs = 0L
+        val gaps = ArrayList<String>()
+        try {
+            while (true) {
+                withFrameNanos { now ->
+                    if (lastNanos >= 0) {
+                        val gapMs = (now - lastNanos) / 1_000_000
+                        if (gapMs > worstGapMs) worstGapMs = gapMs
+                        if (gapMs >= 50 && gaps.size < 40) {
+                            gaps += "${gapMs}ms@+${(lastNanos - firstNanos) / 1_000_000}"
+                        }
+                    } else {
+                        firstNanos = now
+                        // Wall clock too, so a gap can be cut out of a JFR recording by time.
+                        firstFrameEpochMs = System.currentTimeMillis()
+                    }
+                    lastNanos = now
+                    frames++
+                    stalls.markFrame()
+                }
+            }
+        } finally {
+            val upMs = shownAt.elapsedNow().inWholeMilliseconds
+            val drawnMs = if (firstNanos >= 0) (lastNanos - firstNanos) / 1_000_000 else 0
+            println(
+                "Info: (LaunchOverlay) up ${upMs}ms, $frames frames over ${drawnMs}ms, " +
+                    "worst gap ${worstGapMs}ms, firstFrameEpochMs=$firstFrameEpochMs, gaps>=50ms: " +
+                    (if (gaps.isEmpty()) "none" else gaps.joinToString(" ")),
+            )
+            stalls.stopAndReport().forEach { line -> println("Info: (LaunchStall) $line") }
+        }
+    }
+}
+
 @Composable
 private fun AppLaunchOverlay(
     modifier: Modifier = Modifier,
 ) {
     val tokens = MaterialTheme.nuvio
+    val drift = rememberNuvioLaunchDrift()
+    LaunchOverlayFrameGapProbe()
     Box(
         modifier = modifier
-            .background(tokens.colors.background)
+            .nuvioLaunchBackdrop(tokens.colors.background, drift)
             .zIndex(NuvioTokens.Z.dialog),
         contentAlignment = Alignment.Center,
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // The lettering alone, no glyph: the night-sky wash already is the icon. No spinner
+            // either — startup blocks the UI thread, so it froze on its first frame and only ever
+            // signalled "stuck".
             Image(
-                painter = painterResource(Res.drawable.app_logo_wordmark),
+                painter = painterResource(Res.drawable.app_wordmark_text),
                 contentDescription = stringResource(Res.string.app_brand_name),
                 modifier = Modifier
                     .fillMaxWidth(0.48f)
-                    .height(44.dp),
+                    .height(30.dp),
                 contentScale = ContentScale.Fit,
             )
-            Spacer(modifier = Modifier.height(tokens.spacing.sectionGap))
-            CircularProgressIndicator(color = tokens.colors.accent)
+            Spacer(modifier = Modifier.height(NuvioTokens.Space.s12))
+            Text(
+                text = "HOME THEATRE",
+                style = MaterialTheme.typography.labelLarge.copy(letterSpacing = 4.sp),
+                color = tokens.colors.textMuted,
+                // Tracking trails the last letter too; pad the start by the same amount so the
+                // line sits centred under the wordmark instead of half a letter to its left.
+                modifier = Modifier.padding(start = 4.dp),
+            )
         }
     }
 }

@@ -3,7 +3,9 @@ package com.nuvio.app.features.home
 import coil3.compose.LocalPlatformContext
 import coil3.SingletonImageLoader
 import coil3.request.ImageRequest
+import com.nuvio.app.core.i18n.localizedMediaTypeLabel
 import com.nuvio.app.core.ui.nuvioArtworkRequestSize
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.layout.Box
@@ -23,6 +25,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -55,12 +58,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import com.nuvio.app.isDesktop
@@ -73,6 +80,11 @@ import com.nuvio.app.core.ui.NuvioInputField
 import com.nuvio.app.core.ui.NuvioScreen
 import com.nuvio.app.core.ui.NuvioDesktopVerticalScrollbar
 import com.nuvio.app.core.ui.NuvioNetworkOfflineCard
+import com.nuvio.app.core.ui.RecompositionProbe
+import com.nuvio.app.core.ui.frameBudgetProbe
+import com.nuvio.app.core.ui.frameBudgetProbesEnabled
+import com.nuvio.app.core.ui.frameBudgetSetContext
+import com.nuvio.app.core.ui.frameBudgetSetScrolling
 import com.nuvio.app.core.ui.smoothVerticalWheelScroll
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.rememberMouseActivityState
@@ -91,6 +103,7 @@ import com.nuvio.app.features.discover.DiscoverPickerSegment
 import com.nuvio.app.features.discover.DISCOVER_PLACEHOLDER_KEY_PREFIX
 import com.nuvio.app.features.discover.DiscoverRecommendationsRepository
 import com.nuvio.app.features.discover.DiscoverRowBody
+import com.nuvio.app.features.discover.discoverPickerPressDismisses
 import com.nuvio.app.features.discover.DiscoverRowHeader
 import com.nuvio.app.features.discover.discoverRowProvenance
 import com.nuvio.app.features.discover.rememberDiscoverPostersAlpha
@@ -107,6 +120,10 @@ import com.nuvio.app.features.metadata.isAnimeSeasonArtUrl
 import com.nuvio.app.features.details.SeriesPrimaryAction
 import com.nuvio.app.features.details.seriesPrimaryAction
 import com.nuvio.app.features.streams.StreamPrefetchService
+import com.nuvio.app.features.home.components.ImmersiveRowDirection
+import com.nuvio.app.features.home.components.immersiveRowBodyEnter
+import com.nuvio.app.features.home.components.immersiveRowBodyExit
+import com.nuvio.app.features.home.components.immersiveRowTransition
 import com.nuvio.app.features.home.components.immersiveShelfScrimStops
 import com.nuvio.app.features.home.components.PAGE_ITEM_STEP
 import com.nuvio.app.features.home.components.PAGE_SECTION_STEP
@@ -130,12 +147,12 @@ import com.nuvio.app.features.home.components.HomeSkeletonRow
 import com.nuvio.app.features.tmdb.HeroImageSource
 import com.nuvio.app.features.tmdb.TmdbHeroImageService
 import com.nuvio.app.features.tmdb.TmdbSettingsRepository
-import com.nuvio.app.features.simkl.SIMKL_NO_CW_CUTOFF
 import com.nuvio.app.features.simkl.SimklAuthRepository
 import com.nuvio.app.features.simkl.simklContinueWatchingCutoffMs
 import com.nuvio.app.features.simkl.SimklLibraryRepository
 import com.nuvio.app.features.simkl.SimklSettingsRepository
 import com.nuvio.app.features.trakt.TraktAuthRepository
+import com.nuvio.app.features.trakt.TraktCalendarRepository
 import com.nuvio.app.features.trakt.TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL
 import com.nuvio.app.features.trakt.TraktSettingsRepository
 import com.nuvio.app.features.trakt.normalizeTraktContinueWatchingDaysCap
@@ -147,9 +164,13 @@ import com.nuvio.app.features.watchprogress.ContinueWatchingArtworkDiagnostics
 import com.nuvio.app.features.watchprogress.ContinueWatchingEnrichmentCache
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.ContinueWatchingArtworkFailures
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
+import com.nuvio.app.features.watchprogress.needsEpisodeStillRefresh
 import com.nuvio.app.features.watchprogress.ContinueWatchingSortMode
 import com.nuvio.app.features.watchprogress.isMalformedNextUpSeedContentId
+import com.nuvio.app.features.watchprogress.isWithinContinueWatchingWindow
+import com.nuvio.app.features.watchprogress.continueWatchingWindowHorizonMs
 import com.nuvio.app.features.watchprogress.isSeriesTypeForContinueWatching
 import com.nuvio.app.features.watchprogress.nextUpDismissKey
 import com.nuvio.app.features.watchprogress.shouldTreatAsInProgressForContinueWatching
@@ -277,6 +298,7 @@ fun HomeScreen(
     onContinueWatchingLongPress: ((ContinueWatchingItem) -> Unit)? = null,
     onFolderClick: ((collectionId: String, folderId: String) -> Unit)? = null,
     onCastClick: ((HeroCastMember) -> Unit)? = null,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onFirstCatalogRendered: (() -> Unit)? = null,
     onNavigateToSearch: (() -> Unit)? = null,
     onNavigateToLibrary: (() -> Unit)? = null,
@@ -333,6 +355,11 @@ fun HomeScreen(
     // Left edge of each header segment within the header row, reported by layout. The picker panel
     // hangs off the segment that opened it rather than off the row edge.
     var discoverSegmentOffsets by remember { mutableStateOf(emptyMap<DiscoverPickerSegment, Float>()) }
+    // Root-space bounds of the open picker panel and of the header that opened it. While a picker
+    // is up, a press outside both only closes it — it never reaches the dimmed posters beneath.
+    var discoverPickerBounds by remember { mutableStateOf<Rect?>(null) }
+    var discoverHeaderBounds by remember { mutableStateOf<Rect?>(null) }
+    var homeRootCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     // Discover catalogs are derived from the installed addons, so this is lazy — nothing here runs
     // until the user actually opens the tab.
     LaunchedEffect(contentMode, addonsUiState.addons) {
@@ -405,9 +432,10 @@ fun HomeScreen(
             item.poster?.takeIf { it.isNotBlank() }?.let { url ->
                 val request = ImageRequest.Builder(platformContext)
                     .data(url)
-                    // Without this the prefetch decoded at full source resolution and parked that
-                    // in the memory cache, which the card then reused — see
-                    // [nuvioArtworkRequestSize].
+                    // Disk only: a prefetch runs before any card has been laid out, so it cannot
+                    // know the size the card will ask for, and artwork bitmaps are now cached per
+                    // requested size. Decoding one here would warm an entry nothing can reach —
+                    // see [nuvioArtworkRequestSize].
                     .nuvioArtworkRequestSize()
                     .build()
                 imageLoader.enqueue(request)
@@ -1139,10 +1167,27 @@ fun HomeScreen(
         )
     }
 
+    // Trakt seeds come from /sync/watched/shows, which says nothing about the next episode, so
+    // the window reads its air date from the Trakt calendar. Loaded only while the window is on:
+    // "All history" never asks the question, and the load is a few month requests once per run.
+    val traktCalendarState by TraktCalendarRepository.uiState.collectAsStateWithLifecycle()
+    val traktCalendarAiringsByContent = remember(traktCalendarState.entriesByDate) {
+        indexCalendarAiringsByContent(traktCalendarState.entriesByDate)
+    }
+    LaunchedEffect(isTraktProgressActive, traktSettingsUiState.continueWatchingDaysCap) {
+        if (!isTraktProgressActive) return@LaunchedEffect
+        val daysCap = normalizeTraktContinueWatchingDaysCap(traktSettingsUiState.continueWatchingDaysCap)
+        if (daysCap == TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL) return@LaunchedEffect
+        val now = WatchProgressClock.nowEpochMs()
+        val cutoffMs = now - (daysCap.toLong() * MILLIS_PER_DAY)
+        TraktCalendarRepository.ensureMonthsThrough(continueWatchingWindowHorizonMs(cutoffMs, now))
+    }
+
     val recentNextUpSeedCandidates = remember(
         allNextUpSeedCandidates,
         isTraktProgressActive,
         traktSettingsUiState.continueWatchingDaysCap,
+        traktCalendarAiringsByContent,
         simklIsAuthenticated,
         continueWatchingSource,
         simklSettingsUiState.simklContinueWatchingDaysCap,
@@ -1155,15 +1200,25 @@ fun HomeScreen(
             isTraktProgressActive = isTraktProgressActive,
             daysCap = traktSettingsUiState.continueWatchingDaysCap,
             nowEpochMs = now,
+            upcomingAirEpochMs = { candidate ->
+                nextAiringAfterSeed(
+                    airings = traktCalendarAiringsByContent[candidate.content.id],
+                    seedSeasonNumber = candidate.seasonNumber,
+                    seedEpisodeNumber = candidate.episodeNumber,
+                )
+            },
         )
         if (simklCwActive) {
-            val cutoffMs = simklContinueWatchingCutoffMs(
-                daysCap = simklSettingsUiState.simklContinueWatchingDaysCap,
+            // The repository already windows SIMKL rows before they get here (its drops are the
+            // `DROPPED@source-window` lines); this pass exists so the two can never disagree.
+            candidates = filterHomeNextUpCandidatesForContinueWatchingWindow(
+                candidates = candidates,
+                cutoffMs = simklContinueWatchingCutoffMs(
+                    daysCap = simklSettingsUiState.simklContinueWatchingDaysCap,
+                    nowEpochMs = now,
+                ),
                 nowEpochMs = now,
             )
-            if (cutoffMs != SIMKL_NO_CW_CUTOFF) {
-                candidates = candidates.filter { it.markedAtEpochMs >= cutoffMs }
-            }
         }
         candidates
     }
@@ -1804,6 +1859,39 @@ fun HomeScreen(
     val tvModeEnabled =
         homeSettingsUiState.tvModeEnabled && isDesktop && showHeroSlot
     val heroFocusable = showHeroSlot
+    // Frame-budget reporting. The label carries both axes that change what a browsing frame costs:
+    // the tab (Home/Search/Library/Discover render different row sets) and the display mode, which
+    // is the thing under investigation. Reporting is gated on scrolling — an idle home screen is
+    // measuring whatever animation happens to be running, not browsing.
+    RecompositionProbe("home")
+    val frameBudgetLabel = remember(displayMode, homeSettingsUiState) {
+        displayMode.telemetryName() + "/" + homeDisplayModeOf(homeSettingsUiState).name
+    }
+    // Gated as a whole: the scroll-state collector below is a snapshot observer per live HomeScreen,
+    // which is a real if small cost to carry for a measurement nobody asked for. The flag is fixed
+    // for the process lifetime, so branching on it here does not reshape the composition later.
+    val frameBudgetEnabled = frameBudgetProbesEnabled()
+    if (frameBudgetEnabled) {
+        LaunchedEffect(frameBudgetLabel) { frameBudgetSetContext(frameBudgetLabel) }
+    }
+    // Identity, not the label: Home and Search can be composed at the same time under the same
+    // display mode, and two instances sharing an owner key would cancel each other out.
+    val frameBudgetOwner = remember(currentListState) {
+        frameBudgetLabel + "#" + currentListState.hashCode()
+    }
+    if (frameBudgetEnabled) {
+        DisposableEffect(frameBudgetOwner) {
+            // onDispose, not just the flow: navigating away mid-scroll cancels the collector with
+            // this owner still marked scrolling, and every frame of the screen the user landed on
+            // would then be recorded under the home label.
+            onDispose { frameBudgetSetScrolling(frameBudgetOwner, false) }
+        }
+        LaunchedEffect(frameBudgetOwner) {
+            snapshotFlow { currentListState.isScrollInProgress }
+                .distinctUntilChanged()
+                .collect { frameBudgetSetScrolling(frameBudgetOwner, it) }
+        }
+    }
     val homeTvFocus = remember(heroFocusable) {
         HomeTvFocusState { sectionIndex, itemIndex ->
             val rowIndex = sectionIndex - if (heroFocusable) 1 else 0
@@ -1883,6 +1971,19 @@ fun HomeScreen(
         is HomeContentMode.Search -> searchTvFocus
         is HomeContentMode.Catalogs -> catalogTvFocus
         is HomeContentMode.Discover -> discoverTvFocus
+    }
+
+    // TV Mode browses by moving focus between rows and columns; its vertical list is never dragged,
+    // so `isScrollInProgress` stays false and the first instrumented run recorded ZERO TV windows
+    // while producing plenty for the other three modes. Each focus move opens a short window
+    // instead, which is the equivalent unit of browsing there.
+    if (tvModeEnabled && frameBudgetEnabled) {
+        val tvFocusKey = "${tvFocus.sectionIndex}:${tvFocus.itemIndex}"
+        LaunchedEffect(frameBudgetOwner, tvFocusKey) {
+            frameBudgetSetScrolling(frameBudgetOwner, true)
+            delay(TV_FRAME_BUDGET_WINDOW_MS)
+            frameBudgetSetScrolling(frameBudgetOwner, false)
+        }
     }
 
     // --- Continue-watching hero preview ---
@@ -2627,7 +2728,13 @@ fun HomeScreen(
         else -> -1
     }
     val tvFocusedHeroItemRaw = if (tvFocusedRowIndex >= 0) {
+        // Normalised HERE, at the source, so the first backdrop drawn is already the one enrichment
+        // will settle on. The raw catalog item carries the metahub "medium" variant and
+        // `bestBackdrop` upgrades it to "large" - but only during enrichment, so the hero drew the
+        // medium first and the large a moment later: the same picture fetched, decoded and faded in
+        // twice. Invisible before the crossfade made every backdrop change legible.
         tvRows.getOrNull(tvFocusedRowIndex)?.metaItems?.getOrNull(tvFocus.itemIndex)
+            ?.withNormalizedHeroBackdrop()
     } else {
         null
     }
@@ -3031,14 +3138,27 @@ fun HomeScreen(
             .focusRequester(tvFocusRequester)
             .onFocusChanged { homeRootHasFocus = it.hasFocus }
             .focusable()
-            .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { _ ->
+            .onGloballyPositioned { homeRootCoordinates = it }
+            .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { event ->
                 try { tvFocusRequester.requestFocus() } catch (_: Exception) {}
+                // A miss beside an open Discover picker closes it and nothing else: consumed on the
+                // Initial pass so the poster underneath never sees the press. The header and the
+                // panel keep their own handling.
+                if (discoverPickerSegment != null) {
+                    val change = event.changes.firstOrNull() ?: return@onPointerEvent
+                    val position = homeRootCoordinates?.localToRoot(change.position) ?: change.position
+                    if (discoverPickerPressDismisses(position, discoverPickerBounds, discoverHeaderBounds)) {
+                        event.changes.forEach { it.consume() }
+                        discoverPickerSegment = null
+                    }
+                }
             }
             .onPreviewKeyEvent { event ->
                 when {
                     // Escape closes an open Discover picker before anything else can act on it,
                     // so it never falls through to dismissing the whole screen.
-                    discoverPickerSegment != null && event.key == Key.Escape -> {
+                    discoverPickerSegment != null &&
+                        event.navigationKey() in setOf(Key.Escape, Key.Backspace) -> {
                         if (event.type == KeyEventType.KeyUp) discoverPickerSegment = null
                         true
                     }
@@ -3191,9 +3311,12 @@ fun HomeScreen(
                                 Key.RightBracket -> {
                                     handleHomeTvKey(HomeTvKey.VolumeUp)
                                 }
-                                Key.Escape, Key.Back -> {
-                                    // If a hero trailer is showing, Escape dismisses it first
-                                    // (a clear way out of full-screen playback).
+                                Key.Escape, Key.Back, Key.Backspace -> {
+                                    // Dismiss first, navigate second. On a keyboard these are two
+                                    // keys, but a controller has one B button for both, so Back has
+                                    // to close the hero trailer (or resume prompt) before it leaves
+                                    // the screen. Dismiss returns false when there is nothing to
+                                    // close, and Back then falls through to global navigation.
                                     handleHomeTvKey(HomeTvKey.Dismiss)
                                 }
                                 else -> false
@@ -3210,6 +3333,7 @@ fun HomeScreen(
                 accent = activeHeroAccent,
                 onAccentChanged = { activeHeroAccent = it },
                 label = "home_hero_ambient_background",
+                modifier = Modifier.frameBudgetProbe("ambient"),
             )
         }
 
@@ -3227,6 +3351,7 @@ fun HomeScreen(
         // the Discover row through separate call sites.
         val discoverRowTitleContent: @Composable () -> Unit = {
             DiscoverRowHeader(
+                typeLabel = discoverUiState.selectedType?.let(::localizedMediaTypeLabel),
                 catalogLabel = discoverUiState.selectedCatalog?.catalogName.orEmpty(),
                 filterLabel = discoverUiState.selectedCatalog?.let {
                     discoverUiState.selectedGenre ?: discoverAllFiltersLabel
@@ -3239,6 +3364,9 @@ fun HomeScreen(
                     if (discoverSegmentOffsets[segment] != x) {
                         discoverSegmentOffsets = discoverSegmentOffsets + (segment to x)
                     }
+                },
+                onHeaderBoundsChanged = { bounds ->
+                    if (discoverHeaderBounds != bounds) discoverHeaderBounds = bounds
                 },
             )
         }
@@ -3273,6 +3401,9 @@ fun HomeScreen(
                 horizontalPadding = homeSectionPadding,
                 anchorX = with(LocalDensity.current) { anchorPx.toDp() },
                 onSegmentChange = { discoverPickerSegment = it },
+                onPanelBoundsChanged = { bounds ->
+                    if (discoverPickerBounds != bounds) discoverPickerBounds = bounds
+                },
                 emptyText = discoverRowEmptyText,
                 loadingText = discoverRowLoadingText,
             )
@@ -3357,7 +3488,7 @@ fun HomeScreen(
 
                 effectiveHeroItems.isNotEmpty() -> HomeHeroSection(
                     items = effectiveHeroItems,
-                    modifier = Modifier,
+                    modifier = Modifier.frameBudgetProbe("hero"),
                     viewportHeight = maxHeight,
                     mobileBelowSectionHeightHint = mobileHeroBelowSectionHeightHint,
                     sectionPadding = if (isDesktop && !tvModeEnabled) homeSectionPadding else null,
@@ -3393,6 +3524,7 @@ fun HomeScreen(
                         basicHeroActiveItem = item
                     },
                     onCastClick = onCastClick,
+                    onBadgeClick = onBadgeClick,
                     onItemClick = { item ->
                         if ("${item.type}:${item.id}" == effectiveResumeItemKey && effectiveOnResumeAction != null) {
                             effectiveOnResumeAction()
@@ -3844,7 +3976,6 @@ fun HomeScreen(
         }
 
         if (tvModeEnabled && tvRows.isNotEmpty()) {
-            val activeSettingsItem = immersiveRows.getOrNull(getImmersiveRowIndex())
             Box(modifier = Modifier.fillMaxSize()) {
                 renderHero(null)
                 Box(
@@ -3874,30 +4005,44 @@ fun HomeScreen(
                         Alignment.TopStart
                     },
                 ) {
-                    when {
-                        activeSettingsItem == null && isShowingHomeContent -> HomeContinueWatchingSection(
-                            items = continueWatchingRowItems,
-                            style = continueWatchingPreferences.style,
-                            useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
-                            blurNextUp = continueWatchingPreferences.blurNextUp,
-                            sectionPadding = homeSectionPadding,
-                            layout = continueWatchingLayout,
-                            basePosterWidthDpOverride = immersivePosterBaseWidthDp.takeIf {
-                                immersiveLandscapeMode
-                            },
-                            focusedItemIndex = tvFocus.itemIndex,
-                            rowState = continueWatchingRowState,
-                            onHoverItem = ::selectHoveredImmersiveItem,
-                            isKeyboardNavigation = !mouseActivity.isMouseActive,
-                            headerTrailingContent = tvRowDotsContent,
-                            onItemClick = onContinueWatchingClick,
-                            onItemLongPress = onContinueWatchingLongPress,
-                        )
-
-                        isShowingHomeContent && activeSettingsItem?.key == HOME_NEXT_UP_SECTION_KEY ->
-                            HomeContinueWatchingSection(
-                                items = nextUpRowItems,
-                                title = nextUpRowTitle,
+                    // Row changes slide the shelf a few dp in the direction of travel under a short
+                    // cross-fade instead of cutting. Keyed on the row index — not the row — so the
+                    // outgoing row keeps drawing its own content while it leaves, and a jump that
+                    // lands on the same index (mode switch, list refresh) does not animate.
+                    val immersiveRowDirection = remember { ImmersiveRowDirection() }
+                    immersiveRowDirection.observe(getImmersiveRowIndex())
+                    AnimatedContent(
+                        targetState = getImmersiveRowIndex(),
+                        transitionSpec = {
+                            co.touchlab.kermit.Logger.withTag("ImmersiveRowTransition").i {
+                                "row ${initialState} -> ${targetState} forward=${immersiveRowDirection.forward} " +
+                                    "mode=${homeSettingsUiState.tvRowTransition}"
+                            }
+                            immersiveRowTransition(homeSettingsUiState.tvRowTransition)
+                        },
+                        contentAlignment = if (immersiveLandscapeMode) {
+                            Alignment.BottomStart
+                        } else {
+                            Alignment.TopStart
+                        },
+                        label = "immersive_row",
+                    ) { rowIndex ->
+                        val activeSettingsItem = immersiveRows.getOrNull(rowIndex)
+                        // The nudge moves only the posters: the header (title, dots) just fades
+                        // with the shelf, so it never shifts under the reader's eye.
+                        val rowBodyModifier =
+                            if (homeSettingsUiState.tvRowTransition == HomeTvRowTransition.FadeNudge) {
+                                Modifier.animateEnterExit(
+                                    enter = immersiveRowBodyEnter(immersiveRowDirection.forward),
+                                    exit = immersiveRowBodyExit(immersiveRowDirection.forward),
+                                    label = "immersive_row_body",
+                                )
+                            } else {
+                                Modifier
+                            }
+                        when {
+                            activeSettingsItem == null && isShowingHomeContent -> HomeContinueWatchingSection(
+                                items = continueWatchingRowItems,
                                 style = continueWatchingPreferences.style,
                                 useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
                                 blurNextUp = continueWatchingPreferences.blurNextUp,
@@ -3906,117 +4051,145 @@ fun HomeScreen(
                                 basePosterWidthDpOverride = immersivePosterBaseWidthDp.takeIf {
                                     immersiveLandscapeMode
                                 },
+                                maxCardHeight = immersiveShelfCardHeightDp(immersiveShelfHeight.value).dp,
                                 focusedItemIndex = tvFocus.itemIndex,
-                                rowState = nextUpRowState,
+                                rowState = continueWatchingRowState,
                                 onHoverItem = ::selectHoveredImmersiveItem,
                                 isKeyboardNavigation = !mouseActivity.isMouseActive,
                                 headerTrailingContent = tvRowDotsContent,
+                                bodyModifier = rowBodyModifier,
                                 onItemClick = onContinueWatchingClick,
                                 onItemLongPress = onContinueWatchingLongPress,
                             )
 
-                        isShowingHomeContent && activeSettingsItem?.isCollection == true -> {
-                            collectionsMap[activeSettingsItem?.key ?: ""]?.let { collection ->
-                                HomeCollectionRowSection(
-                                    collection = collection,
+                            isShowingHomeContent && activeSettingsItem?.key == HOME_NEXT_UP_SECTION_KEY ->
+                                HomeContinueWatchingSection(
+                                    items = nextUpRowItems,
+                                    title = nextUpRowTitle,
+                                    style = continueWatchingPreferences.style,
+                                    useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
+                                    blurNextUp = continueWatchingPreferences.blurNextUp,
                                     sectionPadding = homeSectionPadding,
-                                    basePosterWidthDpOverride = immersivePosterBaseWidthDp,
-                                    animateGifs = animateCollectionGifs,
-                                    focusedItemIndex = tvFocus.itemIndex,
-                                    rowState = remember(collection.id) {
-                                        HomeScrollMemory.immersiveRowStates.getOrPut("collection:${collection.id}") { LazyListState() }
+                                    layout = continueWatchingLayout,
+                                    basePosterWidthDpOverride = immersivePosterBaseWidthDp.takeIf {
+                                        immersiveLandscapeMode
                                     },
-                                    isKeyboardNavigation = !mouseActivity.isMouseActive,
-                                    rowNumber = catalogRowNumbers[activeSettingsItem?.key],
-                                    headerTrailingContent = tvRowDotsContent,
+                                    maxCardHeight = immersiveShelfCardHeightDp(immersiveShelfHeight.value).dp,
+                                    focusedItemIndex = tvFocus.itemIndex,
+                                    rowState = nextUpRowState,
                                     onHoverItem = ::selectHoveredImmersiveItem,
-                                    onFolderClick = onFolderClick,
+                                    isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                    headerTrailingContent = tvRowDotsContent,
+                                    bodyModifier = rowBodyModifier,
+                                    onItemClick = onContinueWatchingClick,
+                                    onItemLongPress = onContinueWatchingLongPress,
                                 )
-                            }
-                        }
 
-                        else -> {
-                            val immSection = if (isShowingHomeContent) {
-                                sectionsMap[activeSettingsItem?.key ?: ""]
-                            } else {
-                                effectiveSections.firstOrNull { it.key == activeSettingsItem?.key }
-                            }
-                            immSection?.let { section ->
-                                val usesInfiniteScroll =
-                                    section.usesInfiniteHomeRow(catalogSeeMoreEnabled)
-                                val shuffleOrder = shuffleOrderFor(section)
-                                val shuffledItems = section.shuffled(shuffleOrder)
-                                androidx.compose.runtime.key(section.key) {
-                                    HomeCatalogRowSection(
-                                        section = section,
-                                        entries = when {
-                                            !isShowingHomeContent ->
-                                                section.resultRowEntries(
-                                                    catalogSeeMoreEnabled = catalogSeeMoreEnabled,
-                                                    cardEnrichments = heroEnrichmentMap,
-                                                    pendingEnrichmentKeys = landscapePendingEnrichmentKeys,
-                                                )
-                                            usesInfiniteScroll -> shuffledItems
-                                            else -> shuffledItems.take(HOME_CATALOG_PREVIEW_LIMIT)
-                                        },
-                                        onShuffleClick = shuffleClickFor(section),
-                                        isShuffling = section.key in rowShufflingKeys,
-                                        shuffleGeneration = shuffleOrder?.generation ?: 0,
+                            isShowingHomeContent && activeSettingsItem?.isCollection == true -> {
+                                collectionsMap[activeSettingsItem?.key ?: ""]?.let { collection ->
+                                    HomeCollectionRowSection(
+                                        collection = collection,
                                         sectionPadding = homeSectionPadding,
                                         basePosterWidthDpOverride = immersivePosterBaseWidthDp,
+                                        animateGifs = animateCollectionGifs,
                                         focusedItemIndex = tvFocus.itemIndex,
-                                        rowState = remember(section.key) {
-                                            HomeScrollMemory.immersiveRowStates.getOrPut("catalog:${section.key}") { LazyListState() }
+                                        rowState = remember(collection.id) {
+                                            HomeScrollMemory.immersiveRowStates.getOrPut("collection:${collection.id}") { LazyListState() }
                                         },
                                         isKeyboardNavigation = !mouseActivity.isMouseActive,
-                                        onHoverItem = ::selectHoveredImmersiveItem,
-                                        onLoadMore = if (usesInfiniteScroll) {
-                                            if (isShowingHomeContent) {
-                                                { HomeRepository.loadMoreCatalogRow(section.key) }
-                                            } else {
-                                                onLoadMoreCatalog?.let { callback -> { callback(section) } }
-                                            }
-                                        } else {
-                                            null
-                                        },
-                                        isLoadingMore = section.isLoadingMore,
-                                        watchedKeys = watchedUiState.watchedKeys,
-                                        onPosterClick = posterClickHandler,
-                                        onPosterLongClick = onPosterLongClick,
-                                        rowNumber = catalogRowNumbers[section.key],
+                                        rowNumber = catalogRowNumbers[activeSettingsItem?.key],
                                         headerTrailingContent = tvRowDotsContent,
-                                        titleContent = discoverRowTitleContentFor(section),
-                                        bodyAlpha = if (section.key == DISCOVER_BROWSER_ROW_KEY) {
-                                            discoverPostersAlpha
-                                        } else {
-                                            1f
-                                        },
-                                        bodyOverlay = if (section.key == DISCOVER_BROWSER_ROW_KEY) {
-                                            {
-                                                // The immersive shelf is a fixed-height box pinned to
-                                                // the bottom of the window, so the picker is capped to
-                                                // it rather than to the viewport.
-                                                DiscoverRowBodySlot(
-                                                    section = section,
-                                                    pickerMaxHeight = minOf(
-                                                        discoverPickerMaxHeight,
-                                                        immersiveShelfHeight,
-                                                    ),
-                                                )
-                                            }
-                                        } else {
-                                            null
-                                        },
-                                        onViewAllClick = if (
-                                            (isShowingHomeContent || catalogSeeMoreEnabled) &&
-                                            !usesInfiniteScroll &&
-                                            section.canOpenCatalog(HOME_CATALOG_PREVIEW_LIMIT)
-                                        ) {
-                                            onCatalogClick?.let { { it(section) } }
-                                        } else {
-                                            null
-                                        },
+                                        bodyModifier = rowBodyModifier,
+                                        onHoverItem = ::selectHoveredImmersiveItem,
+                                        onFolderClick = onFolderClick,
                                     )
+                                }
+                            }
+
+                            else -> {
+                                val immSection = if (isShowingHomeContent) {
+                                    sectionsMap[activeSettingsItem?.key ?: ""]
+                                } else {
+                                    effectiveSections.firstOrNull { it.key == activeSettingsItem?.key }
+                                }
+                                immSection?.let { section ->
+                                    val usesInfiniteScroll =
+                                        section.usesInfiniteHomeRow(catalogSeeMoreEnabled)
+                                    val shuffleOrder = shuffleOrderFor(section)
+                                    val shuffledItems = section.shuffled(shuffleOrder)
+                                    androidx.compose.runtime.key(section.key) {
+                                        HomeCatalogRowSection(
+                                            section = section,
+                                            entries = when {
+                                                !isShowingHomeContent ->
+                                                    section.resultRowEntries(
+                                                        catalogSeeMoreEnabled = catalogSeeMoreEnabled,
+                                                        cardEnrichments = heroEnrichmentMap,
+                                                        pendingEnrichmentKeys = landscapePendingEnrichmentKeys,
+                                                    )
+                                                usesInfiniteScroll -> shuffledItems
+                                                else -> shuffledItems.take(HOME_CATALOG_PREVIEW_LIMIT)
+                                            },
+                                            onShuffleClick = shuffleClickFor(section),
+                                            isShuffling = section.key in rowShufflingKeys,
+                                            shuffleGeneration = shuffleOrder?.generation ?: 0,
+                                            sectionPadding = homeSectionPadding,
+                                            basePosterWidthDpOverride = immersivePosterBaseWidthDp,
+                                            focusedItemIndex = tvFocus.itemIndex,
+                                            rowState = remember(section.key) {
+                                                HomeScrollMemory.immersiveRowStates.getOrPut("catalog:${section.key}") { LazyListState() }
+                                            },
+                                            isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                            onHoverItem = ::selectHoveredImmersiveItem,
+                                            onLoadMore = if (usesInfiniteScroll) {
+                                                if (isShowingHomeContent) {
+                                                    { HomeRepository.loadMoreCatalogRow(section.key) }
+                                                } else {
+                                                    onLoadMoreCatalog?.let { callback -> { callback(section) } }
+                                                }
+                                            } else {
+                                                null
+                                            },
+                                            isLoadingMore = section.isLoadingMore,
+                                            watchedKeys = watchedUiState.watchedKeys,
+                                            onPosterClick = posterClickHandler,
+                                            onPosterLongClick = onPosterLongClick,
+                                            rowNumber = catalogRowNumbers[section.key],
+                                            headerTrailingContent = tvRowDotsContent,
+                                            bodyModifier = rowBodyModifier,
+                                            titleContent = discoverRowTitleContentFor(section),
+                                            bodyAlpha = if (section.key == DISCOVER_BROWSER_ROW_KEY) {
+                                                discoverPostersAlpha
+                                            } else {
+                                                1f
+                                            },
+                                            bodyOverlay = if (section.key == DISCOVER_BROWSER_ROW_KEY) {
+                                                {
+                                                    // The immersive shelf is a fixed-height box pinned to
+                                                    // the bottom of the window, so the picker is capped to
+                                                    // it rather than to the viewport.
+                                                    DiscoverRowBodySlot(
+                                                        section = section,
+                                                        pickerMaxHeight = minOf(
+                                                            discoverPickerMaxHeight,
+                                                            immersiveShelfHeight,
+                                                        ),
+                                                    )
+                                                }
+                                            } else {
+                                                null
+                                            },
+                                            onViewAllClick = if (
+                                                (isShowingHomeContent || catalogSeeMoreEnabled) &&
+                                                !usesInfiniteScroll &&
+                                                section.canOpenCatalog(HOME_CATALOG_PREVIEW_LIMIT)
+                                            ) {
+                                                onCatalogClick?.let { { it(section) } }
+                                            } else {
+                                                null
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -4109,6 +4282,9 @@ fun HomeScreen(
         )
     }
 }
+
+/** How long one TV Mode focus move counts as browsing, for frame-budget reporting. */
+private const val TV_FRAME_BUDGET_WINDOW_MS = 400L
 
 private const val HOME_CATALOG_PREVIEW_LIMIT = 18
 private const val HOME_CONTINUE_WATCHING_SECTION_KEY = "home:continue-watching"
@@ -4212,8 +4388,9 @@ private const val HOME_STARTUP_METADATA_GRACE_MS = 900L
 private const val HERO_BATCH_ENRICHMENT_STARTUP_GRACE_MS = 350L
 // COLLECTION_HERO_TYPE now lives in HomeModels.kt, shared with HomeRepository's own
 // collection-backdrop hero items.
-private const val IMMERSIVE_SHELF_TOP_PADDING_DP = 68f
-private const val IMMERSIVE_SHELF_BOTTOM_PADDING_DP = 12f
+// Internal, not private: the game library's shelf pads itself the same way.
+internal const val IMMERSIVE_SHELF_TOP_PADDING_DP = 68f
+internal const val IMMERSIVE_SHELF_BOTTOM_PADDING_DP = 12f
 private const val IMMERSIVE_SHELF_HEADER_ESTIMATE_DP = 54f
 private const val IMMERSIVE_POSTER_LABEL_RESERVE_DP = 42f
 private const val IMMERSIVE_POSTER_ASPECT_RATIO = 0.675f
@@ -4235,6 +4412,13 @@ internal fun immersiveShelfHeightDp(
 } else {
     (viewportHeightDp * 0.43f).coerceIn(300f, 440f)
 }
+
+/** Height left for a card inside a shelf of [shelfHeightDp] once its paddings and row header are out. */
+internal fun immersiveShelfCardHeightDp(shelfHeightDp: Float): Float =
+    shelfHeightDp -
+        IMMERSIVE_SHELF_TOP_PADDING_DP -
+        IMMERSIVE_SHELF_BOTTOM_PADDING_DP -
+        IMMERSIVE_SHELF_HEADER_ESTIMATE_DP
 internal const val HomeContinueWatchingMaxRecentProgressItems = 300
 internal const val HomeNextUpInitialResolutionLimit = 32
 
@@ -4265,11 +4449,7 @@ internal fun immersiveCatalogPosterBaseWidthDp(
     landscapeMode: Boolean = false,
 ): Int {
     val labelReserve = if (hideLabels || landscapeMode) 0f else IMMERSIVE_POSTER_LABEL_RESERVE_DP
-    val availablePosterHeight = shelfHeightDp -
-        IMMERSIVE_SHELF_TOP_PADDING_DP -
-        IMMERSIVE_SHELF_BOTTOM_PADDING_DP -
-        IMMERSIVE_SHELF_HEADER_ESTIMATE_DP -
-        labelReserve
+    val availablePosterHeight = immersiveShelfCardHeightDp(shelfHeightDp) - labelReserve
     val heightDrivenWidth = if (landscapeMode) {
         (availablePosterHeight * IMMERSIVE_LANDSCAPE_ASPECT_RATIO /
             IMMERSIVE_LANDSCAPE_WIDTH_SCALE).roundToInt()
@@ -4324,18 +4504,50 @@ internal fun filterEntriesForTraktContinueWatchingWindow(
     return entries.filter { entry -> entry.lastUpdatedEpochMs >= cutoffMs }
 }
 
+/**
+ * @param upcomingAirEpochMs where a seed's next episode date comes from when the seed itself does
+ *   not carry one — for Trakt, the calendar (see [nextAiringAfterSeed]).
+ */
 internal fun filterHomeNextUpCandidatesForTraktContinueWatchingWindow(
     candidates: List<CompletedSeriesCandidate>,
     isTraktProgressActive: Boolean,
     daysCap: Int,
     nowEpochMs: Long,
+    upcomingAirEpochMs: (CompletedSeriesCandidate) -> Long? = { null },
 ): List<CompletedSeriesCandidate> {
     if (!isTraktProgressActive) return candidates
     val normalizedDaysCap = normalizeTraktContinueWatchingDaysCap(daysCap)
     if (normalizedDaysCap == TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL) return candidates
 
     val cutoffMs = nowEpochMs - (normalizedDaysCap.toLong() * MILLIS_PER_DAY)
-    return candidates.filter { candidate -> candidate.markedAtEpochMs >= cutoffMs }
+    return filterHomeNextUpCandidatesForContinueWatchingWindow(
+        candidates = candidates,
+        cutoffMs = cutoffMs,
+        nowEpochMs = nowEpochMs,
+        upcomingAirEpochMs = upcomingAirEpochMs,
+    )
+}
+
+/**
+ * The seed-level Continue Watching window, shared by both providers: a seed stays when it was
+ * watched inside the window or when its next episode airs inside it — its own date first, then
+ * whatever [upcomingAirEpochMs] can find.
+ */
+internal fun filterHomeNextUpCandidatesForContinueWatchingWindow(
+    candidates: List<CompletedSeriesCandidate>,
+    cutoffMs: Long,
+    nowEpochMs: Long,
+    upcomingAirEpochMs: (CompletedSeriesCandidate) -> Long? = { null },
+): List<CompletedSeriesCandidate> {
+    if (cutoffMs <= 0L) return candidates
+    return candidates.filter { candidate ->
+        isWithinContinueWatchingWindow(
+            lastUpdatedEpochMs = candidate.markedAtEpochMs,
+            nextEpisodeAirEpochMs = candidate.nextEpisodeAirEpochMs ?: upcomingAirEpochMs(candidate),
+            cutoffMs = cutoffMs,
+            nowEpochMs = nowEpochMs,
+        )
+    }
 }
 
 /**
@@ -4378,6 +4590,13 @@ internal fun buildHomeNextUpSeedCandidates(
             !isMalformedNextUpSeedContentId(item.id)
     }
 
+    // A provider reports one next-episode date per show, on the seed row itself; the domain
+    // aggregation below does not carry it, so it is re-attached by series here.
+    val nextAirBySeries = progressSeeds
+        .filter { entry -> entry.nextEpisodeAirEpochMs != null }
+        .groupBy { entry -> entry.parentMetaId }
+        .mapValues { (_, entries) -> entries.maxOf { entry -> entry.nextEpisodeAirEpochMs ?: 0L } }
+
     return WatchingState.latestCompletedBySeries(
         progressEntries = progressSeeds,
         watchedItems = watchedSeeds,
@@ -4391,6 +4610,7 @@ internal fun buildHomeNextUpSeedCandidates(
             seasonNumber = completed.seasonNumber,
             episodeNumber = completed.episodeNumber,
             markedAtEpochMs = completed.markedAtEpochMs,
+            nextEpisodeAirEpochMs = nextAirBySeries[content.id],
         )
     }.sortedWith(
         compareByDescending<CompletedSeriesCandidate> { candidate -> candidate.markedAtEpochMs }
@@ -4469,7 +4689,15 @@ private suspend fun resolveHomeNextUpCandidate(
         logNextUpResolutionRejected(completedEntry, "no-primary-action (series finished, or unaired and showUnairedNextUp=off)")
         return null
     }
-    if (action.resumePositionMs != null) {
+    if (action.resumePositionMs != null &&
+        resumeActionRendersAsInProgress(
+            contentId = contentId,
+            actionVideoId = action.videoId,
+            actionSeasonNumber = action.seasonNumber,
+            actionEpisodeNumber = action.episodeNumber,
+            entries = resolvedProgressEntries,
+        )
+    ) {
         logNextUpResolutionRejected(completedEntry, "resumable-episode (renders as in-progress, not Up Next)")
         return null
     }
@@ -4511,6 +4739,40 @@ private suspend fun resolveHomeNextUpCandidate(
         completedEntry.markedAtEpochMs
     }
     return contentId to (sortTimestamp to item)
+}
+
+/**
+ * Whether the resumable episode this action points at will really appear as an in-progress card.
+ *
+ * Standing down for it otherwise drops the series out of Continue Watching altogether, because the
+ * two sides apply different rules. `resumeProgressForSeries` accepts any record that is not
+ * completed; [shouldTreatAsInProgressForContinueWatching] additionally demands that playback has
+ * actually *started* — a position past zero, or a percentage above it.
+ *
+ * A remote source reports a percentage and never a position, so an episode the user has only just
+ * been offered arrives at 0% and position 0. That is resumable to the first rule and not started to
+ * the second, so the Up Next card stood down for an in-progress card that was never rendered and
+ * the title vanished from Continue Watching entirely — while still being marked watched, and while
+ * every seed and history row for it was present and correct. Found on a SIMKL anime whose next
+ * episode had been queued on another device.
+ *
+ * Matching by video id first: [WatchingProgressRecord.toResumeAction] carries the record's own id
+ * through unchanged. Season and episode are the fallback for sources that spell the id differently.
+ */
+internal fun resumeActionRendersAsInProgress(
+    contentId: String,
+    actionVideoId: String?,
+    actionSeasonNumber: Int?,
+    actionEpisodeNumber: Int?,
+    entries: List<WatchProgressEntry>,
+): Boolean = entries.any { entry ->
+    if (entry.parentMetaId != contentId) return@any false
+    val matchesAction = entry.videoId == actionVideoId ||
+        (
+            actionSeasonNumber != null && actionEpisodeNumber != null &&
+                entry.seasonNumber == actionSeasonNumber && entry.episodeNumber == actionEpisodeNumber
+            )
+    matchesAction && entry.shouldTreatAsInProgressForContinueWatching()
 }
 
 private fun logNextUpResolutionRejected(
@@ -4695,6 +4957,8 @@ internal data class CompletedSeriesCandidate(
     val seasonNumber: Int,
     val episodeNumber: Int,
     val markedAtEpochMs: Long,
+    /** When the provider says the next unwatched episode airs; only SIMKL seeds carry it today. */
+    val nextEpisodeAirEpochMs: Long? = null,
 )
 
 /**
@@ -4723,61 +4987,21 @@ internal fun shouldForceNextUpArtworkMetaRefresh(
 /**
  * A non-empty thumbnail is not necessarily an episode still. Some metadata providers fill an
  * unavailable episode thumbnail with the show's backdrop (occasionally at a different TMDB image
- * size). Persisting that value made the old planner declare the card complete forever.
- */
-internal fun ContinueWatchingItem.needsEpisodeThumbnailRefresh(): Boolean {
-    val thumbnail = episodeThumbnail?.trim()?.takeIf(String::isNotBlank) ?: return true
-    val thumbnailIdentity = thumbnail.artworkResourceIdentity() ?: return true
-    val copiesSeriesArtwork = sequenceOf(background, poster)
-        .mapNotNull { seriesArtwork -> seriesArtwork.artworkResourceIdentity() }
-        .any { seriesArtworkIdentity -> seriesArtworkIdentity == thumbnailIdentity }
-    if (copiesSeriesArtwork) return true
-
-    val genericArtworkRule = seriesLevelArtworkRule(thumbnail) ?: return false
-    ContinueWatchingArtworkDiagnostics.logGenericArtworkDetected(
-        contentId = parentMetaId,
-        episodeThumbnail = thumbnail,
-        matchedRule = genericArtworkRule,
-    )
-    return true
-}
-
-/**
- * Comparing the thumbnail against the card's own poster and backdrop only catches a provider that
- * copies *Nuvio's* series artwork into the still field. AIOMetadata does something the comparison
- * cannot see: it serves a TVDB series background as `episodeThumbnail` while Nuvio's backdrop came
- * from TMDB. The two URLs are unrelated, so the card was declared complete and never retried, and
- * the show backdrop stuck for the life of the seed.
+ * size), and a well-formed URL can simply fail to load. Persisting either made the old planner
+ * declare the card complete forever.
  *
- * These providers name the artwork *kind* in the path, so the URL itself says it is show-level.
- * Only show- and season-level directories are listed — TVDB episode stills live under `/episodes/`
- * and `/episode/`, which deliberately do not match, and TMDB paths (`/t/p/<size>/`) carry no kind
- * at all and so never match either.
+ * The rule itself lives in `watchprogress` because the in-progress half of Continue Watching has
+ * to apply the same one — see [needsEpisodeStillRefresh].
  */
-private fun seriesLevelArtworkRule(url: String): String? = SeriesLevelArtworkRules
-    .firstOrNull { (_, pattern) -> pattern.containsMatchIn(url) }
-    ?.first
-
-private val SeriesLevelArtworkRules: List<Pair<String, Regex>> = listOf(
-    "thetvdb series artwork" to Regex(
-        "/series/[^/]+/(?:backgrounds|posters|banners|icons|clearlogo|clearart|fanart)/",
-        RegexOption.IGNORE_CASE,
-    ),
-    "fanart.tv show artwork" to Regex(
-        "/(?:showbackground|tvposter|tvbanner|tvthumb|hdtvlogo|clearlogo|clearart|hdclearart" +
-            "|characterart|seasonposter|seasonthumb)/",
-        RegexOption.IGNORE_CASE,
-    ),
+internal fun ContinueWatchingItem.needsEpisodeThumbnailRefresh(
+    hasArtworkLoadFailed: (String) -> Boolean = ContinueWatchingArtworkFailures::hasFailed,
+): Boolean = needsEpisodeStillRefresh(
+    episodeThumbnail = episodeThumbnail,
+    poster = poster,
+    background = background,
+    contentId = parentMetaId,
+    hasArtworkLoadFailed = hasArtworkLoadFailed,
 )
-
-private fun String?.artworkResourceIdentity(): String? = this
-    ?.trim()
-    ?.takeIf(String::isNotBlank)
-    ?.substringBefore('#')
-    ?.substringBefore('?')
-    // TMDB serves the same file below size-specific paths such as /w500/ and /original/.
-    ?.replace(Regex("/t/p/(?:original|w\\d+)/", RegexOption.IGNORE_CASE), "/t/p/")
-    ?.lowercase()
 
 /**
  * A seed match alone does not mean a cached card is finished: an episode that had no still when it
@@ -4812,6 +5036,7 @@ internal fun planNextUpResolution(
     completedSeriesCandidates: List<CompletedSeriesCandidate>,
     cachedNextUpItems: Map<String, Pair<Long, ContinueWatchingItem>>,
     todayIsoDate: String = CurrentDateProvider.todayIsoDate(),
+    hasArtworkLoadFailed: (String) -> Boolean = ContinueWatchingArtworkFailures::hasFailed,
 ): NextUpResolutionPlan {
     val cachedBySeries = completedSeriesCandidates.mapNotNull { candidate ->
         val cached = cachedNextUpItems[candidate.content.id] ?: return@mapNotNull null
@@ -4825,7 +5050,7 @@ internal fun planNextUpResolution(
         candidate.content.id to cached
     }.toMap()
     val staleArtworkContentIds = cachedBySeries
-        .filterValues { (_, item) -> item.needsEpisodeThumbnailRefresh() }
+        .filterValues { (_, item) -> item.needsEpisodeThumbnailRefresh(hasArtworkLoadFailed) }
         .keys
     val staleReleasePrecisionContentIds = cachedBySeries
         .filterValues { (_, item) -> item.needsReleasePrecisionRefresh(todayIsoDate) }
@@ -5242,6 +5467,21 @@ private suspend fun remapTraktWatchedItems(
 }
 
 // Cinemeta's meta endpoint returns /background/medium/ (1280px); /background/large/ is full HD.
+/**
+ * The backdrop URL this item will end up with, applied before it is first drawn.
+ *
+ * Enrichment normalises the banner on its way through [bestBackdrop]; anything that renders the raw
+ * item before enrichment finishes has to agree with it, or the hero loads one URL and then another
+ * for the same artwork.
+ */
+private fun MetaPreview.withNormalizedHeroBackdrop(): MetaPreview {
+    val normalized = upgradeMetahubBackdrop(banner)
+    return if (normalized == banner) this else copy(banner = normalized)
+}
+
+/** Exposed so the normalisation the hero depends on is pinned by a test. */
+internal fun heroBackdropUrlForTest(url: String?): String? = upgradeMetahubBackdrop(url)
+
 private fun upgradeMetahubBackdrop(url: String?): String? =
     url?.replace("/background/medium/", "/background/large/")
 
@@ -5413,3 +5653,4 @@ private fun isSearchActivationInsertion(previous: String, next: String): Boolean
             next.removeRange(index, index + 1) == previous
     }
 }
+

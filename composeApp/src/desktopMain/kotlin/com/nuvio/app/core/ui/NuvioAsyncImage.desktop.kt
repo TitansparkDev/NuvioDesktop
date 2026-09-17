@@ -16,13 +16,18 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import com.nuvio.app.desktopDisplayMetrics
 import coil3.BitmapImage
 import coil3.Image
 import coil3.PlatformContext
 import coil3.compose.AsyncImage
 import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
+import coil3.decode.BlackholeDecoder
+import coil3.decode.DataSource
+import coil3.request.CachePolicy
+import coil3.size.Precision
+import coil3.size.Size as CoilSize
+import coil3.size.SizeResolver
 import coil3.request.ImageRequest
 import coil3.request.NullRequestDataException
 import org.jetbrains.skia.Bitmap
@@ -37,18 +42,20 @@ import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-private const val MinCustomDownscaleRatio = 1.08f
-private const val MaxDesktopSourceSizePx = 1536
+/** Plain holder, not snapshot state: writing it must not invalidate the composition reading it. */
+private class ArtworkSizeBaseline {
+    var size: CoilSize? = null
+}
+
+// Below this ratio the draw path just blits, above it [ScaledBitmapPainter] resamples on the draw
+// thread. Now that requests are sized from the destination, artwork arrives at ~1.04-1.07x the draw
+// size (the focus headroom in [desktopArtworkDimension]), so this threshold deliberately sits above
+// that band and the painter no longer runs for normal artwork — the reduction happens in
+// [HighQualityBitmapDecoder] instead. What still reaches it: sources a fetcher sized itself, and
+// slots small enough that the 8 px quantum is a large fraction of the card.
+private const val MinCustomDownscaleRatio = 1.20f
 private const val MaxScaledBitmapPixels = 1_250_000L
 
-// See [rememberHeroSourceSize]. The headroom covers HERO_SCROLL_MAX_SCALE (1.3x) without paying for
-// all of it; the quantum keeps a window drag from re-requesting on every frame; the ceiling means a
-// 4K source is still capped on a 4K display, where it is already 1:1.
-private const val HeroScrollScaleHeadroom = 1.15f
-private const val HeroSourceSizeQuantumPx = 128
-private const val MinHeroSourceSizePx = 640
-// 4K plus its headroom: the ceiling must never land below what a 4K display draws 1:1.
-private const val MaxHeroSourceSizePx = 4480
 
 // How far the requested draw size may drift from the cached bitmap before it is worth paying for a
 // fresh resample. A card that has settled asks for the same size every frame and hits the cache
@@ -98,43 +105,87 @@ internal actual fun NuvioAsyncImage(
     val effectiveDesktopImageScaling = remember(desktopImageScaling) {
         if (IsWindowsDesktop) desktopImageScaling else NuvioDesktopImageScaling.Disabled
     }
-    val heroSourceSize = rememberHeroSourceSize()
-    val requestModel = remember(context, model, effectiveDesktopImageScaling, heroSourceSize) {
+    val artworkSizeResolver = remember { DesktopArtworkSizeResolver() }
+    // The resolver answers the request from layout directly, so the first bucket needs no new
+    // request - keying the model on it would cancel the load layout has just enabled and start the
+    // identical one again (measured: two starts, one cancel, per card). Only a *later* bucket
+    // change - a window resize or a monitor DPI change - is worth a fresh request, so the first
+    // answer is absorbed as the baseline and only drift from it re-keys the model below.
+    val artworkSizeBaseline = remember(artworkSizeResolver) { ArtworkSizeBaseline() }
+    val artworkSize = artworkSizeResolver.requestSize
+    if (artworkSizeBaseline.size == null) artworkSizeBaseline.size = artworkSize
+    val artworkSizeKey = artworkSize?.takeIf { it != artworkSizeBaseline.size }
+    val requestModel = remember(context, model, effectiveDesktopImageScaling, artworkSizeKey) {
         when {
             effectiveDesktopImageScaling != NuvioDesktopImageScaling.Disabled ->
-                model.withDesktopSize(context, MaxDesktopSourceSizePx, MaxDesktopSourceSizePx)
+                model.withDesktopArtworkSize(
+                    context,
+                    artworkSizeKey?.let { SizeResolver(it) } ?: artworkSizeResolver,
+                )
             // Scaling "disabled" only ever meant "do not run the custom painter on this". It also
             // silently meant "send no size", which left the hero decoding backdrops at whatever the
-            // source happened to be - see [rememberHeroSourceSize].
-            heroSourceSize != null ->
-                model.withDesktopSize(context, heroSourceSize.width, heroSourceSize.height)
-            else -> model
+            // source happened to be. It now takes its size from LAYOUT like every other surface -
+            // see [rememberHeroSourceSize] for why that used to come from the monitor instead.
+            else ->
+                model.withDesktopArtworkSize(
+                    context,
+                    artworkSizeKey?.let { SizeResolver(it) } ?: artworkSizeResolver,
+                    // The hero draws no custom painter, so nothing downstream needs a per-size cache
+                    // key; and the backdrop is one image on screen at a time, not a grid of cards.
+                    tagForCacheKey = false,
+                )
         }
     }
+    // The last painter this surface successfully drew, kept so a reload does not blank it.
+    //
+    // Keyed on [model], NOT on the request: the request also carries the resolved artwork size, so
+    // a size-bucket change re-keys it and restarts the load. Measured from a screen recording of TV
+    // Mode, that blanked already-loaded cards to their grey `surface` colour for ~250 ms at a time —
+    // brightness 144 to 30 and back, with the card showing the identical picture either side. An
+    // animated card hits this on every recomposition, because animated images are deliberately
+    // excluded from Coil's memory cache.
+    //
+    // Keying on [model] is what makes it safe in a recycling row: a card reused for a different
+    // folder gets a different model, so the holder resets and cannot show the previous item's
+    // artwork. Only a reload of *the same picture* keeps drawing it.
+    val retained = remember(model) { RetainedArtwork() }
     val transform: (AsyncImagePainter.State) -> AsyncImagePainter.State = remember(
         placeholder,
         error,
         fallback,
         effectiveDesktopImageScaling,
+        retained,
     ) {
         { state ->
             when (state) {
                 is AsyncImagePainter.State.Loading -> {
-                    placeholder?.let { state.copy(painter = it) } ?: state
+                    retained.painter?.let { state.copy(painter = it) }
+                        ?: placeholder?.let { state.copy(painter = it) }
+                        ?: state
                 }
                 is AsyncImagePainter.State.Success -> {
                     val image = state.result.image
+                    DesktopArtworkTelemetry.recordLoad(
+                        sourceUrl = state.result.memoryCacheKey?.key ?: state.result.diskCacheKey,
+                        fromMemoryCache = state.result.dataSource == DataSource.MEMORY_CACHE,
+                        widthPx = image.width,
+                        heightPx = image.height,
+                        dataSource = state.result.dataSource.name,
+                    )
                     if (image is SkiaAnimatedImage) {
-                        state.copy(painter = SkiaAnimatedPainter(image))
+                        state.copy(painter = SkiaAnimatedPainter(image)).also {
+                            retained.painter = it.painter
+                        }
                     } else {
                         image.toScaledBitmapPainter(
                             desktopImageScaling = effectiveDesktopImageScaling,
                             // Identity of the *source*, so a card scrolled away and back reuses the
                             // reduction the previous painter already paid for.
-                            sourceKey = state.result.memoryCacheKey?.key ?: state.result.diskCacheKey,
+                            sourceKey = state.result.memoryCacheKey?.toString() ?: state.result.diskCacheKey,
                         )
                             ?.let { state.copy(painter = it) }
-                            ?: state
+                            ?.also { retained.painter = it.painter }
+                            ?: state.also { retained.painter = it.painter }
                     }
                 }
                 is AsyncImagePainter.State.Error -> {
@@ -167,7 +218,8 @@ internal actual fun NuvioAsyncImage(
     AsyncImage(
         model = requestModel,
         contentDescription = contentDescription,
-        modifier = modifier,
+        // Attached for every path now: the hero sizes from layout as well.
+        modifier = modifier.then(artworkSizeResolver),
         transform = transform,
         onState = onState,
         alignment = alignment,
@@ -179,79 +231,36 @@ internal actual fun NuvioAsyncImage(
     )
 }
 
-internal actual fun ImageRequest.Builder.nuvioArtworkRequestSize(): ImageRequest.Builder =
-    size(MaxDesktopSourceSizePx)
-
-private fun Any?.withDesktopSize(context: PlatformContext, width: Int, height: Int): Any? {
-    if (this == null) return null
-
-    return if (this is ImageRequest) {
-        newBuilder()
-            .size(width, height)
-            .build()
+internal actual fun ImageRequest.Builder.nuvioArtworkRequestSize(
+    widthPx: Int?,
+    heightPx: Int?,
+): ImageRequest.Builder = apply {
+    if (widthPx != null && heightPx != null) {
+        size(desktopArtworkDimension(widthPx), desktopArtworkDimension(heightPx))
+        precision(Precision.INEXACT)
+        desktopArtworkCacheSize()
     } else {
-        ImageRequest.Builder(context)
-            .data(this)
-            .size(width, height)
-            .build()
+        // No layout yet: warm compressed disk data without decoding an oversized placeholder.
+        size(1)
+        memoryCachePolicy(CachePolicy.DISABLED)
+        decoderFactory(BlackholeDecoder.Factory())
     }
 }
 
-/**
- * The resolution a hero backdrop is worth decoding at, from the display it will be drawn on.
- *
- * Every hero path passes [NuvioDesktopImageScaling.Disabled], which was meant to say "do not run the
- * custom resampling painter on this". It also had the side effect of sending no size at all, and
- * `AsyncImagePainter` answers a request with no size resolver by applying `SizeResolver.ORIGINAL` -
- * so backdrops were decoded and cached at full source resolution. Measured over one live disk cache:
- * 13.1% of images exceed 1536 px and average 15.8 MB decoded, and 284 of them were 3840x2160 at
- * 31.6 MB each. Ten of those is an entire 327 MB memory cache.
- *
- * **Physical pixels, from [desktopDisplayMetrics], not `LocalWindowInfo.containerSize`.** That
- * distinction is the whole correctness argument here. On a 4K display at 200% scaling, AWT and the
- * window state both report 1920x1080 - a request sized from those would have the hero decoded at
- * 2304 px and then drawn across 3840 physical pixels, which is a 1.67x upsample and a visibly soft
- * backdrop. [DesktopDisplayMetrics.sizePx] is explicitly `bounds * transform.scaleX`, so it is the
- * real framebuffer size, and it is snapshot-backed and re-evaluated when the window changes monitor.
- *
- * Capping at the *display* rather than the window is deliberately conservative: a small window on a
- * large display then saves nothing, but no configuration can ever end up asking for less than it
- * draws. Softness on the largest image in the app is a much worse outcome than a missed saving.
- *
- * Both axes are sent because `ContentScale.Crop` resolves to `Scale.FILL`, which takes the *larger*
- * of the two ratios - a square size lets the short axis decide and reduces nothing at all.
- *
- * [HeroScrollScaleHeadroom] covers the parallax zoom, which reaches `HERO_SCROLL_MAX_SCALE` (1.3x)
- * as the hero scrolls away. Deliberately less than the full 1.3: at rest, where the image is
- * actually looked at, this is at or above 1:1, and the remaining ~13% upsample only ever applies at
- * the extreme of a transient zoom on an element moving off screen.
- *
- * Quantised so that dragging a window across monitors does not re-request per intermediate DPI.
- *
- * On a display whose own resolution matches the source there is nothing to remove and this correctly
- * becomes a no-op: a 3840x2160 backdrop on a 3840x2160 display is already 1:1. The saving is real on
- * 1080p and 1440p displays, where a 4K backdrop is being decoded at two to four times the pixels
- * that can ever be shown.
- */
-@Composable
-private fun rememberHeroSourceSize(): IntSize? {
-    val displaySizePx = desktopDisplayMetrics()?.sizePx
-    return remember(displaySizePx) {
-        if (displaySizePx == null || displaySizePx.width <= 0 || displaySizePx.height <= 0) {
-            return@remember null
-        }
-        IntSize(
-            width = quantizeHeroSourceAxis(displaySizePx.width),
-            height = quantizeHeroSourceAxis(displaySizePx.height),
-        )
-    }
+private fun Any?.withDesktopArtworkSize(
+    context: PlatformContext,
+    resolver: SizeResolver,
+    tagForCacheKey: Boolean = true,
+): Any? {
+    if (this == null) return null
+    return (if (this is ImageRequest) newBuilder() else ImageRequest.Builder(context).data(this))
+        .size(resolver)
+        .precision(Precision.INEXACT)
+        .apply { if (tagForCacheKey) desktopArtworkCacheSize() }
+        .build()
 }
 
-internal fun quantizeHeroSourceAxis(pixels: Int): Int {
-    val withHeadroom = pixels * HeroScrollScaleHeadroom
-    val quantised = ceil(withHeadroom / HeroSourceSizeQuantumPx) * HeroSourceSizeQuantumPx
-    return quantised.toInt().coerceIn(MinHeroSourceSizePx, MaxHeroSourceSizePx)
-}
+
 
 @Composable
 internal actual fun rememberNuvioDownscaledPainter(bitmap: ImageBitmap): Painter =
@@ -272,6 +281,10 @@ private fun Image.toScaledBitmapPainter(
 /**
  * Reductions already performed, shared across painters and keyed by source identity plus target size.
  *
+ * **Mostly idle now.** This existed to make [ScaledBitmapPainter] cheap to re-enter, and that painter
+ * is bypassed for artwork sized from its destination — see [MinCustomDownscaleRatio]. It is kept for
+ * the surfaces that still reach the painter, and the numbers below describe that original workload.
+ *
  * [ScaledBitmapPainter] caches its result in the painter instance, which is exactly as long-lived as
  * the card that owns it. A lazy row disposes a card the moment it leaves the viewport and builds a
  * fresh one when it comes back, so scrolling away and back threw the reduction away and paid for it
@@ -290,6 +303,13 @@ internal object ScaledBitmapCache {
 
     private val map = object : LinkedHashMap<String, ImageBitmap>(16, 0.75f, true) {}
     private var currentBytes = 0L
+    private var maxBytes = MaxBytes
+
+    @Synchronized
+    fun setBackgroundMode(restricted: Boolean) {
+        maxBytes = if (restricted) PlaybackScaledCacheBytes else MaxBytes
+        evictToBudget()
+    }
 
     fun key(sourceKey: String, size: IntSize): String = "$sourceKey|${size.width}x${size.height}"
 
@@ -301,9 +321,13 @@ internal object ScaledBitmapCache {
         val bytes = bitmap.width.toLong() * bitmap.height.toLong() * 4
         map.put(key, bitmap)?.let { currentBytes -= it.width.toLong() * it.height.toLong() * 4 }
         currentBytes += bytes
+        evictToBudget()
+    }
+
+    private fun evictToBudget() {
         // accessOrder = true, so iteration starts at the least recently used.
         val iterator = map.entries.iterator()
-        while (currentBytes > MaxBytes && map.size > 1 && iterator.hasNext()) {
+        while (currentBytes > maxBytes && iterator.hasNext()) {
             val eldest = iterator.next()
             iterator.remove()
             currentBytes -= eldest.value.width.toLong() * eldest.value.height.toLong() * 4
@@ -338,6 +362,16 @@ private class ScaledBitmapPainter(
         val drawSize = IntSize(
             width = size.width.roundToInt().coerceAtLeast(1),
             height = size.height.roundToInt().coerceAtLeast(1),
+        )
+        // Sampled here rather than inside the branch below: the interesting number is how far the
+        // decoded bitmap is from the draw size across *all* artwork, and the common case now is
+        // precisely the one that skips the resample.
+        DesktopArtworkTelemetry.recordDraw(
+            sourceKey = sourceKey,
+            suppliedWidth = image.width,
+            suppliedHeight = image.height,
+            drawWidth = drawSize.width,
+            drawHeight = drawSize.height,
         )
         if (!shouldUseScaledBitmap(drawSize)) {
             drawSource(drawSize)
@@ -442,8 +476,9 @@ private class ScaledBitmapPainter(
      * Box-halves the source until the remaining reduction is under 2x, then does one cubic pass.
      *
      * Doing the whole reduction in a single cubic pass is what made large minifications alias: the
-     * kernel's footprint does not grow with the ratio, so reducing a 1536px poster straight to a
-     * 210px card sampled a small fraction of the source. Each halving step is an exact box average
+     * kernel's footprint does not grow with the ratio, so reducing a poster straight from a 1536px
+     * request down to a 210px card — what this path used to be handed — sampled a small fraction of
+     * the source. Each halving step is an exact box average
      * and throws nothing away, so the cubic only ever sees a well-conditioned final step.
      */
     private fun ImageBitmap.downscaleTo(target: IntSize): ImageBitmap {
@@ -486,4 +521,15 @@ private class ScaledBitmapPainter(
             image.close()
         }
     }
+}
+
+/**
+ * Holds the painter a surface last drew successfully, so a reload of the same picture is invisible.
+ *
+ * A plain holder rather than snapshot state on purpose: it is written from inside the state
+ * transform, and a snapshot write there would invalidate the composition that is already being
+ * updated by the load itself.
+ */
+private class RetainedArtwork {
+    var painter: Painter? = null
 }

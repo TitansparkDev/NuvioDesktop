@@ -126,6 +126,9 @@ fun <T> NuvioShelfSection(
     // underneath; the overlay draws on top.
     bodyAlpha: Float = 1f,
     bodyOverlay: (@Composable BoxScope.() -> Unit)? = null,
+    // Applied to the body (posters + overlay) but not the header, so a caller can move the row's
+    // cards without moving its title (TV Mode's row-change nudge).
+    bodyModifier: Modifier = Modifier,
     focusedItemIndex: Int? = null,
     onHoverItem: ((Int) -> Unit)? = null,
     onLoadMore: (() -> Unit)? = null,
@@ -233,7 +236,7 @@ fun <T> NuvioShelfSection(
                 titleContent = titleContent,
             )
         }
-        Box(modifier = Modifier.fillMaxWidth()) {
+        Box(modifier = bodyModifier.fillMaxWidth()) {
         LazyRow(
             state = rowState,
             modifier = Modifier

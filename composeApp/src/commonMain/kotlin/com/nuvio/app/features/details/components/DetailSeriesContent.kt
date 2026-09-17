@@ -27,7 +27,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -59,6 +58,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -1023,6 +1023,9 @@ private fun EpisodeHorizontalRow(
         state = listState,
         modifier = Modifier
             .fillMaxWidth()
+            // Room on the start edge for the focus scale-up, taken out of the surrounding margin
+            // rather than out of the card's position - see startEdgeBleed.
+            .startEdgeBleed(rowMetrics.rowHorizontalPadding)
             .desktopHorizontalListNavigation(
                 listState,
                 scrollStepPx = itemExtentPx,
@@ -1030,7 +1033,7 @@ private fun EpisodeHorizontalRow(
                 handlePageAndEdgeKeys = true,
             ),
         contentPadding = PaddingValues(
-            start = 0.dp,
+            start = rowMetrics.rowHorizontalPadding,
             top = rowMetrics.rowVerticalPadding,
             end = rowMetrics.rowHorizontalPadding,
             bottom = rowMetrics.rowVerticalPadding,
@@ -1074,6 +1077,28 @@ private fun EpisodeHorizontalRow(
                 )
             }
         }
+    }
+}
+
+/**
+ * Widens the row by [bleed] on its start edge and places it that far to the left, while still
+ * reporting its original width to the parent.
+ *
+ * A LazyRow clips to its own bounds, so the leftmost card's focus scale-up was sliced off at the
+ * row's start edge. This moves the clip boundary [bleed] into the surrounding page margin, giving
+ * the scale somewhere to grow into; a matching start contentPadding keeps the first card at the
+ * same x it sat at before.
+ */
+private fun Modifier.startEdgeBleed(bleed: Dp): Modifier = layout { measurable, constraints ->
+    val extra = bleed.roundToPx()
+    val placeable = measurable.measure(
+        constraints.copy(
+            minWidth = constraints.minWidth + extra,
+            maxWidth = if (constraints.hasBoundedWidth) constraints.maxWidth + extra else constraints.maxWidth,
+        ),
+    )
+    layout(placeable.width - extra, placeable.height) {
+        placeable.place(-extra, 0)
     }
 }
 
@@ -1940,7 +1965,6 @@ private fun ImdbEpisodeRatingBadge(
         ) {
             Text(
                 text = rating,
-                modifier = Modifier.offset(y = (-1).dp),
                 style = MaterialTheme.typography.labelSmall.copy(
                     fontSize = textSize,
                     fontWeight = FontWeight.SemiBold,

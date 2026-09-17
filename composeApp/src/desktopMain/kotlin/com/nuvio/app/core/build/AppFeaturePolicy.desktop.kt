@@ -9,4 +9,5 @@ actual object AppFeaturePolicy {
     actual val heroTrailerPlaybackSupported: Boolean = true
     actual val inAppUpdaterEnabled: Boolean = true
     actual val imdbRatingLogoEnabled: Boolean = true
+    actual val customServerConnectionsEnabled: Boolean = true
 }

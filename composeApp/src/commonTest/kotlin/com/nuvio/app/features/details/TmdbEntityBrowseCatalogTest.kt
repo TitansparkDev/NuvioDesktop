@@ -48,7 +48,8 @@ class TmdbEntityBrowseCatalogTest {
         )
 
         val section = buildEntityCatalogSections(
-            data = data,
+            rails = data.rails,
+            name = data.header.name,
             labels = EntityCatalogLabels(
                 movies = "Movies",
                 series = "Series",
@@ -69,6 +70,33 @@ class TmdbEntityBrowseCatalogTest {
         assertTrue(section.isLoadingMore)
         assertEquals(3, section.nextSkip)
         assertTrue(section.usesInfiniteHomeRow(catalogSeeMoreEnabled = true))
+    }
+
+    @Test
+    fun `badge rails label winners and drop the rail word for featured lists`() {
+        val preview = MetaPreview(id = "tmdb:1054867", type = "movie", name = "One Battle After Another", poster = "p")
+        val labels = EntityCatalogLabels(
+            movies = "Movies",
+            series = "Series",
+            popular = "Popular",
+            topRated = "Top rated",
+            recent = "Recent",
+            winners = "Winners",
+            nominees = "Nominees",
+        )
+        val rails = listOf(
+            TmdbEntityRail(mediaType = TmdbEntityMediaType.MOVIE, railType = TmdbEntityRailType.WINNERS, items = listOf(preview)),
+            TmdbEntityRail(mediaType = TmdbEntityMediaType.TV, railType = TmdbEntityRailType.FEATURED, items = listOf(preview)),
+        )
+
+        val sections = buildEntityCatalogSections(rails = rails, name = "Best Picture", labels = labels)
+
+        assertEquals("tmdb-entity:movie:winners", sections[0].key)
+        assertEquals("Movies • Winners • Best Picture", sections[0].title)
+        assertEquals("tmdb-entity:tv:featured", sections[1].key)
+        assertEquals("Series • Best Picture", sections[1].title)
+        assertFalse(sections[0].hasMore)
+        assertNull(sections[0].nextSkip)
     }
 
     @Test

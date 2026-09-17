@@ -1,0 +1,380 @@
+package com.nuvio.app.features.input
+
+import co.touchlab.kermit.Logger
+import com.nuvio.app.core.ui.TextInputFocusTracker
+import com.nuvio.app.features.player.desktop.DesktopHostOs
+import com.nuvio.app.features.player.desktop.NativePlayerBridge
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.Condition
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+import kotlin.math.abs
+
+/**
+ * Whether the native player currently owns the screen. The player installs its own global
+ * KeyEventDispatcher only while it is mounted, so routing already works either way — but a pad
+ * wants A to mean "select" in a grid and "play/pause" during playback, and that is a difference of
+ * intent the key path cannot infer. Set from the dispatcher lifecycle in PlayerEngine.desktop.
+ */
+internal object GamepadContext {
+    @Volatile
+    var playerActive: Boolean = false
+
+    /**
+     * Whether a shader chain is currently running on the picture. Published by the player's
+     * playback-info pass, which is the only thing that knows — the settings alone do not say, since
+     * an anime preset does nothing to live action. Decides what the right stick's down direction
+     * cycles, because shaders and HDR both apply at once.
+     */
+    @Volatile
+    var animeShaderActive: Boolean = false
+}
+
+/** A stick pushed past its dead zone, before it is attributed to the left or right stick. */
+internal enum class StickDirection { Up, Down, Left, Right }
+
+/**
+ * Reads XInput on a background thread and replays what it finds as keystrokes.
+ *
+ * Windows-only, and off unless the user turns it on. Start/stop is driven from the window
+ * lifecycle in Main; the thread itself parks on a monitor while disabled, so a disabled pad — or a
+ * machine with no pad at all — costs nothing beyond one idle thread.
+ */
+object GamepadInput {
+    private val log = Logger.withTag("Gamepad")
+
+    // XInput wButtons bits (Xinput.h). Mirrored rather than imported so the poll loop stays pure
+    // Kotlin — the native side hands back the raw word untouched.
+    private const val BIT_DPAD_UP = 0x0001
+    private const val BIT_DPAD_DOWN = 0x0002
+    private const val BIT_DPAD_LEFT = 0x0004
+    private const val BIT_DPAD_RIGHT = 0x0008
+    private const val BIT_START = 0x0010
+    private const val BIT_BACK = 0x0020
+    private const val BIT_LEFT_THUMB = 0x0040
+    private const val BIT_RIGHT_THUMB = 0x0080
+    private const val BIT_LEFT_SHOULDER = 0x0100
+    private const val BIT_RIGHT_SHOULDER = 0x0200
+    private const val BIT_A = 0x1000
+    private const val BIT_B = 0x2000
+    private const val BIT_X = 0x4000
+    private const val BIT_Y = 0x8000
+
+    // Slots 0-3 are XInput pads; slots 4-7 are DualSense pads the native side reads over raw HID and
+    // hands back in the same XInput-shaped layout. Nothing here needs to know which kind a slot is.
+    private const val SLOT_COUNT = 8
+    private const val SLOT_STRIDE = 8
+    private const val ALL_SLOTS = 0xFF
+
+    private const val POLL_INTERVAL_MS = 16L
+
+    /**
+     * Querying an empty XInput slot is the slow case, and re-enumerating HID devices is slower
+     * still, so disconnected slots are rechecked on this cadence rather than every tick.
+     */
+    private const val RESCAN_INTERVAL_MS = 2_000L
+
+    /** Tick length while no pad is connected: there is nothing to miss until one appears. */
+    private const val IDLE_POLL_INTERVAL_MS = 250L
+
+    /** Trigger travel (of 255) treated as a press. Well above XInput's own 30-unit noise floor. */
+    private const val TRIGGER_PRESS_THRESHOLD = 60
+
+    private const val THUMB_RANGE = 32_767f
+
+    /**
+     * Floor for the right stick, independent of the user's navigation dead zone. Its directions fire
+     * one-shot actions — a speed step, a shader cycle — so a light brush past a 30% threshold while
+     * reaching for a face button would be a visible mistake rather than a harmless cursor nudge.
+     */
+    private const val RIGHT_STICK_MIN_DEAD_ZONE = 0.55f
+
+    private val buttonBits = listOf(
+        GamepadButton.DpadUp to BIT_DPAD_UP,
+        GamepadButton.DpadDown to BIT_DPAD_DOWN,
+        GamepadButton.DpadLeft to BIT_DPAD_LEFT,
+        GamepadButton.DpadRight to BIT_DPAD_RIGHT,
+        GamepadButton.Start to BIT_START,
+        GamepadButton.Back to BIT_BACK,
+        GamepadButton.LeftThumb to BIT_LEFT_THUMB,
+        GamepadButton.RightThumb to BIT_RIGHT_THUMB,
+        GamepadButton.LeftShoulder to BIT_LEFT_SHOULDER,
+        GamepadButton.RightShoulder to BIT_RIGHT_SHOULDER,
+        GamepadButton.A to BIT_A,
+        GamepadButton.B to BIT_B,
+        GamepadButton.X to BIT_X,
+        GamepadButton.Y to BIT_Y,
+    )
+
+    private val directions = setOf(
+        GamepadButton.DpadUp,
+        GamepadButton.DpadDown,
+        GamepadButton.DpadLeft,
+        GamepadButton.DpadRight,
+    )
+
+    private val started = AtomicBoolean(false)
+    // A lock/condition pair rather than wait/notify: Kotlin has no Object monitor to sit on, and
+    // parking here is what keeps a disabled pad from costing anything.
+    private val wakeLock = ReentrantLock()
+    private val wakeCondition: Condition = wakeLock.newCondition()
+
+    /**
+     * Bumped by every [stop]. A poll thread runs only while its own generation is still current, so
+     * a stop/start pair — the window being recreated, say — cannot leave the outgoing thread alive
+     * alongside its replacement, which would inject every press twice.
+     */
+    private val generation = AtomicInteger(0)
+
+    /** Set once XInput turns out to be missing, so the thread parks instead of retrying forever. */
+    @Volatile
+    private var unavailable = false
+
+    private var thread: Thread? = null
+
+    /**
+     * When the pad was last actually used. A connected controller sitting on the sofa is not the
+     * same as a controller in someone's hands, and the on-screen keyboard should not ambush a mouse
+     * user who clicked into a settings field.
+     */
+    @Volatile
+    private var lastInputAtMs = 0L
+
+    /** True if the pad has been touched recently enough to assume the user is holding it. */
+    fun usedRecently(withinMs: Long = 60_000L): Boolean {
+        val last = lastInputAtMs
+        return last != 0L && System.currentTimeMillis() - last <= withinMs
+    }
+
+    /**
+     * Milliseconds since the pad was last used, or null if it has not been this session. The
+     * screensaver folds this into the system idle time, which knows nothing about controllers.
+     */
+    fun idleMs(): Long? {
+        val last = lastInputAtMs
+        return if (last == 0L) null else (System.currentTimeMillis() - last).coerceAtLeast(0L)
+    }
+
+    /**
+     * Installs the poll thread. Safe to call when gamepad support is off or the host is not
+     * Windows — both cases no-op, and the native library is never touched.
+     */
+    fun start() {
+        if (DesktopHostOs.current != DesktopHostOs.WINDOWS) return
+        if (!started.compareAndSet(false, true)) return
+        val myGeneration = generation.get()
+        thread = Thread({ pollLoop(myGeneration) }, "nuvio-gamepad").apply {
+            isDaemon = true
+            // Below the UI: this thread only synthesizes events, it must never compete with drawing.
+            priority = Thread.NORM_PRIORITY - 1
+            start()
+        }
+    }
+
+    fun stop() {
+        if (!started.compareAndSet(true, false)) return
+        generation.incrementAndGet()
+        wakeLock.withLock { wakeCondition.signalAll() }
+        thread = null
+    }
+
+    private fun isCurrent(myGeneration: Int): Boolean = generation.get() == myGeneration
+
+    /** Wakes the parked poll thread when the user flips the setting on. */
+    internal fun onEnabledChanged(enabled: Boolean) {
+        if (!enabled) GamepadSettingsRepository.setConnected(false)
+        wakeLock.withLock { wakeCondition.signalAll() }
+    }
+
+    private fun pollLoop(myGeneration: Int) {
+        val state = IntArray(SLOT_COUNT * SLOT_STRIDE)
+        var pressed = emptySet<GamepadButton>()
+        val repeatDueAt = HashMap<GamepadButton, Long>()
+        var connectedMask = 0
+        var nextRescanAt = 0L
+
+        while (isCurrent(myGeneration)) {
+            if (!GamepadSettingsRepository.enabled || unavailable) {
+                // Parked: no polling, no native call, no wakeups until the setting changes.
+                pressed = emptySet()
+                repeatDueAt.clear()
+                connectedMask = 0
+                nextRescanAt = 0L
+                GamepadSettingsRepository.setConnected(false)
+                wakeLock.withLock {
+                    if (isCurrent(myGeneration) && (!GamepadSettingsRepository.enabled || unavailable)) {
+                        runCatching { wakeCondition.await(1, TimeUnit.SECONDS) }
+                    }
+                }
+                continue
+            }
+
+            if (!ensureNativeReady()) continue
+
+            val now = System.currentTimeMillis()
+            // A narrow tick asks only about slots already known to be connected; the periodic full
+            // tick is what discovers a pad that was plugged in since. Either way the answer is the
+            // whole truth about the slots that were asked, so it replaces the mask outright.
+            val slotMask = if (now >= nextRescanAt) {
+                nextRescanAt = now + RESCAN_INTERVAL_MS
+                ALL_SLOTS
+            } else {
+                connectedMask
+            }
+
+            if (slotMask != 0) {
+                connectedMask = runCatching { NativePlayerBridge.pollGamepads(slotMask, state) }
+                    .onFailure {
+                        log.w(it) { "XInput poll failed; gamepad input disabled for this session" }
+                        unavailable = true
+                    }
+                    .getOrDefault(0)
+                GamepadSettingsRepository.setConnected(connectedMask != 0)
+            }
+
+            val current = if (connectedMask == 0) emptySet() else readPressed(state, connectedMask)
+            dispatch(current, pressed, repeatDueAt, now)
+            pressed = current
+
+            // With nothing plugged in there is no input to miss, so idle until the next rescan
+            // rather than waking sixty times a second on a machine that has no controller.
+            sleep(if (connectedMask == 0) IDLE_POLL_INTERVAL_MS else POLL_INTERVAL_MS)
+        }
+        GamepadSettingsRepository.setConnected(false)
+    }
+
+    /**
+     * Loads the native bridge lazily, on this thread. player_bridge.dll carries the JNI entry
+     * point, and its load is deliberately paid off the UI thread — see
+     * [NativePlayerBridge.ensureNativeLibraryLoaded]. On a dev tree with no native build, or a
+     * machine without the runtime, this fails once and parks the thread for good.
+     */
+    private fun ensureNativeReady(): Boolean {
+        val loaded = runCatching { NativePlayerBridge.ensureNativeLibraryLoaded() }
+            .onFailure { log.w(it) { "native bridge unavailable; gamepad input disabled for this session" } }
+            .isSuccess
+        if (!loaded) unavailable = true
+        return loaded
+    }
+
+    /**
+     * Collapses every connected pad into one set of held controls. Merging rather than picking a
+     * "primary" pad means a second controller just works, and costs only the OR.
+     */
+    private fun readPressed(state: IntArray, connectedMask: Int): Set<GamepadButton> {
+        val deadZone = GamepadSettingsRepository.deadZone
+        val held = HashSet<GamepadButton>()
+        for (slot in 0 until SLOT_COUNT) {
+            if (connectedMask and (1 shl slot) == 0) continue
+            val base = slot * SLOT_STRIDE
+            val buttons = state[base]
+            buttonBits.forEach { (button, bit) -> if (buttons and bit != 0) held += button }
+            if (state[base + 1] >= TRIGGER_PRESS_THRESHOLD) held += GamepadButton.LeftTrigger
+            if (state[base + 2] >= TRIGGER_PRESS_THRESHOLD) held += GamepadButton.RightTrigger
+            stickDirection(state[base + 3], state[base + 4], deadZone)?.let { held += leftStickButton(it) }
+            stickDirection(
+                state[base + 5],
+                state[base + 6],
+                deadZone.coerceAtLeast(RIGHT_STICK_MIN_DEAD_ZONE),
+            )?.let { held += rightStickButton(it) }
+        }
+        return held
+    }
+
+    private fun leftStickButton(direction: StickDirection): GamepadButton = when (direction) {
+        StickDirection.Up -> GamepadButton.DpadUp
+        StickDirection.Down -> GamepadButton.DpadDown
+        StickDirection.Left -> GamepadButton.DpadLeft
+        StickDirection.Right -> GamepadButton.DpadRight
+    }
+
+    private fun rightStickButton(direction: StickDirection): GamepadButton = when (direction) {
+        StickDirection.Up -> GamepadButton.RightStickUp
+        StickDirection.Down -> GamepadButton.RightStickDown
+        StickDirection.Left -> GamepadButton.RightStickLeft
+        StickDirection.Right -> GamepadButton.RightStickRight
+    }
+
+    /**
+     * Folds the left stick into a single D-pad direction. Only the dominant axis counts, so a
+     * diagonal push moves one way instead of firing two navigation keys at once.
+     */
+    internal fun stickDirection(rawX: Int, rawY: Int, deadZone: Float): StickDirection? {
+        val x = rawX / THUMB_RANGE
+        val y = rawY / THUMB_RANGE
+        if (abs(x) < deadZone && abs(y) < deadZone) return null
+        return if (abs(x) >= abs(y)) {
+            if (x > 0) StickDirection.Right else StickDirection.Left
+        } else {
+            // XInput's Y is positive upward; screen coordinates are not.
+            if (y > 0) StickDirection.Up else StickDirection.Down
+        }
+    }
+
+    /**
+     * Decides which buttons fire on this tick and updates [repeatDueAt] in place. Pure apart from
+     * that map, so the press/hold/repeat timing is testable without a controller or an event queue
+     * — the part of this feature most likely to feel wrong is exactly the part hardware cannot be
+     * assumed for.
+     *
+     * A button fires on the tick it is first seen. Only directions then repeat, after
+     * [GamepadSettingsRepository.DEFAULT_REPEAT_DELAY_MS] and every `repeatIntervalMs` after that:
+     * a held face button repeating would fire its action over and over, and "back" would walk the
+     * whole navigation stack on a single press.
+     */
+    internal fun resolveFiring(
+        current: Set<GamepadButton>,
+        previous: Set<GamepadButton>,
+        repeatDueAt: MutableMap<GamepadButton, Long>,
+        now: Long,
+        repeatIntervalMs: Int,
+    ): List<GamepadButton> {
+        val firing = ArrayList<GamepadButton>(current.size)
+        current.forEach { button ->
+            if (button !in previous) {
+                firing += button
+                if (button in directions) {
+                    repeatDueAt[button] = now + GamepadSettingsRepository.DEFAULT_REPEAT_DELAY_MS
+                }
+                return@forEach
+            }
+            val dueAt = repeatDueAt[button] ?: return@forEach
+            if (now >= dueAt) {
+                firing += button
+                repeatDueAt[button] = now + repeatIntervalMs
+            }
+        }
+        previous.forEach { button -> if (button !in current) repeatDueAt.remove(button) }
+        return firing
+    }
+
+    private fun dispatch(
+        current: Set<GamepadButton>,
+        previous: Set<GamepadButton>,
+        repeatDueAt: MutableMap<GamepadButton, Long>,
+        now: Long,
+    ) {
+        val inPlayer = GamepadContext.playerActive
+        resolveFiring(current, previous, repeatDueAt, now, GamepadSettingsRepository.repeatIntervalMs)
+            .forEach { button -> send(button, inPlayer) }
+    }
+
+    private fun send(button: GamepadButton, inPlayer: Boolean) {
+        lastInputAtMs = System.currentTimeMillis()
+        // Picking up the pad while a text field already holds focus summons the keyboard, for the
+        // case where the field was reached with the mouse.
+        if (OnScreenKeyboard.onPadInputWhileTextFocused(TextInputFocusTracker.active.value)) return
+        // While the on-screen keyboard is up it owns the pad entirely, including the buttons it does
+        // not use. A press falling through to the screen behind would fire a browsing shortcut in
+        // the middle of a word.
+        if (OnScreenKeyboard.consume(button)) return
+        val binding = GamepadDefaults.binding(button)
+        GamepadKeyInjector.send(if (inPlayer) binding.player else binding.browsing)
+    }
+
+    private fun sleep(millis: Long) {
+        runCatching { Thread.sleep(millis) }.onFailure { Thread.currentThread().interrupt() }
+    }
+}

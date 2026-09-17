@@ -103,6 +103,24 @@ object PlayerShortcutsRepository {
         publish()
     }
 
+    /**
+     * Restores [actions] to their defaults. Rebinding refuses a key another action already holds,
+     * so the only way a default can be taken is by an action outside this set that was rebound to
+     * it — that action is reset too, rather than leaving two actions on one key.
+     */
+    fun resetToDefaults(actions: Collection<PlayerShortcutAction>) {
+        ensureLoaded()
+        val toReset = actions.toMutableSet()
+        val reclaimedKeys = actions.map { defaults.getValue(it) }.toSet()
+        bindings.forEach { (action, keyCode) ->
+            if (action !in toReset && keyCode in reclaimedKeys) toReset += action
+        }
+        if (toReset.none { bindings[it] != defaults.getValue(it) }) return
+        bindings = bindings.toMutableMap().apply { toReset.forEach { put(it, defaults.getValue(it)) } }
+        toReset.forEach { store.remove(scoped(it.id)) }
+        publish()
+    }
+
     private fun publish() {
         _uiState.value = bindings
         _keyLabels.value = bindings.mapValues { playerShortcutKeyCodeLabel(it.value) }

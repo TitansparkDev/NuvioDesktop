@@ -29,6 +29,13 @@ data class SynchronizationPreferencesUiState(
 internal expect object SynchronizationPreferencesStorage {
     fun loadPayload(): String?
     fun savePayload(payload: String)
+
+    /**
+     * Identity ("userId|profileId") of a local settings edit that has not yet reached the server,
+     * or null when local and remote are believed to be in step. See [ProfileSettingsSync].
+     */
+    fun loadPendingPushMarker(): String?
+    fun savePendingPushMarker(marker: String?)
 }
 
 object SynchronizationPreferencesRepository {

@@ -355,10 +355,20 @@ object PlayerStreamsRepository {
             val completions = Channel<StreamLoadCompletion>(capacity = Channel.BUFFERED)
             val debridAvailabilityJobs = mutableListOf<Job>()
 
+            // The excluded list is the whole diagnosis when an addon is missing from the panel for
+            // one episode but not another: exclusion is by manifest (stream resource / type /
+            // idPrefixes vs the resolved id), so a differently-shaped videoId silently drops addons
+            // that declare a narrow prefix while permissive ones survive.
+            val keptAddonNames = streamAddons.map { it.addonName }.toSet()
+            val excludedAddonNames = installedAddons.mapNotNull { addon ->
+                val manifest = addon.manifest ?: return@mapNotNull null
+                addon.displayTitle.ifBlank { manifest.name }.takeIf { it !in keptAddonNames }
+            }
             log.i {
                 "Fetch started type=$type id=$effectiveVideoId season=$effectiveSeason episode=$effectiveEpisode " +
                     "affinity=$sourceAffinity addons=${streamAddons.size} " +
-                    "pluginScrapers=${pluginProviderGroups.sumOf { it.scrapers.size }}"
+                    "pluginScrapers=${pluginProviderGroups.sumOf { it.scrapers.size }} " +
+                    "excludedAddons=$excludedAddonNames"
             }
 
             fun publishCompletion(completion: StreamLoadCompletion) {

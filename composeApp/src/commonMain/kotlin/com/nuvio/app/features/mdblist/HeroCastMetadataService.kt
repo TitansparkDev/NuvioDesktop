@@ -7,6 +7,8 @@ import com.nuvio.app.features.home.HeroCastMember
 import com.nuvio.app.features.library.LibraryClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
@@ -23,15 +25,23 @@ object HeroCastMetadataService {
     private val json = Json { ignoreUnknownKeys = true }
     private val cacheMutex = Mutex()
     private val inFlightRequests = mutableMapOf<String, CompletableDeferred<List<HeroCastMember>>>()
+    @kotlin.concurrent.Volatile
     private var cache: MutableMap<String, CachedCast>? = null
 
+    /**
+     * Never parses the on-disk cache: this runs inside Home's composition on the UI thread, and
+     * that parse is a megabyte of JSON (measured 2026-09-14 as part of the launch stall). Until
+     * [fetch] has loaded it — off the caller's dispatcher — there is nothing to peek at, and the
+     * fetch that follows fills the caller's own cache a few milliseconds later.
+     */
     fun peek(type: String, id: String): List<HeroCastMember>? {
         val cacheKey = cacheKey(type = type, id = id)
-        val entry = ensureCacheLoaded()[cacheKey] ?: return null
+        val entry = (cache ?: return null)[cacheKey] ?: return null
         return entry.cast.takeIf { entry.expiresAtMs > LibraryClock.nowEpochMs() }
     }
 
     suspend fun fetch(type: String, id: String): List<HeroCastMember> {
+        ensureCacheLoadedOffCaller()
         val cacheKey = cacheKey(type = type, id = id)
         val now = LibraryClock.nowEpochMs()
         var ownsRequest = false
@@ -173,6 +183,12 @@ object HeroCastMetadataService {
 
     private fun normalizeName(name: String): String =
         name.trim().lowercase()
+
+    /** The first-touch parse, on a worker rather than whichever dispatcher the caller is on. */
+    private suspend fun ensureCacheLoadedOffCaller() {
+        if (cache != null) return
+        withContext(Dispatchers.Default) { cacheMutex.withLock { ensureCacheLoaded() } }
+    }
 
     private fun ensureCacheLoaded(): MutableMap<String, CachedCast> {
         cache?.let { return it }

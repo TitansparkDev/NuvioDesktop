@@ -82,6 +82,17 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val currentGestureFeedback = liveGestureFeedback ?: gestureFeedback
     val isP2pPlaybackActive = activeTorrentInfoHash != null
     val p2pStats = p2pStreamingState as? P2pStreamingState.Streaming
+    val p2pConnecting = p2pStreamingState as? P2pStreamingState.Connecting
+    // Bytes the engine has pulled from the swarm or handed to the player, whichever is further
+    // along: before mpv opens the route only the download side moves, afterwards delivery does.
+    val p2pLoadingBytes = p2pStats?.let { maxOf(it.downloadedBytes, it.deliveredBytes) } ?: 0L
+    val connectingPeerInfo = p2pConnecting?.let { state ->
+        org.jetbrains.compose.resources.stringResource(
+            nuvio.composeapp.generated.resources.Res.string.player_torrent_peer_info,
+            state.seeds,
+            state.peers,
+        )
+    }
     val p2pPeerInfo = p2pStats?.let { stats ->
         org.jetbrains.compose.resources.stringResource(
             nuvio.composeapp.generated.resources.Res.string.player_torrent_peer_info,
@@ -92,18 +103,25 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val p2pDownloadSpeed = p2pStats?.let { formatP2pSpeed(it.downloadSpeed) }
     val p2pInitialLoadingMessage = when {
         !isP2pPlaybackActive || initialLoadCompleted -> null
-        p2pStreamingState is P2pStreamingState.Connecting -> {
-            org.jetbrains.compose.resources.stringResource(
-                nuvio.composeapp.generated.resources.Res.string.player_torrent_connecting_peers,
-            )
+        p2pConnecting != null -> {
+            if (p2pSettingsUiState.hideTorrentStats) {
+                p2pConnectingPhaseLabel(p2pConnecting.phase)
+            } else {
+                org.jetbrains.compose.resources.stringResource(
+                    nuvio.composeapp.generated.resources.Res.string.player_torrent_connecting_status,
+                    p2pConnectingPhaseLabel(p2pConnecting.phase),
+                    connectingPeerInfo.orEmpty(),
+                    formatP2pSpeed(p2pConnecting.downloadSpeed),
+                )
+            }
         }
         p2pStats != null -> {
             if (p2pSettingsUiState.hideTorrentStats) {
                 null
             } else {
                 org.jetbrains.compose.resources.stringResource(
-                    nuvio.composeapp.generated.resources.Res.string.player_torrent_buffered_status,
-                    formatP2pMegabytes(p2pStats.preloadedBytes),
+                    nuvio.composeapp.generated.resources.Res.string.player_torrent_loading_status,
+                    formatP2pMegabytes(p2pLoadingBytes),
                     p2pPeerInfo.orEmpty(),
                     p2pDownloadSpeed.orEmpty(),
                 )
@@ -113,9 +131,15 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             nuvio.composeapp.generated.resources.Res.string.player_torrent_starting_engine,
         )
     }
+    val bufferedAheadMs = (playbackSnapshot.bufferedPositionMs - playbackSnapshot.positionMs)
+        .coerceAtLeast(0L)
     val p2pInitialLoadingProgress = when {
         !isP2pPlaybackActive || initialLoadCompleted || p2pStats == null -> null
-        else -> (p2pStats.preloadedBytes.toFloat() / P2pInitialPreloadTargetBytes.toFloat()).coerceIn(0f, 1f)
+        else -> p2pInitialLoadingProgress(
+            bufferedAheadMs = bufferedAheadMs,
+            downloadedBytes = p2pStats.downloadedBytes,
+            deliveredBytes = p2pStats.deliveredBytes,
+        )
     }
     val showP2pRebufferStats = isP2pPlaybackActive &&
         initialLoadCompleted &&
@@ -307,6 +331,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         pictureInPictureActive = pictureInPictureActive,
         desktopHdrModeLabel = playerSettingsUiState.desktopHdrMode.label,
         desktopColorProfileLabel = playerSettingsUiState.desktopColorProfile.label,
+        desktopColorContrast = playerSettingsUiState.desktopColorContrast,
+        desktopColorBrightness = playerSettingsUiState.desktopColorBrightness,
+        desktopColorSaturation = playerSettingsUiState.desktopColorSaturation,
+        desktopColorGamma = playerSettingsUiState.desktopColorGamma,
         // Shows what is actually in effect: a session force wins; otherwise the persisted preset
         // only counts when it would auto-apply (auto-detect on + detected anime), else "Off".
         desktopAnimeModeLabel = playerSettingsUiState.desktopAnimeSessionOverride?.label
@@ -318,13 +346,24 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         desktopAnimeSvpEnabled = playerSettingsUiState.desktopAnimeSvpEnabled,
         playbackInfoPanelEnabled = playerSettingsUiState.desktopPlaybackInfoPanelEnabled,
         activeSubtitleLabel = activePlaybackSubtitleLabel(),
-        seekThumbnailsEnabled = playerSettingsUiState.desktopBufferPreset != DesktopBufferPreset.Metered,
+        seekThumbnailsEnabled = playerSettingsUiState.desktopSeekThumbnailsEnabled &&
+            playerSettingsUiState.desktopBufferPreset != DesktopBufferPreset.Metered,
         seekStepSeconds = playerSettingsUiState.seekStepSeconds,
         tapToUnlockLabel = stringResource(Res.string.compose_player_tap_to_unlock),
         playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
         playbackErrorMessage = errorMessage.orEmpty(),
         playbackErrorActionLabel = stringResource(Res.string.compose_player_go_back),
-        sourcesPanelTitle = stringResource(Res.string.compose_player_panel_sources),
+        sourcesPanelTitle = pendingSourcesEpisode?.let { pending ->
+            stringResource(
+                Res.string.compose_player_panel_sources_for_episode,
+                stringResource(
+                    Res.string.compose_player_episode_title_format,
+                    pending.playbackSeasonNumber() ?: 1,
+                    pending.playbackEpisodeNumber() ?: 0,
+                    pending.title.orEmpty(),
+                ),
+            )
+        } ?: stringResource(Res.string.compose_player_panel_sources),
         episodesPanelTitle = stringResource(Res.string.compose_player_panel_episodes),
         streamsPanelTitle = stringResource(Res.string.compose_player_panel_streams),
         allFilterLabel = allFilterLabel,
@@ -423,8 +462,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         playbackSpeedToggleLow = playerSettingsUiState.playbackSpeedToggleLow,
         playbackSpeedToggleHigh = playerSettingsUiState.playbackSpeedToggleHigh,
         uiScalePercent = playerSettingsUiState.desktopUiScalePercent,
+        controlIconScalePercent = playerSettingsUiState.desktopControlIconScalePercent,
         uiFontFamily = MaterialTheme.appFontFamilyName,
         sourceNotchPosition = playerSettingsUiState.desktopSourceNotchPosition.name.lowercase(),
+        sourceNotchHoverEnabled = playerSettingsUiState.desktopSourceNotchHoverEnabled,
         notificationPosition = playerSettingsUiState.desktopPlayerNotificationPosition.webValue,
         parentalWarnings = parentalWarnings,
         showParentalGuide = showParentalGuide,
@@ -479,6 +520,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         subtitleAutoSyncIsLoading = subtitleAutoSyncState.isLoading,
         subtitleAutoSyncErrorMessage = subtitleAutoSyncState.errorMessage.orEmpty(),
         closeModalsToken = playerControlsCloseModalsToken,
+        openSourcesToken = playerControlsOpenSourcesToken,
+        sourcesPanelOpen = showSourcesPanel,
         showOpeningOverlay = openingOverlayWanted,
         openingArtwork = background ?: poster,
         // Poster first here, unlike openingArtwork: the flyout thumbnail is a small near-square
@@ -960,6 +1003,12 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
             showAudioModal = true
         }
         PlayerControlsAction.Sources -> {
+            // The Sources button always means "sources for what is playing".
+            pendingSourcesEpisode = null
+            // The HUD owns its own modal visibility, so this flag is Kotlin's only record that the
+            // panel is open. The next-episode prewarm reads it: without it, a prewarm landing while
+            // the user has the panel open would swap the list under them.
+            showSourcesPanel = true
             prepareSourcesForPlayerControls()
         }
         PlayerControlsAction.Episodes -> {
@@ -1024,13 +1073,27 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         "reloadSources" -> {
             prepareSourcesForPlayerControls(forceRefresh = true)
         }
+        "sourcesPanelClosed" -> {
+            pendingSourcesEpisode = null
+            showSourcesPanel = false
+        }
         "selectSource" -> {
             val streams = sourceStreamsState.groups.flatMap { it.streams }
             val stream = streams.getOrNull(value.toInt()) ?: return true
             resetFailoverBudget()
-            if (requestP2pConsentForPlayerControls(stream = stream, episode = null)) return true
-            switchToSource(stream)
-            playerControlsCloseModalsToken += 1
+            // The panel may be showing another episode's streams ("Apply To Next Episode"), in which
+            // case this is an episode switch, not a re-source of what is playing.
+            val pendingEpisode = pendingSourcesEpisode
+            if (requestP2pConsentForPlayerControls(stream = stream, episode = pendingEpisode)) return true
+            if (pendingEpisode != null) {
+                pendingSourcesEpisode = null
+                switchToEpisodeStream(stream, pendingEpisode)
+                playerControlsCloseModalsToken += 1
+            } else {
+                // A same-item swap leaves the Sources sheet open so the new stream can be checked
+                // and swapped again; the HUD only closes it on the user's click outside / Close.
+                switchToSource(stream, keepSourcesPanelOpen = true)
+            }
         }
         "selectEpisode" -> {
             val episode = playerMetaVideos.getOrNull(value.toInt()) ?: return true
@@ -1083,6 +1146,9 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             val interval = activeSkipInterval ?: return true
             acceptSkipInterval(interval)
         }
+        // Right-click on the HUD prompt: hide it for this segment without seeking. Cleared again by
+        // the position effect when playback enters the next segment.
+        "dismissSkipInterval" -> skipIntervalDismissed = true
         "playNextEpisode" -> {
             if (nextEpisodeInfo?.hasAired == true) {
                 nextEpisodeAutoPlayJob?.cancel()
@@ -1352,7 +1418,10 @@ private fun PlayerScreenRuntime.enableP2pForPlayerControls() {
 }
 
 private fun PlayerScreenRuntime.prepareSourcesForPlayerControls(forceRefresh: Boolean = false) {
-    val vid = activeVideoId
+    // Reload must refetch whatever the panel is currently showing, which is not always the playing
+    // item — "Apply To Next Episode" points it at the next episode.
+    val pending = pendingSourcesEpisode
+    val vid = pending?.id ?: activeVideoId
     if (vid == null) {
         return
     }
@@ -1362,8 +1431,8 @@ private fun PlayerScreenRuntime.prepareSourcesForPlayerControls(forceRefresh: Bo
         videoId = vid,
         parentMetaId = parentMetaId,
         title = title,
-        season = activeSeasonNumber,
-        episode = activeEpisodeNumber,
+        season = pending?.playbackSeasonNumber() ?: activeSeasonNumber,
+        episode = pending?.playbackEpisodeNumber() ?: activeEpisodeNumber,
         forceRefresh = forceRefresh,
     )
 }
@@ -2082,22 +2151,32 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
         activeSourceUrl = activeSourceUrl,
         activeStreamTitle = activeStreamTitle,
         onSourceFilterSelected = PlayerStreamsRepository::selectSourceFilter,
-        onSourceStreamSelected = { stream -> selectSourceManually(stream) },
+        onSourceStreamSelected = { stream ->
+            val pendingEpisode = pendingSourcesEpisode
+            if (pendingEpisode != null) {
+                pendingSourcesEpisode = null
+                switchToEpisodeStream(stream, pendingEpisode)
+            } else {
+                selectSourceManually(stream)
+            }
+        },
         onReloadSources = {
-            val vid = activeVideoId
+            val pending = pendingSourcesEpisode
+            val vid = pending?.id ?: activeVideoId
             if (vid != null) {
                 PlayerStreamsRepository.loadSources(
                     type = contentType ?: parentMetaType,
                     videoId = vid,
                     parentMetaId = parentMetaId,
                     title = title,
-                    season = activeSeasonNumber,
-                    episode = activeEpisodeNumber,
+                    season = pending?.playbackSeasonNumber() ?: activeSeasonNumber,
+                    episode = pending?.playbackEpisodeNumber() ?: activeEpisodeNumber,
                     forceRefresh = true,
                 )
             }
         },
         onSourcesPanelDismissed = {
+            pendingSourcesEpisode = null
             showSourcesPanel = false
             controlsVisible = true
         },
@@ -2219,4 +2298,17 @@ private fun PlayerScreenRuntime.downloadAddonSubtitle(addon: AddonSubtitle) {
             AddonSubtitleDownloadResult.Cancelled -> Unit
         }
     }
+}
+
+@Composable
+private fun p2pConnectingPhaseLabel(phase: String): String = when (phase) {
+    "add_magnet" -> org.jetbrains.compose.resources.stringResource(
+        nuvio.composeapp.generated.resources.Res.string.player_torrent_fetching_metadata,
+    )
+    "prepare_stream", "attach_route" -> org.jetbrains.compose.resources.stringResource(
+        nuvio.composeapp.generated.resources.Res.string.player_torrent_preparing_stream,
+    )
+    else -> org.jetbrains.compose.resources.stringResource(
+        nuvio.composeapp.generated.resources.Res.string.player_torrent_starting_engine,
+    )
 }

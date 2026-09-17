@@ -14,4 +14,7 @@ expect object AppFeaturePolicy {
     val heroTrailerPlaybackSupported: Boolean
     val inAppUpdaterEnabled: Boolean
     val imdbRatingLogoEnabled: Boolean
+
+    /** Whether the user may point this build at a self-hosted Nuvio backend. */
+    val customServerConnectionsEnabled: Boolean
 }

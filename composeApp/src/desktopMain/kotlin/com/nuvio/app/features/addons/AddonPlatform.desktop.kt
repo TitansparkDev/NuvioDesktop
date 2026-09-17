@@ -89,11 +89,25 @@ actual suspend fun httpRequestRaw(
     body: String,
     followRedirects: Boolean,
     allowLargeResponse: Boolean,
+    callTimeoutMs: Long,
+    connectTimeoutMs: Long,
 ): RawHttpResponse = withContext(Dispatchers.IO) {
-    val client = if (followRedirects) {
+    val needsOwnClient = !followRedirects || callTimeoutMs > 0 || connectTimeoutMs > 0
+    val client = if (!needsOwnClient) {
         desktopHttpClient
     } else {
-        desktopHttpClient.newBuilder().followRedirects(false).followSslRedirects(false).build()
+        desktopHttpClient.newBuilder()
+            .apply {
+                if (!followRedirects) {
+                    followRedirects(false)
+                    followSslRedirects(false)
+                }
+                // OkHttp's own whole-call ceiling. Unlike readTimeout it is not refreshed by
+                // traffic, so it is the only one of these that bounds a call that never finishes.
+                if (callTimeoutMs > 0) callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+                if (connectTimeoutMs > 0) connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
+            }
+            .build()
     }
     client.newCall(buildDesktopRequest(method, url, headers, body)).execute().use { response ->
         RawHttpResponse(

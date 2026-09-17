@@ -31,7 +31,9 @@ internal actual object PlayerSettingsStorage {
     private const val playbackSpeedToggleHighKey = "playback_speed_toggle_high"
     private const val desktopVerboseMpvLoggingEnabledKey = "desktop_verbose_mpv_logging_enabled"
     private const val desktopUiScalePercentKey = "desktop_ui_scale_percent"
+    private const val desktopControlIconScalePercentKey = "desktop_control_icon_scale_percent"
     private const val desktopSourceNotchPositionKey = "desktop_source_notch_position"
+    private const val desktopSourceNotchHoverEnabledKey = "desktop_source_notch_hover_enabled"
     private const val desktopPlayerNotificationPositionKey =
         "desktop_player_notification_position"
     private const val seekStepSecondsKey = "seek_step_seconds"
@@ -43,6 +45,8 @@ internal actual object PlayerSettingsStorage {
     private const val preferredSubtitleLanguageKey = "preferred_subtitle_language"
     private const val secondaryPreferredSubtitleLanguageKey = "secondary_preferred_subtitle_language"
     private const val dualSubtitlesEnabledKey = "dual_subtitles_enabled"
+    private const val preferredSubtitleTrackKindKey = "preferred_subtitle_track_kind"
+    // Pre-1.14 keys. Still cleared and imported by sync so an older peer's payload migrates here.
     private const val preferHearingImpairedSubtitlesKey = "prefer_hearing_impaired_subtitles"
     private const val subtitleTextColorKey = "subtitle_text_color"
     private const val subtitleBackgroundColorKey = "subtitle_background_color"
@@ -88,6 +92,7 @@ internal actual object PlayerSettingsStorage {
     private const val skipDbApiKeyKey = "skipdb_api_key"
     private const val introSubmitEnabledKey = "intro_submit_enabled"
     private const val streamAutoPlayNextEpisodeEnabledKey = "stream_auto_play_next_episode_enabled"
+    private const val streamAutoPlayManualNextEpisodeKey = "stream_auto_play_manual_next_episode"
     private const val streamAutoPlayPreferBingeGroupKey = "stream_auto_play_prefer_binge_group"
     private const val streamAutoPlayReuseBingeGroupKey = "stream_auto_play_reuse_binge_group"
     private const val streamFailoverEnabledKey = "stream_failover_enabled"
@@ -114,8 +119,13 @@ internal actual object PlayerSettingsStorage {
     private const val iosGammaKey = "ios_gamma"
     private const val desktopHdrModeKey = "desktop_hdr_mode"
     private const val desktopColorProfileKey = "desktop_color_profile"
+    private const val desktopColorContrastKey = "desktop_color_contrast"
+    private const val desktopColorBrightnessKey = "desktop_color_brightness"
+    private const val desktopColorSaturationKey = "desktop_color_saturation"
+    private const val desktopColorGammaKey = "desktop_color_gamma"
     private const val desktopBufferPresetKey = "desktop_buffer_preset"
     private const val desktopRendererApiKey = "desktop_renderer_api"
+    private const val desktopPerformanceLoggingKey = "desktop_performance_logging"
     private const val desktopLowVramModeKey = "desktop_low_vram_mode"
     private const val desktopAnimeModeKey = "desktop_anime_mode"
     private const val desktopAnimeModeAutoEnabledKey = "desktop_anime_mode_auto_enabled"
@@ -128,6 +138,7 @@ internal actual object PlayerSettingsStorage {
     private const val desktopCustomShaderPathsKey = "desktop_custom_shader_paths"
     private const val desktopCustomShaderSelectedPathKey = "desktop_custom_shader_selected_path"
     private const val desktopAudioPassthroughEnabledKey = "desktop_audio_passthrough_enabled"
+    private const val desktopSeekThumbnailsEnabledKey = "desktop_seek_thumbnails_enabled"
     private const val desktopCustomMpvOptionsKey = "desktop_custom_mpv_options"
     private const val desktopMpvConfigModeKey = "desktop_mpv_config_mode"
     private const val desktopMpvPropertyOverridesKey = "desktop_mpv_property_overrides"
@@ -148,6 +159,7 @@ internal actual object PlayerSettingsStorage {
         preferredSubtitleLanguageKey,
         secondaryPreferredSubtitleLanguageKey,
         dualSubtitlesEnabledKey,
+        preferredSubtitleTrackKindKey,
         preferHearingImpairedSubtitlesKey,
         subtitleTextColorKey,
         subtitleBackgroundColorKey,
@@ -190,6 +202,7 @@ internal actual object PlayerSettingsStorage {
         animeSkipEnabledKey,
         animeSkipClientIdKey,
         streamAutoPlayNextEpisodeEnabledKey,
+        streamAutoPlayManualNextEpisodeKey,
         streamAutoPlayPreferBingeGroupKey,
         streamAutoPlayReuseBingeGroupKey,
         streamFailoverEnabledKey,
@@ -272,11 +285,19 @@ internal actual object PlayerSettingsStorage {
     }
 
     actual fun saveDesktopUiScalePercent(percent: Int) = saveInt(desktopUiScalePercentKey, percent)
+    actual fun loadDesktopControlIconScalePercent(): Int? = loadInt(desktopControlIconScalePercentKey)
+    actual fun saveDesktopControlIconScalePercent(percent: Int) =
+        saveInt(desktopControlIconScalePercentKey, percent)
     actual fun loadSeekStepSeconds(): Int? = loadInt(seekStepSecondsKey)
     actual fun saveSeekStepSeconds(seconds: Int) = saveInt(seekStepSecondsKey, seconds)
     actual fun loadDesktopSourceNotchPosition(): String? = loadString(desktopSourceNotchPositionKey)
     actual fun saveDesktopSourceNotchPosition(position: String) =
         saveString(desktopSourceNotchPositionKey, position)
+
+    actual fun loadDesktopSourceNotchHoverEnabled(): Boolean? =
+        loadBoolean(desktopSourceNotchHoverEnabledKey)
+    actual fun saveDesktopSourceNotchHoverEnabled(enabled: Boolean) =
+        saveBoolean(desktopSourceNotchHoverEnabledKey, enabled)
 
     actual fun loadDesktopPlayerNotificationPosition(): String? =
         loadString(desktopPlayerNotificationPositionKey)
@@ -298,9 +319,10 @@ internal actual object PlayerSettingsStorage {
     actual fun saveSecondaryPreferredSubtitleLanguage(language: String?) = saveOptionalString(secondaryPreferredSubtitleLanguageKey, language)
     actual fun loadDualSubtitlesEnabled(): Boolean? = loadBoolean(dualSubtitlesEnabledKey)
     actual fun saveDualSubtitlesEnabled(enabled: Boolean) = saveBoolean(dualSubtitlesEnabledKey, enabled)
-    actual fun loadPreferHearingImpairedSubtitles(): Boolean? = loadBoolean(preferHearingImpairedSubtitlesKey)
-    actual fun savePreferHearingImpairedSubtitles(enabled: Boolean) =
-        saveBoolean(preferHearingImpairedSubtitlesKey, enabled)
+    actual fun loadPreferredSubtitleTrackKind(): String? = loadString(preferredSubtitleTrackKindKey)
+    actual fun savePreferredSubtitleTrackKind(kind: String) = saveString(preferredSubtitleTrackKindKey, kind)
+    actual fun loadLegacyPreferHearingImpairedSubtitles(): Boolean? = loadBoolean(preferHearingImpairedSubtitlesKey)
+    actual fun loadLegacySubtitleUseForcedSubtitles(): Boolean? = loadBoolean(subtitleUseForcedSubtitlesKey)
     actual fun loadSubtitleTextColor(): String? = loadString(subtitleTextColorKey)
     actual fun saveSubtitleTextColor(colorHex: String) = saveString(subtitleTextColorKey, colorHex)
     actual fun loadSubtitleBackgroundColor(): String? = loadString(subtitleBackgroundColorKey)
@@ -333,8 +355,6 @@ internal actual object PlayerSettingsStorage {
     actual fun saveSubtitleAssStyleMode(mode: String) = saveString(subtitleAssStyleModeKey, mode)
     actual fun loadSubtitleAssScalePercent(): Int? = loadInt(subtitleAssScalePercentKey)
     actual fun saveSubtitleAssScalePercent(percent: Int) = saveInt(subtitleAssScalePercentKey, percent)
-    actual fun loadSubtitleUseForcedSubtitles(): Boolean? = loadBoolean(subtitleUseForcedSubtitlesKey)
-    actual fun saveSubtitleUseForcedSubtitles(enabled: Boolean) = saveBoolean(subtitleUseForcedSubtitlesKey, enabled)
     actual fun loadSubtitleShowOnlyPreferredLanguages(): Boolean? = loadBoolean(subtitleShowOnlyPreferredLanguagesKey)
     actual fun saveSubtitleShowOnlyPreferredLanguages(enabled: Boolean) = saveBoolean(subtitleShowOnlyPreferredLanguagesKey, enabled)
     actual fun loadAddonSubtitleStartupMode(): String? = loadString(addonSubtitleStartupModeKey)
@@ -395,6 +415,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveIntroSubmitEnabled(enabled: Boolean) = saveBoolean(introSubmitEnabledKey, enabled)
     actual fun loadStreamAutoPlayNextEpisodeEnabled(): Boolean? = loadBoolean(streamAutoPlayNextEpisodeEnabledKey)
     actual fun saveStreamAutoPlayNextEpisodeEnabled(enabled: Boolean) = saveBoolean(streamAutoPlayNextEpisodeEnabledKey, enabled)
+    actual fun loadStreamAutoPlayManualNextEpisode(): Boolean? = loadBoolean(streamAutoPlayManualNextEpisodeKey)
+    actual fun saveStreamAutoPlayManualNextEpisode(enabled: Boolean) = saveBoolean(streamAutoPlayManualNextEpisodeKey, enabled)
     actual fun loadStreamAutoPlayPreferBingeGroup(): Boolean? = loadBoolean(streamAutoPlayPreferBingeGroupKey)
     actual fun saveStreamAutoPlayPreferBingeGroup(enabled: Boolean) = saveBoolean(streamAutoPlayPreferBingeGroupKey, enabled)
     actual fun loadStreamAutoPlayReuseBingeGroup(): Boolean? = loadBoolean(streamAutoPlayReuseBingeGroupKey)
@@ -447,11 +469,22 @@ internal actual object PlayerSettingsStorage {
     actual fun saveDesktopHdrMode(mode: String) = saveString(desktopHdrModeKey, mode)
     actual fun loadDesktopColorProfile(): String? = loadString(desktopColorProfileKey)
     actual fun saveDesktopColorProfile(profile: String) = saveString(desktopColorProfileKey, profile)
+    actual fun loadDesktopColorContrast(): Int? = loadInt(desktopColorContrastKey)
+    actual fun saveDesktopColorContrast(value: Int) = saveInt(desktopColorContrastKey, value)
+    actual fun loadDesktopColorBrightness(): Int? = loadInt(desktopColorBrightnessKey)
+    actual fun saveDesktopColorBrightness(value: Int) = saveInt(desktopColorBrightnessKey, value)
+    actual fun loadDesktopColorSaturation(): Int? = loadInt(desktopColorSaturationKey)
+    actual fun saveDesktopColorSaturation(value: Int) = saveInt(desktopColorSaturationKey, value)
+    actual fun loadDesktopColorGamma(): Int? = loadInt(desktopColorGammaKey)
+    actual fun saveDesktopColorGamma(value: Int) = saveInt(desktopColorGammaKey, value)
     actual fun loadDesktopBufferPreset(): String? =
         loadString(desktopBufferPresetKey) ?: if (hadExistingDesktopPreferences) DesktopBufferPreset.Resilient.name else null
     actual fun saveDesktopBufferPreset(preset: String) = saveString(desktopBufferPresetKey, preset)
     actual fun loadDesktopRendererApi(): String? = loadString(desktopRendererApiKey)
     actual fun saveDesktopRendererApi(api: String) = saveString(desktopRendererApiKey, api)
+    actual fun loadDesktopPerformanceLogging(): Boolean? = loadBoolean(desktopPerformanceLoggingKey)
+    actual fun saveDesktopPerformanceLogging(enabled: Boolean) =
+        saveBoolean(desktopPerformanceLoggingKey, enabled)
     actual fun loadDesktopLowVramMode(): String? = loadString(desktopLowVramModeKey)
     actual fun saveDesktopLowVramMode(mode: String) = saveString(desktopLowVramModeKey, mode)
     actual fun loadDesktopAnimeMode(): String? = loadString(desktopAnimeModeKey)
@@ -484,6 +517,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveDesktopCustomShaderSelectedPath(path: String) = saveString(desktopCustomShaderSelectedPathKey, path)
     actual fun loadDesktopAudioPassthroughEnabled(): Boolean? = loadBoolean(desktopAudioPassthroughEnabledKey)
     actual fun saveDesktopAudioPassthroughEnabled(enabled: Boolean) = saveBoolean(desktopAudioPassthroughEnabledKey, enabled)
+    actual fun loadDesktopSeekThumbnailsEnabled(): Boolean? = loadBoolean(desktopSeekThumbnailsEnabledKey)
+    actual fun saveDesktopSeekThumbnailsEnabled(enabled: Boolean) = saveBoolean(desktopSeekThumbnailsEnabledKey, enabled)
     actual fun loadDesktopCustomMpvOptions(): String? = loadString(desktopCustomMpvOptionsKey)
     actual fun saveDesktopCustomMpvOptions(options: String) = saveString(desktopCustomMpvOptionsKey, options)
     actual fun loadDesktopMpvConfigMode(): String? = loadString(desktopMpvConfigModeKey)
@@ -527,9 +562,7 @@ internal actual object PlayerSettingsStorage {
         loadPreferredSubtitleLanguage()?.let { put(preferredSubtitleLanguageKey, encodeSyncString(it)) }
         loadSecondaryPreferredSubtitleLanguage()?.let { put(secondaryPreferredSubtitleLanguageKey, encodeSyncString(it)) }
         loadDualSubtitlesEnabled()?.let { put(dualSubtitlesEnabledKey, encodeSyncBoolean(it)) }
-        loadPreferHearingImpairedSubtitles()?.let {
-            put(preferHearingImpairedSubtitlesKey, encodeSyncBoolean(it))
-        }
+        loadPreferredSubtitleTrackKind()?.let { put(preferredSubtitleTrackKindKey, encodeSyncString(it)) }
         loadSubtitleTextColor()?.let { put(subtitleTextColorKey, encodeSyncString(it)) }
         loadSubtitleBackgroundColor()?.let { put(subtitleBackgroundColorKey, encodeSyncString(it)) }
         loadSubtitleOutlineColor()?.let { put(subtitleOutlineColorKey, encodeSyncString(it)) }
@@ -546,7 +579,6 @@ internal actual object PlayerSettingsStorage {
         loadSubtitleFontFamily()?.let { put(subtitleFontFamilyKey, encodeSyncString(it)) }
         loadSubtitleAssStyleMode()?.let { put(subtitleAssStyleModeKey, encodeSyncString(it)) }
         loadSubtitleAssScalePercent()?.let { put(subtitleAssScalePercentKey, encodeSyncInt(it)) }
-        loadSubtitleUseForcedSubtitles()?.let { put(subtitleUseForcedSubtitlesKey, encodeSyncBoolean(it)) }
         loadSubtitleShowOnlyPreferredLanguages()?.let { put(subtitleShowOnlyPreferredLanguagesKey, encodeSyncBoolean(it)) }
         loadAddonSubtitleStartupMode()?.let { put(addonSubtitleStartupModeKey, encodeSyncString(it)) }
         loadRejectedSubtitleKeywords()?.let { put(rejectedSubtitleKeywordsKey, encodeSyncStringSet(it)) }
@@ -571,6 +603,7 @@ internal actual object PlayerSettingsStorage {
         loadAnimeSkipEnabled()?.let { put(animeSkipEnabledKey, encodeSyncBoolean(it)) }
         loadAnimeSkipClientId()?.let { put(animeSkipClientIdKey, encodeSyncString(it)) }
         loadStreamAutoPlayNextEpisodeEnabled()?.let { put(streamAutoPlayNextEpisodeEnabledKey, encodeSyncBoolean(it)) }
+        loadStreamAutoPlayManualNextEpisode()?.let { put(streamAutoPlayManualNextEpisodeKey, encodeSyncBoolean(it)) }
         loadStreamAutoPlayPreferBingeGroup()?.let { put(streamAutoPlayPreferBingeGroupKey, encodeSyncBoolean(it)) }
         loadStreamAutoPlayReuseBingeGroup()?.let { put(streamAutoPlayReuseBingeGroupKey, encodeSyncBoolean(it)) }
         loadStreamFailoverEnabled()?.let { put(streamFailoverEnabledKey, encodeSyncBoolean(it)) }
@@ -616,8 +649,10 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(preferredSubtitleLanguageKey)?.let(::savePreferredSubtitleLanguage)
         payload.decodeSyncString(secondaryPreferredSubtitleLanguageKey)?.let(::saveSecondaryPreferredSubtitleLanguage)
         payload.decodeSyncBoolean(dualSubtitlesEnabledKey)?.let(::saveDualSubtitlesEnabled)
+        payload.decodeSyncString(preferredSubtitleTrackKindKey)?.let(::savePreferredSubtitleTrackKind)
+        // An older peer sends the two switches instead; the repository folds them in on reload.
         payload.decodeSyncBoolean(preferHearingImpairedSubtitlesKey)
-            ?.let(::savePreferHearingImpairedSubtitles)
+            ?.let { saveBoolean(preferHearingImpairedSubtitlesKey, it) }
         payload.decodeSyncString(subtitleTextColorKey)?.let(::saveSubtitleTextColor)
         payload.decodeSyncString(subtitleBackgroundColorKey)?.let(::saveSubtitleBackgroundColor)
         payload.decodeSyncString(subtitleOutlineColorKey)?.let(::saveSubtitleOutlineColor)
@@ -634,7 +669,7 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(subtitleFontFamilyKey)?.let(::saveSubtitleFontFamily)
         payload.decodeSyncString(subtitleAssStyleModeKey)?.let(::saveSubtitleAssStyleMode)
         payload.decodeSyncInt(subtitleAssScalePercentKey)?.let(::saveSubtitleAssScalePercent)
-        payload.decodeSyncBoolean(subtitleUseForcedSubtitlesKey)?.let(::saveSubtitleUseForcedSubtitles)
+        payload.decodeSyncBoolean(subtitleUseForcedSubtitlesKey)?.let { saveBoolean(subtitleUseForcedSubtitlesKey, it) }
         payload.decodeSyncBoolean(subtitleShowOnlyPreferredLanguagesKey)?.let(::saveSubtitleShowOnlyPreferredLanguages)
         payload.decodeSyncString(addonSubtitleStartupModeKey)?.let(::saveAddonSubtitleStartupMode)
         payload.decodeSyncStringSet(rejectedSubtitleKeywordsKey)?.let(::saveRejectedSubtitleKeywords)
@@ -662,6 +697,7 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(skipDbApiKeyKey)?.let(::saveSkipDbApiKey)
         payload.decodeSyncBoolean(introSubmitEnabledKey)?.let(::saveIntroSubmitEnabled)
         payload.decodeSyncBoolean(streamAutoPlayNextEpisodeEnabledKey)?.let(::saveStreamAutoPlayNextEpisodeEnabled)
+        payload.decodeSyncBoolean(streamAutoPlayManualNextEpisodeKey)?.let(::saveStreamAutoPlayManualNextEpisode)
         payload.decodeSyncBoolean(streamAutoPlayPreferBingeGroupKey)?.let(::saveStreamAutoPlayPreferBingeGroup)
         payload.decodeSyncBoolean(streamAutoPlayReuseBingeGroupKey)?.let(::saveStreamAutoPlayReuseBingeGroup)
         payload.decodeSyncBoolean(streamFailoverEnabledKey)?.let(::saveStreamFailoverEnabled)

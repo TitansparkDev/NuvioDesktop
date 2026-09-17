@@ -1,7 +1,9 @@
 package com.nuvio.app.features.games
 
+import kotlinx.serialization.Serializable
+
 /**
- * User-facing configuration for game mode (Umbra), stored alongside every other Nuvio setting
+ * User-facing configuration for game mode, stored alongside every other Nuvio setting
  * rather than inside the game library file.
  *
  * The library itself — the games, their artwork and the last browsed executable folder — stays in
@@ -14,6 +16,7 @@ data class GameLibrarySettings(
     val igdbClientSecret: String = "",
     val steamGridDbApiKey: String = "",
     val backdropStyle: GameBackdropStyle = GameBackdropStyle.BlackShelf,
+    val metadataSource: GameMetadataSource = GameMetadataSource.Igdb,
 ) {
     /** IGDB needs both halves of a Twitch confidential application; one alone buys nothing. */
     val igdbConfigured: Boolean
@@ -21,6 +24,33 @@ data class GameLibrarySettings(
 
     val steamGridDbConfigured: Boolean
         get() = steamGridDbApiKey.isNotBlank()
+
+    /** Whether the chosen provider can actually be asked anything right now. */
+    val metadataConfigured: Boolean
+        get() = when (metadataSource) {
+            GameMetadataSource.Igdb -> igdbConfigured
+            GameMetadataSource.Steam -> true
+        }
+}
+
+/**
+ * Where a game's title, summary, genres, release date, rating and artwork come from.
+ *
+ * Not a fallback chain, deliberately. Two providers filling one entry between them would make the
+ * result depend on the order the top-up happened to run in, and a game would silently change its
+ * description when a match appeared elsewhere. One source answers for the whole library, and the
+ * user is told what each costs.
+ */
+@Serializable
+enum class GameMetadataSource {
+    /** Every platform, but needs a Twitch client id and secret. */
+    Igdb,
+
+    /**
+     * No key of any kind, and no coverage outside Steam's own store: a game Steam does not sell
+     * cannot be matched at all, so this suits a Steam-heavy library and nothing else.
+     */
+    Steam,
 }
 
 /** How far the artwork behind the game library extends before the cover rail takes over. */

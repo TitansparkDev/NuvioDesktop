@@ -18,5 +18,7 @@ import androidx.compose.ui.Modifier
 expect fun NuvioPosterHoverTooltip(
     title: String,
     modifier: Modifier = Modifier,
+    /** Optional dimmer second line under [title]; the card shows when either is non-blank. */
+    subtitle: String = "",
     content: @Composable () -> Unit,
 )

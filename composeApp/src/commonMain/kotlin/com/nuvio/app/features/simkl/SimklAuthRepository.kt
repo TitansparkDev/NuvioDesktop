@@ -14,7 +14,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+
+/** See [SimklAuthRepository.fetchActivities]. */
+private const val ACTIVITIES_BURST_WINDOW_MS = 15_000L
 
 private const val BASE_URL = "https://api.simkl.com"
 
@@ -31,6 +36,9 @@ internal object SimklAuthRepository {
     val isAuthenticated: StateFlow<Boolean> = _isAuthenticated.asStateFlow()
 
     private var authState = SimklAuthState()
+    private val activitiesMutex = Mutex()
+    private var cachedActivities: SimklActivities? = null
+    private var cachedActivitiesAtMs = 0L
     private var pinPollJob: Job? = null
     private var loaded = false
 
@@ -55,6 +63,7 @@ internal object SimklAuthRepository {
         pinPollJob = null
         loaded = false
         authState = SimklAuthState()
+        clearActivitiesCache()
         ensureLoaded()
     }
 
@@ -71,21 +80,40 @@ internal object SimklAuthRepository {
     /**
      * Fetches the activities endpoint — must be called before any /sync/all-items request.
      * Returns null if unauthenticated or the request fails.
+     *
+     * Successful answers are held for [ACTIVITIES_BURST_WINDOW_MS]. This is a burst collapser, not
+     * a cache: one Continue Watching pull asks three times over — the watching-seed gate, the
+     * watched-history gate and the library each check the stamp within a second of each other — and
+     * the window is far shorter than any interval those gates are polled on, so nothing that could
+     * have observed a change is hidden from it. The mutex makes a concurrent trio share one request
+     * rather than race to issue three.
      */
     suspend fun fetchActivities(): SimklActivities? {
         val headers = authorizedHeaders() ?: return null
-        val url = appendParams("$BASE_URL/sync/activities")
-        return runCatching {
-            val resp = httpRequestRaw(method = "GET", url = url, headers = headers, body = "")
-            if (resp.status !in 200..299) return null
-            json.decodeFromString<SimklActivities>(resp.body)
-        }.onFailure { log.w(it) { "SIMKL /sync/activities failed" } }.getOrNull()
-            ?.also { activities ->
-                val settingsStamp = activities.settings?.all
-                if (!settingsStamp.isNullOrBlank() && settingsStamp != authState.settingsActivitiesAt) {
-                    refreshUserSettings(settingsStamp)
+        return activitiesMutex.withLock {
+            val now = System.currentTimeMillis()
+            cachedActivities?.takeIf { now - cachedActivitiesAtMs < ACTIVITIES_BURST_WINDOW_MS }
+                ?.let { return@withLock it }
+            val url = appendParams("$BASE_URL/sync/activities")
+            runCatching {
+                val resp = httpRequestRaw(method = "GET", url = url, headers = headers, body = "")
+                if (resp.status !in 200..299) return@withLock null
+                json.decodeFromString<SimklActivities>(resp.body)
+            }.onFailure { log.w(it) { "SIMKL /sync/activities failed" } }.getOrNull()
+                ?.also { activities ->
+                    cachedActivities = activities
+                    cachedActivitiesAtMs = now
+                    val settingsStamp = activities.settings?.all
+                    if (!settingsStamp.isNullOrBlank() && settingsStamp != authState.settingsActivitiesAt) {
+                        refreshUserSettings(settingsStamp)
+                    }
                 }
-            }
+        }
+    }
+
+    private fun clearActivitiesCache() {
+        cachedActivities = null
+        cachedActivitiesAtMs = 0L
     }
 
     /** Appends required query parameters to any SIMKL API URL. */
@@ -129,6 +157,7 @@ internal object SimklAuthRepository {
         pinPollJob?.cancel()
         pinPollJob = null
         authState = SimklAuthState()
+        clearActivitiesCache()
         SimklAuthStorage.clearPayload()
         SimklRewatchRepository.clearLocalState()
         publishState()

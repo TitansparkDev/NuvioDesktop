@@ -155,7 +155,7 @@ internal object MdbListScrobbleRepository {
                 return TrackingScrobbleResult.Declined
             }
 
-            log.d { "MDBList scrobble $action response: ${response.status}" }
+            log.d { "MDBList scrobble $action response: ${response.status} ${response.body.take(300)}" }
 
             when (response.status) {
                 in 200..299 -> {

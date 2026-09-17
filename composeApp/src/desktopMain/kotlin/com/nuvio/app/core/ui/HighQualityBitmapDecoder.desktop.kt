@@ -19,25 +19,16 @@ import org.jetbrains.skia.Image as SkiaImage
  * Decodes still images, reducing them properly on the way rather than leaving that to the draw path.
  *
  * Coil's own non-Android decoder decodes at full resolution and then reduces to the requested size
- * with `SamplingMode.DEFAULT`, which is `FilterMipmap(NEAREST, NONE)` — nearest-neighbour. That is
- * the reason [ScaledBitmapPainter] exists: past about 2x minification a single-pass filter discards
- * most of the source, so the app re-reduces from a deliberately oversized 1536 px request using
- * repeated box-halving and a Mitchell cubic, and does it inside `onDraw`.
+ * with `SamplingMode.DEFAULT`, which is `FilterMipmap(NEAREST, NONE)` — nearest-neighbour. Past
+ * about 2x minification a single-pass filter discards most of the source, which is why
+ * [ScaledBitmapPainter] used to re-reduce every image from a deliberately oversized 1536 px request,
+ * with repeated box-halving and a Mitchell cubic, inside `onDraw`.
  *
  * This moves that reduction to where it belongs — the decode dispatcher — and removes the
  * nearest-neighbour step entirely, so a large source is no longer aliased before the careful pass
- * ever sees it.
- *
- * **Registered behind the animated and SVG factories, and it changes no sizing yet.** Requests are
- * still pinned at 1536 px by `NuvioAsyncImage`, so for a typical `w500` poster the multiplier is 1.0,
- * this performs the same 1:1 blit into an N32 bitmap that Coil does, and [ScaledBitmapPainter] still
- * reduces to the card size exactly as before — byte for byte. Only sources larger than 1536 px change
- * at all, and only by losing an aliasing step.
- *
- * Sizing the request from the destination is the separate half of that change, and it is the one that
- * makes this decoder pay off: the reduction then lands here instead of on the draw thread, and the
- * memory cache holds card-sized bitmaps. That half needs `rememberConstraintsSizeResolver`, whose
- * `size()` suspends until layout constraints arrive, so it is deliberately not bundled in here.
+ * ever sees it. Requests are now sized from the destination, so what lands in Coil's memory cache is
+ * already card-sized; the small headroom left on top covers focus enlargement. [ScaledBitmapPainter]
+ * survives only as a fallback for fetchers that return their own oversized `BitmapImage`.
  */
 internal class HighQualityBitmapDecoder(
     private val source: ImageSource,
@@ -60,6 +51,14 @@ internal class HighQualityBitmapDecoder(
                 encoded.reduceHighQuality(targetWidth, targetHeight)
             }
             bitmap.setImmutable()
+            DesktopArtworkTelemetry.recordDecode(
+                sourceWidth = encoded.width,
+                sourceHeight = encoded.height,
+                outWidth = bitmap.width,
+                outHeight = bitmap.height,
+                destinationSized = options.hasDesktopArtworkDestinationSize(),
+            )
+            DesktopArtworkTelemetry.maybeLogSummary()
             return DecodeResult(image = bitmap.asImage(), isSampled = multiplier < 1.0)
         } finally {
             encoded.close()

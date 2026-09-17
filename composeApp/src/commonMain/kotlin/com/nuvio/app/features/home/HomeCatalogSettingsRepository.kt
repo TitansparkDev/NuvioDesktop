@@ -148,6 +148,20 @@ internal fun migrateHeroInfoPrioritySlots(
     )
 }
 
+/**
+ * Hero backdrop crossfade, in milliseconds. 0 restores the original hard cut.
+ *
+ * The backdrop used to swap in a single frame, which on a variable-refresh OLED made an
+ * instantaneous full-screen brightness step - a near-black backdrop followed by a bright one - that
+ * the panel's brightness limiter answered with a visible dim. Fading the step over time removed it
+ * with nothing else given up: highlight effects and backdrop brightness both stay at full strength.
+ * It also reads better in a dark room, where a hard cut between a black and a white backdrop is a
+ * flashbang.
+ */
+internal const val HERO_CROSSFADE_MIN_MS = 0
+internal const val HERO_CROSSFADE_MAX_MS = 1000
+internal const val HERO_CROSSFADE_DEFAULT_MS = 300
+
 private const val HERO_INFO_LINES_MIN = 0
 private const val HERO_INFO_LINES_MAX = 6
 private const val HERO_BADGE_SCALE_MIN = 1f
@@ -155,7 +169,7 @@ private const val HERO_BADGE_SCALE_MAX = 2.5f
 private const val ADAPTIVE_HERO_VERTICAL_BIAS_MIN = -1f
 private const val ADAPTIVE_HERO_VERTICAL_BIAS_MAX = 1f
 private const val ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT = -0.58f
-private const val ADAPTIVE_HERO_HEIGHT_MULTIPLIER_MIN = 0.75f
+private const val ADAPTIVE_HERO_HEIGHT_MULTIPLIER_MIN = 0.5f
 private const val ADAPTIVE_HERO_HEIGHT_MULTIPLIER_MAX = 1.75f
 private const val ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT = 1.25f
 
@@ -181,6 +195,7 @@ data class HomeCatalogSettingsItem(
 data class HomeCatalogSettingsUiState(
     val heroEnabled: Boolean = true,
     val heroInfoLines: Int = 2,
+    val heroBackdropCrossfadeMillis: Int = HERO_CROSSFADE_DEFAULT_MS,
     val heroInfoPriority: String = DEFAULT_HERO_INFO_PRIORITY,
     val heroBadgePlacement: HeroBadgePlacement = HeroBadgePlacement.BottomBackdrop,
     val heroBadgeScale: Float = 1f,
@@ -217,6 +232,7 @@ data class HomeCatalogSettingsUiState(
     val catalogRowNumbersEnabled: Boolean = false,
     val tvRowDotsEnabled: Boolean = false,
     val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle,
+    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Fade,
     val tvFullBackdropEnabled: Boolean = false,
     val randomPlayEnabled: Boolean = false,
     val randomPlayIncludeCollections: Boolean = false,
@@ -231,6 +247,8 @@ data class HomeCatalogSettingsUiState(
             append(heroEnabled)
             append('|')
             append(heroInfoLines)
+            append('|')
+            append(heroBackdropCrossfadeMillis)
             append('|')
             append(heroInfoPriority)
             append('|')
@@ -270,6 +288,8 @@ data class HomeCatalogSettingsUiState(
             append('|')
             append(tvRowDotsAnchor)
             append('|')
+            append(tvRowTransition)
+            append('|')
             append(tvFullBackdropEnabled)
             append('|')
             append(randomPlayEnabled)
@@ -302,6 +322,7 @@ internal data class HomeCatalogPreference(
 internal data class HomeCatalogSettingsSnapshot(
     val heroEnabled: Boolean,
     val heroInfoLines: Int,
+    val heroBackdropCrossfadeMillis: Int,
     val heroInfoPriority: String,
     val heroBadgePlacement: HeroBadgePlacement,
     val heroBadgeScale: Float,
@@ -346,6 +367,22 @@ enum class HomeTvRowDotsAnchor {
     /** Over the backdrop, in the slot the "Bottom of backdrop" hero badges occupy. */
     @SerialName("hero_backdrop")
     HeroBackdrop,
+}
+
+/** How TV Mode's shelf changes rows. See immersiveRowTransition. */
+@Serializable
+enum class HomeTvRowTransition {
+    /** Hard cut, as before the transition existed. */
+    @SerialName("off")
+    Off,
+
+    /** The rows cross-fade in place. */
+    @SerialName("fade")
+    Fade,
+
+    /** Cross-fade plus a small slide in the direction of travel. */
+    @SerialName("fade_nudge")
+    FadeNudge,
 }
 
 /**
@@ -462,6 +499,7 @@ private data class StoredHomeCatalogPreference(
 private data class StoredHomeCatalogSettingsPayload(
     val heroEnabled: Boolean = true,
     val heroInfoLines: Int = 2,
+    val heroBackdropCrossfadeMillis: Int = HERO_CROSSFADE_DEFAULT_MS,
     val heroInfoPriority: String = DEFAULT_HERO_INFO_PRIORITY,
     val heroInfoPrioritySlotMigrations: Set<String> = emptySet(),
     val heroBadgePlacement: HeroBadgePlacement = HeroBadgePlacement.BottomBackdrop,
@@ -501,6 +539,7 @@ private data class StoredHomeCatalogSettingsPayload(
     val catalogRowNumbersEnabled: Boolean = false,
     val tvRowDotsEnabled: Boolean = false,
     val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle,
+    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Fade,
     val tvFullBackdropEnabled: Boolean = false,
     val randomPlayEnabled: Boolean = false,
     val randomPlayIncludeCollections: Boolean = false,
@@ -531,6 +570,7 @@ object HomeCatalogSettingsRepository {
     private var preferences: MutableMap<String, StoredHomeCatalogPreference> = mutableMapOf()
     private var heroEnabled = true
     private var heroInfoLines = 2
+    private var heroBackdropCrossfadeMillis = HERO_CROSSFADE_DEFAULT_MS
     private var heroInfoPriority = DEFAULT_HERO_INFO_PRIORITY
     private var heroInfoPrioritySlotMigrations: Set<String> = emptySet()
     private var heroBadgePlacement = HeroBadgePlacement.BottomBackdrop
@@ -573,6 +613,7 @@ object HomeCatalogSettingsRepository {
     private var catalogRowNumbersEnabled = false
     private var tvRowDotsEnabled = false
     private var tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
+    private var tvRowTransition = HomeTvRowTransition.Fade
     private var tvFullBackdropEnabled = false
     private var randomPlayEnabled = false
     private var randomPlayIncludeCollections = false
@@ -586,6 +627,7 @@ object HomeCatalogSettingsRepository {
         preferences.clear()
         heroEnabled = true
         heroInfoLines = 2
+        heroBackdropCrossfadeMillis = HERO_CROSSFADE_DEFAULT_MS
         heroInfoPriority = DEFAULT_HERO_INFO_PRIORITY
         // The default string already contains every migrated slot, so nothing is outstanding.
         heroInfoPrioritySlotMigrations = HERO_INFO_PRIORITY_SLOT_MIGRATIONS.mapTo(mutableSetOf()) { it.slot }
@@ -620,6 +662,7 @@ object HomeCatalogSettingsRepository {
         catalogRowNumbersEnabled = false
         tvRowDotsEnabled = false
         tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
+        tvRowTransition = HomeTvRowTransition.Fade
         tvFullBackdropEnabled = false
         resetRandomPlaySettings()
         definitions = emptyList()
@@ -636,6 +679,7 @@ object HomeCatalogSettingsRepository {
         preferences.clear()
         heroEnabled = true
         heroInfoLines = 2
+        heroBackdropCrossfadeMillis = HERO_CROSSFADE_DEFAULT_MS
         heroInfoPriority = DEFAULT_HERO_INFO_PRIORITY
         // The default string already contains every migrated slot, so nothing is outstanding.
         heroInfoPrioritySlotMigrations = HERO_INFO_PRIORITY_SLOT_MIGRATIONS.mapTo(mutableSetOf()) { it.slot }
@@ -670,6 +714,7 @@ object HomeCatalogSettingsRepository {
         catalogRowNumbersEnabled = false
         tvRowDotsEnabled = false
         tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
+        tvRowTransition = HomeTvRowTransition.Fade
         tvFullBackdropEnabled = false
         resetRandomPlaySettings()
         _uiState.value = HomeCatalogSettingsUiState()
@@ -717,6 +762,7 @@ object HomeCatalogSettingsRepository {
         return HomeCatalogSettingsSnapshot(
             heroEnabled = heroEnabled,
             heroInfoLines = heroInfoLines,
+            heroBackdropCrossfadeMillis = heroBackdropCrossfadeMillis,
             heroInfoPriority = heroInfoPriority,
             heroBadgePlacement = heroBadgePlacement,
             heroBadgeScale = heroBadgeScale,
@@ -778,6 +824,15 @@ object HomeCatalogSettingsRepository {
         publish()
         persist()
     }
+    fun setHeroBackdropCrossfadeMillis(millis: Int) {
+        ensureLoaded()
+        val normalized = normalizeHeroCrossfade(millis)
+        if (heroBackdropCrossfadeMillis == normalized) return
+        heroBackdropCrossfadeMillis = normalized
+        publish()
+        persist()
+    }
+
     fun setHeroInfoLines(lines: Int) {
         ensureLoaded()
         val normalizedLines = lines.coerceIn(HERO_INFO_LINES_MIN, HERO_INFO_LINES_MAX)
@@ -1253,6 +1308,14 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    fun setTvRowTransition(transition: HomeTvRowTransition) {
+        ensureLoaded()
+        if (tvRowTransition == transition) return
+        tvRowTransition = transition
+        publish()
+        persist()
+    }
+
     fun setHeroSourceEnabled(key: String, enabled: Boolean) {
         updatePreference(key) { preference ->
             if (!enabled) {
@@ -1355,6 +1418,7 @@ object HomeCatalogSettingsRepository {
         ensureLoaded()
         heroEnabled = true
         heroInfoLines = 2
+        heroBackdropCrossfadeMillis = HERO_CROSSFADE_DEFAULT_MS
         heroInfoPriority = DEFAULT_HERO_INFO_PRIORITY
         // The default string already contains every migrated slot, so nothing is outstanding.
         heroInfoPrioritySlotMigrations = HERO_INFO_PRIORITY_SLOT_MIGRATIONS.mapTo(mutableSetOf()) { it.slot }
@@ -1389,6 +1453,7 @@ object HomeCatalogSettingsRepository {
         catalogRowNumbersEnabled = false
         tvRowDotsEnabled = false
         tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
+        tvRowTransition = HomeTvRowTransition.Fade
         tvFullBackdropEnabled = false
         resetRandomPlaySettings()
         preferences.clear()
@@ -1464,6 +1529,7 @@ object HomeCatalogSettingsRepository {
         if (parsedPayload != null) {
             heroEnabled = parsedPayload.heroEnabled
             heroInfoLines = normalizeHeroInfoLines(parsedPayload.heroInfoLines)
+            heroBackdropCrossfadeMillis = normalizeHeroCrossfade(parsedPayload.heroBackdropCrossfadeMillis)
             heroInfoPriority = normalizeHeroInfoPriority(parsedPayload.heroInfoPriority)
             heroBadgePlacement = parsedPayload.heroBadgePlacement
             heroBadgeScale = normalizeHeroBadgeScale(parsedPayload.heroBadgeScale)
@@ -1514,6 +1580,7 @@ object HomeCatalogSettingsRepository {
             catalogRowNumbersEnabled = parsedPayload.catalogRowNumbersEnabled
             tvRowDotsEnabled = parsedPayload.tvRowDotsEnabled
             tvRowDotsAnchor = parsedPayload.tvRowDotsAnchor
+            tvRowTransition = parsedPayload.tvRowTransition
             tvFullBackdropEnabled = parsedPayload.tvFullBackdropEnabled
             randomPlayEnabled = parsedPayload.randomPlayEnabled
             randomPlayIncludeCollections = parsedPayload.randomPlayIncludeCollections
@@ -1650,6 +1717,7 @@ object HomeCatalogSettingsRepository {
         _uiState.value = HomeCatalogSettingsUiState(
             heroEnabled = heroEnabled,
             heroInfoLines = normalizeHeroInfoLines(heroInfoLines),
+            heroBackdropCrossfadeMillis = normalizeHeroCrossfade(heroBackdropCrossfadeMillis),
             heroInfoPriority = heroInfoPriority,
             heroBadgePlacement = heroBadgePlacement,
             heroBadgeScale = heroBadgeScale,
@@ -1696,6 +1764,7 @@ object HomeCatalogSettingsRepository {
             // saved while the toggle sits disabled outside TV Mode; the shelf gates on the mode.
             tvRowDotsEnabled = tvRowDotsEnabled,
             tvRowDotsAnchor = tvRowDotsAnchor,
+            tvRowTransition = tvRowTransition,
             tvFullBackdropEnabled = tvFullBackdropEnabled,
             randomPlayEnabled = randomPlayEnabled,
             randomPlayIncludeCollections = randomPlayIncludeCollections,
@@ -1713,8 +1782,12 @@ object HomeCatalogSettingsRepository {
             heroAmbientBackgroundEnabled = false
         }
         heroInfoLines = normalizeHeroInfoLines(heroInfoLines)
+        heroBackdropCrossfadeMillis = normalizeHeroCrossfade(heroBackdropCrossfadeMillis)
         heroInfoPriority = normalizeHeroInfoPriority(heroInfoPriority)
     }
+
+    private fun normalizeHeroCrossfade(millis: Int): Int =
+        millis.coerceIn(HERO_CROSSFADE_MIN_MS, HERO_CROSSFADE_MAX_MS)
 
     private fun normalizeHeroInfoLines(lines: Int): Int =
         lines.coerceIn(HERO_INFO_LINES_MIN, HERO_INFO_LINES_MAX)
@@ -1761,6 +1834,7 @@ object HomeCatalogSettingsRepository {
                 StoredHomeCatalogSettingsPayload(
                     heroEnabled = heroEnabled,
                     heroInfoLines = heroInfoLines,
+                    heroBackdropCrossfadeMillis = heroBackdropCrossfadeMillis,
                     heroInfoPriority = heroInfoPriority,
                     heroInfoPrioritySlotMigrations = heroInfoPrioritySlotMigrations,
                     heroBadgePlacement = heroBadgePlacement,
@@ -1795,6 +1869,7 @@ object HomeCatalogSettingsRepository {
                     tvRowDotsEnabled = tvRowDotsEnabled,
                     tvFullBackdropEnabled = tvFullBackdropEnabled,
                     tvRowDotsAnchor = tvRowDotsAnchor,
+                    tvRowTransition = tvRowTransition,
                     randomPlayEnabled = randomPlayEnabled,
                     randomPlayIncludeCollections = randomPlayIncludeCollections,
                     randomPlayCategories = randomPlayCategories,

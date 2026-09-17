@@ -79,6 +79,39 @@ class PluginRuntimeDesktopTest {
     }
 
     /**
+     * A playback-startup hold defers new scraper starts without cancelling them: the scraper runs
+     * to completion the moment the hold is released. A stale hold (release never sent) must not
+     * become a scraper that waits out its whole budget — that is what the cap is for, but it is
+     * 30 s, so only the release path is exercised here.
+     */
+    @Test
+    fun `playback startup hold defers scraper starts until released`() = runBlocking {
+        PluginRuntime.setPlaybackStartupHold(true)
+        try {
+            val held = async {
+                PluginRuntime.executePlugin(
+                    code = """
+                        module.exports.getStreams = async function() {
+                            return [{ title: "after hold", url: "https://example.test/held.mp4" }];
+                        };
+                    """.trimIndent(),
+                    tmdbId = "603",
+                    mediaType = "movie",
+                    season = null,
+                    episode = null,
+                    scraperId = "hold-test",
+                )
+            }
+            kotlinx.coroutines.delay(400)
+            assertEquals(false, held.isCompleted, "scraper started while the hold was active")
+            PluginRuntime.setPlaybackStartupHold(false)
+            assertEquals("after hold", held.await().single().title)
+        } finally {
+            PluginRuntime.setPlaybackStartupHold(false)
+        }
+    }
+
+    /**
      * `fetch` is backed by an async binding, so a plugin awaiting several requests at once really
      * does issue them at once. While the binding was a blocking one, `Promise.all` was a lie: each
      * call held the JS engine until the response came back, so five 300 ms mirrors cost 1.5 s.

@@ -66,8 +66,10 @@ internal object SimklWatchedAdapter : TrackingWatchedProvider {
 
     override suspend fun pull(profileId: Int, pageSize: Int): List<WatchedItem> {
         if (profileId != ProfileRepository.activeProfileId) return emptyList()
-        return SimklWatchedRepository.watchedItems()
+        return SimklWatchedRepository.watchedItems(profileId)
     }
+
+    override fun invalidateChangeDetection() = SimklWatchedRepository.invalidate()
 
     // Manual mutations use SimklHistoryWriter. These are deliberately no-ops here so a local
     // playback completion cannot be written twice through both the scrobbler and watched sync.

@@ -18,6 +18,10 @@
 #include <windows.media.h>
 #include <systemmediatransportcontrolsinterop.h>
 #include <WebView2.h>
+#include <Xinput.h>
+#include <hidsdi.h>
+#include <hidpi.h>
+#include <setupapi.h>
 #include <jni.h>
 
 #include <algorithm>
@@ -328,6 +332,25 @@ std::string redactedSourceSummary(const std::string &sourceUrl) {
     if (query != std::string::npos) tail.resize(query);
     if (tail.size() > 96) tail.resize(96);
     return tail.empty() ? "(unknown)" : tail;
+}
+// The host (no path, no query) of an http(s) source, or "-" for anything else. A 429 report
+// needs to say *which* host refused — the addon's resolver or the CDN it redirected to — and
+// redactedSourceSummary deliberately keeps only the filename.
+std::string sourceHostSummary(const std::string &sourceUrl) {
+    const size_t scheme = sourceUrl.find("://");
+    if (scheme == std::string::npos) return "-";
+    const std::string lowerScheme = [&]() {
+        std::string value = sourceUrl.substr(0, scheme);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return value;
+    }();
+    if (lowerScheme != "http" && lowerScheme != "https") return "-";
+    const size_t start = scheme + 3;
+    const size_t end = sourceUrl.find_first_of("/?#", start);
+    std::string authority = sourceUrl.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    const size_t credentials = authority.find('@');
+    if (credentials != std::string::npos) authority = authority.substr(credentials + 1);
+    return authority.empty() ? "-" : authority;
 }
 const wchar_t *kMessageWindowClass = L"NuvioPlayerBridgeMessageWindow";
 const wchar_t *kContainerWindowClass = L"NuvioPlayerBridgeContainerWindow";
@@ -1021,14 +1044,41 @@ std::wstring currentExecutablePath() {
     return std::wstring(buffer, length);
 }
 
-std::wstring startMenuShortcutPath() {
-    PWSTR programs = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs)) || !programs) {
-        return {};
-    }
-    std::wstring path(programs);
-    CoTaskMemFree(programs);
-    return path + L"\\Nuvio.lnk";
+// The shortcut is named "Nuvio HTPC", not "Nuvio", on purpose. The official Nuvio Desktop's
+// icon picker rewrites the IconLocation of every "Nuvio.lnk" it finds in the Start Menu, taskbar
+// pin store and Desktop without checking what the shortcut launches, so an HTPC entry under the
+// shared name inherits whichever icon the user chose over there. A distinct filename keeps this
+// entry (and pins Windows copies from it) off that list; the icon self-heal below covers pins the
+// user made before the rename.
+const wchar_t *const kStartMenuShortcutName = L"Nuvio HTPC.lnk";
+const wchar_t *const kLegacyStartMenuShortcutName = L"Nuvio.lnk";
+
+std::wstring knownFolder(REFKNOWNFOLDERID id) {
+    PWSTR path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(id, 0, nullptr, &path)) || !path) return {};
+    std::wstring result(path);
+    CoTaskMemFree(path);
+    return result;
+}
+
+std::wstring startMenuShortcutPath(const wchar_t *name) {
+    const std::wstring programs = knownFolder(FOLDERID_Programs);
+    if (programs.empty()) return {};
+    return programs + L"\\" + name;
+}
+
+// Where the official Nuvio Desktop stages the icons its picker points shortcuts at. An icon under
+// here on a shortcut that launches us is unambiguously that app's doing, as opposed to an icon the
+// user chose for a desktop shortcut themselves, which is theirs to keep.
+std::wstring officialAppIconDirectory() {
+    const std::wstring localAppData = knownFolder(FOLDERID_LocalAppData);
+    if (localAppData.empty()) return {};
+    return localAppData + L"\\Nuvio\\icons\\";
+}
+
+bool startsWithNoCase(const std::wstring &value, const std::wstring &prefix) {
+    return !prefix.empty() && value.size() >= prefix.size() &&
+           _wcsnicmp(value.c_str(), prefix.c_str(), prefix.size()) == 0;
 }
 
 bool setShortcutAumid(IShellLinkW *link) {
@@ -1042,17 +1092,21 @@ bool setShortcutAumid(IShellLinkW *link) {
     return ok;
 }
 
-// Reports whether the shortcut points at this exe, and whether it already carries our AUMID, so
-// a normal launch rewrites nothing. Rewriting matters: touching the Start Menu entry re-flags
-// Nuvio as "recently added", and touching a taskbar pin risks disturbing the pin itself.
-bool inspectShortcut(
-    const std::wstring &linkPath,
-    const std::wstring &exePath,
-    bool *targetsUs,
-    bool *hasOurAumid
-) {
-    *targetsUs = false;
-    *hasOurAumid = false;
+struct ShortcutState {
+    bool targetsUs = false;
+    bool hasOurAumid = false;
+    // The icon is this exe's own (what we write) — or no explicit icon at all, which the shell
+    // resolves to the target's icon and so means the same thing.
+    bool iconIsOurs = false;
+    // The icon points into the official Nuvio Desktop's staged-icon directory.
+    bool iconIsOfficialApps = false;
+};
+
+// Reports what the shortcut currently says, so a normal launch rewrites nothing. Rewriting matters:
+// touching the Start Menu entry re-flags Nuvio as "recently added", and touching a taskbar pin
+// risks disturbing the pin itself.
+bool inspectShortcut(const std::wstring &linkPath, const std::wstring &exePath, ShortcutState *state) {
+    *state = ShortcutState{};
 
     ComPtr<IShellLinkW> link;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) {
@@ -1063,29 +1117,39 @@ bool inspectShortcut(
 
     wchar_t target[MAX_PATH] = {};
     if (FAILED(link->GetPath(target, ARRAYSIZE(target), nullptr, 0))) return false;
-    *targetsUs = _wcsicmp(target, exePath.c_str()) == 0;
+    state->targetsUs = _wcsicmp(target, exePath.c_str()) == 0;
+
+    wchar_t icon[MAX_PATH] = {};
+    int iconIndex = 0;
+    if (SUCCEEDED(link->GetIconLocation(icon, ARRAYSIZE(icon), &iconIndex))) {
+        state->iconIsOurs = icon[0] == L'\0' || _wcsicmp(icon, exePath.c_str()) == 0;
+        state->iconIsOfficialApps = startsWithNoCase(icon, officialAppIconDirectory());
+    }
 
     ComPtr<IPropertyStore> store;
     if (SUCCEEDED(link.As(&store))) {
         PROPVARIANT value;
         PropVariantInit(&value);
         if (SUCCEEDED(store->GetValue(PKEY_AppUserModel_ID, &value)) && value.vt == VT_LPWSTR) {
-            *hasOurAumid = value.pwszVal && wcscmp(value.pwszVal, kNuvioAppUserModelId) == 0;
+            state->hasOurAumid = value.pwszVal && wcscmp(value.pwszVal, kNuvioAppUserModelId) == 0;
         }
         PropVariantClear(&value);
     }
     return true;
 }
 
-// Stamps our AUMID onto an EXISTING shortcut that already launches this exe, leaving everything
-// else about it untouched. Required because once the process declares an explicit AUMID, Windows
-// only associates a launcher with the running window when the shortcut declares the same one —
-// otherwise a pinned taskbar icon spawns a second, separate taskbar entry.
-bool stampExistingShortcut(const std::wstring &linkPath, const std::wstring &exePath) {
-    bool targetsUs = false;
-    bool hasOurAumid = false;
-    if (!inspectShortcut(linkPath, exePath, &targetsUs, &hasOurAumid)) return false;
-    if (!targetsUs || hasOurAumid) return false;
+// Repairs an EXISTING shortcut that already launches this exe, leaving everything else about it
+// untouched: stamps our AUMID if it is missing, and puts our icon back if the official app's icon
+// picker replaced it. The AUMID is required because once the process declares an explicit AUMID,
+// Windows only associates a launcher with the running window when the shortcut declares the same
+// one — otherwise a pinned taskbar icon spawns a second, separate taskbar entry.
+bool repairExistingShortcut(const std::wstring &linkPath, const std::wstring &exePath) {
+    ShortcutState state;
+    if (!inspectShortcut(linkPath, exePath, &state)) return false;
+    if (!state.targetsUs) return false;
+    const bool needsAumid = !state.hasOurAumid;
+    const bool needsIcon = state.iconIsOfficialApps;
+    if (!needsAumid && !needsIcon) return false;
 
     ComPtr<IShellLinkW> link;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) {
@@ -1093,32 +1157,25 @@ bool stampExistingShortcut(const std::wstring &linkPath, const std::wstring &exe
     }
     ComPtr<IPersistFile> file;
     if (FAILED(link.As(&file)) || FAILED(file->Load(linkPath.c_str(), STGM_READWRITE))) return false;
-    if (!setShortcutAumid(link.Get())) return false;
+    if (needsAumid && !setShortcutAumid(link.Get())) return false;
+    if (needsIcon && FAILED(link->SetIconLocation(exePath.c_str(), 0))) return false;
     return SUCCEEDED(file->Save(linkPath.c_str(), TRUE));
 }
 
 // Never creates shortcuts here — only repairs ones the user already made. Nuvio has no business
 // adding itself to a taskbar or desktop the user didn't ask it to.
-int stampShortcutsInDirectory(const std::wstring &directory, const std::wstring &exePath) {
+int repairShortcutsInDirectory(const std::wstring &directory, const std::wstring &exePath) {
     if (directory.empty()) return 0;
     WIN32_FIND_DATAW found = {};
     HANDLE search = FindFirstFileW((directory + L"\\*.lnk").c_str(), &found);
     if (search == INVALID_HANDLE_VALUE) return 0;
-    int stamped = 0;
+    int repaired = 0;
     do {
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (stampExistingShortcut(directory + L"\\" + found.cFileName, exePath)) stamped++;
+        if (repairExistingShortcut(directory + L"\\" + found.cFileName, exePath)) repaired++;
     } while (FindNextFileW(search, &found));
     FindClose(search);
-    return stamped;
-}
-
-std::wstring knownFolder(REFKNOWNFOLDERID id) {
-    PWSTR path = nullptr;
-    if (FAILED(SHGetKnownFolderPath(id, 0, nullptr, &path)) || !path) return {};
-    std::wstring result(path);
-    CoTaskMemFree(path);
-    return result;
+    return repaired;
 }
 
 // The taskbar pin store has no KNOWNFOLDERID of its own.
@@ -1128,15 +1185,16 @@ std::wstring taskbarPinnedDirectory() {
     return appData + L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar";
 }
 
-// Rewritten (not just created) whenever the target drifts, so moving a portable copy self-heals
-// on next launch instead of leaving a shortcut aimed at a path that no longer exists.
+// Rewritten (not just created) whenever the target, AUMID or icon drifts, so moving a portable copy
+// self-heals on next launch instead of leaving a shortcut aimed at a path that no longer exists,
+// and an icon the official app's picker stamped on here is put back.
 bool ensureStartMenuShortcut(const std::wstring &exePath) {
-    const std::wstring linkPath = startMenuShortcutPath();
+    const std::wstring linkPath = startMenuShortcutPath(kStartMenuShortcutName);
     if (linkPath.empty()) return false;
 
-    bool targetsUs = false;
-    bool hasOurAumid = false;
-    if (inspectShortcut(linkPath, exePath, &targetsUs, &hasOurAumid) && targetsUs && hasOurAumid) {
+    ShortcutState state;
+    if (inspectShortcut(linkPath, exePath, &state) && state.targetsUs && state.hasOurAumid &&
+        state.iconIsOurs) {
         return true;
     }
 
@@ -1146,7 +1204,7 @@ bool ensureStartMenuShortcut(const std::wstring &exePath) {
     }
     link->SetPath(exePath.c_str());
     link->SetIconLocation(exePath.c_str(), 0);
-    link->SetDescription(L"Nuvio");
+    link->SetDescription(L"Nuvio HTPC");
     const size_t slash = exePath.find_last_of(L"\\/");
     if (slash != std::wstring::npos) {
         link->SetWorkingDirectory(exePath.substr(0, slash).c_str());
@@ -1156,6 +1214,17 @@ bool ensureStartMenuShortcut(const std::wstring &exePath) {
     ComPtr<IPersistFile> file;
     if (FAILED(link.As(&file))) return false;
     return SUCCEEDED(file->Save(linkPath.c_str(), TRUE));
+}
+
+// Removes the "Nuvio.lnk" Start Menu entry earlier builds wrote — but only when it launches this
+// exe. One that launches something else (the official app, say) is the user's and stays.
+bool removeLegacyStartMenuShortcut(const std::wstring &exePath) {
+    const std::wstring linkPath = startMenuShortcutPath(kLegacyStartMenuShortcutName);
+    if (linkPath.empty()) return false;
+    if (GetFileAttributesW(linkPath.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    ShortcutState state;
+    if (!inspectShortcut(linkPath, exePath, &state) || !state.targetsUs) return false;
+    return DeleteFileW(linkPath.c_str()) != 0;
 }
 
 void initializeAppIdentity() {
@@ -1170,18 +1239,21 @@ void initializeAppIdentity() {
     const bool shouldUninitialize = SUCCEEDED(comResult);
 
     const bool wrote = ensureStartMenuShortcut(exePath);
+    const bool removedLegacy = removeLegacyStartMenuShortcut(exePath);
     // Repair launchers the user already created. Without our AUMID on these, launching from a
-    // taskbar pin opens a SECOND taskbar entry instead of lighting up the pinned one.
-    const int stampedTaskbar = stampShortcutsInDirectory(taskbarPinnedDirectory(), exePath);
-    const int stampedDesktop = stampShortcutsInDirectory(knownFolder(FOLDERID_Desktop), exePath);
+    // taskbar pin opens a SECOND taskbar entry instead of lighting up the pinned one; and pins made
+    // under the old "Nuvio.lnk" name are still exposed to the official app's icon picker.
+    const int repairedTaskbar = repairShortcutsInDirectory(taskbarPinnedDirectory(), exePath);
+    const int repairedDesktop = repairShortcutsInDirectory(knownFolder(FOLDERID_Desktop), exePath);
 
     if (shouldUninitialize) CoUninitialize();
 
     nuvioBridgeLog(
         std::string("app identity ") + (wrote ? "shortcut ok" : "shortcut unavailable") +
         ", aumid " + toUtf8(kNuvioAppUserModelId) +
-        ", stamped taskbar=" + std::to_string(stampedTaskbar) +
-        " desktop=" + std::to_string(stampedDesktop)
+        (removedLegacy ? ", removed legacy Nuvio.lnk" : "") +
+        ", repaired taskbar=" + std::to_string(repairedTaskbar) +
+        " desktop=" + std::to_string(repairedDesktop)
     );
 }
 
@@ -1296,6 +1368,7 @@ public:
         if (!trailer) nuvioMpvLogReset(playbackLogPath);
         nuvioBridgeLog(
             "initialize requested source=" + redactedSourceSummary(sourceUrl) +
+            " host=" + sourceHostSummary(sourceUrl) +
             " audio=" + (audioUrl.empty() ? "no" : "yes") +
             " playWhenReady=" + (playWhenReady ? "yes" : "no") +
             " initialMs=" + std::to_string(initialPositionMs) +
@@ -3040,6 +3113,15 @@ private:
     bool startupPlaybackReady = false;
     bool fileLoadedForCurrentSource = false;
     bool startupFailureReported = false;
+    // Audio passthrough (audio-spdif=...) was requested for this load. When the output device
+    // cannot bitstream (laptop speakers, a shared-mode-only endpoint) the wasapi AO open fails in
+    // exclusive mode, and mpv's own spdif->PCM fallback has been observed never to re-open the
+    // AO: playback sits at position 0 until the Kotlin startup watchdog fails the source over,
+    // and every DD/DTS source then dies the same way. `audio-fallback-to-null` cannot cover it
+    // either — mpv masks the null fallback for the duration of a spdif attempt. So the bridge
+    // watches for the AO failure itself and rebuilds the audio chain as PCM (log handler below).
+    bool audioPassthroughRequested = false;
+    bool audioPassthroughFallbackApplied = false;
     std::atomic<bool> playbackFailureDetected{false};
     std::string lastHttpPlaybackError;
     std::chrono::steady_clock::time_point lastHttpPlaybackErrorAt{};
@@ -3452,6 +3534,8 @@ private:
             appAddedSubtitleUrls.clear();
         }
         startupFailureReported = false;
+        audioPassthroughRequested = false;
+        audioPassthroughFallbackApplied = false;
         playbackFailureDetected.store(false);
         lastHttpPlaybackError.clear();
         lastHttpPlaybackErrorAt = {};
@@ -3775,6 +3859,10 @@ private:
                 recordNuvioConfiguredOptions = !userOption;
                 if (!setMpvOptionStringLocked(key.c_str(), value.c_str())) {
                     nuvioMpvLogAppend("[nuvio] ignored custom mpv option: " + key + "\n");
+                } else if (key == "audio-spdif") {
+                    // The passthrough setting or a hand-typed line; last writer wins, and an empty
+                    // value means passthrough is off for this load.
+                    audioPassthroughRequested = !value.empty();
                 }
             }
             recordNuvioConfiguredOptions = false;
@@ -4214,6 +4302,46 @@ private:
         return false;
     }
 
+    // Passthrough rejected by the output device. mpv logs this once per spdif attempt; by the
+    // time it does, the decoder has been flipped to PCM but the AO is not reliably re-opened (see
+    // audioPassthroughRequested). Clearing audio-spdif and reselecting the track rebuilds the
+    // whole audio chain as PCM from the start, on the path where mpv's null fallback is no longer
+    // masked — so a device that cannot open even PCM still yields silent video rather than a
+    // stalled start. One shot per load: a second failure means PCM itself is broken, and cycling
+    // the track again would only loop. Returns whether this log line triggered the recovery.
+    bool tryRecoverFromPassthroughAoFailure(
+        const std::string &level,
+        const std::string &prefix,
+        const std::string &message
+    ) {
+        const bool isPassthroughAoFailure = audioPassthroughRequested &&
+            !audioPassthroughFallbackApplied &&
+            (level == "error" || level == "fatal") &&
+            prefix == "ao" &&
+            message.find("Failed to initialize audio driver") != std::string::npos;
+        if (!isPassthroughAoFailure) return false;
+        audioPassthroughFallbackApplied = true;
+        std::string audioTrackId;
+        char *currentAid = nullptr;
+        if (mpvApi().getProperty(mpv, "aid", MPV_FORMAT_STRING, &currentAid) >= 0 && currentAid) {
+            audioTrackId = currentAid;
+        }
+        if (currentAid) mpvApi().freeValue(currentAid);
+        const bool hasSelectedTrack = !audioTrackId.empty() &&
+            audioTrackId != "no" && audioTrackId != "auto";
+        mpvApi().setPropertyString(mpv, "audio-spdif", "");
+        if (hasSelectedTrack) {
+            mpvApi().setPropertyString(mpv, "aid", "no");
+            mpvApi().setPropertyString(mpv, "aid", audioTrackId.c_str());
+        }
+        nuvioMpvLogAppend("[nuvio] audio passthrough rejected by output device (" + message + "); " +
+            (hasSelectedTrack
+                ? "reloading audio track " + audioTrackId + " as PCM\n"
+                : "no audio track selected to reload\n"));
+        sendPlayerEvent("audioPassthroughFallback", hasSelectedTrack ? 1.0 : 0.0);
+        return true;
+    }
+
     void drainMpvEvents() {
         gPlaybackThreadLog = playbackLogPath;
         while (!stopping.load()) {
@@ -4330,6 +4458,7 @@ private:
                                 lastHttpPlaybackErrorAt + std::chrono::seconds(10));
                         }
                     }
+                    tryRecoverFromPassthroughAoFailure(level, prefix, message);
                     const bool isHlsSegmentFailure = prefix == "ffmpeg/demuxer" &&
                         message.find("failed too many times, skipping") != std::string::npos;
                     if (isHlsSegmentFailure && !startupFailureReported) {
@@ -5797,4 +5926,577 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_forceVideoRedraw(
     auto player = playerFromHandle(handle);
     if (!player) return;
     player->forceVideoRedraw();
+}
+
+// ---------------------------------------------------------------------------
+// Gamepad (XInput)
+// ---------------------------------------------------------------------------
+// XInput is resolved at runtime rather than linked. XInput1_4.dll ships with Windows 8+ and
+// XInput9_1_0.dll with Vista+, but a hard import on either would make player_bridge.dll fail to
+// load outright on a machine missing that exact version — and this DLL is on the playback path,
+// which must not depend on a controller being supportable. Only XInputGetState is needed; the
+// ordinal-100 variant that also reports the Guide button is deliberately not used (undocumented
+// ordinals are exactly the shape AV heuristics flag, and Guide is not bound to anything).
+using XInputGetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
+
+static XInputGetStateFn resolveXInputGetState() {
+    static XInputGetStateFn resolved = nullptr;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        static const wchar_t *kCandidates[] = {
+            L"XInput1_4.dll",   // Windows 8+
+            L"XInput1_3.dll",   // DirectX SDK redistributable
+            L"XInput9_1_0.dll", // Windows Vista/7 in-box
+        };
+        for (const wchar_t *name : kCandidates) {
+            HMODULE library = LoadLibraryW(name);
+            if (!library) continue;
+            auto fn = reinterpret_cast<XInputGetStateFn>(GetProcAddress(library, "XInputGetState"));
+            if (fn) {
+                resolved = fn;
+                nuvioBridgeLog("gamepad XInput resolved");
+                return;
+            }
+        }
+        nuvioBridgeLog("gamepad XInput unavailable");
+    });
+    return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Gamepad (DualSense over raw HID)
+// ---------------------------------------------------------------------------
+// A PlayStation controller is not an XInput device: Windows exposes it as a plain HID gamepad, so
+// XInput reports nothing at all unless a remapper (DS4Windows, Steam Input) is translating it. That
+// is a bad thing to require of a media app on an HTPC, so the reports are decoded here.
+//
+// Everything below normalizes into the XINPUT_GAMEPAD shape — the same button word, the same
+// 0..255 triggers, the same signed thumb axes. That is deliberate: the Kotlin poll loop, dead zone,
+// repeat timing and default layout are then identical for both kinds of pad, and Cross/Circle/
+// Square/Triangle land on A/B/X/Y where the layout already expects them.
+namespace nuvio_gamepad_hid {
+
+constexpr USHORT kSonyVendorId = 0x054C;
+constexpr USHORT kDualSenseProductId = 0x0CE6;
+constexpr USHORT kDualSenseEdgeProductId = 0x0DF2;
+constexpr USHORT kDualShock4V1ProductId = 0x05C4;     // original DS4 (2013)
+constexpr USHORT kDualShock4V2ProductId = 0x09CC;     // revised DS4 (2016), lightbar visible on the touchpad
+constexpr USHORT kDualShock4DongleProductId = 0x0BA0; // official USB wireless adaptor
+
+// The two families share a button layout but not a report layout, so the model has to be known
+// before a report can be read. See layoutFor().
+enum class PadModel { DualSense, DualShock4 };
+
+const char *modelName(PadModel model) {
+    return model == PadModel::DualSense ? "DualSense" : "DualShock 4";
+}
+
+bool productIsSupported(USHORT productId, PadModel &model) {
+    switch (productId) {
+        case kDualSenseProductId:
+        case kDualSenseEdgeProductId:
+            model = PadModel::DualSense;
+            return true;
+        case kDualShock4V1ProductId:
+        case kDualShock4V2ProductId:
+        case kDualShock4DongleProductId:
+            model = PadModel::DualShock4;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Report lengths Windows advertises, which is also how the transport is identified: the USB and
+// Bluetooth report layouts differ, and the report id alone cannot separate USB 0x01 from the
+// cut-down Bluetooth 0x01.
+constexpr USHORT kUsbInputReportLength = 64;
+constexpr USHORT kBluetoothInputReportLength = 78;
+
+constexpr size_t kMaxPads = 4;
+
+// How often the HID device list is re-read. Enumeration is the expensive part, so it slows right
+// down once a pad has been found; a pad plugged in later is picked up within the idle interval.
+constexpr DWORD kEnumerateIntervalIdleMs = 2000;
+constexpr DWORD kEnumerateIntervalActiveMs = 10000;
+
+// XInput button bits, so the decoded state is directly comparable to a real XInput pad.
+constexpr USHORT kBtnDpadUp = 0x0001;
+constexpr USHORT kBtnDpadDown = 0x0002;
+constexpr USHORT kBtnDpadLeft = 0x0004;
+constexpr USHORT kBtnDpadRight = 0x0008;
+constexpr USHORT kBtnStart = 0x0010;
+constexpr USHORT kBtnBack = 0x0020;
+constexpr USHORT kBtnLeftThumb = 0x0040;
+constexpr USHORT kBtnRightThumb = 0x0080;
+constexpr USHORT kBtnLeftShoulder = 0x0100;
+constexpr USHORT kBtnRightShoulder = 0x0200;
+constexpr USHORT kBtnA = 0x1000;
+constexpr USHORT kBtnB = 0x2000;
+constexpr USHORT kBtnX = 0x4000;
+constexpr USHORT kBtnY = 0x8000;
+
+struct PadState {
+    USHORT buttons = 0;
+    unsigned char leftTrigger = 0;
+    unsigned char rightTrigger = 0;
+    short thumbLX = 0;
+    short thumbLY = 0;
+    short thumbRX = 0;
+    short thumbRY = 0;
+    unsigned int packet = 0;
+};
+
+struct Pad {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    HANDLE event = nullptr;
+    OVERLAPPED overlapped{};
+    std::vector<unsigned char> buffer;
+    USHORT inputReportLength = 0;
+    bool readPending = false;
+    // One diagnostic line per connected pad. Without it a controller whose report layout this
+    // decoder does not recognise simply does nothing, with no way to tell that from "not detected".
+    bool loggedFirstReport = false;
+    PadModel model = PadModel::DualSense;
+    std::wstring path;
+    // Last successfully decoded report. Reads are non-blocking, so a tick that finds nothing new
+    // must keep reporting the previous state rather than dropping every held button.
+    PadState state;
+};
+
+std::mutex g_mutex;
+std::vector<std::unique_ptr<Pad>> g_pads;
+DWORD g_nextEnumerateAt = 0;
+
+// Converts one HID stick byte (0..255, centred at 128) to the signed range XInput reports. The Y
+// axes are negated because HID counts downward and XInput counts upward.
+short toThumb(unsigned char value, bool invert) {
+    int centred = (static_cast<int>(value) - 128) * 257;
+    if (invert) centred = -centred;
+    if (centred > 32767) centred = 32767;
+    if (centred < -32768) centred = -32768;
+    return static_cast<short>(centred);
+}
+
+// D-pad is a hat switch: 0 = north, going clockwise in eighths, 8 = centred.
+USHORT decodeHat(unsigned char hat) {
+    switch (hat & 0x0F) {
+        case 0: return kBtnDpadUp;
+        case 1: return kBtnDpadUp | kBtnDpadRight;
+        case 2: return kBtnDpadRight;
+        case 3: return kBtnDpadDown | kBtnDpadRight;
+        case 4: return kBtnDpadDown;
+        case 5: return kBtnDpadDown | kBtnDpadLeft;
+        case 6: return kBtnDpadLeft;
+        case 7: return kBtnDpadUp | kBtnDpadLeft;
+        default: return 0;
+    }
+}
+
+// The three DualSense button bytes, in the order they appear in every layout.
+USHORT decodeButtons(unsigned char b0, unsigned char b1, unsigned char b2) {
+    USHORT buttons = decodeHat(b0);
+    if (b0 & 0x10) buttons |= kBtnX; // Square
+    if (b0 & 0x20) buttons |= kBtnA; // Cross
+    if (b0 & 0x40) buttons |= kBtnB; // Circle
+    if (b0 & 0x80) buttons |= kBtnY; // Triangle
+    if (b1 & 0x01) buttons |= kBtnLeftShoulder;  // L1
+    if (b1 & 0x02) buttons |= kBtnRightShoulder; // R1
+    if (b1 & 0x10) buttons |= kBtnBack;          // Create
+    if (b1 & 0x20) buttons |= kBtnStart;         // Options
+    if (b1 & 0x40) buttons |= kBtnLeftThumb;     // L3
+    if (b1 & 0x80) buttons |= kBtnRightThumb;    // R3
+    // b2 carries PS, touchpad click and mute. None is bound: the PS button belongs to the system,
+    // and a touchpad press is far too easy to trigger by accident while holding the pad.
+    (void)b2;
+    return buttons;
+}
+
+// Offsets of the first axis, trigger and button byte within one report.
+struct ReportLayout {
+    size_t axes;
+    size_t triggers;
+    size_t buttons;
+};
+
+/**
+ * Picks the byte layout for a report. Both families put the axes first and use identical button
+ * bits, but they disagree on what follows: a DualSense USB report has the triggers before the
+ * buttons, and a DualShock 4 has them after. That is why the model and the transport both have to
+ * be known before a single byte is read — the report id alone is ambiguous in three directions.
+ *
+ * Transport is inferred from the report length Windows advertises (64 = USB, 78 = Bluetooth), since
+ * report id 0x01 is used by both.
+ */
+bool layoutFor(
+    PadModel model,
+    unsigned char reportId,
+    USHORT inputReportLength,
+    DWORD length,
+    ReportLayout &out
+) {
+    const bool usb = inputReportLength == kUsbInputReportLength;
+    const bool bluetooth = inputReportLength == kBluetoothInputReportLength;
+
+    if (model == PadModel::DualSense) {
+        // USB: axes, triggers, a sequence byte, then the buttons.
+        if (usb && reportId == 0x01 && length >= 11) { out = {1, 5, 8}; return true; }
+        // Bluetooth, full report: the USB layout shifted by one extra header byte.
+        if (bluetooth && reportId == 0x31 && length >= 12) { out = {2, 6, 9}; return true; }
+        // Bluetooth, cut-down report sent until full mode is requested: buttons before triggers.
+        if (bluetooth && reportId == 0x01 && length >= 10) { out = {1, 8, 5}; return true; }
+        return false;
+    }
+
+    // DualShock 4. Its USB layout is the one the DualSense only uses over cut-down Bluetooth:
+    // axes, buttons, then triggers.
+    if (usb && reportId == 0x01 && length >= 10) { out = {1, 8, 5}; return true; }
+    // Bluetooth, full report: the same payload behind two extra header bytes.
+    if (bluetooth && reportId == 0x11 && length >= 12) { out = {3, 10, 7}; return true; }
+    // Bluetooth before full mode is requested, same shape as USB.
+    if (bluetooth && reportId == 0x01 && length >= 10) { out = {1, 8, 5}; return true; }
+    return false;
+}
+
+// Decodes one input report into [state]. Returns false for a report this code does not understand,
+// which the caller ignores rather than treating as a disconnect.
+bool decodeReport(
+    const unsigned char *report,
+    DWORD length,
+    USHORT inputReportLength,
+    PadModel model,
+    PadState &state
+) {
+    if (length < 10) return false;
+
+    ReportLayout layout{};
+    if (!layoutFor(model, report[0], inputReportLength, length, layout)) return false;
+    const size_t axes = layout.axes;
+    const size_t triggers = layout.triggers;
+    const size_t buttons = layout.buttons;
+
+    if (length < buttons + 3 || length < triggers + 2 || length < axes + 4) return false;
+
+    state.thumbLX = toThumb(report[axes + 0], false);
+    state.thumbLY = toThumb(report[axes + 1], true);
+    state.thumbRX = toThumb(report[axes + 2], false);
+    state.thumbRY = toThumb(report[axes + 3], true);
+    state.leftTrigger = report[triggers + 0];
+    state.rightTrigger = report[triggers + 1];
+    state.buttons = decodeButtons(report[buttons + 0], report[buttons + 1], report[buttons + 2]);
+    state.packet++;
+    return true;
+}
+
+void closePad(Pad &pad) {
+    if (pad.handle != INVALID_HANDLE_VALUE) {
+        CancelIo(pad.handle);
+        CloseHandle(pad.handle);
+        pad.handle = INVALID_HANDLE_VALUE;
+    }
+    if (pad.event) {
+        CloseHandle(pad.event);
+        pad.event = nullptr;
+    }
+}
+
+// Records what the first report from a pad actually looked like, so an unrecognised layout is
+// reported as such instead of failing silently. `decoded` false here is the whole diagnosis.
+void logFirstReport(Pad &pad, DWORD length, bool decoded) {
+    if (pad.loggedFirstReport) return;
+    pad.loggedFirstReport = true;
+    char line[192];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "gamepad %s first report id=0x%02X bytes=%lu reportLength=%u decoded=%s",
+                modelName(pad.model),
+                length > 0 ? pad.buffer[0] : 0, static_cast<unsigned long>(length),
+                static_cast<unsigned>(pad.inputReportLength), decoded ? "yes" : "no");
+    nuvioBridgeLog(line);
+}
+
+// Consumes whatever reports are already waiting, without ever blocking. Returns false once the
+// device has gone away. The drain loop matters because a DualSense streams far faster than the UI
+// polls: taking only one report per tick would run progressively further behind the user's thumb.
+bool pump(Pad &pad) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (!pad.readPending) {
+            ResetEvent(pad.event);
+            pad.overlapped = OVERLAPPED{};
+            pad.overlapped.hEvent = pad.event;
+            DWORD read = 0;
+            if (ReadFile(pad.handle, pad.buffer.data(), pad.inputReportLength, &read, &pad.overlapped)) {
+                logFirstReport(pad, read, decodeReport(pad.buffer.data(), read, pad.inputReportLength, pad.model, pad.state));
+                continue;
+            }
+            const DWORD error = GetLastError();
+            if (error != ERROR_IO_PENDING) return false;
+            pad.readPending = true;
+        }
+
+        DWORD read = 0;
+        if (GetOverlappedResult(pad.handle, &pad.overlapped, &read, FALSE)) {
+            pad.readPending = false;
+            logFirstReport(pad, read, decodeReport(pad.buffer.data(), read, pad.inputReportLength, pad.model, pad.state));
+            continue;
+        }
+        const DWORD error = GetLastError();
+        if (error == ERROR_IO_INCOMPLETE) return true; // Nothing new this tick; keep the last state.
+        pad.readPending = false;
+        return false;
+    }
+    return true;
+}
+
+bool alreadyOpen(const std::wstring &path) {
+    for (const auto &pad : g_pads) {
+        if (pad->path == path) return true;
+    }
+    return false;
+}
+
+// The device interface path carries the ids ("...hid#vid_054c&pid_0ce6#..."), so the wrong devices
+// are rejected on a string compare. That matters: opening every HID interface on the machine just
+// to ask what it is would touch keyboards and mice for no reason.
+bool pathLooksLikeSupportedPad(const std::wstring &path) {
+    std::wstring lowered = path;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::towlower);
+    if (lowered.find(L"vid_054c") == std::wstring::npos) return false;
+    // Matched on the product id too, not just Sony's vendor id: the same vendor ships headsets and
+    // cameras, and there is no reason to open those.
+    static const wchar_t *kProductIds[] = {
+        L"pid_0ce6", // DualSense
+        L"pid_0df2", // DualSense Edge
+        L"pid_05c4", // DualShock 4 v1
+        L"pid_09cc", // DualShock 4 v2
+        L"pid_0ba0", // DualShock 4 USB wireless adaptor
+    };
+    for (const wchar_t *productId : kProductIds) {
+        if (lowered.find(productId) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+bool openPad(const std::wstring &path) {
+    HANDLE handle = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+
+    HIDD_ATTRIBUTES attributes{};
+    attributes.Size = sizeof(attributes);
+    PadModel model = PadModel::DualSense;
+    if (!HidD_GetAttributes(handle, &attributes) ||
+        attributes.VendorID != kSonyVendorId ||
+        !productIsSupported(attributes.ProductID, model)) {
+        CloseHandle(handle);
+        return false;
+    }
+
+    PHIDP_PREPARSED_DATA preparsed = nullptr;
+    if (!HidD_GetPreparsedData(handle, &preparsed)) {
+        CloseHandle(handle);
+        return false;
+    }
+    HIDP_CAPS caps{};
+    const bool gotCaps = HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS;
+    HidD_FreePreparsedData(preparsed);
+
+    // Only the two report sizes this decoder understands are accepted. A DualSense also exposes
+    // collections that are not the gamepad, and they get rejected right here.
+    if (!gotCaps ||
+        (caps.InputReportByteLength != kUsbInputReportLength &&
+         caps.InputReportByteLength != kBluetoothInputReportLength)) {
+        // A DualSense exposes collections that are not the gamepad, so most rejections here are
+        // expected and uninteresting. It is logged anyway: if the gamepad collection itself ever
+        // reports an unexpected size, this line is the only thing that would say so.
+        char line[160];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "gamepad %s collection skipped reportLength=%u",
+                    modelName(model),
+                    gotCaps ? static_cast<unsigned>(caps.InputReportByteLength) : 0u);
+        nuvioBridgeLog(line);
+        CloseHandle(handle);
+        return false;
+    }
+
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) {
+        CloseHandle(handle);
+        return false;
+    }
+
+    auto pad = std::make_unique<Pad>();
+    pad->handle = handle;
+    pad->event = event;
+    pad->inputReportLength = caps.InputReportByteLength;
+    pad->buffer.assign(caps.InputReportByteLength, 0);
+    pad->path = path;
+    pad->model = model;
+    const bool bluetooth = caps.InputReportByteLength == kBluetoothInputReportLength;
+    g_pads.push_back(std::move(pad));
+    char line[128];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "gamepad %s connected (%s)",
+                modelName(model), bluetooth ? "bluetooth" : "usb");
+    nuvioBridgeLog(line);
+    return true;
+}
+
+void enumerate() {
+    GUID hidGuid{};
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO deviceInfo = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (deviceInfo == INVALID_HANDLE_VALUE) return;
+
+    SP_DEVICE_INTERFACE_DATA interfaceData{};
+    interfaceData.cbSize = sizeof(interfaceData);
+    std::vector<unsigned char> detailBuffer;
+    for (DWORD index = 0; g_pads.size() < kMaxPads; ++index) {
+        if (!SetupDiEnumDeviceInterfaces(deviceInfo, nullptr, &hidGuid, index, &interfaceData)) break;
+
+        DWORD required = 0;
+        SetupDiGetDeviceInterfaceDetailW(deviceInfo, &interfaceData, nullptr, 0, &required, nullptr);
+        if (required == 0) continue;
+        detailBuffer.assign(required, 0);
+        auto *detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuffer.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfo, &interfaceData, detail, required, nullptr, nullptr)) {
+            continue;
+        }
+
+        std::wstring path(detail->DevicePath);
+        if (!pathLooksLikeSupportedPad(path) || alreadyOpen(path)) continue;
+        openPad(path);
+    }
+    SetupDiDestroyDeviceInfoList(deviceInfo);
+}
+
+// Refreshes every open pad and drops the ones that have gone away. Returns how many are live.
+size_t poll(PadState *out, size_t capacity) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+
+    const DWORD now = GetTickCount();
+    if (now >= g_nextEnumerateAt) {
+        enumerate();
+        g_nextEnumerateAt = now + (g_pads.empty() ? kEnumerateIntervalIdleMs : kEnumerateIntervalActiveMs);
+    }
+
+    size_t live = 0;
+    for (auto it = g_pads.begin(); it != g_pads.end();) {
+        Pad &pad = **it;
+        if (!pump(pad)) {
+            closePad(pad);
+            it = g_pads.erase(it);
+            nuvioBridgeLog("gamepad disconnected");
+            // A disconnect is the one event worth re-enumerating promptly for: the same pad
+            // reconnecting on a different path is exactly what a cable reseat looks like.
+            g_nextEnumerateAt = 0;
+            continue;
+        }
+        if (live < capacity) out[live] = pad.state;
+        ++live;
+        ++it;
+    }
+    return live > capacity ? capacity : live;
+}
+
+} // namespace nuvio_gamepad_hid
+
+// Fills `out` with kGamepadSlotStride ints per slot and returns a bitmask of connected slots.
+// Slots 0-3 are XInput pads, slots 4-7 are DualSense pads read over raw HID; both are written in
+// the same XInput-shaped layout, so the caller never has to care which kind a slot holds.
+//
+// `slotMask` selects which slots to query. Polling an empty XInput slot is the expensive case, so
+// the Kotlin side rescans on a slow cadence and passes only the mask it wants; the HID side keeps
+// its own enumeration timer, so its bits only say whether to read at all.
+static constexpr jint kGamepadSlotStride = 8;
+static constexpr jint kGamepadXInputSlots = 4;
+static constexpr jint kGamepadHidSlots = 4;
+static constexpr jint kGamepadTotalSlots = kGamepadXInputSlots + kGamepadHidSlots;
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_pollGamepads(
+    JNIEnv *env,
+    jobject,
+    jint slotMask,
+    jintArray out
+) {
+    if (!out) return 0;
+    const jsize capacity = env->GetArrayLength(out);
+    if (capacity < kGamepadTotalSlots * kGamepadSlotStride) return 0;
+
+    jint connectedMask = 0;
+    jint slotValues[kGamepadSlotStride];
+
+    auto writeSlot = [&](jint slot, USHORT buttons, unsigned char leftTrigger, unsigned char rightTrigger,
+                         short thumbLX, short thumbLY, short thumbRX, short thumbRY, unsigned int packet) {
+        slotValues[0] = static_cast<jint>(buttons);
+        slotValues[1] = static_cast<jint>(leftTrigger);
+        slotValues[2] = static_cast<jint>(rightTrigger);
+        slotValues[3] = static_cast<jint>(thumbLX);
+        slotValues[4] = static_cast<jint>(thumbLY);
+        slotValues[5] = static_cast<jint>(thumbRX);
+        slotValues[6] = static_cast<jint>(thumbRY);
+        slotValues[7] = static_cast<jint>(packet);
+        env->SetIntArrayRegion(out, slot * kGamepadSlotStride, kGamepadSlotStride, slotValues);
+        connectedMask |= (1 << slot);
+    };
+
+    if (auto getState = resolveXInputGetState()) {
+        for (jint slot = 0; slot < kGamepadXInputSlots; ++slot) {
+            if ((slotMask & (1 << slot)) == 0) continue;
+            XINPUT_STATE state{};
+            if (getState(static_cast<DWORD>(slot), &state) != ERROR_SUCCESS) continue;
+            const XINPUT_GAMEPAD &pad = state.Gamepad;
+            writeSlot(slot, pad.wButtons, pad.bLeftTrigger, pad.bRightTrigger,
+                      pad.sThumbLX, pad.sThumbLY, pad.sThumbRX, pad.sThumbRY, state.dwPacketNumber);
+        }
+    }
+
+    if ((slotMask >> kGamepadXInputSlots) != 0) {
+        nuvio_gamepad_hid::PadState hidStates[kGamepadHidSlots];
+        const size_t live = nuvio_gamepad_hid::poll(hidStates, kGamepadHidSlots);
+        for (size_t index = 0; index < live; ++index) {
+            const nuvio_gamepad_hid::PadState &state = hidStates[index];
+            writeSlot(kGamepadXInputSlots + static_cast<jint>(index), state.buttons,
+                      state.leftTrigger, state.rightTrigger,
+                      state.thumbLX, state.thumbLY, state.thumbRX, state.thumbRY, state.packet);
+        }
+    }
+
+    return connectedMask;
+}
+
+// Milliseconds since the last keyboard or mouse input anywhere on this desktop session, from
+// GetLastInputInfo; -1 if the call fails. Feeds the screensaver: a mouse move over the mpv surface
+// or a key into the WebView2 HUD never reaches AWT, so in-process event listeners alone would
+// dim the screen on someone who is plainly using it. Controllers are not counted here — XInput is
+// not "input" to Windows — so the Kotlin side folds its own gamepad timestamp in.
+//
+// Like pollGamepads, here only because this is the process's one JNI surface.
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_systemIdleMs(JNIEnv *, jobject) {
+    LASTINPUTINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetLastInputInfo(&info)) return -1;
+    // DWORD arithmetic on purpose: both tick counts wrap at 49.7 days and the difference is
+    // still right across the wrap.
+    const DWORD idle = GetTickCount() - info.dwTime;
+    return static_cast<jlong>(idle);
+}
+
+// Whether the foreground window belongs to this process. The screensaver's shutdown wants "is
+// Nuvio what the user left on screen", and AWT's own notion of the active window is unreliable
+// while keyboard focus sits in the WebView2 HUD, a non-AWT child of the frame.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_isForegroundProcess(JNIEnv *, jobject) {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return JNI_FALSE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    return pid == GetCurrentProcessId() ? JNI_TRUE : JNI_FALSE;
 }

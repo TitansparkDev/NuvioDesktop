@@ -29,14 +29,24 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.ui.draw.clip
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Casino
 import androidx.compose.material.icons.rounded.CollectionsBookmark
+import androidx.compose.material.icons.rounded.DateRange
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Keyboard
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Notifications
@@ -50,6 +60,7 @@ import androidx.compose.material.icons.rounded.SportsEsports
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.rounded.Explore
 import androidx.compose.material.icons.rounded.ViewColumn
+import androidx.compose.material.icons.rounded.WidthFull
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
@@ -86,17 +97,15 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalUriHandler
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.max
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.core.build.AppVersionConfig
-import com.nuvio.app.core.build.AppVersionPolicy
 import com.nuvio.app.core.ui.accentGradientMask
 import com.nuvio.app.core.ui.AppTheme
 import com.nuvio.app.core.ui.TextInputFocusTracker
@@ -109,7 +118,6 @@ import com.nuvio.app.core.ui.PlatformBackHandler
 import com.nuvio.app.core.ui.isLiquidGlassNativeTabBarSupported
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.core.ui.platformExitApp
-import com.nuvio.app.core.ui.platformOpenLogsDirectory
 import com.nuvio.app.core.ui.secondaryClick
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.details.MetaScreenSettingsRepository
@@ -134,7 +142,9 @@ import com.nuvio.app.features.librarypvr.libraryDownloadsSection
 import com.nuvio.app.features.mdblist.MdbListSettings
 import com.nuvio.app.features.mdblist.MdbListSettingsRepository
 import com.nuvio.app.features.games.GameLibrarySettings
+import com.nuvio.app.features.screensaver.ScreensaverSettings
 import com.nuvio.app.features.games.GameLibrarySettingsRepository
+import com.nuvio.app.features.screensaver.ScreensaverSettingsRepository
 import com.nuvio.app.features.games.GameModeController
 import com.nuvio.app.features.qualicache.QualiCacheSettings
 import com.nuvio.app.features.qualicache.QualiCacheSettingsRepository
@@ -153,6 +163,8 @@ import com.nuvio.app.features.simkl.SimklSettingsRepository
 import com.nuvio.app.features.simkl.SimklSettingsUiState
 import com.nuvio.app.features.yamtrack.YamtrackSettings
 import com.nuvio.app.features.yamtrack.YamtrackSettingsRepository
+import com.nuvio.app.features.lights.LightsSettings
+import com.nuvio.app.features.lights.LightsSettingsRepository
 import com.nuvio.app.features.trakt.TraktAuthUiState
 import com.nuvio.app.features.trakt.TraktAuthRepository
 import com.nuvio.app.features.trakt.TraktConnectionMode
@@ -161,15 +173,14 @@ import com.nuvio.app.features.trakt.TraktSettingsRepository
 import com.nuvio.app.features.trakt.TraktSettingsUiState
 import com.nuvio.app.features.tmdb.TmdbSettings
 import com.nuvio.app.features.tmdb.TmdbSettingsRepository
-import com.nuvio.app.features.updater.AppUpdaterPlatform
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesUiState
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.*
 import nuvio.composeapp.generated.resources.collections_header
-import nuvio.composeapp.generated.resources.compose_about_open_logs_folder
 import nuvio.composeapp.generated.resources.compose_nav_home
+import nuvio.composeapp.generated.resources.calendar_title
 import nuvio.composeapp.generated.resources.compose_nav_library
 import nuvio.composeapp.generated.resources.compose_nav_search
 import nuvio.composeapp.generated.resources.compose_settings_page_account
@@ -188,7 +199,6 @@ import nuvio.composeapp.generated.resources.compose_settings_page_meta_screen
 import nuvio.composeapp.generated.resources.compose_settings_page_notifications
 import nuvio.composeapp.generated.resources.compose_settings_page_playback
 import nuvio.composeapp.generated.resources.compose_settings_page_plugins
-import nuvio.composeapp.generated.resources.compose_settings_page_poster_customization
 import nuvio.composeapp.generated.resources.compose_settings_page_root
 import nuvio.composeapp.generated.resources.compose_settings_page_streams
 import nuvio.composeapp.generated.resources.compose_settings_page_local_library
@@ -212,7 +222,6 @@ private val SettingsSearchRevealThreshold = 28.dp
 private const val SettingsSearchRevealAnimationMillis = 240L
 private const val SettingsSearchRevealHapticDelayMillis = 90L
 // Placeholder GitHub target for the sidebar footer link — no dedicated Nuvio HTPC repo exists yet.
-private const val NuvioHtpcRepoUrl = "https://github.com/UmbraProjects/NuvioDesktop"
 
 private val DesktopSettingsSidebarWidth = 244.dp
 // Widened 20% from 775.dp: the denser pages (stream scoring's label + stepper rows in particular)
@@ -244,6 +253,7 @@ fun SettingsScreen(
     onNavigateToSearch: (() -> Unit)? = null,
     onNavigateToLibrary: (() -> Unit)? = null,
     onNavigateToDiscover: (() -> Unit)? = null,
+    onNavigateToCalendar: (() -> Unit)? = null,
 ) {
     val homeKeyFocusRequester = remember { FocusRequester() }
     var settingsSearchHasFocus by remember { mutableStateOf(false) }
@@ -296,6 +306,9 @@ fun SettingsScreen(
         val desktopColumnGuidesVisible by remember {
             ThemeSettingsRepository.desktopColumnGuidesVisible
         }.collectAsStateWithLifecycle()
+        val desktopSettingsFullWidth by remember {
+            ThemeSettingsRepository.desktopSettingsFullWidth
+        }.collectAsStateWithLifecycle()
         val desktopNavigationLayout by remember {
             ThemeSettingsRepository.desktopNavigationLayout
         }.collectAsStateWithLifecycle()
@@ -323,6 +336,10 @@ fun SettingsScreen(
             GameLibrarySettingsRepository.ensureLoaded()
             GameLibrarySettingsRepository.uiState
         }.collectAsStateWithLifecycle()
+        val screensaverSettings by remember {
+            ScreensaverSettingsRepository.ensureLoaded()
+            ScreensaverSettingsRepository.uiState
+        }.collectAsStateWithLifecycle()
         val debridSettings by remember {
             DebridSettingsRepository.ensureLoaded()
             DebridSettingsRepository.uiState
@@ -346,6 +363,10 @@ fun SettingsScreen(
         val yamtrackSettingsUiState by remember {
             YamtrackSettingsRepository.ensureLoaded()
             YamtrackSettingsRepository.uiState
+        }.collectAsStateWithLifecycle()
+        val lightsSettingsUiState by remember {
+            LightsSettingsRepository.ensureLoaded()
+            LightsSettingsRepository.uiState
         }.collectAsStateWithLifecycle()
         val traktCommentsEnabled by remember {
             TraktCommentsSettings.ensureLoaded()
@@ -517,6 +538,8 @@ fun SettingsScreen(
                 onDesktopAppUiScaleAppliesToDetailsChange = ThemeSettingsRepository::setDesktopAppUiScaleAppliesToDetails,
                 desktopColumnGuidesVisible = desktopColumnGuidesVisible,
                 onDesktopColumnGuidesVisibleChange = ThemeSettingsRepository::setDesktopColumnGuidesVisible,
+                desktopSettingsFullWidth = desktopSettingsFullWidth,
+                onDesktopSettingsFullWidthChange = ThemeSettingsRepository::setDesktopSettingsFullWidth,
                 selectedAppLanguage = selectedAppLanguage,
                 onAppLanguageSelected = ThemeSettingsRepository::setAppLanguage,
                 episodeReleaseNotificationsUiState = episodeReleaseNotificationsUiState,
@@ -524,6 +547,7 @@ fun SettingsScreen(
                 mdbListSettings = mdbListSettings,
                 qualiCacheSettings = qualiCacheSettings,
                 gameLibrarySettings = gameLibrarySettings,
+                screensaverSettings = screensaverSettings,
                 debridSettings = debridSettings,
                 discordPresenceSettings = discordPresenceSettings,
                 traktAuthUiState = traktAuthUiState,
@@ -532,6 +556,7 @@ fun SettingsScreen(
                 simklAuthUiState = simklAuthUiState,
                 simklSettingsUiState = simklSettingsUiState,
                 yamtrackSettingsUiState = yamtrackSettingsUiState,
+                lightsSettingsUiState = lightsSettingsUiState,
                 homescreenHeroEnabled = homescreenSettingsUiState.heroEnabled,
                 homescreenHeroInfoLines = homescreenSettingsUiState.heroInfoLines,
                 homescreenHeroInfoPriority = homescreenSettingsUiState.heroInfoPriority,
@@ -566,6 +591,7 @@ fun SettingsScreen(
                 onNavigateToSearch = onNavigateToSearch,
                 onNavigateToLibrary = onNavigateToLibrary,
                 onNavigateToDiscover = onNavigateToDiscover,
+                onNavigateToCalendar = onNavigateToCalendar,
                 onSettingsSearchFocusChange = { settingsSearchHasFocus = it },
             )
         } else {
@@ -608,6 +634,7 @@ fun SettingsScreen(
                 mdbListSettings = mdbListSettings,
                 qualiCacheSettings = qualiCacheSettings,
                 gameLibrarySettings = gameLibrarySettings,
+                screensaverSettings = screensaverSettings,
                 debridSettings = debridSettings,
                 discordPresenceSettings = discordPresenceSettings,
                 traktAuthUiState = traktAuthUiState,
@@ -616,6 +643,7 @@ fun SettingsScreen(
                 simklAuthUiState = simklAuthUiState,
                 simklSettingsUiState = simklSettingsUiState,
                 yamtrackSettingsUiState = yamtrackSettingsUiState,
+                lightsSettingsUiState = lightsSettingsUiState,
                 homescreenHeroEnabled = homescreenSettingsUiState.heroEnabled,
                 homescreenHeroInfoLines = homescreenSettingsUiState.heroInfoLines,
                 homescreenHeroInfoPriority = homescreenSettingsUiState.heroInfoPriority,
@@ -701,6 +729,7 @@ private fun MobileSettingsScreen(
     mdbListSettings: MdbListSettings,
     qualiCacheSettings: QualiCacheSettings,
     gameLibrarySettings: GameLibrarySettings,
+    screensaverSettings: ScreensaverSettings,
     debridSettings: DebridSettings,
     discordPresenceSettings: DiscordPresenceSettings,
     traktAuthUiState: TraktAuthUiState,
@@ -709,6 +738,7 @@ private fun MobileSettingsScreen(
     simklAuthUiState: SimklAuthUiState,
     simklSettingsUiState: SimklSettingsUiState,
     yamtrackSettingsUiState: YamtrackSettings,
+    lightsSettingsUiState: LightsSettings,
     homescreenHeroEnabled: Boolean,
     homescreenHeroInfoLines: Int,
     homescreenHeroInfoPriority: String,
@@ -748,6 +778,7 @@ private fun MobileSettingsScreen(
     onNavigateToSearch: (() -> Unit)? = null,
     onNavigateToLibrary: (() -> Unit)? = null,
     onNavigateToDiscover: (() -> Unit)? = null,
+    onNavigateToCalendar: (() -> Unit)? = null,
     onSettingsSearchFocusChange: (Boolean) -> Unit = {},
 ) {
     val saveableStateHolder = rememberSaveableStateHolder()
@@ -1012,10 +1043,6 @@ private fun MobileSettingsScreen(
                     showResumePromptOnLaunch = continueWatchingPreferencesUiState.showResumePromptOnLaunch,
                     sortMode = continueWatchingPreferencesUiState.sortMode,
                 )
-                SettingsPage.PosterCustomization -> posterCustomizationSettingsContent(
-                    isTablet = false,
-                    uiState = posterCardStyleUiState,
-                )
                 SettingsPage.ContentDiscovery -> contentDiscoveryContent(
                     isTablet = false,
                     showPluginsEntry = AppFeaturePolicy.pluginsEnabled,
@@ -1056,9 +1083,6 @@ private fun MobileSettingsScreen(
                 )
                 SettingsPage.Integrations -> integrationsContent(
                     isTablet = false,
-                    discordPresenceSettings = discordPresenceSettings,
-                    onDiscordPresenceModeChange = DiscordPresenceSettingsRepository::setMode,
-                    onDiscordEpisodeArtworkChange = DiscordPresenceSettingsRepository::setEpisodeArtwork,
                     onTmdbClick = { onPageChange(SettingsPage.TmdbEnrichment) },
                     onMdbListClick = { onPageChange(SettingsPage.MdbListRatings) },
                     onQualiCacheClick = { onPageChange(SettingsPage.QualiCache) },
@@ -1066,6 +1090,8 @@ private fun MobileSettingsScreen(
                     onTraktClick = { onPageChange(SettingsPage.TraktAuthentication) },
                     onSimklClick = { onPageChange(SettingsPage.SimklAuthentication) },
                     onYamtrackClick = { onPageChange(SettingsPage.YamtrackAuthentication) },
+                    onLightsClick = { onPageChange(SettingsPage.Lights) },
+                    onDiscordClick = { onPageChange(SettingsPage.DiscordPresence) },
                 )
                 SettingsPage.TmdbEnrichment -> tmdbSettingsContent(
                     isTablet = false,
@@ -1083,6 +1109,10 @@ private fun MobileSettingsScreen(
                     isTablet = false,
                     settings = gameLibrarySettings,
                 )
+                SettingsPage.Screensaver -> screensaverSettingsContent(
+                    isTablet = false,
+                    settings = screensaverSettings,
+                )
                 SettingsPage.Debrid -> debridSettingsContent(
                     isTablet = false,
                     settings = debridSettings,
@@ -1096,6 +1126,15 @@ private fun MobileSettingsScreen(
                 )
                 SettingsPage.SimklAuthentication -> simklSettingsContent(isTablet = false, uiState = simklAuthUiState, settingsUiState = simklSettingsUiState)
                 SettingsPage.YamtrackAuthentication -> yamtrackSettingsContent(isTablet = false, settings = yamtrackSettingsUiState)
+                SettingsPage.Lights -> lightsSettingsContent(isTablet = false, settings = lightsSettingsUiState)
+                SettingsPage.DiscordPresence -> discordPresenceSettingsContent(
+                    isTablet = false,
+                    settings = discordPresenceSettings,
+                    onModeChange = DiscordPresenceSettingsRepository::setMode,
+                    onEpisodeArtworkChange = DiscordPresenceSettingsRepository::setEpisodeArtwork,
+                    onActivityStyleChange = DiscordPresenceSettingsRepository::setActivityStyle,
+                    onActivityNameChange = DiscordPresenceSettingsRepository::setActivityName,
+                )
             }
         }
     }
@@ -1188,6 +1227,8 @@ private fun TabletSettingsScreen(
     onDesktopAppUiScaleAppliesToDetailsChange: (Boolean) -> Unit,
     desktopColumnGuidesVisible: Boolean,
     onDesktopColumnGuidesVisibleChange: (Boolean) -> Unit,
+    desktopSettingsFullWidth: Boolean,
+    onDesktopSettingsFullWidthChange: (Boolean) -> Unit,
     selectedAppLanguage: AppLanguage,
     onAppLanguageSelected: (AppLanguage) -> Unit,
     episodeReleaseNotificationsUiState: EpisodeReleaseNotificationsUiState,
@@ -1195,6 +1236,7 @@ private fun TabletSettingsScreen(
     mdbListSettings: MdbListSettings,
     qualiCacheSettings: QualiCacheSettings,
     gameLibrarySettings: GameLibrarySettings,
+    screensaverSettings: ScreensaverSettings,
     debridSettings: DebridSettings,
     discordPresenceSettings: DiscordPresenceSettings,
     traktAuthUiState: TraktAuthUiState,
@@ -1203,6 +1245,7 @@ private fun TabletSettingsScreen(
     simklAuthUiState: SimklAuthUiState,
     simklSettingsUiState: SimklSettingsUiState,
     yamtrackSettingsUiState: YamtrackSettings,
+    lightsSettingsUiState: LightsSettings,
     homescreenHeroEnabled: Boolean,
     homescreenHeroInfoLines: Int,
     homescreenHeroInfoPriority: String,
@@ -1237,6 +1280,7 @@ private fun TabletSettingsScreen(
     onNavigateToSearch: (() -> Unit)? = null,
     onNavigateToLibrary: (() -> Unit)? = null,
     onNavigateToDiscover: (() -> Unit)? = null,
+    onNavigateToCalendar: (() -> Unit)? = null,
     onSettingsSearchFocusChange: (Boolean) -> Unit = {},
 ) {
     val tokens = MaterialTheme.nuvio
@@ -1262,7 +1306,9 @@ private fun TabletSettingsScreen(
     ) {
         val contextPanelWidth = if (showContextPanel) DesktopSettingsContextPanelWidth else 0.dp
         val desiredShellWidth = DesktopSettingsSidebarWidth + DesktopSettingsMainColumnWidth + contextPanelWidth
-        val shellWidth = if (maxWidth < desiredShellWidth) maxWidth else desiredShellWidth
+        // Full width: the shell takes the whole window and the main column absorbs the slack;
+        // otherwise the fixed column set sits centred with the window's spare width as gutters.
+        val shellWidth = if (desktopSettingsFullWidth || maxWidth < desiredShellWidth) maxWidth else desiredShellWidth
         val contentWidth = shellWidth - DesktopSettingsSidebarWidth
 
         saveableStateHolder.SaveableStateProvider(page.name) {
@@ -1342,6 +1388,7 @@ private fun TabletSettingsScreen(
                     listState.animateScrollToItem(0)
                 }
             }
+            SeekSettingsAnchorIntoView(listState)
 
         val columnGuideModifier = if (desktopColumnGuidesVisible) {
             Modifier.drawBehind {
@@ -1380,11 +1427,14 @@ private fun TabletSettingsScreen(
                 onShowLatestChangelogClick = onShowLatestChangelogClick ?: onCheckForUpdatesClick,
                 columnGuidesVisible = desktopColumnGuidesVisible,
                 onColumnGuidesVisibleChange = onDesktopColumnGuidesVisibleChange,
+                fullWidth = desktopSettingsFullWidth,
+                onFullWidthChange = onDesktopSettingsFullWidthChange,
                 onQuitClick = { platformExitApp() },
                 onNavigateToHome = onNavigateToHome,
                 onNavigateToSearch = onNavigateToSearch,
                 onNavigateToLibrary = onNavigateToLibrary,
                 onNavigateToDiscover = onNavigateToDiscover,
+                onNavigateToCalendar = onNavigateToCalendar,
                 contextPanelWidth = contextPanelWidth,
             )
             if (desktopColumnGuidesVisible) {
@@ -1444,7 +1494,16 @@ private fun TabletSettingsScreen(
                                     items = visibleSidebarItems,
                                     allItems = orderedSidebarItems,
                                     activeSidebarPage = activeSidebarPage,
+                                    currentPage = page,
+                                    subItems = desktopSettingsSidebarSubItems(
+                                        sidebarPage = activeSidebarPage,
+                                        homescreenItems = homescreenItems,
+                                    ),
                                     onPageChange = ::openInlinePage,
+                                    onSubItemClick = { subItem ->
+                                        if (subItem.page != page) openInlinePage(subItem.page)
+                                        subItem.anchor?.let { SettingsScrollAnchor.request(it) }
+                                    },
                                 )
                             }
                         }
@@ -1464,7 +1523,6 @@ private fun TabletSettingsScreen(
                             },
                         )
                     }
-                    DesktopSettingsSidebarFooter()
                 }
                 if (desktopColumnGuidesVisible) {
                     Box(
@@ -1480,39 +1538,47 @@ private fun TabletSettingsScreen(
             BoxWithConstraints(modifier = Modifier.width(contentWidth).fillMaxHeight()) {
                     val contextPanelWidth = if (showContextPanel) DesktopSettingsContextPanelWidth else 0.dp
                     val remainingForMain = maxWidth - contextPanelWidth
-                    val mainColumnWidth = if (remainingForMain < DesktopSettingsMainColumnWidth) {
+                    val mainColumnWidth = if (desktopSettingsFullWidth || remainingForMain < DesktopSettingsMainColumnWidth) {
                         remainingForMain
                     } else {
                         DesktopSettingsMainColumnWidth
                     }
                     Row(modifier = Modifier.fillMaxSize()) {
+                        // The list's size, for headings that scroll themselves to the top of it.
+                        val listViewportSize = remember { mutableStateOf(IntSize.Zero) }
+                        val anchorViewport = remember {
+                            SettingsAnchorViewport(listViewportSize, DesktopSettingsPageTopInset)
+                        }
                         // Expose the current page to every SettingsSection heading so it can build a
                         // stable favorite/scroll-anchor id and be pinned via right-click.
-                        CompositionLocalProvider(LocalSettingsPage provides page) {
+                        CompositionLocalProvider(
+                            LocalSettingsPage provides page,
+                            LocalSettingsSectionCards provides true,
+                            LocalSettingsAnchorViewport provides anchorViewport,
+                        ) {
                         LazyColumn(
                             state = listState,
                             modifier = Modifier
                                 .width(mainColumnWidth)
                                 .fillMaxHeight()
+                                .onSizeChanged { listViewportSize.value = it }
                                 .nestedScroll(rootSearchRevealConnection),
                             contentPadding = PaddingValues(
                                 start = 32.dp,
-                                top = 22.dp,
+                                top = DesktopSettingsPageTopInset,
                                 end = 32.dp,
                                 bottom = 40.dp + bottomOverlayPadding,
                             ),
                             verticalArrangement = Arrangement.spacedBy(SettingsSectionGap),
                         ) {
-                val previousPage = page.desktopBackPage()
-                if (previousPage != null) {
+                // Sub-pages keep their title but no back control: the sidebar already shows the
+                // parent category unfolded with this page marked current, and is the way back.
+                if (page.desktopBackPage() != null) {
                     item {
                         TabletPageHeader(
                             title = stringResource(page.titleRes),
-                            showBack = true,
-                            onBack = {
-                                val dest = SettingsScrollAnchor.consumeBackTo() ?: previousPage
-                                dest.let(onPageChange)
-                            },
+                            showBack = false,
+                            onBack = {},
                         )
                     }
                 }
@@ -1659,7 +1725,7 @@ private fun TabletSettingsScreen(
                     SettingsPage.Advanced -> advancedSettingsContent(
                         isTablet = true,
                         rememberLastProfileEnabled = rememberLastProfileEnabled,
-                    )
+                        )
                     SettingsPage.Notifications -> if (AppFeaturePolicy.notificationsEnabled) {
                         notificationsSettingsContent(
                             isTablet = true,
@@ -1678,10 +1744,6 @@ private fun TabletSettingsScreen(
                         blurNextUp = continueWatchingPreferencesUiState.blurNextUp,
                         showResumePromptOnLaunch = continueWatchingPreferencesUiState.showResumePromptOnLaunch,
                         sortMode = continueWatchingPreferencesUiState.sortMode,
-                    )
-                    SettingsPage.PosterCustomization -> posterCustomizationSettingsContent(
-                        isTablet = true,
-                        uiState = posterCardStyleUiState,
                     )
                     SettingsPage.ContentDiscovery -> contentDiscoveryContent(
                         isTablet = true,
@@ -1723,9 +1785,6 @@ private fun TabletSettingsScreen(
                     )
                     SettingsPage.Integrations -> integrationsContent(
                         isTablet = true,
-                        discordPresenceSettings = discordPresenceSettings,
-                        onDiscordPresenceModeChange = DiscordPresenceSettingsRepository::setMode,
-                        onDiscordEpisodeArtworkChange = DiscordPresenceSettingsRepository::setEpisodeArtwork,
                         onTmdbClick = { onPageChange(SettingsPage.TmdbEnrichment) },
                         onMdbListClick = { onPageChange(SettingsPage.MdbListRatings) },
                     onQualiCacheClick = { onPageChange(SettingsPage.QualiCache) },
@@ -1733,6 +1792,8 @@ private fun TabletSettingsScreen(
                         onTraktClick = { onPageChange(SettingsPage.TraktAuthentication) },
                         onSimklClick = { onPageChange(SettingsPage.SimklAuthentication) },
                         onYamtrackClick = { onPageChange(SettingsPage.YamtrackAuthentication) },
+                        onLightsClick = { onPageChange(SettingsPage.Lights) },
+                        onDiscordClick = { onPageChange(SettingsPage.DiscordPresence) },
                     )
                     SettingsPage.TmdbEnrichment -> tmdbSettingsContent(
                         isTablet = true,
@@ -1750,6 +1811,10 @@ private fun TabletSettingsScreen(
                         isTablet = true,
                         settings = gameLibrarySettings,
                     )
+                    SettingsPage.Screensaver -> screensaverSettingsContent(
+                        isTablet = true,
+                        settings = screensaverSettings,
+                    )
                     SettingsPage.Debrid -> debridSettingsContent(
                         isTablet = true,
                         settings = debridSettings,
@@ -1763,6 +1828,15 @@ private fun TabletSettingsScreen(
                     )
                     SettingsPage.SimklAuthentication -> simklSettingsContent(isTablet = true, uiState = simklAuthUiState, settingsUiState = simklSettingsUiState)
                     SettingsPage.YamtrackAuthentication -> yamtrackSettingsContent(isTablet = true, settings = yamtrackSettingsUiState)
+                    SettingsPage.Lights -> lightsSettingsContent(isTablet = true, settings = lightsSettingsUiState)
+                    SettingsPage.DiscordPresence -> discordPresenceSettingsContent(
+                        isTablet = true,
+                        settings = discordPresenceSettings,
+                        onModeChange = DiscordPresenceSettingsRepository::setMode,
+                        onEpisodeArtworkChange = DiscordPresenceSettingsRepository::setEpisodeArtwork,
+                        onActivityStyleChange = DiscordPresenceSettingsRepository::setActivityStyle,
+                        onActivityNameChange = DiscordPresenceSettingsRepository::setActivityName,
+                    )
                 }
                     }
                     }
@@ -1861,6 +1935,11 @@ private fun desktopSettingsSidebarDefaultItems(): List<DesktopSettingsSidebarIte
         page = SettingsPage.Appearance,
     ),
     DesktopSettingsSidebarItem(
+        label = stringResource(Res.string.compose_settings_page_screensaver),
+        icon = Icons.Rounded.Bedtime,
+        page = SettingsPage.Screensaver,
+    ),
+    DesktopSettingsSidebarItem(
         label = stringResource(Res.string.compose_settings_page_playback),
         icon = Icons.Rounded.PlayArrow,
         page = SettingsPage.Playback,
@@ -1917,6 +1996,10 @@ private fun desktopSettingsSidebarDefaultItems(): List<DesktopSettingsSidebarIte
     ),
 ).filter { it.page.isEnabledByFeaturePolicy() }
 
+/** Gap between the top of the page list and its first item; also where a heading that scrolls
+ * itself to the top of the list lands, so it keeps the same breathing room it has at rest. */
+private val DesktopSettingsPageTopInset = 22.dp
+
 private fun SettingsPage.desktopSidebarPage(): SettingsPage = when (this) {
     SettingsPage.Addons -> SettingsPage.Addons
     SettingsPage.Collections -> SettingsPage.Collections
@@ -1925,8 +2008,8 @@ private fun SettingsPage.desktopSidebarPage(): SettingsPage = when (this) {
     SettingsPage.Playback -> SettingsPage.Playback
     SettingsPage.RandomPlay -> SettingsPage.RandomPlay
     SettingsPage.Discover -> SettingsPage.Discover
-    SettingsPage.Appearance,
-    SettingsPage.PosterCustomization -> SettingsPage.Appearance
+    SettingsPage.Appearance -> SettingsPage.Appearance
+    SettingsPage.Screensaver -> SettingsPage.Screensaver
     SettingsPage.Homescreen -> SettingsPage.Homescreen
     SettingsPage.Plugins -> SettingsPage.Plugins
     SettingsPage.Streams -> SettingsPage.Streams
@@ -1940,7 +2023,9 @@ private fun SettingsPage.desktopSidebarPage(): SettingsPage = when (this) {
     SettingsPage.Account -> SettingsPage.Account
     SettingsPage.TraktAuthentication,
     SettingsPage.SimklAuthentication -> SettingsPage.Integrations
-    SettingsPage.YamtrackAuthentication -> SettingsPage.Integrations
+    SettingsPage.YamtrackAuthentication,
+    SettingsPage.Lights,
+    SettingsPage.DiscordPresence -> SettingsPage.Integrations
     SettingsPage.Integrations,
     SettingsPage.TmdbEnrichment,
     SettingsPage.MdbListRatings,
@@ -1952,7 +2037,6 @@ private fun SettingsPage.desktopSidebarPage(): SettingsPage = when (this) {
 }
 
 private fun SettingsPage.desktopBackPage(): SettingsPage? = when (this) {
-    SettingsPage.PosterCustomization -> SettingsPage.Appearance
     SettingsPage.StreamScoring -> SettingsPage.Streams
     SettingsPage.TmdbEnrichment,
     SettingsPage.MdbListRatings,
@@ -1960,7 +2044,9 @@ private fun SettingsPage.desktopBackPage(): SettingsPage? = when (this) {
     SettingsPage.Debrid,
     SettingsPage.TraktAuthentication,
     SettingsPage.SimklAuthentication,
-    SettingsPage.YamtrackAuthentication -> SettingsPage.Integrations
+    SettingsPage.YamtrackAuthentication,
+    SettingsPage.Lights,
+    SettingsPage.DiscordPresence -> SettingsPage.Integrations
     else -> null
 }
 
@@ -1979,7 +2065,10 @@ private fun DesktopSettingsSidebarList(
     items: List<DesktopSettingsSidebarItem>,
     allItems: List<DesktopSettingsSidebarItem>,
     activeSidebarPage: SettingsPage,
+    currentPage: SettingsPage,
+    subItems: List<DesktopSettingsSidebarSubItem>,
     onPageChange: (SettingsPage) -> Unit,
+    onSubItemClick: (DesktopSettingsSidebarSubItem) -> Unit,
 ) {
     val hapticFeedback = LocalHapticFeedback.current
     val listState = rememberLazyListState()
@@ -2000,23 +2089,40 @@ private fun DesktopSettingsSidebarList(
     ) {
         itemsIndexed(items, key = { _, item -> item.page.name }) { _, item ->
             ReorderableItem(reorderableLazyListState, key = item.page.name) {
-                DesktopSettingsSidebarRow(
-                    label = item.label,
-                    icon = item.icon,
-                    selected = item.page == activeSidebarPage,
-                    modifier = with(this@ReorderableItem) {
-                        // The whole row is both clickable (select category) and the drag handle, so
-                        // draggableHandle's immediate slop-based drag turned a click with the
-                        // slightest movement into a reorder. Require a deliberate long-press before a
-                        // drag begins so a normal click just selects the category.
-                        Modifier.longPressDraggableHandle(
-                            onDragStarted = {
-                                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
-                            },
+                val selected = item.page == activeSidebarPage
+                Column {
+                    DesktopSettingsSidebarRow(
+                        label = item.label,
+                        icon = item.icon,
+                        selected = selected,
+                        modifier = with(this@ReorderableItem) {
+                            // The whole row is both clickable (select category) and the drag handle, so
+                            // draggableHandle's immediate slop-based drag turned a click with the
+                            // slightest movement into a reorder. Require a deliberate long-press before a
+                            // drag begins so a normal click just selects the category.
+                            Modifier.longPressDraggableHandle(
+                                onDragStarted = {
+                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                },
+                            )
+                        },
+                        onClick = { onPageChange(item.page) },
+                    )
+                    // The selected category unfolds its sections underneath, so a page's headings
+                    // are one click away from the sidebar. Only one row is ever open; a single
+                    // entry is not worth a tree.
+                    AnimatedVisibility(
+                        visible = selected && subItems.size > 1,
+                        enter = expandVertically() + fadeIn(),
+                        exit = shrinkVertically() + fadeOut(),
+                    ) {
+                        DesktopSettingsSidebarSubList(
+                            items = subItems,
+                            currentPage = currentPage,
+                            onClick = onSubItemClick,
                         )
-                    },
-                    onClick = { onPageChange(item.page) },
-                )
+                    }
+                }
             }
         }
     }
@@ -2060,6 +2166,110 @@ private fun DesktopSettingsSidebarRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+/**
+ * The section list under the selected sidebar category. A hairline guide runs down the left under
+ * the category icon, tree-style, so the entries read as children of the row above rather than as
+ * more categories.
+ */
+@Composable
+private fun DesktopSettingsSidebarSubList(
+    items: List<DesktopSettingsSidebarSubItem>,
+    currentPage: SettingsPage,
+    onClick: (DesktopSettingsSidebarSubItem) -> Unit,
+) {
+    val tokens = MaterialTheme.nuvio
+    val guideColor = tokens.colors.borderDefault
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = DesktopSidebarSubListGuideInset, top = 2.dp, bottom = 6.dp)
+            .drawBehind {
+                val x = tokens.borders.hairline.toPx() / 2f
+                drawLine(
+                    color = guideColor,
+                    start = Offset(x, 0f),
+                    end = Offset(x, size.height),
+                    strokeWidth = tokens.borders.hairline.toPx(),
+                )
+            }
+            .padding(start = DesktopSidebarSubListTextInset),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        items.forEach { item ->
+            // A sub-page entry (TMDB under Integrations) is "current" while that page is open; a
+            // section entry never is, since the page does not report which heading is in view.
+            val current = item.anchor == null && item.page == currentPage
+            val color = if (current) tokens.colors.accent else tokens.colors.textMuted
+            val accentMask = if (current) Modifier.accentGradientMask() else Modifier
+            Text(
+                text = item.label,
+                style = MaterialTheme.typography.bodySmall,
+                color = color,
+                fontWeight = if (current) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(NuvioTokens.Radius.sm))
+                    .clickable { onClick(item) }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                    .then(accentMask),
+            )
+        }
+    }
+}
+
+/** Centre of the 22.dp category icon, where the sub-list's guide line hangs from. */
+private val DesktopSidebarSubListGuideInset = 11.dp
+
+/** From the guide line to the sub-list text, landing the text on the category label's column
+ * (icon 22.dp + 12.dp gap) minus the 8.dp of click padding the entries carry. */
+private val DesktopSidebarSubListTextInset = 15.dp
+
+private const val SettingsAnchorSeekStartDelayMillis = 200L
+private const val SettingsAnchorSeekFallbackStepMillis = 160L
+
+/**
+ * Carries a pending [SettingsScrollAnchor] request to a heading that lives in a lazy item which is
+ * not composed yet. The anchor mechanism is opt-in per element: the target brings itself into view
+ * when it sees the request, which only works while it is composed, and most pages put one section
+ * per lazy item. A sidebar section, favourite or search result below the fold was silently ignored.
+ *
+ * Gives an already-composed target (or its fallback, which waits 120ms) first refusal, then walks
+ * the list from the top a viewport at a time; as soon as the target mounts it consumes the request
+ * and its own bringIntoView lands it exactly. A request that reaches the end unconsumed (the section
+ * is hidden by a condition the sidebar table could not predict) is expired and the list put back.
+ */
+@Composable
+private fun SeekSettingsAnchorIntoView(listState: LazyListState) {
+    val requested by SettingsScrollAnchor.requested.collectAsStateWithLifecycle()
+    LaunchedEffect(requested) {
+        val request = requested ?: return@LaunchedEffect
+        delay(SettingsAnchorSeekStartDelayMillis)
+        fun pending() = SettingsScrollAnchor.requested.value?.sequence == request.sequence
+        if (!pending()) return@LaunchedEffect
+        val startIndex = listState.firstVisibleItemIndex
+        val startOffset = listState.firstVisibleItemScrollOffset
+        // A search result's exact row may be hidden, in which case its section heading consumes the
+        // request on its behalf - after a 120ms grace that would never elapse if the heading were
+        // scrolled out (and disposed) a frame after it mounted.
+        val settleMillis = if (request.fallbackAnchor != null) SettingsAnchorSeekFallbackStepMillis else 0L
+        listState.scrollToItem(0)
+        while (pending()) {
+            withFrameNanos {}
+            withFrameNanos {}
+            if (settleMillis > 0) delay(settleMillis)
+            if (!pending()) break
+            if (!listState.canScrollForward) {
+                SettingsScrollAnchor.expire(request.sequence)
+                listState.scrollToItem(startIndex, startOffset)
+                break
+            }
+            listState.scrollBy(listState.layoutInfo.viewportSize.height * 0.8f)
+        }
     }
 }
 
@@ -2114,11 +2324,14 @@ private fun DesktopSettingsTopBar(
     onShowLatestChangelogClick: (() -> Unit)?,
     columnGuidesVisible: Boolean,
     onColumnGuidesVisibleChange: (Boolean) -> Unit,
+    fullWidth: Boolean,
+    onFullWidthChange: (Boolean) -> Unit,
     onQuitClick: () -> Unit,
     onNavigateToHome: (() -> Unit)?,
     onNavigateToSearch: (() -> Unit)?,
     onNavigateToLibrary: (() -> Unit)?,
     onNavigateToDiscover: (() -> Unit)?,
+    onNavigateToCalendar: (() -> Unit)?,
     contextPanelWidth: Dp,
 ) {
     val tokens = MaterialTheme.nuvio
@@ -2181,6 +2394,15 @@ private fun DesktopSettingsTopBar(
                     modifier = if (columnGuidesVisible) Modifier.accentGradientMask() else Modifier,
                 )
             }
+            // Centred column set vs. the whole window; lit like the guides toggle when it is on.
+            IconButton(onClick = { onFullWidthChange(!fullWidth) }) {
+                Icon(
+                    imageVector = Icons.Rounded.WidthFull,
+                    contentDescription = stringResource(Res.string.settings_desktop_toggle_full_width),
+                    tint = if (fullWidth) tokens.colors.accent else tokens.colors.textMuted,
+                    modifier = if (fullWidth) Modifier.accentGradientMask() else Modifier,
+                )
+            }
             IconButton(onClick = onQuitClick) {
                 Icon(
                     imageVector = Icons.Rounded.PowerSettingsNew,
@@ -2195,6 +2417,7 @@ private fun DesktopSettingsTopBar(
                 onNavigateToSearch = onNavigateToSearch,
                 onNavigateToLibrary = onNavigateToLibrary,
                 onNavigateToDiscover = onNavigateToDiscover,
+                onNavigateToCalendar = onNavigateToCalendar,
             )
             Spacer(modifier = Modifier.weight(1f))
             if (contextPanelWidth == 0.dp) {
@@ -2236,6 +2459,7 @@ private fun DesktopSettingsRootNavigation(
     onNavigateToSearch: (() -> Unit)?,
     onNavigateToLibrary: (() -> Unit)?,
     onNavigateToDiscover: (() -> Unit)?,
+    onNavigateToCalendar: (() -> Unit)?,
 ) {
     val tokens = MaterialTheme.nuvio
     val discoverTabVisible by remember {
@@ -2313,6 +2537,25 @@ private fun DesktopSettingsRootNavigation(
                     .size(22.dp)
                     .then(if (onNavigateToLibrary != null) Modifier.accentGradientMask() else Modifier),
                 tint = if (onNavigateToLibrary != null) {
+                    tokens.colors.accent
+                } else {
+                    tokens.colors.textMuted.copy(alpha = 0.42f)
+                },
+            )
+        }
+        // Calendar is a pushed route rather than a tab, so it has no sidebar entry to fall back
+        // on; from Settings the only other ways in are the hotkey or the Library header icon.
+        IconButton(
+            onClick = { onNavigateToCalendar?.invoke() },
+            enabled = onNavigateToCalendar != null,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.DateRange,
+                contentDescription = stringResource(Res.string.calendar_title),
+                modifier = Modifier
+                    .size(22.dp)
+                    .then(if (onNavigateToCalendar != null) Modifier.accentGradientMask() else Modifier),
+                tint = if (onNavigateToCalendar != null) {
                     tokens.colors.accent
                 } else {
                     tokens.colors.textMuted.copy(alpha = 0.42f)
@@ -2493,79 +2736,6 @@ private fun DesktopPanelSection(
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             content()
         }
-    }
-}
-
-@Composable
-private fun DesktopSettingsSidebarFooter() {
-    val tokens = MaterialTheme.nuvio
-    val uriHandler = LocalUriHandler.current
-    Column(
-        modifier = Modifier.padding(top = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        // Muted rather than accent-coloured: this is a quiet footnote, and a bright accent (red,
-        // cyan, gold) made it the loudest thing in the sidebar. The underline still marks it as a
-        // link.
-        Text(
-            text = stringResource(Res.string.settings_desktop_project_name),
-            style = MaterialTheme.typography.bodySmall,
-            color = tokens.colors.textMuted,
-            fontWeight = FontWeight.Medium,
-            textDecoration = TextDecoration.Underline,
-            modifier = Modifier.clickable {
-                runCatching { uriHandler.openUri(NuvioHtpcRepoUrl) }
-            },
-        )
-        // Every nightly reports the version of the release it was cut from, so the version name on
-        // its own cannot tell a nightly from the stable build of the same number — which is exactly
-        // the question a bug report needs answered. Name the build when one is installed.
-        val nightlyBuild = remember { AppUpdaterPlatform.getInstalledNightlyBuild() }
-        // The version name is the same string for every build cut from it, so a freshly installed
-        // build looks identical to the one it replaced. The packaging stamp is the part that
-        // moves, and it also carries the channel the image was cut for — the marker above only
-        // knows about nightlies that arrived through the updater, not ones installed by hand.
-        val packagedBuild = remember { AppVersionPolicy.packagedBuild }
-        Text(
-            text = when {
-                nightlyBuild != null -> stringResource(
-                    Res.string.settings_desktop_build_nightly,
-                    AppVersionConfig.DESKTOP_VERSION_NAME,
-                    AppVersionConfig.DESKTOP_VERSION_CODE,
-                    nightlyBuild.label,
-                )
-
-                packagedBuild?.isNightly == true -> stringResource(
-                    Res.string.settings_desktop_build_nightly_stamped,
-                    AppVersionConfig.DESKTOP_VERSION_NAME,
-                    AppVersionConfig.DESKTOP_VERSION_CODE,
-                    packagedBuild.label,
-                )
-
-                packagedBuild != null -> stringResource(
-                    Res.string.settings_desktop_build_stamped,
-                    AppVersionConfig.DESKTOP_VERSION_NAME,
-                    AppVersionConfig.DESKTOP_VERSION_CODE,
-                    packagedBuild.label,
-                )
-
-                else -> stringResource(
-                    Res.string.settings_desktop_build,
-                    AppVersionConfig.DESKTOP_VERSION_NAME,
-                    AppVersionConfig.DESKTOP_VERSION_CODE,
-                )
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = tokens.colors.textMuted,
-        )
-        Text(
-            text = stringResource(Res.string.compose_about_open_logs_folder),
-            style = MaterialTheme.typography.bodySmall,
-            color = tokens.colors.textMuted,
-            fontWeight = FontWeight.Medium,
-            textDecoration = TextDecoration.Underline,
-            modifier = Modifier.clickable { platformOpenLogsDirectory() },
-        )
     }
 }
 

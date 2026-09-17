@@ -10,14 +10,12 @@ class PlayerTrackRejectKeywordsTest {
         rejected: Set<SubtitleRejectKeyword>,
         showOnlyPreferred: Boolean = false,
         preferred: String = SubtitleLanguageOption.NONE,
-        useForced: Boolean = false,
+        trackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
     ) = PlayerSettingsUiState(
         preferredSubtitleLanguage = preferred,
+        preferredSubtitleTrackKind = trackKind,
         rejectedSubtitleKeywords = rejected,
-        subtitleStyle = SubtitleStyleState(
-            showOnlyPreferredLanguages = showOnlyPreferred,
-            useForcedSubtitles = useForced,
-        ),
+        subtitleStyle = SubtitleStyleState(showOnlyPreferredLanguages = showOnlyPreferred),
     )
 
     @Test
@@ -56,7 +54,7 @@ class PlayerTrackRejectKeywordsTest {
     fun `preferring forced subtitles overrides a blanket forced rejection`() {
         val settings = subtitleSettings(
             rejected = setOf(SubtitleRejectKeyword.FORCED, SubtitleRejectKeyword.SIGNS),
-            useForced = true,
+            trackKind = SubtitleTrackKind.FORCED,
         )
         assertEquals(setOf(SubtitleRejectKeyword.SIGNS), settings.effectiveRejectedSubtitleKeywords())
     }

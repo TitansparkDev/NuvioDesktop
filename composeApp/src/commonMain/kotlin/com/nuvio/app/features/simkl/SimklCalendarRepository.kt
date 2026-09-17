@@ -2,8 +2,10 @@ package com.nuvio.app.features.simkl
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpRequestRaw
+import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.trakt.TraktCalendarEntry
 import com.nuvio.app.features.trakt.TraktCalendarUiState
+import com.nuvio.app.features.trakt.TraktPlatformClock
 import com.nuvio.app.features.trakt.addMonth
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.CancellationException
@@ -21,13 +23,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 private const val API_URL = "https://api.simkl.com"
 private const val CDN_URL = "https://data.simkl.in"
 private const val MAX_CONCURRENT_EPISODE_FETCHES = 5
+
+/**
+ * How long an unchanged activities stamp keeps the cached calendar. The stamp only tracks the
+ * user's own library changes; SIMKL adding air dates to a followed show bumps nothing, so a
+ * matching stamp is not proof the schedule is current. Twelve hours bounds that at two full
+ * fetches a day for someone who restarts constantly, instead of one per restart.
+ */
+private const val CACHE_TTL_MS = 12 * 60 * 60 * 1000L
 
 @Serializable
 private data class SimklEpisodeDto(
@@ -60,6 +72,12 @@ internal object SimklCalendarRepository {
     private var loaded = false
     private var loadJob: kotlinx.coroutines.Job? = null
 
+    // Provenance of whatever entries are currently published, whether fetched or restored from
+    // disk; the pair decides whether the next load can stop after `/sync/activities`.
+    private var hydrated = false
+    private var lastActivitiesStamp: String? = null
+    private var lastBuiltAtEpochMs = 0L
+
     // Movie watchlist data — populated from /sync/all-items, used when fetching per-movie
     // release dates from /movies/{id}. Keyed by simkl_id.
     private val movieWatchlistIds = mutableSetOf<Int>()
@@ -85,6 +103,9 @@ internal object SimklCalendarRepository {
     fun onProfileChanged() {
         loadJob?.cancel()
         loaded = false
+        hydrated = false
+        lastActivitiesStamp = null
+        lastBuiltAtEpochMs = 0L
         movieWatchlistIds.clear()
         movieWatchlistContentIds.clear()
         movieWatchlistPosters.clear()
@@ -109,25 +130,53 @@ internal object SimklCalendarRepository {
     }
 
     private suspend fun loadAll() {
-        _uiState.value = TraktCalendarUiState(isLoading = true, isAuthenticated = true)
+        // `copy`, not a fresh state: entries restored from disk on an earlier attempt stay on
+        // screen while this one decides whether they are still current.
+        _uiState.value = _uiState.value.copy(isLoading = true, isAuthenticated = true, errorMessage = null)
 
         val headers = SimklAuthRepository.authorizedHeaders() ?: run {
             _uiState.value = TraktCalendarUiState(isAuthenticated = false, hasLoaded = true)
             return
         }
 
+        hydrateFromDisk()
+
         // Rule: check /sync/activities before any /sync/all-items call.
         val activities = SimklAuthRepository.fetchActivities()
-        val latestTs = activities?.tvShows?.all
-        val savedTs = SimklSettingsRepository.lastCalendarActivitiesAt()
-        if (latestTs != null && latestTs == savedTs && loaded && _uiState.value.entriesByDate.isNotEmpty()) {
-            log.d { "SIMKL calendar: activities unchanged, reusing cached data" }
-            _uiState.value = _uiState.value.copy(isLoading = false)
+        val stamp = simklCalendarActivitiesStamp(activities)
+        val haveEntries = _uiState.value.entriesByDate.isNotEmpty()
+        val age = TraktPlatformClock.nowEpochMs() - lastBuiltAtEpochMs
+        if (haveEntries && stamp != null && stamp == lastActivitiesStamp && age in 0 until CACHE_TTL_MS) {
+            log.d { "SIMKL calendar: activities unchanged, reusing cached data (${age}ms old)" }
+            loaded = true
+            _uiState.value = _uiState.value.copy(isLoading = false, hasLoaded = true)
+            return
+        }
+        if (haveEntries && activities == null) {
+            // No activities means no SIMKL at all right now; the shows fetch would only fail the
+            // same way, and a failed fetch used to publish an empty calendar over a good one.
+            log.d { "SIMKL calendar: activities unavailable, keeping cached data" }
+            loaded = true
+            _uiState.value = _uiState.value.copy(isLoading = false, hasLoaded = true)
             return
         }
 
         // Step 1: fetch the user's library to get shows to include in the calendar.
         val shows = fetchWatchingShows(headers)
+        if (shows == null) {
+            if (haveEntries) {
+                log.d { "SIMKL calendar: library fetch failed, keeping cached data" }
+                _uiState.value = _uiState.value.copy(isLoading = false, hasLoaded = true)
+            } else {
+                _uiState.value = TraktCalendarUiState(
+                    isLoading = false,
+                    isAuthenticated = true,
+                    errorMessage = "Failed to load calendar",
+                    hasLoaded = true,
+                )
+            }
+            return
+        }
         if (shows.isEmpty()) {
             _uiState.value = TraktCalendarUiState(
                 isLoading = false,
@@ -136,6 +185,9 @@ internal object SimklCalendarRepository {
                 entriesByDate = emptyMap(),
             )
             loaded = true
+            lastActivitiesStamp = stamp
+            lastBuiltAtEpochMs = TraktPlatformClock.nowEpochMs()
+            persistToDisk(emptyList(), stamp, lastBuiltAtEpochMs)
             return
         }
         log.d { "SIMKL calendar: fetching episodes for ${shows.size} shows" }
@@ -157,31 +209,111 @@ internal object SimklCalendarRepository {
         }
 
         // Step 3: bucket by date and publish.
-        val byDate = allEntries
-            .groupBy { it.dateKey }
-            .mapValues { (_, entries) ->
-                entries
-                    .distinctBy { "${it.type}:${it.contentId}:${it.seasonNumber}:${it.episodeNumber}" }
-                    .sortedBy { it.title.lowercase() }
-            }
+        val byDate = allEntries.groupedByDate()
 
         log.d { "SIMKL calendar: ${allEntries.size} entries across ${byDate.size} dates" }
         loaded = true
-        if (latestTs != null) SimklSettingsRepository.setLastCalendarActivitiesAt(latestTs)
+        lastActivitiesStamp = stamp
+        lastBuiltAtEpochMs = TraktPlatformClock.nowEpochMs()
         _uiState.value = TraktCalendarUiState(
             isLoading = false,
             isAuthenticated = true,
             hasLoaded = true,
             entriesByDate = byDate,
         )
+        persistToDisk(allEntries, stamp, lastBuiltAtEpochMs)
     }
 
-    private suspend fun fetchWatchingShows(headers: Map<String, String>): List<ShowCalendarInfo> {
+    private fun List<TraktCalendarEntry>.groupedByDate(): Map<String, List<TraktCalendarEntry>> =
+        groupBy { it.dateKey }
+            .mapValues { (_, entries) ->
+                entries
+                    .distinctBy { "${it.type}:${it.contentId}:${it.seasonNumber}:${it.episodeNumber}" }
+                    .sortedBy { it.title.lowercase() }
+            }
+
+    /**
+     * Publishes the last fetched calendar from disk, once per process, so the screen has entries
+     * before `/sync/activities` answers — and so that answer can end the load at one request.
+     *
+     * Only a readable, current-version file for the active profile is restored; nothing here
+     * decides freshness, [loadAll] does that with the stamp and age this records.
+     */
+    private suspend fun hydrateFromDisk() {
+        if (hydrated) return
+        hydrated = true
+
+        val read = withContext(Dispatchers.IO) { runCatching { SimklCalendarCacheStorage.load() } }
+        val raw = read.getOrElse { error ->
+            log.d { "Could not read the SIMKL calendar cache: ${error.message}" }
+            return
+        }
+        if (raw == null) {
+            log.d { "No SIMKL calendar cache on disk" }
+            return
+        }
+        val entry = runCatching { json.decodeFromString<SimklCalendarCacheEntry>(raw) }
+            .getOrElse { error ->
+                log.d { "Discarding unreadable SIMKL calendar cache: ${error.message}" }
+                runCatching { SimklCalendarCacheStorage.save(null) }
+                return
+            }
+        if (entry.version != SimklCalendarCacheEntry.VERSION) {
+            log.d { "SIMKL calendar cache is v${entry.version}, expected v${SimklCalendarCacheEntry.VERSION}; ignoring" }
+            runCatching { SimklCalendarCacheStorage.save(null) }
+            return
+        }
+        val profileId = ProfileRepository.activeProfileId
+        if (entry.profileId != profileId) {
+            log.d { "SIMKL calendar cache belongs to profile ${entry.profileId}, active is $profileId; ignoring" }
+            return
+        }
+        if (entry.entries.isEmpty()) return
+
+        val byDate = entry.entries.map { it.toEntry() }.groupedByDate()
+        lastActivitiesStamp = entry.activitiesStamp
+        lastBuiltAtEpochMs = entry.builtAtEpochMs
+        _uiState.value = _uiState.value.copy(
+            isAuthenticated = true,
+            hasLoaded = true,
+            entriesByDate = byDate,
+        )
+        log.d {
+            "SIMKL calendar cache restored: ${entry.entries.size} entries, " +
+                "${TraktPlatformClock.nowEpochMs() - entry.builtAtEpochMs}ms old"
+        }
+    }
+
+    /** Fire-and-forget: nothing waits on the file, and an empty library clears it rather than leaving the old one. */
+    private fun persistToDisk(entries: List<TraktCalendarEntry>, stamp: String?, builtAtEpochMs: Long) {
+        val profileId = ProfileRepository.activeProfileId
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                SimklCalendarCacheStorage.save(
+                    if (entries.isEmpty()) {
+                        null
+                    } else {
+                        json.encodeToString(
+                            SimklCalendarCacheEntry(
+                                builtAtEpochMs = builtAtEpochMs,
+                                profileId = profileId,
+                                activitiesStamp = stamp,
+                                entries = entries.map { it.toCached() },
+                            ),
+                        )
+                    },
+                )
+            }.onFailure { error -> log.d { "Could not persist the SIMKL calendar: ${error.message}" } }
+        }
+    }
+
+    /** Null when SIMKL could not be reached or answered with an error — distinct from an empty library. */
+    private suspend fun fetchWatchingShows(headers: Map<String, String>): List<ShowCalendarInfo>? {
         val url = SimklAuthRepository.appendParams("$API_URL/sync/all-items/all")
         val resp = runCatching {
             httpRequestRaw(method = "GET", url = url, headers = headers, body = "")
-        }.getOrNull() ?: return emptyList()
-        if (resp.status !in 200..299) return emptyList()
+        }.getOrNull() ?: return null
+        if (resp.status !in 200..299) return null
 
         return runCatching {
             val parsed = json.decodeFromString<SimklAllItemsResponse>(resp.body)
@@ -244,7 +376,7 @@ internal object SimklCalendarRepository {
                     ))
                 }
             }
-        }.onFailure { log.w(it) { "Failed to parse SIMKL library" } }.getOrDefault(emptyList())
+        }.onFailure { log.w(it) { "Failed to parse SIMKL library" } }.getOrNull()
     }
 
     private suspend fun fetchShowEntries(

@@ -22,7 +22,7 @@ class IgdbClient : AutoCloseable {
     private val json = Json { ignoreUnknownKeys = true }
     private var token: CachedToken? = null
 
-    suspend fun search(query: String, settings: GameLibrarySettings): List<IgdbGame> {
+    suspend fun search(query: String, settings: GameLibrarySettings): List<GameMetadata> {
         require(settings.igdbClientId.isNotBlank()) { "Enter an IGDB Client ID in Settings." }
         require(settings.igdbClientSecret.isNotBlank()) { "Enter an IGDB Client Secret in Settings." }
         val search = query.trim()
@@ -52,7 +52,7 @@ class IgdbClient : AutoCloseable {
         return json.decodeFromString<List<IgdbGameDto>>(body).map(IgdbGameDto::toDomain)
     }
 
-    suspend fun game(gameId: Long, settings: GameLibrarySettings): IgdbGame? {
+    suspend fun game(gameId: Long, settings: GameLibrarySettings): GameMetadata? {
         require(settings.igdbClientId.isNotBlank()) { "Enter an IGDB Client ID in Settings." }
         require(settings.igdbClientSecret.isNotBlank()) { "Enter an IGDB Client Secret in Settings." }
         val accessToken = accessToken(settings)
@@ -153,7 +153,7 @@ private data class IgdbGameDto(
     val genres: List<IgdbNamedDto> = emptyList(),
     val platforms: List<IgdbNamedDto> = emptyList(),
 ) {
-    fun toDomain(): IgdbGame {
+    fun toDomain(): GameMetadata {
         val artworkBackdrops = artworks
             .asSequence()
             .filter { it.imageId.isNotBlank() && !it.alphaChannel && it.aspectRatio >= 1.25 }
@@ -167,8 +167,9 @@ private data class IgdbGameDto(
             .map { it.toArtworkCandidate(ArtworkSource.SCREENSHOT) }
             .toList()
         val backdropCandidates = (artworkBackdrops + screenshotBackdrops).distinctBy(ArtworkCandidate::url)
-        return IgdbGame(
+        return GameMetadata(
             id = id,
+            source = GameMetadataSource.Igdb,
             title = name,
             coverUrl = cover?.imageId?.takeIf(String::isNotBlank)?.let { imageUrl(it, "1080p") },
             backdropUrl = backdropCandidates.firstOrNull()?.url,

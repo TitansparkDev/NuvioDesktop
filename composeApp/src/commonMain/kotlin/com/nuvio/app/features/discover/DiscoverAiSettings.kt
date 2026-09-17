@@ -36,6 +36,24 @@ data class DiscoverAiSettings(
      * every refresh spends the user's own money, so the opt-in has to be theirs.
      */
     val dailyRefresh: Boolean = false,
+    /**
+     * Season recaps on the details screen are on — a second consumer of the same credential.
+     *
+     * Its own switch rather than a reuse of [enabled], because the two features cost different
+     * things and are wanted independently: recaps are one small request on an explicit click, AI
+     * rows are a browse feed. Sharing one toggle would mean anyone who wants a recap has to turn on
+     * a Discover feed they never asked for, and the reverse.
+     */
+    val recapEnabled: Boolean = false,
+    /**
+     * Recaps may draw on the model's own knowledge of the series for events before the cut-off.
+     *
+     * Off by default and deliberately not the same switch as [recapEnabled]: it changes what a
+     * recap is allowed to be *wrong about*, not whether the feature exists. Shipped to be judged in
+     * the field by people who know the shows, because the failure it risks — a later season's event
+     * reported as already having happened — is only visible to someone who has seen the show.
+     */
+    val recapUseModelKnowledge: Boolean = false,
 ) {
     val effectiveModel: String get() = model.trim().ifBlank { provider.defaultModel }
 
@@ -46,7 +64,21 @@ data class DiscoverAiSettings(
                 baseUrl.trim().trimEnd('/').ifBlank { DISCOVER_AI_DEFAULT_OPENAI_BASE_URL }
         }
 
-    /** Everything needed to make a request is present and the user has agreed to it being made. */
+    /**
+     * A request could be made: credential, model and consent are all present.
+     *
+     * Deliberately says nothing about *which* feature wants to make it. This is the half
+     * [DiscoverAiClient] checks, so that adding a consumer does not mean teaching the client about
+     * another feature flag; each consumer gates on its own switch below.
+     */
+    val isConfigured: Boolean
+        get() = consentGiven && apiKey.isNotBlank() && effectiveModel.isNotBlank()
+
+    /** Discover's AI rows may generate. */
     val isReady: Boolean
-        get() = enabled && consentGiven && apiKey.isNotBlank() && effectiveModel.isNotBlank()
+        get() = enabled && isConfigured
+
+    /** The details screen may build a recap. */
+    val isRecapReady: Boolean
+        get() = recapEnabled && isConfigured
 }

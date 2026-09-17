@@ -13,6 +13,7 @@ import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +33,7 @@ object AuthRepository {
     val error: StateFlow<String?> = _error.asStateFlow()
 
     private var initialized = false
+    private var sessionStatusJob: Job? = null
 
     fun initialize() {
         if (initialized) return
@@ -46,7 +48,7 @@ object AuthRepository {
             )
         }
 
-        scope.launch {
+        sessionStatusJob = scope.launch {
             SupabaseProvider.client.auth.sessionStatus.collect { status ->
                 if (AuthStorage.loadAnonymousUserId() != null) return@collect
                 when (status) {
@@ -121,6 +123,46 @@ object AuthRepository {
     }.onFailure { e ->
         log.e(e) { "Sign-out failed" }
         _error.value = e.message ?: getString(Res.string.auth_sign_out_failed)
+    }
+
+    /**
+     * Drops the local session without the full sign-out wipe, so the account can be re-created
+     * against a different backend.
+     *
+     * [signOut] deliberately runs [LocalAccountDataCleaner.wipe]; a server switch must NOT, because
+     * the user is moving their client between backends rather than leaving an account, and the local
+     * library/progress is what they expect to push to the new server.
+     */
+    suspend fun prepareForServerSwitch(): Result<Unit> = runCatching {
+        _error.value = null
+        // Detach from the outgoing client first: SupabaseProvider.reset() closes it moments from
+        // now, and a collector still attached to a closed client keeps publishing the previous
+        // backend's session state.
+        sessionStatusJob?.cancel()
+        sessionStatusJob = null
+        initialized = false
+        AuthStorage.clearAnonymousUserId()
+        SupabaseProvider.client.auth.clearSession()
+        _state.value = AuthState.Unauthenticated
+        log.i { "Local session cleared, ready to switch servers" }
+    }.onFailure { e ->
+        log.e(e) { "Failed to clear the local session before switching servers" }
+    }
+
+    /**
+     * Re-runs [initialize] against whatever Supabase client is current.
+     *
+     * The session collector is bound to one client instance, so it has to be cancelled before
+     * [SupabaseProvider.reset] hands out a new one - otherwise the old collector keeps publishing
+     * the previous backend's session state.
+     */
+    fun reinitialize() {
+        sessionStatusJob?.cancel()
+        sessionStatusJob = null
+        initialized = false
+        _state.value = AuthState.Loading
+        log.i { "Re-initializing auth against the active server" }
+        initialize()
     }
 
     suspend fun deleteAccount(): Result<Unit> = runCatching {

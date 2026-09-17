@@ -57,6 +57,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.nuvio.app.core.ui.NuvioPosterHoverTooltip
+import com.nuvio.app.features.details.GenreSubgenres
+import com.nuvio.app.features.details.allKeywords
 import androidx.compose.ui.graphics.graphicsLayer
 import com.nuvio.app.core.ui.NuvioDesktopImageScaling
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
@@ -133,6 +136,8 @@ fun DetailHero(
     ratingProviderName: String? = null,
     onCastClick: ((MetaPerson, String?) -> Unit)? = null,
     onCompanyClick: ((MetaCompany, String) -> Unit)? = null,
+    /** A discovery badge with a browse target was clicked. */
+    onBadgeClick: ((HeroDiscoveryFact) -> Unit)? = null,
     onHeroTrailerMuteToggle: () -> Unit = {},
     onHeroTrailerVolumeChange: (Int) -> Unit = {},
     // Invoked when the passive trailer surface's WebView2 transiently grabs OS focus (chrome
@@ -437,6 +442,7 @@ fun DetailHero(
                             facts = discoveryFacts,
                             maxCount = maxDiscoveryBadges,
                             placement = HeroBadgePlacement.TopRightHorizontal,
+                            onBadgeClick = onBadgeClick,
                         )
                     }
                 }
@@ -937,17 +943,31 @@ private fun DetailHeroMetadataRow(
     val countryBadge = meta.country
         ?.trim()
         ?.takeIf { it.isNotBlank() }
+    // Each genre is its own hoverable entry (every one opens the title's single sub-genre card);
+    // they are still drawn as one "Drama • Thriller" group, spaced like the joined string used to
+    // be rather than like the wider bullets between fields.
+    val shownGenres = meta.genres.take(3).filter { it.isNotBlank() }
+    val card = remember(shownGenres, meta.imdbInterests, meta.tmdbKeywords, meta.mdblistKeywords) {
+        GenreSubgenres.card(shownGenres, meta.imdbInterests, meta.allKeywords())
+    }
+    val genreEntries = shownGenres.map { genre ->
+        DetailMetadataEntry(
+            text = genre,
+            hoverBreakdown = card.headline,
+            hoverThemes = card.themeLine,
+        )
+    }
     val items = buildList {
-        releaseLine?.let { add(it) }
-        if (meta.genres.isNotEmpty()) add(meta.genres.take(3).joinToString(" \u2022 "))
-        runtimeText?.let { add(it) }
-        ageBadge?.let { add(it) }
-        languageBadge?.let { add(it) }
-        countryBadge?.let { add(it) }
+        releaseLine?.let { add(listOf(DetailMetadataEntry(it))) }
+        if (genreEntries.isNotEmpty()) add(genreEntries)
+        runtimeText?.let { add(listOf(DetailMetadataEntry(it))) }
+        ageBadge?.let { add(listOf(DetailMetadataEntry(it))) }
+        languageBadge?.let { add(listOf(DetailMetadataEntry(it))) }
+        countryBadge?.let { add(listOf(DetailMetadataEntry(it))) }
     }
         // Drop any blank entry so the bullet separators (drawn between items) never end up
         // orphaned next to an empty value.
-        .filter { it.isNotBlank() }
+        .filter { group -> group.any { it.text.isNotBlank() } }
     if (items.isEmpty()) return
 
     Row(
@@ -955,26 +975,48 @@ private fun DetailHeroMetadataRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
     ) {
-        items.forEachIndexed { index, item ->
+        items.forEachIndexed { index, group ->
             if (index > 0) {
-                Text(
-                    text = "\u2022",
-                    modifier = Modifier.padding(horizontal = 10.dp),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                    fontWeight = FontWeight.Bold,
-                )
+                DetailMetadataBullet(horizontalPadding = 10.dp)
             }
-            Text(
-                text = item,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            group.forEachIndexed { entryIndex, entry ->
+                if (entryIndex > 0) {
+                    DetailMetadataBullet(horizontalPadding = 5.dp)
+                }
+                // The tooltip wrapper renders its content unchanged when the title is blank, so a
+                // genre with nothing to say costs no hover affordance.
+                NuvioPosterHoverTooltip(title = entry.hoverBreakdown, subtitle = entry.hoverThemes) {
+                    Text(
+                        text = entry.text,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
     }
+}
+
+private data class DetailMetadataEntry(
+    val text: String,
+    /** Hover card text; blank for entries with nothing to expand on. */
+    val hoverBreakdown: String = "",
+    /** Dimmer second line of the hover card (a genre's themes); blank when there are none. */
+    val hoverThemes: String = "",
+)
+
+@Composable
+private fun DetailMetadataBullet(horizontalPadding: Dp) {
+    Text(
+        text = "\u2022",
+        modifier = Modifier.padding(horizontal = horizontalPadding),
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+        fontWeight = FontWeight.Bold,
+    )
 }
 
 private fun detailHeroHeight(

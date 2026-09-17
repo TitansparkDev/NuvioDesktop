@@ -53,6 +53,9 @@ const playerVolumeSlider = document.getElementById("playerVolumeSlider");
 const playerVolumeIcon = document.getElementById("playerVolumeIcon");
 const controlTooltip = document.getElementById("controlTooltip");
 const actionRow = document.querySelector(".action-row");
+const actionOverflowButton = document.getElementById("actionOverflowButton");
+const actionOverflowMenu = document.getElementById("actionOverflowMenu");
+let actionOverflowOpen = false;
 const subtitlesLabel = document.getElementById("subtitlesLabel");
 const audioLabel = document.getElementById("audioLabel");
 const sourcesLabel = document.getElementById("sourcesLabel");
@@ -66,6 +69,11 @@ const pictureInPicturePlayButton = document.getElementById("pictureInPicturePlay
 const pictureInPictureToggleIcon = document.getElementById("pictureInPictureToggleIcon");
 const pictureInPictureResizeHandles = document.querySelectorAll("[data-pip-resize]");
 const backButton = document.getElementById("backButton");
+const colorGradePanel = document.getElementById("colorGradePanel");
+const colorGradeClose = document.getElementById("colorGradeClose");
+const colorGradeReset = document.getElementById("colorGradeReset");
+const colorGradeNote = document.getElementById("colorGradeNote");
+let colorGradePanelOpen = false;
 const playerClockTime = document.getElementById("playerClockTime");
 const playerEndTime = document.getElementById("playerEndTime");
 const openingOverlay = document.getElementById("openingOverlay");
@@ -348,8 +356,10 @@ let state = {
   appFullscreenKeyCode: 122,
   playerShortcutKeyCodes: {},
   uiScalePercent: 0,
+  controlIconScalePercent: 0,
   uiFontFamily: "",
   sourceNotchPosition: "right",
+  sourceNotchHoverEnabled: true,
   notificationPosition: "center",
   parentalWarnings: [],
   showParentalGuide: false,
@@ -445,11 +455,14 @@ let state = {
   subtitleBackgroundColorSwatches: [],
   subtitleShadowColorSwatches: [],
   closeModalsToken: 0,
+  openSourcesToken: 0,
+  sourcesPanelOpen: false,
 };
 let isScrubbing = false;
 let scrubPositionMs = 0;
 let tapTimer = 0;
 let activeModal = "";
+let sourceNotchHoverOpens = true;
 let pressedButton = null;
 let sourceFilterId = "";
 let sourceVirtualKey = "";
@@ -541,6 +554,20 @@ function applyUserUiScale(percent) {
   updateViewportUiScale();
 }
 
+// Bottom-row-only multiplier (desktopControlIconScalePercent). Purely a CSS variable: it rides on
+// top of the native page zoom that carries the main UI-scale knob, and only the control-row
+// button rules in controls.css consume it, so the header/timeline/panels are untouched. The
+// action-row overflow measurement reads offsetWidth, so a change must re-fold the row.
+let appliedControlIconScale = null;
+function applyControlIconScale(percent) {
+  const clamped = Math.max(-50, Math.min(50, Math.round(Number(percent) || 0)));
+  const scale = 1 + clamped / 100;
+  if (scale === appliedControlIconScale) return;
+  appliedControlIconScale = scale;
+  document.documentElement.style.setProperty("--control-icon-scale", String(scale));
+  invalidateActionRowOverflow();
+}
+
 function updateViewportUiScale() {
   const userScale = 1;
   // Native zoom owns DPI normalization and the user's preference. This second factor is strictly
@@ -585,6 +612,7 @@ function updateViewportUiScale() {
   root.classList.toggle("hud-compact", tier === "compact" || tier === "small" || tier === "minimal");
   root.classList.toggle("hud-small", tier === "small" || tier === "minimal");
   root.classList.toggle("hud-minimal", tier === "minimal");
+  invalidateActionRowOverflow();
 }
 
 const prefersReducedMotion = window.matchMedia &&
@@ -908,7 +936,10 @@ const hideSeekThumbnail = () => {
 };
 
 const showSeekThumbnailAt = event => {
-  if (!state.seekThumbnailsEnabled) return hideSeekThumbnail();
+  // With previews off the card still shows the hovered time and chapter — those cost nothing.
+  // Only the frame itself needs the second stream and its range request.
+  const previewsEnabled = !!state.seekThumbnailsEnabled;
+  seekThumbnail.classList.toggle("no-preview", !previewsEnabled);
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   const rect = seek.getBoundingClientRect();
   if (durationMs <= 0 || rect.width <= 0) return hideSeekThumbnail();
@@ -926,6 +957,11 @@ const showSeekThumbnailAt = event => {
   });
   seekThumbnailChapter.textContent = chapter?.title || "";
   seekThumbnailChapter.hidden = !chapter;
+  if (!previewsEnabled) {
+    seekThumbnailImage.removeAttribute("src");
+    seekThumbnail.hidden = false;
+    return;
+  }
   const cached = seekThumbnailCache.get(thumbnailPositionMs);
   if (cached) {
     seekThumbnailImage.src = cached;
@@ -1354,6 +1390,12 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   if (notifyDismiss && closingModal === "p2pConsent") {
     send("cancelP2pForPlayerControls", 0);
   }
+  // The Sources panel can be pointed at another episode ("Apply To Next Episode"). Kotlin has to
+  // learn that it closed, or that redirect would still be live the next time the Sources button is
+  // used for the playing item.
+  if (closingModal === "sources") {
+    send("sourcesPanelClosed", 0);
+  }
   if (keyboardPanelMode && closingModal === keyboardPanelMode) {
     keyboardPanelMode = "";
     send("keyboardPanelClosed", 0);
@@ -1372,6 +1414,9 @@ const openPlayerModal = modal => {
     send("keyboardPanelClosed", 0);
   }
   activeModal = modal;
+  // Modals draw their own scrim at the same stacking level, so the grade panel would sit dimmed
+  // and unusable behind one. Close it rather than leave a dead panel on screen.
+  setColorGradePanelOpen(false);
   if (modal === "submitIntro") {
     submitIntroDraft = {
       segmentType: state.submitIntroSegmentType || "intro",
@@ -1541,6 +1586,10 @@ const contextMenuItems = [
         { label: "Neutral", action: "send:selectDesktopColorProfile:0", selectedField: "desktopColorProfileLabel" },
         { label: "Cinematic", action: "send:selectDesktopColorProfile:1", selectedField: "desktopColorProfileLabel" },
         { label: "Vivid", action: "send:selectDesktopColorProfile:2", selectedField: "desktopColorProfileLabel" },
+        // Selection only: the offsets themselves live in Settings > Playback. Picking Custom here is
+        // what makes the C hotkey an A/B between neutral and the user's own grade mid-playback.
+        { label: "Custom", action: "send:selectDesktopColorProfile:3", selectedField: "desktopColorProfileLabel" },
+        { label: "Adjust custom color…", action: "colorGradePanel" },
       ] },
       { label: "Anime shader", dynamicKey: "animeShaders", children: [] },
       { label: "SVP interpolation", action: "send:keyboardCycleAnimeSvp", toggleKey: "desktopAnimeSvpEnabled" },
@@ -1745,6 +1794,128 @@ const closeContextMenu = () => {
   noteChromeActivity(true);
 };
 
+
+// --- Custom colour grade panel ---------------------------------------------------------------
+// Lives over playing video (see the .grade-panel note in controls.css). Every stepper sends a
+// delta to Kotlin, which owns the values; the panel only ever renders what comes back in state,
+// so it can never drift from the settings page showing the same four numbers.
+
+const COLOR_GRADE_VALUE_ELEMENTS = {
+  adjustDesktopColorContrast: document.getElementById("colorGradeContrastValue"),
+  adjustDesktopColorBrightness: document.getElementById("colorGradeBrightnessValue"),
+  adjustDesktopColorSaturation: document.getElementById("colorGradeSaturationValue"),
+  adjustDesktopColorGamma: document.getElementById("colorGradeGammaValue"),
+};
+
+const COLOR_GRADE_STATE_FIELDS = {
+  adjustDesktopColorContrast: "desktopColorContrast",
+  adjustDesktopColorBrightness: "desktopColorBrightness",
+  adjustDesktopColorSaturation: "desktopColorSaturation",
+  adjustDesktopColorGamma: "desktopColorGamma",
+};
+
+// Offsets from neutral, so the sign carries the meaning — a bare "0" would read as "off".
+const formatColorGradeValue = value => {
+  const number = Number(value) || 0;
+  return number > 0 ? `+${number}` : String(number);
+};
+
+const renderColorGradePanel = () => {
+  if (!colorGradePanel) return;
+  Object.entries(COLOR_GRADE_VALUE_ELEMENTS).forEach(([command, element]) => {
+    if (element) element.textContent = formatColorGradeValue(state[COLOR_GRADE_STATE_FIELDS[command]]);
+  });
+  const isCustom = String(state.desktopColorProfileLabel || "") === "Custom";
+  if (colorGradeNote) {
+    // Two different reasons the panel can look like it is doing nothing, and the user cannot tell
+    // them apart from the picture alone: a preset is active (so these values are not in play), or
+    // the grade is suppressed because the content is HDR.
+    colorGradeNote.textContent = isCustom
+      ? "Not applied to HDR playback"
+      : `${state.desktopColorProfileLabel || "Neutral"} active — adjusting switches to Custom`;
+  }
+  if (colorGradeReset) {
+    const isNeutral = Object.values(COLOR_GRADE_STATE_FIELDS)
+      .every(field => (Number(state[field]) || 0) === 0);
+    colorGradeReset.disabled = isNeutral;
+  }
+};
+
+const setColorGradePanelOpen = open => {
+  if (!colorGradePanel || colorGradePanelOpen === Boolean(open)) return;
+  colorGradePanelOpen = Boolean(open);
+  colorGradePanel.classList.toggle("visible", colorGradePanelOpen);
+  colorGradePanel.setAttribute("aria-hidden", colorGradePanelOpen ? "false" : "true");
+  if (colorGradePanelOpen) renderColorGradePanel();
+  // Mirrors closeContextMenu: the panel suppressed chrome auto-hide while open, so restart the
+  // inactivity timer on the way out instead of leaving the controls pinned.
+  renderChrome();
+  noteChromeActivity(true);
+};
+
+if (colorGradePanel) {
+  // The overlay under this panel toggles play/pause on click.
+  colorGradePanel.addEventListener("click", event => event.stopPropagation());
+  colorGradePanel.addEventListener("dblclick", event => event.stopPropagation());
+}
+
+if (colorGradeClose) {
+  colorGradeClose.addEventListener("click", event => {
+    event.stopPropagation();
+    setColorGradePanelOpen(false);
+  });
+}
+
+if (colorGradeReset) {
+  colorGradeReset.addEventListener("click", event => {
+    event.stopPropagation();
+    send("resetDesktopColorGrade", 0);
+  });
+}
+
+// Press-and-hold repeat. Sweeping a channel from 0 to -20 is a normal thing to want while
+// grading, and forty individual clicks is exactly the friction this panel exists to remove.
+const COLOR_GRADE_REPEAT_DELAY_MS = 380;
+const COLOR_GRADE_REPEAT_INTERVAL_MS = 90;
+let colorGradeRepeatDelay = 0;
+let colorGradeRepeatTimer = 0;
+
+const stopColorGradeRepeat = () => {
+  if (colorGradeRepeatDelay) {
+    window.clearTimeout(colorGradeRepeatDelay);
+    colorGradeRepeatDelay = 0;
+  }
+  if (colorGradeRepeatTimer) {
+    window.clearInterval(colorGradeRepeatTimer);
+    colorGradeRepeatTimer = 0;
+  }
+};
+
+document.querySelectorAll("[data-grade-command]").forEach(button => {
+  const command = button.dataset.gradeCommand;
+  const delta = Number(button.dataset.gradeDelta) || 0;
+  const step = () => send(command, delta);
+  button.addEventListener("pointerdown", event => {
+    event.stopPropagation();
+    // Only the primary button, and never a second overlapping hold.
+    if (event.button !== 0) return;
+    stopColorGradeRepeat();
+    step();
+    colorGradeRepeatDelay = window.setTimeout(() => {
+      colorGradeRepeatTimer = window.setInterval(step, COLOR_GRADE_REPEAT_INTERVAL_MS);
+    }, COLOR_GRADE_REPEAT_DELAY_MS);
+  });
+  // pointerup alone leaks a running interval whenever the pointer leaves the button mid-hold or
+  // the browser cancels the gesture, which would keep driving the value after release.
+  ["pointerup", "pointercancel", "pointerleave", "blur"].forEach(type => {
+    button.addEventListener(type, stopColorGradeRepeat);
+  });
+  // The pointer handler already stepped; without this the click would step a second time.
+  button.addEventListener("click", event => event.stopPropagation());
+});
+
+window.addEventListener("blur", stopColorGradeRepeat);
+
 const openSubtitleContextTab = tab => {
   openPlayerModal("subtitles");
   send("subtitleTab", tab);
@@ -1765,6 +1936,7 @@ const cycleAspectFromControls = () => {
 const contextActionOpensSurface = action => {
   const kind = String(action || "").split(":")[0];
   if (kind === "modal" || kind === "subtitleTab" || kind === "subtitleColorPrompt") return true;
+  if (kind === "colorGradePanel") return true;
   return action === "send:back" ||
     action === "send:toggleFullscreen" ||
     action === "send:pictureInPicture" ||
@@ -1848,6 +2020,10 @@ const executeContextAction = action => {
     } else {
       openPlayerModal(modal);
     }
+    return;
+  }
+  if (kind === "colorGradePanel") {
+    setColorGradePanelOpen(true);
     return;
   }
   if (kind === "subtitleTab") {
@@ -3009,8 +3185,9 @@ const renderSourceVirtualRows = () => {
     wrapper.className = "source-virtual-row";
     wrapper.style.transform = `translateY(${sourceVirtualOffsets[index]}px)`;
     const row = buildSourceRow(item, selected => {
+      // The sheet stays open on a same-item swap so the new stream can be checked and swapped
+      // again; Kotlin still closes it (closeModalsToken) when the pick is an episode switch.
       send("selectSource", Number(selected.index) || 0);
-      window.setTimeout(closePlayerModal, 120);
     });
     row.dataset.keyboardSourceIndex = String(index);
     row.classList.toggle("keyboard-focused", keyboardPanelMode === "sources" && index === keyboardSourceIndex);
@@ -3065,8 +3242,15 @@ const updateSourcePanelWidth = items => {
     // The addon is absolutely right-aligned inside the row and must not dictate panel width.
     return Math.max(widest, primary + 92);
   }, 400);
-  const viewportLimit = Math.max(500, Math.min(760, window.innerWidth * .62));
-  sourcePanel.style.width = `${Math.round(Math.min(viewportLimit, Math.max(540, contentWidth * 1.15)))}px`;
+  // A side sheet: never more than half the player, so the picture stays watchable beside it.
+  const viewportLimit = Math.max(500, Math.min(760, window.innerWidth * .5));
+  const panelWidth = Math.round(Math.min(viewportLimit, Math.max(540, contentWidth * 1.15)));
+  sourcePanel.style.width = `${panelWidth}px`;
+  // On-screen width (the panel is CSS-zoomed) for centring the buffering spinner beside the sheet.
+  document.documentElement.style.setProperty(
+    "--source-panel-width",
+    `${Math.round(panelWidth * currentSourcePanelScale())}px`,
+  );
 };
 
 const renderSourceModal = () => {
@@ -3704,6 +3888,8 @@ const canAutoHideChrome = showOpening => Boolean(
   !state.isLocked &&
   !activeModal &&
   !contextMenuOpen &&
+  !colorGradePanelOpen &&
+  !actionOverflowOpen &&
   !isScrubbing &&
   !isInteractingWithChrome() &&
   !playbackErrorText() &&
@@ -3719,6 +3905,7 @@ const currentChromeAutoHideKey = showOpening => {
     state.isLoading ? "loading" : "ready",
     state.isLocked ? "locked" : "unlocked",
     activeModal || "none",
+    actionOverflowOpen ? "overflow-open" : "overflow-closed",
     isScrubbing ? "scrubbing" : "idle",
     isInteractingWithChrome() ? "interacting" : "idle-controls",
     showOpening ? "opening" : "ready",
@@ -3815,10 +4002,11 @@ const renderChrome = () => {
   ["off", "white", "accent", "shine"].forEach(mode =>
     root.classList.toggle(`poster-highlight-${mode}`, mode === posterHighlightMode));
   applyUserUiScale(state.uiScalePercent);
+  applyControlIconScale(state.controlIconScalePercent);
   root.classList.toggle("locked-visible", Boolean(state.isLocked && state.lockedOverlayVisible));
   // Playback failures are a compact notification now. Keep the normal chrome and cursor visible
   // so Back remains immediately available instead of turning the error into a modal takeover.
-  const isChromeHidden = Boolean(!pictureInPictureActive && !showError && (!activeModal && !contextMenuOpen && !state.controlsVisible && !(state.isLocked && state.lockedOverlayVisible)));
+  const isChromeHidden = Boolean(!pictureInPictureActive && !showError && (!activeModal && !contextMenuOpen && !colorGradePanelOpen && !actionOverflowOpen && !state.controlsVisible && !(state.isLocked && state.lockedOverlayVisible)));
   root.classList.toggle("chrome-hidden", isChromeHidden);
   if (isChromeHidden || activeModal) hideControlTooltip();
   // Never hide the cursor in hero-trailer mode — it's a background surface, not the
@@ -3844,12 +4032,16 @@ const renderChrome = () => {
   episodesLabel.textContent = state.episodesLabel || "Episodes";
   episodeNotchLabel.textContent = state.episodesLabel || "Episodes";
   lockedLabel.textContent = state.tapToUnlockLabel || "Tap to unlock";
-  const showBuffering = Boolean(!showError && state.isLoading && !state.isLocked && !activeModal && !showOpening);
+  // The Sources sheet leaves the picture uncovered and stays open across a swap, so buffering
+  // must still show through it; every other modal hides the spinner as before.
+  const modalHidesBuffering = Boolean(activeModal) && activeModal !== "sources";
+  const showBuffering = Boolean(!showError && state.isLoading && !state.isLocked && !modalHidesBuffering && !showOpening);
   bufferingStatus.classList.toggle("visible", showBuffering);
   bufferingStatus.setAttribute("aria-hidden", showBuffering ? "false" : "true");
 
   setVisible(submitIntroButton, Boolean(state.showSubmitIntro));
   setVisible(videoSettingsButton, Boolean(state.showVideoSettings));
+  renderColorGradePanel();
   setVisible(sourcesButton, Boolean(state.showSources));
   setVisible(episodesButton, Boolean(state.showEpisodes));
   setVisible(episodeNotch, Boolean(state.showEpisodes));
@@ -3857,9 +4049,11 @@ const renderChrome = () => {
     ? state.sourceNotchPosition
     : "right";
   root.classList.toggle("source-notch-left", sourceNotchPosition === "left");
+  sourceNotchHoverOpens = state.sourceNotchHoverEnabled !== false;
   root.classList.toggle("notifications-top", state.notificationPosition === "top-center");
   setVisible(sourceNotch, Boolean(state.showSources) && sourceNotchPosition !== "hidden");
   document.querySelectorAll(".episode-skip").forEach(button => setVisible(button, Boolean(state.showEpisodes)));
+  scheduleActionOverflowSync();
 
   const playPauseLabel = isPlaying ? state.pauseLabel : state.playLabel;
   if (toggle) {
@@ -4404,9 +4598,22 @@ const showControlTooltip = button => {
   const buttonRect = button.getBoundingClientRect();
   const rootRect = root.getBoundingClientRect();
   const tooltipScale = appliedCombinedUserScale || (1 + (appliedUiScalePercent || 0) / 100);
-  controlTooltip.textContent = label;
-  controlTooltip.style.left = `${Math.max(70, Math.min(rootRect.width - 70, buttonRect.left - rootRect.left + buttonRect.width / 2))}px`;
-  controlTooltip.style.top = `${buttonRect.top - rootRect.top - 8 * tooltipScale}px`;
+  // A folded icon has no room for the live value its row button shows, so fold it into the
+  // tooltip instead: "Aspect ratio - Fit".
+  const beside = Boolean(actionOverflowMenu && actionOverflowMenu.contains(button));
+  const value = beside ? actionValueLabel(button) : "";
+  controlTooltip.classList.toggle("tooltip-beside", beside);
+  controlTooltip.textContent = value ? `${label} - ${value}` : label;
+  if (beside) {
+    // Stacked icons sit directly above one another, so an overhead tooltip would cover the
+    // neighbour. Anchor it to the strip's left edge, centred on the hovered icon.
+    const menuRect = actionOverflowMenu.getBoundingClientRect();
+    controlTooltip.style.left = `${menuRect.left - rootRect.left - 8 * tooltipScale}px`;
+    controlTooltip.style.top = `${buttonRect.top - rootRect.top + buttonRect.height / 2}px`;
+  } else {
+    controlTooltip.style.left = `${Math.max(70, Math.min(rootRect.width - 70, buttonRect.left - rootRect.left + buttonRect.width / 2))}px`;
+    controlTooltip.style.top = `${buttonRect.top - rootRect.top - 8 * tooltipScale}px`;
+  }
   controlTooltip.hidden = false;
 };
 
@@ -4417,7 +4624,8 @@ if (actionRow && controlTooltip) {
   });
   actionRow.addEventListener("pointerover", event => {
     const button = event.target.closest("button");
-    if (button && actionRow.contains(button)) showControlTooltip(button);
+    if (!button || !actionRow.contains(button)) return;
+    showControlTooltip(button);
   });
   actionRow.addEventListener("pointerout", event => {
     const button = event.target.closest("button");
@@ -4425,6 +4633,170 @@ if (actionRow && controlTooltip) {
     hideControlTooltip();
   });
   actionRow.addEventListener("pointerleave", hideControlTooltip);
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Action-row overflow.
+
+   The control row is a three-track grid whose outer tracks are 1fr, so the right-hand track is
+   sized by the window, not by how many action buttons are showing. Once the buttons need more
+   than that track the flex row spills leftwards over the centre transport. Rather than thinning
+   the row by viewport tier (which silently removed controls the user was still aiming for), the
+   stack stays right-aligned and folds its lowest-priority buttons into #actionOverflowMenu behind
+   a single container icon. data-action-priority in controls.html orders the fold: lower survives
+   longer. --------------------------------------------------------------------------------- */
+const overflowCapableActions = actionRow
+  ? Array.from(actionRow.querySelectorAll(".action[data-action-priority]"))
+  : [];
+// Commands that raise a panel of their own; the menu has done its job once they fire. The cycling
+// commands are left alone so the menu can be clicked repeatedly to step through their values.
+const actionOverflowDismissCommands = new Set([
+  "subtitles",
+  "audio",
+  "sources",
+  "episodes",
+  "submitIntro",
+  "pictureInPicture",
+]);
+let actionOverflowSyncHandle = 0;
+let appliedActionOverflowSignature = "";
+
+// The live value an action shows in its row (the selected track, the current aspect/speed).
+// Only those spans carry an id -- the rest are static captions that just repeat the name.
+const actionValueLabel = button => {
+  const value = button.querySelector("span[id]");
+  return value ? String(value.textContent || "").trim() : "";
+};
+
+const setActionOverflowOpen = open => {
+  if (!actionOverflowButton || !actionOverflowMenu) return;
+  const next = Boolean(open) && !actionOverflowButton.hidden;
+  if (actionOverflowOpen === next) return;
+  actionOverflowOpen = next;
+  actionOverflowMenu.hidden = !next;
+  actionOverflowButton.setAttribute("aria-expanded", next ? "true" : "false");
+  actionOverflowButton.classList.toggle("selected", next);
+  if (!next) hideControlTooltip();
+  // Mirrors setColorGradePanelOpen: the menu suppressed chrome auto-hide while open, so restart
+  // the inactivity timer on the way out instead of leaving the controls pinned.
+  renderChrome();
+  noteChromeActivity(true);
+};
+
+// Returns every collapsible button to the row in authored order, so a measurement always starts
+// from the uncollapsed layout.
+const restoreActionRowLayout = () => {
+  overflowCapableActions.forEach(button => {
+    actionRow.insertBefore(button, actionOverflowButton);
+  });
+};
+
+function syncActionRowOverflow() {
+  actionOverflowSyncHandle = 0;
+  if (!actionRow || !actionOverflowButton || !actionOverflowMenu) return;
+
+  // The legacy HUD centres a labelled pill, PiP has no action row, and hud-minimal hides it
+  // outright. None of them overflow, so hand the buttons back and stand down.
+  const collapsible = !root.classList.contains("legacy-hud")
+    && !root.classList.contains("pip-active")
+    && !root.classList.contains("hud-minimal");
+  if (!collapsible) {
+    setActionOverflowOpen(false);
+    restoreActionRowLayout();
+    actionOverflowButton.hidden = true;
+    appliedActionOverflowSignature = "";
+    return;
+  }
+
+  // The 1fr track is content-independent, so this width is stable across the fold below and can
+  // be read before any button moves.
+  const available = actionRow.clientWidth;
+  const signature = [
+    Math.round(available),
+    appliedCombinedUserScale,
+    root.className,
+    overflowCapableActions.map(button => (button.hidden ? "0" : "1")).join(""),
+  ].join("|");
+  if (signature === appliedActionOverflowSignature) return;
+  appliedActionOverflowSignature = signature;
+
+  restoreActionRowLayout();
+  // Measured at its natural width; hidden again below if nothing needs to fold.
+  actionOverflowButton.hidden = false;
+
+  const gap = parseFloat(window.getComputedStyle(actionRow).columnGap) || 0;
+  // offsetParent covers #episodesButton, which base CSS keeps display:none outside legacy.
+  const items = overflowCapableActions.filter(button => !button.hidden && button.offsetParent);
+  const widths = new Map(items.map(button => [button, button.offsetWidth]));
+  const natural = items.reduce((total, button) => total + widths.get(button), 0)
+    + gap * Math.max(0, items.length - 1);
+
+  if (natural <= available) {
+    setActionOverflowOpen(false);
+    actionOverflowButton.hidden = true;
+    return;
+  }
+
+  const budget = available - actionOverflowButton.offsetWidth - gap;
+  const kept = new Set();
+  let used = 0;
+  const byPriority = items.slice().sort((a, b) => (
+    (Number(a.dataset.actionPriority) || 0) - (Number(b.dataset.actionPriority) || 0)
+  ));
+  for (const button of byPriority) {
+    const next = used + widths.get(button) + (kept.size ? gap : 0);
+    if (next > budget) break;
+    used = next;
+    kept.add(button);
+  }
+
+  // Appending in authored order keeps the menu reading like the row it came from. The buttons
+  // are moved as-is, so they keep the row's icon-only look; #controlTooltip supplies the name.
+  items.filter(button => !kept.has(button)).forEach(button => {
+    actionOverflowMenu.appendChild(button);
+  });
+}
+
+const scheduleActionOverflowSync = () => {
+  if (actionOverflowSyncHandle) return;
+  actionOverflowSyncHandle = window.requestAnimationFrame(syncActionRowOverflow);
+};
+
+const invalidateActionRowOverflow = () => {
+  appliedActionOverflowSignature = "";
+  scheduleActionOverflowSync();
+};
+
+if (actionRow && actionOverflowButton && actionOverflowMenu) {
+  actionOverflowButton.addEventListener("click", event => {
+    event.stopPropagation();
+    noteChromeActivity(true);
+    setActionOverflowOpen(!actionOverflowOpen);
+  });
+
+  // Every button carries its own click listener and each one stops propagation, so a bubbling
+  // listener here would never fire. Capture instead, and close after the target's handler has
+  // run: closing synchronously would re-parent the button mid-dispatch.
+  actionOverflowMenu.addEventListener("click", event => {
+    const button = event.target.closest(".action");
+    if (!button || !actionOverflowMenu.contains(button)) return;
+    if (!actionOverflowDismissCommands.has(button.dataset.command || "")) return;
+    window.setTimeout(() => setActionOverflowOpen(false), 0);
+  }, true);
+
+  document.addEventListener("pointerdown", event => {
+    if (!actionOverflowOpen) return;
+    const target = event.target;
+    if (target && target.closest && target.closest("#actionOverflowMenu, #actionOverflowButton")) return;
+    setActionOverflowOpen(false);
+  }, true);
+
+  if (window.ResizeObserver) {
+    // The right-hand track resizes with the window and with every hud-* tier change, which is
+    // exactly when the fold has to be recomputed.
+    new window.ResizeObserver(scheduleActionOverflowSync).observe(actionRow);
+  }
+  window.addEventListener("resize", scheduleActionOverflowSync, { passive: true });
 }
 
 const toggleChrome = () => {
@@ -4941,6 +5313,15 @@ skipPrompt.addEventListener("click", event => {
   focusShortcutRoot();
   send("skipInterval", 0);
 });
+// Right-click dismisses the prompt without seeking, for a segment whose timestamps are wrong:
+// the only other way to make a bad prompt go away was to wait out its auto-hide or leave the
+// segment. Stopped here so the player's own context menu does not open on top of it.
+skipPrompt.addEventListener("contextmenu", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  focusShortcutRoot();
+  send("dismissSkipInterval", 0);
+});
 
 nextEpisodeCard.addEventListener("click", event => {
   event.stopPropagation();
@@ -5009,6 +5390,9 @@ episodeNotch.addEventListener("pointerenter", () => {
   if (activeModal !== "episodes") episodeNotch.click();
 });
 sourceNotch.addEventListener("pointerenter", () => {
+  // Hover-to-open is optional: on a multi-monitor desktop the pointer crosses this screen edge on
+  // its way to another display, and opening Sources every time it does is worse than a click.
+  if (!sourceNotchHoverOpens) return;
   if (activeModal !== "sources") sourceNotch.click();
 });
 episodeList.addEventListener("pointerdown", event => {
@@ -5160,6 +5544,7 @@ window.playerUpdate = update => {
 
 window.playerControls = nextState => {
   const previousCloseToken = Number(state.closeModalsToken) || 0;
+  const previousOpenSourcesToken = Number(state.openSourcesToken) || 0;
   state = { ...state, ...nextState };
   applyUiFontFamily(state.uiFontFamily);
   if (!state.seekThumbnailsEnabled) {
@@ -5174,8 +5559,10 @@ window.playerControls = nextState => {
   // The rejected-keyword audio list arrives on this channel, not with the native track push, so
   // the menu has to be rebuilt here too or it keeps showing the unfiltered list until the next tick.
   setContextMenuDynamicItems("audioTracks", visibleAudioTracks());
+  const isFirstPlayerControls = !hasReceivedPlayerControls;
   hasReceivedPlayerControls = true;
   const closeToken = Number(state.closeModalsToken) || 0;
+  const openSourcesToken = Number(state.openSourcesToken) || 0;
   if (closeToken !== previousCloseToken) {
     closePlayerModal();
   }
@@ -5183,6 +5570,21 @@ window.playerControls = nextState => {
     openPlayerModal("p2pConsent");
   } else if (!state.showP2pConsent && activeModal === "p2pConsent") {
     closePlayerModal();
+  }
+  // Kotlin asking for the Sources modal — "Apply To Next Episode", and the autoplay-exhausted
+  // fallback. A token rather than a boolean, exactly like closeModalsToken above: a sticky flag
+  // would reopen the modal on the next state push after the user closed it.
+  if (openSourcesToken !== previousOpenSourcesToken) {
+    sourceFilterId = "";
+    openPlayerModal("sources");
+  }
+  // A stream swap rebuilds the native bridge and with it this whole HUD, so a Sources sheet that
+  // was open when the user picked a stream is gone by the time the new stream opens. Kotlin keeps
+  // the record (sourcesPanelOpen); honour it once, on this HUD's first push, so the sheet is back
+  // for checking the new stream and swapping again. Never afterwards — a sticky flag would
+  // reopen a sheet the user closed (Kotlin hears sourcesPanelClosed, but only after the push).
+  if (isFirstPlayerControls && state.sourcesPanelOpen && activeModal !== "sources") {
+    openPlayerModal("sources");
   }
   render();
 };
@@ -5338,6 +5740,16 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape" && contextMenuOpen) {
     event.preventDefault();
     closeContextMenu();
+    return;
+  }
+  if (event.key === "Escape" && actionOverflowOpen) {
+    event.preventDefault();
+    setActionOverflowOpen(false);
+    return;
+  }
+  if (event.key === "Escape" && colorGradePanelOpen) {
+    event.preventDefault();
+    setColorGradePanelOpen(false);
     return;
   }
   if (event.key === "Escape" && playbackErrorText()) {

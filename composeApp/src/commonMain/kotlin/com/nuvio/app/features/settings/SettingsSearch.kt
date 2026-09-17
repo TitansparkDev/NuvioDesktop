@@ -33,6 +33,8 @@ import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Palette
@@ -176,7 +178,6 @@ private fun settingsSearchEntries(
     val streamScoringPage = resolve(Res.string.compose_settings_page_stream_scoring)
     val localLibraryPage = resolve(Res.string.compose_settings_page_local_library)
     val gamesPage = resolve(Res.string.compose_settings_page_games)
-    val posterCustomizationPage = resolve(Res.string.compose_settings_page_poster_customization)
     val integrationsPage = resolve(Res.string.compose_settings_page_integrations)
     val debridPage = resolve(Res.string.compose_settings_page_debrid)
     val notificationsPage = resolve(Res.string.compose_settings_page_notifications)
@@ -193,6 +194,8 @@ private fun settingsSearchEntries(
     val qualiCachePage = resolve(Res.string.compose_settings_page_qualicache)
     val simklPage = resolve(Res.string.compose_settings_page_simkl)
     val yamtrackPage = resolve(Res.string.compose_settings_page_yamtrack)
+    val lightsPage = resolve(Res.string.compose_settings_page_lights)
+    val screensaverPage = resolve(Res.string.compose_settings_page_screensaver)
 
     val entries = mutableListOf<SettingsSearchEntry>()
 
@@ -420,6 +423,18 @@ private fun settingsSearchEntries(
             resolve(Res.string.settings_discover_ai_section),
         ),
         PlaybackSearchRow(
+            "ai-recap-enabled",
+            resolve(Res.string.settings_ai_recap_enabled),
+            resolve(Res.string.settings_ai_recap_enabled_description),
+            resolve(Res.string.settings_discover_ai_section),
+        ),
+        PlaybackSearchRow(
+            "ai-recap-model-knowledge",
+            resolve(Res.string.settings_ai_recap_model_knowledge),
+            resolve(Res.string.settings_ai_recap_model_knowledge_description),
+            resolve(Res.string.settings_discover_ai_section),
+        ),
+        PlaybackSearchRow(
             "discover-ai-rows",
             resolve(Res.string.settings_discover_ai_add_row),
             resolve(Res.string.settings_discover_ai_add_row_description),
@@ -563,6 +578,17 @@ private fun settingsSearchEntries(
             description = resolve(Res.string.settings_shortcuts_search_description),
             icon = Icons.Rounded.Keyboard,
         )
+        // Controller settings share the shortcuts page (a pad press is replayed as the keystroke
+        // the same action already has), but nobody searches "keyboard" looking for a gamepad.
+        addRow(
+            page = SettingsPage.KeyboardShortcuts,
+            key = "gamepad-control",
+            title = "Gamepad control",
+            description = "Controller support: navigate Nuvio with an Xbox or XInput pad.",
+            pageLabel = resolve(Res.string.compose_settings_page_keyboard_shortcuts),
+            section = "Controller",
+            icon = Icons.Rounded.Keyboard,
+        )
     }
     if (isDesktop) {
         addRow(
@@ -574,25 +600,60 @@ private fun settingsSearchEntries(
             section = resolve(Res.string.settings_appearance_section_display),
             icon = Icons.Rounded.Palette,
         )
+        val discordPage = resolve(Res.string.compose_settings_page_discord_presence)
+        val discordPresenceSection = resolve(Res.string.settings_discord_section_presence)
+        val discordActivitySection = resolve(Res.string.settings_discord_section_activity)
+        addPage(
+            page = SettingsPage.DiscordPresence,
+            key = "discord",
+            title = discordPage,
+            description = resolve(Res.string.settings_integrations_discord_description),
+            category = generalCategory,
+            icon = Icons.Rounded.Link,
+        )
         addRow(
-            page = SettingsPage.Integrations,
+            page = SettingsPage.DiscordPresence,
             key = "discord-presence",
             title = resolve(Res.string.settings_discord_presence),
             description = resolve(Res.string.settings_discord_presence_search_description),
-            pageLabel = integrationsPage,
-            section = resolve(Res.string.settings_integrations_section_title),
+            pageLabel = discordPage,
+            section = discordPresenceSection,
+            category = generalCategory,
             icon = Icons.Rounded.Link,
             anchor = SettingsScrollAnchor.DiscordPresence,
         )
         addRow(
-            page = SettingsPage.Integrations,
+            page = SettingsPage.DiscordPresence,
             key = "discord-episode-artwork",
             title = resolve(Res.string.settings_discord_episode_artwork),
             description = resolve(Res.string.settings_discord_episode_artwork_search_description),
-            pageLabel = integrationsPage,
-            section = resolve(Res.string.settings_integrations_section_title),
+            pageLabel = discordPage,
+            section = discordActivitySection,
+            category = generalCategory,
             icon = Icons.Rounded.Link,
             anchor = SettingsScrollAnchor.DiscordEpisodeArtwork,
+        )
+        addRow(
+            page = SettingsPage.DiscordPresence,
+            key = "discord-activity-style",
+            title = resolve(Res.string.settings_discord_activity_style),
+            description = resolve(Res.string.settings_discord_activity_style_search_description),
+            pageLabel = discordPage,
+            section = discordActivitySection,
+            category = generalCategory,
+            icon = Icons.Rounded.Link,
+            anchor = SettingsScrollAnchor.DiscordActivityStyle,
+        )
+        addRow(
+            page = SettingsPage.DiscordPresence,
+            key = "discord-activity-name",
+            title = resolve(Res.string.settings_discord_activity_name),
+            description = resolve(Res.string.settings_discord_activity_name_search_description),
+            pageLabel = discordPage,
+            section = discordActivitySection,
+            category = generalCategory,
+            icon = Icons.Rounded.Link,
+            anchor = SettingsScrollAnchor.DiscordActivityName,
         )
     }
     // The four export destinations lost their own rows when they moved inside the export dialog
@@ -929,6 +990,16 @@ private fun settingsSearchEntries(
         )
     }
     addRow(
+        page = SettingsPage.Advanced,
+        key = "performance-logging",
+        title = resolve(Res.string.settings_advanced_performance_logging),
+        description = resolve(Res.string.settings_advanced_performance_logging_description),
+        pageLabel = advancedPage,
+        section = resolve(Res.string.settings_advanced_section_diagnostics),
+        category = advancedCategory,
+        icon = Icons.Rounded.Tune,
+    )
+    addRow(
         page = SettingsPage.Account,
         key = "remember-last-profile",
         title = resolve(Res.string.settings_advanced_remember_last_profile),
@@ -1009,13 +1080,6 @@ private fun settingsSearchEntries(
         title = homeLayoutPage,
         description = resolve(Res.string.settings_content_discovery_homescreen_description),
         icon = Icons.Rounded.Home,
-    )
-    addPage(
-        page = SettingsPage.PosterCustomization,
-        key = "poster-customization",
-        title = posterCustomizationPage,
-        description = "Configure poster width, corners, landscape titles, and depth effects.",
-        icon = Icons.Rounded.Palette,
     )
     addPage(
         page = SettingsPage.MetaScreen,
@@ -1132,9 +1196,11 @@ private fun settingsSearchEntries(
 
     listOf(
         PlaybackSearchRow("games-shortcut", gamesPage, resolve(Res.string.settings_games_shortcut_hint), resolve(Res.string.settings_games_title)),
-        PlaybackSearchRow("games-igdb-client-id", resolve(Res.string.settings_games_igdb_client_id), resolve(Res.string.settings_games_igdb_client_id_description), resolve(Res.string.settings_games_section_igdb)),
-        PlaybackSearchRow("games-igdb-client-secret", resolve(Res.string.settings_games_igdb_client_secret), resolve(Res.string.settings_games_igdb_client_secret_description), resolve(Res.string.settings_games_section_igdb)),
+        PlaybackSearchRow("games-metadata-source", resolve(Res.string.settings_games_metadata_source), resolve(Res.string.settings_games_metadata_source_description), resolve(Res.string.settings_games_section_metadata)),
+        PlaybackSearchRow("games-igdb-client-id", resolve(Res.string.settings_games_igdb_client_id), resolve(Res.string.settings_games_igdb_client_id_description), resolve(Res.string.settings_games_section_metadata)),
+        PlaybackSearchRow("games-igdb-client-secret", resolve(Res.string.settings_games_igdb_client_secret), resolve(Res.string.settings_games_igdb_client_secret_description), resolve(Res.string.settings_games_section_metadata)),
         PlaybackSearchRow("games-backdrop-style", resolve(Res.string.settings_games_backdrop_style), resolve(Res.string.settings_games_backdrop_style_description), resolve(Res.string.settings_games_section_presentation)),
+        PlaybackSearchRow("games-rows", resolve(Res.string.settings_games_section_rows), resolve(Res.string.settings_games_rows_description), resolve(Res.string.settings_games_section_rows)),
         PlaybackSearchRow("games-steamgriddb-key", resolve(Res.string.settings_games_steamgriddb_key), resolve(Res.string.settings_games_steamgriddb_key_description), resolve(Res.string.settings_games_section_artwork)),
     ).forEach { row ->
         addRow(
@@ -1196,6 +1262,12 @@ private fun settingsSearchEntries(
                 anchor = SettingsScrollAnchor.SourceNotch,
             ) else null,
             if (isDesktop) PlaybackSearchRow(
+                "source-notch-hover",
+                resolve(Res.string.settings_playback_source_notch_hover),
+                resolve(Res.string.settings_playback_source_notch_hover_description),
+                anchor = SettingsScrollAnchor.SourceNotchHover,
+            ) else null,
+            if (isDesktop) PlaybackSearchRow(
                 "notification-position",
                 resolve(Res.string.settings_playback_notification_position),
                 resolve(Res.string.settings_playback_notification_position_description),
@@ -1211,6 +1283,33 @@ private fun settingsSearchEntries(
                 resolve(Res.string.settings_playback_desktop_color_profile),
                 anchor = SettingsScrollAnchor.ColorProfile,
             ) else null,
+            // The four offsets are only rendered while the Custom profile is selected, so a hit on
+            // one of these can land on a row that is not on screen. The section fallback anchor
+            // scrolls to the colour profile picker instead, which is where you go to reveal them.
+            if (isDesktop) PlaybackSearchRow(
+                "color-contrast",
+                resolve(Res.string.settings_playback_desktop_color_contrast),
+                resolve(Res.string.settings_playback_desktop_color_custom_description),
+                fallbackAnchor = SettingsScrollAnchor.ColorProfile,
+            ) else null,
+            if (isDesktop) PlaybackSearchRow(
+                "color-brightness",
+                resolve(Res.string.settings_playback_desktop_color_brightness),
+                resolve(Res.string.settings_playback_desktop_color_custom_description),
+                fallbackAnchor = SettingsScrollAnchor.ColorProfile,
+            ) else null,
+            if (isDesktop) PlaybackSearchRow(
+                "color-saturation",
+                resolve(Res.string.settings_playback_desktop_color_saturation),
+                resolve(Res.string.settings_playback_desktop_color_custom_description),
+                fallbackAnchor = SettingsScrollAnchor.ColorProfile,
+            ) else null,
+            if (isDesktop) PlaybackSearchRow(
+                "color-gamma",
+                resolve(Res.string.settings_playback_desktop_color_gamma),
+                resolve(Res.string.settings_playback_desktop_color_custom_description),
+                fallbackAnchor = SettingsScrollAnchor.ColorProfile,
+            ) else null,
             if (isDesktop) PlaybackSearchRow(
                 "desktop-renderer",
                 resolve(Res.string.settings_playback_desktop_renderer),
@@ -1221,6 +1320,12 @@ private fun settingsSearchEntries(
                 "desktop-buffer-preset",
                 resolve(Res.string.settings_playback_desktop_buffer_preset),
                 anchor = SettingsScrollAnchor.BufferPreset,
+            ) else null,
+            if (isDesktop) PlaybackSearchRow(
+                "desktop-seek-thumbnails",
+                resolve(Res.string.settings_playback_desktop_seek_thumbnails),
+                resolve(Res.string.settings_playback_desktop_seek_thumbnails_desc),
+                anchor = SettingsScrollAnchor.SeekThumbnails,
             ) else null,
             if (isDesktop) PlaybackSearchRow(
                 "desktop-anime-mode",
@@ -1290,6 +1395,11 @@ private fun settingsSearchEntries(
                 resolve(Res.string.settings_playback_dual_subtitles_description),
             ) else null,
             PlaybackSearchRow(
+                "subtitle-track-kind",
+                resolve(Res.string.settings_playback_subtitle_track_kind),
+                resolve(Res.string.settings_playback_subtitle_track_kind_search_hint),
+            ),
+            PlaybackSearchRow(
                 "addon-subtitle-startup",
                 resolve(Res.string.settings_playback_addon_subtitle_startup_mode),
                 resolve(Res.string.settings_playback_addon_subtitle_startup_fast_description),
@@ -1346,6 +1456,7 @@ private fun settingsSearchEntries(
         icon = Icons.Rounded.PlayArrow,
         rows = buildList {
             add(PlaybackSearchRow("stream-mode", resolve(Res.string.settings_playback_stream_selection_mode)))
+            add(PlaybackSearchRow("manual-next-episode", resolve(Res.string.settings_playback_manual_next_episode), resolve(Res.string.settings_playback_manual_next_episode_description)))
             add(PlaybackSearchRow("regex-pattern", resolve(Res.string.settings_playback_regex_pattern)))
             add(PlaybackSearchRow("stream-timeout", resolve(Res.string.settings_playback_stream_timeout), resolve(Res.string.settings_playback_stream_timeout_description)))
             add(PlaybackSearchRow("source-scope", resolve(Res.string.settings_playback_source_scope)))
@@ -1486,7 +1597,9 @@ private fun settingsSearchEntries(
         ),
     )
 
+    // Poster card styling lives on the Layout page, in its own two sections.
     val posterSection = resolve(Res.string.settings_poster_card_style)
+    val cardDepthSection = resolve(Res.string.settings_appearance_card_depth)
     listOf(
         PlaybackSearchRow(
             "poster-width",
@@ -1518,18 +1631,18 @@ private fun settingsSearchEntries(
         ),
         PlaybackSearchRow("poster-hide-labels", resolve(Res.string.settings_poster_hide_labels)),
         PlaybackSearchRow("action-preview", resolve(Res.string.settings_poster_action_preview), resolve(Res.string.settings_poster_action_preview_description)),
-        PlaybackSearchRow("card-depth", resolve(Res.string.settings_poster_card_depth), resolve(Res.string.settings_poster_card_depth_description)),
-        PlaybackSearchRow("card-depth-edge", resolve(Res.string.settings_poster_card_depth_edge)),
-        PlaybackSearchRow("card-depth-sheen", resolve(Res.string.settings_poster_card_depth_sheen)),
-        PlaybackSearchRow("card-depth-edge-coverage", resolve(Res.string.settings_poster_card_depth_edge_coverage)),
+        PlaybackSearchRow("card-depth", resolve(Res.string.settings_poster_card_depth), resolve(Res.string.settings_poster_card_depth_description), sectionOverride = cardDepthSection),
+        PlaybackSearchRow("card-depth-edge", resolve(Res.string.settings_poster_card_depth_edge), sectionOverride = cardDepthSection),
+        PlaybackSearchRow("card-depth-sheen", resolve(Res.string.settings_poster_card_depth_sheen), sectionOverride = cardDepthSection),
+        PlaybackSearchRow("card-depth-edge-coverage", resolve(Res.string.settings_poster_card_depth_edge_coverage), sectionOverride = cardDepthSection),
     ).forEach { row ->
         addRow(
-            page = SettingsPage.PosterCustomization,
+            page = SettingsPage.Appearance,
             key = "poster-${row.key}",
             title = row.title,
             description = row.description,
-            pageLabel = posterCustomizationPage,
-            section = posterSection,
+            pageLabel = layoutPage,
+            section = row.sectionOverride ?: posterSection,
             icon = Icons.Rounded.Tune,
             anchor = row.anchor,
         )
@@ -1557,6 +1670,8 @@ private fun settingsSearchEntries(
         PlaybackSearchRow("home-hover-preview", resolve(Res.string.settings_home_hover_preview), resolve(Res.string.settings_home_hover_preview_description)),
         PlaybackSearchRow("home-catalog-see-more", resolve(Res.string.settings_home_see_more_arrows), resolve(Res.string.settings_home_see_more_arrows_description)),
         PlaybackSearchRow("home-catalog-row-numbers", "Number catalog rows", "Append each row's position to its name, including collections."),
+        PlaybackSearchRow("hero-backdrop-crossfade", "Backdrop crossfade", "How long the hero backdrop takes to fade when moving between titles."),
+        PlaybackSearchRow("home-tv-row-transition", "Row change", "Cut, cross-fade, or cross-fade with a nudge when TV Mode moves between rows."),
         PlaybackSearchRow("home-tv-full-backdrop", "Full backdrop", "Extend the TV Mode backdrop to the bottom of the screen and let the rows float over it."),
         PlaybackSearchRow("home-tv-row-dots", "Row jump dots", "Click a dot beside the TV Mode row name to jump straight to that catalog."),
         PlaybackSearchRow("home-tv-row-dots-anchor", "Row jump dot position", "Put the TV Mode jump dots on the row name's line or over the backdrop."),
@@ -1836,6 +1951,76 @@ private fun settingsSearchEntries(
         )
     }
 
+    if (isDesktop) {
+        val screensaverSection = resolve(Res.string.settings_screensaver_section_title)
+        val shutdownSection = resolve(Res.string.settings_screensaver_section_shutdown)
+        addPage(
+            page = SettingsPage.Screensaver,
+            key = "screensaver",
+            title = screensaverPage,
+            description = resolve(Res.string.settings_screensaver_description),
+            category = generalCategory,
+            icon = Icons.Rounded.Bedtime,
+        )
+        listOf(
+            PlaybackSearchRow("screensaver-enable", resolve(Res.string.settings_screensaver_enable), resolve(Res.string.settings_screensaver_enable_description), screensaverSection),
+            PlaybackSearchRow("screensaver-dim-delay", resolve(Res.string.settings_screensaver_idle_time), resolve(Res.string.settings_screensaver_idle_time_description), screensaverSection),
+            PlaybackSearchRow("screensaver-dim-amount", resolve(Res.string.settings_screensaver_dim_amount), resolve(Res.string.settings_screensaver_dim_amount_description), screensaverSection),
+            PlaybackSearchRow("screensaver-during-playback", resolve(Res.string.settings_screensaver_during_playback), resolve(Res.string.settings_screensaver_during_playback_description), screensaverSection),
+            PlaybackSearchRow("screensaver-playback-dim-delay", resolve(Res.string.settings_screensaver_playback_idle_time), resolve(Res.string.settings_screensaver_playback_idle_time_description), screensaverSection),
+            PlaybackSearchRow("screensaver-shutdown-enable", resolve(Res.string.settings_screensaver_shutdown_enable), resolve(Res.string.settings_screensaver_shutdown_enable_description), shutdownSection),
+            PlaybackSearchRow("screensaver-shutdown-delay", resolve(Res.string.settings_screensaver_shutdown_idle_time), resolve(Res.string.settings_screensaver_shutdown_idle_time_description), shutdownSection),
+            PlaybackSearchRow("screensaver-playback-shutdown-delay", resolve(Res.string.settings_screensaver_playback_shutdown_idle_time), resolve(Res.string.settings_screensaver_playback_shutdown_idle_time_description), shutdownSection),
+        ).forEach { row ->
+            addRow(
+                page = SettingsPage.Screensaver,
+                key = row.key,
+                title = row.title,
+                description = row.description,
+                pageLabel = screensaverPage,
+                section = row.sectionOverride ?: screensaverSection,
+                category = generalCategory,
+                icon = Icons.Rounded.Bedtime,
+            )
+        }
+
+        val lightsSection = resolve(Res.string.settings_lights_section_title)
+        val goveeSection = resolve(Res.string.settings_lights_section_govee)
+        val webhooksSection = resolve(Res.string.settings_lights_section_webhooks)
+        addPage(
+            page = SettingsPage.Lights,
+            key = "lights",
+            title = lightsPage,
+            description = resolve(Res.string.settings_integrations_lights_description),
+            category = generalCategory,
+            icon = Icons.Rounded.Lightbulb,
+        )
+        listOf(
+            PlaybackSearchRow("lights-enable", resolve(Res.string.settings_lights_enable), resolve(Res.string.settings_lights_enable_description), lightsSection),
+            PlaybackSearchRow("lights-start-action", resolve(Res.string.settings_lights_start_action), resolve(Res.string.settings_lights_start_action_description), lightsSection),
+            PlaybackSearchRow("lights-pause", resolve(Res.string.settings_lights_pause_behavior), resolve(Res.string.settings_lights_pause_behavior_description), lightsSection),
+            PlaybackSearchRow("lights-end", resolve(Res.string.settings_lights_end_behavior), resolve(Res.string.settings_lights_end_behavior_description), lightsSection),
+            PlaybackSearchRow("lights-external", resolve(Res.string.settings_lights_external_players), resolve(Res.string.settings_lights_external_players_description), lightsSection),
+            PlaybackSearchRow("lights-schedule", resolve(Res.string.settings_lights_schedule), resolve(Res.string.settings_lights_schedule_description), lightsSection),
+            PlaybackSearchRow("lights-test", resolve(Res.string.settings_lights_test), resolve(Res.string.settings_lights_test_idle), lightsSection),
+            PlaybackSearchRow("lights-govee-key", resolve(Res.string.settings_lights_govee_api_key), resolve(Res.string.settings_lights_govee_api_key_description), goveeSection),
+            PlaybackSearchRow("lights-govee-devices", resolve(Res.string.settings_lights_govee_devices), resolve(Res.string.settings_lights_govee_devices_description), goveeSection),
+            PlaybackSearchRow("lights-webhook-method", resolve(Res.string.settings_lights_webhook_method), resolve(Res.string.settings_lights_webhook_method_description), webhooksSection),
+            PlaybackSearchRow("lights-webhook-urls", webhooksSection, resolve(Res.string.settings_lights_webhooks_description), webhooksSection),
+        ).forEach { row ->
+            addRow(
+                page = SettingsPage.Lights,
+                key = row.key,
+                title = row.title,
+                description = row.description,
+                pageLabel = lightsPage,
+                section = row.sectionOverride ?: lightsSection,
+                category = generalCategory,
+                icon = Icons.Rounded.Lightbulb,
+            )
+        }
+    }
+
     // Every page exposed by Settings must remain discoverable. Keep the assertion beside the
     // registry so adding a new SettingsPage without a search entry fails immediately in debug/test
     // builds instead of silently producing another unreachable option.
@@ -1847,7 +2032,12 @@ private fun settingsSearchEntries(
             add(SettingsPage.Downloads)
         }
         if (!notificationsEnabled) add(SettingsPage.Notifications)
-        if (!isDesktop) add(SettingsPage.KeyboardShortcuts)
+        if (!isDesktop) {
+            add(SettingsPage.KeyboardShortcuts)
+            add(SettingsPage.Screensaver)
+            add(SettingsPage.Lights)
+            add(SettingsPage.DiscordPresence)
+        }
     }
     val indexedPages = entries.mapNotNull { (it.target as? SettingsSearchTarget.Page)?.page }.toSet()
     check(SettingsPage.entries.none { it !in unavailablePages && it !in indexedPages }) {

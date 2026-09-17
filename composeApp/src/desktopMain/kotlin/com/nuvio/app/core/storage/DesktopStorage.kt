@@ -1,5 +1,6 @@
 package com.nuvio.app.core.storage
 
+import co.touchlab.kermit.Logger
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.nio.file.Files
@@ -13,6 +14,8 @@ import java.util.UUID
 import kotlin.io.path.exists
 
 internal object DesktopStorage {
+    private val log = Logger.withTag("DesktopStorage")
+    private const val SLOW_LOAD_LOG_THRESHOLD_MS = 250L
     private val json = Json { ignoreUnknownKeys = true }
     private val stores = mutableMapOf<String, Store>()
 
@@ -214,9 +217,25 @@ internal object DesktopStorage {
             loaded = true
             properties.clear()
             if (!file.exists()) return
+            // Timed separately because the open alone has stalled the UI thread for seconds
+            // (2026-09-14 launch sampler: 5.75s in `CreateFile0` under this method). These files
+            // are rewritten on every save, so an on-access scanner treats each open as a fresh
+            // file; knowing which store and whether it was the open or the parse is what the next
+            // slow launch needs to say.
+            val startedAt = System.nanoTime()
+            var openedAt = startedAt
             runCatching {
                 Files.newInputStream(file).use { input ->
+                    openedAt = System.nanoTime()
                     properties.load(input)
+                }
+            }
+            val totalMs = (System.nanoTime() - startedAt) / 1_000_000
+            if (totalMs >= SLOW_LOAD_LOG_THRESHOLD_MS) {
+                val openMs = (openedAt - startedAt) / 1_000_000
+                log.w {
+                    "slow store load: ${file.fileName} took ${totalMs}ms " +
+                        "(open ${openMs}ms, parse ${totalMs - openMs}ms) on ${Thread.currentThread().name}"
                 }
             }
         }

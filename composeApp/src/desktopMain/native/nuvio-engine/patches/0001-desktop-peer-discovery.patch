@@ -1,0 +1,121 @@
+From a626b627a5f8313c5dad69a14977311f2cd16d82 Mon Sep 17 00:00:00 2001
+From: Nuvio Desktop <nuviodesktop@local>
+Date: Fri, 11 Sep 2026 23:58:16 +0100
+Subject: [PATCH] desktop: Stremio-parity peer discovery (bootstrap routers,
+ 30s peer search, patient connects, TCP-only outgoing)
+
+---
+ src/torrent/libtorrent_backend.cpp | 59 +++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/src/torrent/libtorrent_backend.cpp b/src/torrent/libtorrent_backend.cpp
+index c479962..7904677 100644
+--- a/src/torrent/libtorrent_backend.cpp
++++ b/src/torrent/libtorrent_backend.cpp
+@@ -40,10 +40,25 @@ namespace {
+ constexpr std::size_t maximum_session_state_size = 4 * 1024 * 1024;
+ constexpr std::size_t maximum_resume_state_size = 16 * 1024 * 1024;
+ constexpr std::size_t maximum_pending_disk_reclaims = 256;
+-constexpr int peer_connect_timeout_seconds = 3;
++// Nuvio desktop tuning (see NuvioDesktop/composeApp/src/desktopMain/native/nuvio-engine/README):
++// sparse public swarms are the common case on a desktop client, and Stremio's engine wins them
++// by being patient with peers and impatient with trackers. Measured against it on the same
++// infohashes: 3 s connect timeouts plus libtorrent's 3-strike failcount wrote off every peer of
++// a 4-peer swarm inside 15 s, after which nothing re-asked the trackers for 5 minutes.
++constexpr int peer_connect_timeout_seconds = 10;
+ constexpr int peer_handshake_timeout_seconds = 20;
+ constexpr int peer_reconnect_floor_seconds = 4;
++constexpr int peer_max_failcount = 8;
+ constexpr int piece_request_timeout_seconds = 4;
++// Stremio re-runs every tracker and a DHT lookup on this cadence while the swarm is below
++// peer_search_target peers; libtorrent alone would honour tracker intervals (>= 5 min).
++constexpr auto peer_search_interval = std::chrono::seconds(30);
++constexpr int peer_search_target_peers = 40;
++// libtorrent's stock bootstrap is a single node; these are the routers every mainstream client
++// (and bittorrent-dht, which Stremio uses) starts from.
++constexpr char dht_bootstrap_nodes[] =
++    "dht.libtorrent.org:25401,router.bittorrent.com:6881,router.utorrent.com:6881,"
++    "dht.transmissionbt.com:6881,dht.aelitis.com:6881";
+ 
+ struct TorrentProfileSettings {
+     int connection_limit;
+@@ -101,6 +116,11 @@ lt::settings_pack make_settings(const ProtocolBackendConfig& config) {
+     settings.set_str(lt::settings_pack::user_agent, "Nuvio Engine/0.1.1");
+     settings.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0,[::]:0");
+     settings.set_bool(lt::settings_pack::enable_dht, true);
++    settings.set_str(lt::settings_pack::dht_bootstrap_nodes, dht_bootstrap_nodes);
++    // TCP-only outgoing, like Stremio: a uTP attempt to a TCP-only peer is a wasted strike
++    // against its failcount, and desktop networks rarely need uTP's NAT behaviour.
++    settings.set_bool(lt::settings_pack::enable_outgoing_utp, false);
++    settings.set_int(lt::settings_pack::max_failcount, peer_max_failcount);
+     settings.set_bool(lt::settings_pack::enable_lsd, true);
+     settings.set_bool(lt::settings_pack::enable_upnp, true);
+     settings.set_bool(lt::settings_pack::enable_natpmp, true);
+@@ -383,6 +403,7 @@ public:
+         touch_disk_cache(id);
+         warm_since_.erase(id);
+         quiesced_torrents_.erase(id);
++        last_peer_search_.erase(id);
+         stream_bridge_->remove_torrent(id);
+         try {
+             storage::remove_file_if_present(resume_path(id));
+@@ -538,6 +559,7 @@ public:
+             }
+         }
+         run_periodic_checkpoints(events);
++        run_peer_search();
+         run_warm_quiescence();
+         process_disk_reclaims(events);
+         run_disk_cache_enforcement(events);
+@@ -1220,6 +1242,40 @@ private:
+         );
+         quiesced_torrents_.erase(id);
+         warm_since_.erase(id);
++        // A torrent coming back from warm gets a fresh search straight away, not in 30 s.
++        last_peer_search_.erase(id);
++    }
++
++    // Stremio-style peer search: while a live torrent has fewer than peer_search_target_peers
++    // connected, force a fresh announce to every tracker and a DHT lookup every
++    // peer_search_interval, ignoring the trackers' own minimum intervals. Warm (parked)
++    // torrents are left alone.
++    void run_peer_search() {
++        if (shutting_down_) {
++            return;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        for (const auto& [id, handle] : handles_) {
++            if (!handle.is_valid() || pending_removals_.contains(id) ||
++                warm_since_.contains(id) || quiesced_torrents_.contains(id)) {
++                continue;
++            }
++            const auto telemetry = telemetry_.find(id);
++            if (telemetry != telemetry_.end() &&
++                telemetry->second.connected_peers >= peer_search_target_peers) {
++                continue;
++            }
++            auto& last = last_peer_search_[id];
++            if (last.time_since_epoch().count() != 0 && now - last < peer_search_interval) {
++                continue;
++            }
++            last = now;
++            try {
++                handle.force_reannounce(0, -1, lt::torrent_handle::ignore_min_interval);
++                handle.force_dht_announce();
++            } catch (...) {
++            }
++        }
+     }
+ 
+     void run_warm_quiescence() {
+@@ -1705,6 +1761,7 @@ private:
+     std::unordered_map<RequestContext*, std::unique_ptr<RequestContext>> pending_;
+     std::unordered_map<std::string, std::unique_ptr<RequestContext>> active_;
+     std::unordered_map<std::string, lt::torrent_handle> handles_;
++    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_peer_search_;
+     std::unordered_map<std::string, TorrentTelemetry> telemetry_;
+     std::unordered_map<std::string, std::chrono::steady_clock::time_point> warm_since_;
+     std::unordered_set<std::string> quiesced_torrents_;
+-- 
+2.54.0.windows.1
+

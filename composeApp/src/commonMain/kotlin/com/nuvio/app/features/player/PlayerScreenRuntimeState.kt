@@ -154,6 +154,13 @@ internal class PlayerScreenRuntime(
      * proxy falls back to. See `BindDiscordRichPresenceEffect`.
      */
     var discordAnimePosterUrl by mutableStateOf<String?>(null)
+
+    /**
+     * This title's poster from the user's custom poster service (Settings → TMDB → Library
+     * posters), when one is configured. Details and playback show the addon's own art, so this
+     * is the only place the styled poster reaches Rich Presence. See `BindDiscordRichPresenceEffect`.
+     */
+    var discordCustomPosterUrl by mutableStateOf<String?>(null)
     var activePauseDescription by mutableStateOf(pauseDescription)
     var activeVideoId by mutableStateOf(videoId)
     var activeInitialPositionMs by mutableStateOf(initialPositionMs)
@@ -229,6 +236,12 @@ internal class PlayerScreenRuntime(
     var submitIntroStatusMessage by mutableStateOf<String?>(null)
     var playerControlsPendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)
     var playerControlsCloseModalsToken by mutableStateOf(0L)
+    // Bumped to ask the desktop HUD to open its Sources modal. Kotlin has no other way in: the
+    // HUD owns modal visibility and only ever accepted a close signal.
+    var playerControlsOpenSourcesToken by mutableStateOf(0L)
+    // When set, the Sources panel is showing that episode's streams rather than the playing item's,
+    // and picking one switches to that episode. Null is the ordinary "sources for what's playing".
+    var pendingSourcesEpisode by mutableStateOf<MetaVideo?>(null)
     var episodeStreamsPanelState by mutableStateOf(EpisodeStreamsPanelState())
     var playerMetaVideos by mutableStateOf<List<MetaVideo>>(emptyList())
     var playerChapters by mutableStateOf<List<PlayerChapter>>(emptyList())

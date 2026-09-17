@@ -1,29 +1,266 @@
 package com.nuvio.app.features.home
 
 internal object HeroDiscoveryAwards {
+    // ---------------------------------------------------------------------------
+    // Academy Award for Best Picture — hardcoded TMDB IDs
+    // Sourced from: themoviedb.org/award/1-academy-awards/category/1-best-picture
+    // Covers the 70th (1998) through 98th (2026) ceremonies, winners and nominees;
+    // that is as far back as TMDB's award page goes. Years are ceremony years.
+    // The badge itself is normally driven by the MDBList `best-picture-winner` /
+    // `best-picture-nominated` keywords; these sets are the fallback and the source
+    // for the badge's browse rails. Update annually after the ceremony.
+    // ---------------------------------------------------------------------------
+
     val BEST_PICTURE_WINNER_TMDB_IDS = setOf<Int>(
-        1064213, // Anora (2024)
-        872585,  // Oppenheimer (2023)
-        738652,  // Everything Everywhere All at Once (2022)
-        77338,   // CODA (2021)
-        581734,  // Nomadland (2020)
-        496243,  // Parasite (2019)
-        490132,  // Green Book (2018)
-        399055,  // The Shape of Water (2017)
-        376867,  // Moonlight (2016)
-        315664,  // Spotlight (2015)
-        194662,  // Birdman (2014)
-        76203,   // 12 Years a Slave (2013)
-        68734,   // Argo (2012)
-        74360,   // The Artist (2011)
-        23986    // The King's Speech (2010)
+        1054867, // One Battle After Another (2026)
+        1064213, // Anora (2025)
+        872585,  // Oppenheimer (2024)
+        545611,  // Everything Everywhere All at Once (2023)
+        776503,  // CODA (2022)
+        581734,  // Nomadland (2021)
+        496243,  // Parasite (2020)
+        490132,  // Green Book (2019)
+        399055,  // The Shape of Water (2018)
+        376867,  // Moonlight (2017)
+        314365,  // Spotlight (2016)
+        194662,  // Birdman or (The Unexpected Virtue of Ignorance) (2015)
+        76203,   // 12 Years a Slave (2014)
+        68734,   // Argo (2013)
+        74643,   // The Artist (2012)
+        45269,   // The King's Speech (2011)
+        12162,   // The Hurt Locker (2010)
+        12405,   // Slumdog Millionaire (2009)
+        6977,    // No Country for Old Men (2008)
+        1422,    // The Departed (2007)
+        1640,    // Crash (2006)
+        70,      // Million Dollar Baby (2005)
+        122,     // The Lord of the Rings: The Return of the King (2004)
+        1574,    // Chicago (2003)
+        453,     // A Beautiful Mind (2002)
+        98,      // Gladiator (2001)
+        14,      // American Beauty (2000)
+        1934,    // Shakespeare in Love (1999)
+        597,     // Titanic (1998)
     )
 
+    /** Nominees only — never contains a winner, so the browse "Nominees" rail is disjoint from "Winners". */
     val BEST_PICTURE_NOM_TMDB_IDS = setOf<Int>(
-        1064213, // Anora (2024)
-        549509,  // The Brutalist (2024)
-        1013850, // A Real Pain (2024)
-        872585   // Oppenheimer (2023)
+        // 2026 (98th)
+        701387,  // Bugonia
+        911430,  // F1
+        1062722, // Frankenstein
+        1241983, // Train Dreams
+        858024,  // Hamnet
+        1317288, // Marty Supreme
+        1220564, // The Secret Agent
+        1124566, // Sentimental Value
+        1233413, // Sinners
+        // 2025 (97th)
+        549509,  // The Brutalist
+        661539,  // A Complete Unknown
+        974576,  // Conclave
+        693134,  // Dune: Part Two
+        974950,  // Emilia Pérez
+        1000837, // I'm Still Here
+        1028196, // Nickel Boys
+        933260,  // The Substance
+        402431,  // Wicked
+        // 2024 (96th)
+        1056360, // American Fiction
+        915935,  // Anatomy of a Fall
+        346698,  // Barbie
+        840430,  // The Holdovers
+        466420,  // Killers of the Flower Moon
+        523607,  // Maestro
+        666277,  // Past Lives
+        792307,  // Poor Things
+        467244,  // The Zone of Interest
+        // 2023 (95th)
+        49046,   // All Quiet on the Western Front
+        76600,   // Avatar: The Way of Water
+        674324,  // The Banshees of Inisherin
+        614934,  // Elvis
+        804095,  // The Fabelmans
+        817758,  // TÁR
+        361743,  // Top Gun: Maverick
+        497828,  // Triangle of Sadness
+        777245,  // Women Talking
+        // 2022 (94th)
+        777270,  // Belfast
+        646380,  // Don't Look Up
+        758866,  // Drive My Car
+        438631,  // Dune
+        614917,  // King Richard
+        718032,  // Licorice Pizza
+        597208,  // Nightmare Alley
+        600583,  // The Power of the Dog
+        511809,  // West Side Story
+        // 2021 (93rd)
+        600354,  // The Father
+        583406,  // Judas and the Black Messiah
+        614560,  // Mank
+        615643,  // Minari
+        582014,  // Promising Young Woman
+        502033,  // Sound of Metal
+        556984,  // The Trial of the Chicago 7
+        // 2020 (92nd)
+        359724,  // Ford v Ferrari
+        398978,  // The Irishman
+        515001,  // Jojo Rabbit
+        475557,  // Joker
+        331482,  // Little Women
+        492188,  // Marriage Story
+        530915,  // 1917
+        466272,  // Once Upon a Time... in Hollywood
+        // 2019 (91st)
+        487558,  // BlacKkKlansman
+        284054,  // Black Panther
+        424694,  // Bohemian Rhapsody
+        375262,  // The Favourite
+        426426,  // Roma
+        332562,  // A Star Is Born
+        429197,  // Vice
+        // 2018 (90th)
+        398818,  // Call Me by Your Name
+        399404,  // Darkest Hour
+        374720,  // Dunkirk
+        419430,  // Get Out
+        391713,  // Lady Bird
+        400617,  // Phantom Thread
+        446354,  // The Post
+        359940,  // Three Billboards Outside Ebbing, Missouri
+        // 2017 (89th)
+        329865,  // Arrival
+        393457,  // Fences
+        324786,  // Hacksaw Ridge
+        338766,  // Hell or High Water
+        381284,  // Hidden Figures
+        313369,  // La La Land
+        334543,  // Lion
+        334541,  // Manchester by the Sea
+        // 2016 (88th)
+        318846,  // The Big Short
+        296098,  // Bridge of Spies
+        167073,  // Brooklyn
+        76341,   // Mad Max: Fury Road
+        286217,  // The Martian
+        281957,  // The Revenant
+        264644,  // Room
+        // 2015 (87th)
+        190859,  // American Sniper
+        85350,   // Boyhood
+        120467,  // The Grand Budapest Hotel
+        205596,  // The Imitation Game
+        273895,  // Selma
+        266856,  // The Theory of Everything
+        244786,  // Whiplash
+        // 2014 (86th)
+        168672,  // American Hustle
+        109424,  // Captain Phillips
+        152532,  // Dallas Buyers Club
+        49047,   // Gravity
+        152601,  // Her
+        129670,  // Nebraska
+        205220,  // Philomena
+        106646,  // The Wolf of Wall Street
+        // 2013 (85th)
+        86837,   // Amour
+        84175,   // Beasts of the Southern Wild
+        68718,   // Django Unchained
+        82695,   // Les Misérables
+        87827,   // Life of Pi
+        72976,   // Lincoln
+        82693,   // Silver Linings Playbook
+        97630,   // Zero Dark Thirty
+        // 2012 (84th)
+        65057,   // The Descendants
+        64685,   // Extremely Loud & Incredibly Close
+        50014,   // The Help
+        44826,   // Hugo
+        59436,   // Midnight in Paris
+        60308,   // Moneyball
+        8967,    // The Tree of Life
+        57212,   // War Horse
+        // 2011 (83rd)
+        44214,   // Black Swan
+        45317,   // The Fighter
+        27205,   // Inception
+        39781,   // The Kids Are All Right
+        44115,   // 127 Hours
+        37799,   // The Social Network
+        10193,   // Toy Story 3
+        44264,   // True Grit
+        39013,   // Winter's Bone
+        // 2010 (82nd)
+        19995,   // Avatar
+        22881,   // The Blind Side
+        17654,   // District 9
+        24684,   // An Education
+        16869,   // Inglourious Basterds
+        25793,   // Precious: Based on the Novel 'Push' by Sapphire
+        12573,   // A Serious Man
+        14160,   // Up
+        22947,   // Up in the Air
+        // 2009 (81st)
+        4922,    // The Curious Case of Benjamin Button
+        11499,   // Frost/Nixon
+        10139,   // Milk
+        8055,    // The Reader
+        // 2008 (80th)
+        4347,    // Atonement
+        7326,    // Juno
+        4566,    // Michael Clayton
+        7345,    // There Will Be Blood
+        // 2007 (79th)
+        1164,    // Babel
+        1251,    // Letters from Iwo Jima
+        773,     // Little Miss Sunshine
+        1165,    // The Queen
+        // 2006 (78th)
+        142,     // Brokeback Mountain
+        398,     // Capote
+        3291,    // Good Night, and Good Luck.
+        612,     // Munich
+        // 2005 (77th)
+        2567,    // The Aviator
+        866,     // Finding Neverland
+        1677,    // Ray
+        9675,    // Sideways
+        // 2004 (76th)
+        153,     // Lost in Translation
+        8619,    // Master and Commander: The Far Side of the World
+        322,     // Mystic River
+        4464,    // Seabiscuit
+        // 2003 (75th)
+        3131,    // Gangs of New York
+        590,     // The Hours
+        121,     // The Lord of the Rings: The Two Towers
+        423,     // The Pianist
+        // 2002 (74th)
+        5279,    // Gosford Park
+        1999,    // In the Bedroom
+        120,     // The Lord of the Rings: The Fellowship of the Ring
+        824,     // Moulin Rouge!
+        // 2001 (73rd)
+        392,     // Chocolat
+        146,     // Crouching Tiger, Hidden Dragon
+        462,     // Erin Brockovich
+        1900,    // Traffic
+        // 2000 (72nd)
+        1715,    // The Cider House Rules
+        497,     // The Green Mile
+        9008,    // The Insider
+        745,     // The Sixth Sense
+        // 1999 (71st)
+        4518,    // Elizabeth
+        637,     // Life Is Beautiful
+        857,     // Saving Private Ryan
+        8741,    // The Thin Red Line
+        // 1998 (70th)
+        2898,    // As Good as It Gets
+        9427,    // The Full Monty
+        489,     // Good Will Hunting
+        2118,    // L.A. Confidential
     )
 
     val GOLDEN_GLOBE_DRAMA_WINNER_TMDB_IDS = setOf<Int>(
@@ -672,6 +909,14 @@ internal object HeroDiscoveryAwards {
     )
 
     val EMMY_DRAMA_NOM_TMDB_IDS = setOf<Int>(
+        // 2026 (78th)
+        203857, // The Diplomat
+        81723, // The Gilded Age
+        224372, // A Knight of the Seven Kingdoms
+        245927, // Paradise
+        225171, // Pluribus
+        95480, // Slow Horses
+        241609, // Your Friends & Neighbors
         // 2025 (77th)
         83867, // Star Wars: Andor
         203857, // The Diplomat
@@ -754,6 +999,14 @@ internal object HeroDiscoveryAwards {
     )
 
     val EMMY_COMEDY_NOM_TMDB_IDS = setOf<Int>(
+        // 2026 (78th)
+        125935, // Abbott Elementary
+        136315, // The Bear
+        124101, // Hacks
+        245318, // Margo's Got Money Troubles
+        250923, // Nobody Wants This
+        107113, // Only Murders in the Building
+        136311, // Shrinking
         // 2025 (77th)
         125935, // Abbott Elementary
         136315, // The Bear
@@ -863,6 +1116,11 @@ internal object HeroDiscoveryAwards {
     )
 
     val EMMY_LIMITED_NOM_TMDB_IDS = setOf<Int>(
+        // 2026 (78th)
+        246386, // All Her Fault
+        250504, // The Beast in Me
+        154385, // Beef
+        131142, // Love Story: John F. Kennedy Jr. & Carolyn Bessette
         // 2025 (77th)
         42009, // Black Mirror
         241405, // Dying for Sex
@@ -961,6 +1219,7 @@ internal object HeroDiscoveryAwards {
 
     val EMMY_WINNER_TMDB_IDS = setOf<Int>(
         // Comedy
+        270476, // Widow's Bay
         247767, // The Studio
         124101, // Hacks
         136315, // The Bear
@@ -1023,6 +1282,7 @@ internal object HeroDiscoveryAwards {
         1103, // Elizabeth R
         3213, // Marcus Welby M.D.
         // Limited Series
+        206828, // DTF St. Louis
         249042, // Adolescence
         154385, // Beef
         111803, // The White Lotus
@@ -1050,4 +1310,48 @@ internal object HeroDiscoveryAwards {
         11121, // The Odyssey
         13675, // Gulliver's Travels
     )
+
+    /**
+     * The ids a badge's browse rail lists, newest first.
+     *
+     * The category sets are each written newest-first with one winner per year, so interleaving
+     * them (drama, comedy, drama, comedy…) keeps the merged rail roughly chronological instead of
+     * showing every drama winner back to 1952 before the first comedy. `setOf` preserves insertion
+     * order, which is what makes this work — keep the sets ordered when updating them.
+     */
+    fun browseIds(award: HeroAward, won: Boolean, tv: Boolean): List<Int> = when (award) {
+        HeroAward.BEST_PICTURE -> when {
+            tv -> emptyList()
+            won -> BEST_PICTURE_WINNER_TMDB_IDS.toList()
+            else -> BEST_PICTURE_NOM_TMDB_IDS.toList()
+        }
+        HeroAward.GOLDEN_GLOBE -> when {
+            tv && won -> interleave(
+                GOLDEN_GLOBE_TV_DRAMA_WINNER_TMDB_IDS,
+                GOLDEN_GLOBE_TV_COMEDY_WINNER_TMDB_IDS,
+                GOLDEN_GLOBE_TV_LIMITED_WINNER_TMDB_IDS,
+            )
+            tv -> interleave(
+                GOLDEN_GLOBE_TV_DRAMA_NOM_TMDB_IDS,
+                GOLDEN_GLOBE_TV_COMEDY_NOM_TMDB_IDS,
+                GOLDEN_GLOBE_TV_LIMITED_NOM_TMDB_IDS,
+            )
+            won -> interleave(GOLDEN_GLOBE_DRAMA_WINNER_TMDB_IDS, GOLDEN_GLOBE_COMEDY_WINNER_TMDB_IDS)
+            else -> interleave(GOLDEN_GLOBE_DRAMA_NOM_TMDB_IDS, GOLDEN_GLOBE_COMEDY_NOM_TMDB_IDS)
+        }
+        HeroAward.EMMY -> when {
+            !tv -> emptyList()
+            won -> EMMY_WINNER_TMDB_IDS.toList()
+            else -> interleave(EMMY_DRAMA_NOM_TMDB_IDS, EMMY_COMEDY_NOM_TMDB_IDS, EMMY_LIMITED_NOM_TMDB_IDS)
+        }
+    }
+
+    private fun interleave(vararg sets: Set<Int>): List<Int> {
+        val iterators = sets.map { it.iterator() }
+        val out = ArrayList<Int>(sets.sumOf { it.size })
+        while (iterators.any { it.hasNext() }) {
+            for (iterator in iterators) if (iterator.hasNext()) out += iterator.next()
+        }
+        return out.distinct()
+    }
 }

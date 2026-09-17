@@ -5,11 +5,18 @@ import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,12 +53,14 @@ internal object SettingsScrollAnchor {
     const val DesktopRenderer = "desktop_renderer"
     const val MouseMove = "mouse_move"
     const val SourceNotch = "source_notch"
+    const val SourceNotchHover = "source_notch_hover"
     const val NotificationPosition = "notification_position"
     const val DefaultSpeed = "default_speed"
     const val SpeedToggle = "speed_toggle"
     const val BingeMode = "binge_mode"
     const val ExtraLargePosters = "extra_large_posters"
     const val BufferPreset = "buffer_preset"
+    const val SeekThumbnails = "seek_thumbnails"
     const val AnimeEnhancements = "anime_enhancements"
     const val AnimeAutoApply = "anime_auto_apply"
     const val AnimeIncludeWesternAnimation = "anime_include_western_animation"
@@ -63,6 +72,8 @@ internal object SettingsScrollAnchor {
     const val TvdbApiKey = "tvdb_api_key"
     const val DiscordPresence = "discord_presence"
     const val DiscordEpisodeArtwork = "discord_episode_artwork"
+    const val DiscordActivityStyle = "discord_activity_style"
+    const val DiscordActivityName = "discord_activity_name"
 
     fun searchKey(key: String): String = "settings_search_$key"
     fun section(title: String): String = "settings_section_$title"
@@ -134,6 +145,33 @@ internal object SettingsScrollAnchor {
 }
 
 /**
+ * The scroll viewport the settings anchors live in: its size, and the inset a heading lands at
+ * when it is scrolled to the top. Provided by the desktop settings screen from its page list; null
+ * where the page is not one scroll container (mobile), which leaves headings to the plain
+ * bring-into-view.
+ */
+internal class SettingsAnchorViewport(
+    val size: State<IntSize>,
+    val topInset: Dp,
+) {
+    /**
+     * A viewport-tall rect hung from the element's top edge (less [topInset]). Bringing it into
+     * view scrolls the element to the top of the viewport whichever side of it the element starts
+     * on, whereas the element's own bounds only ask for the nearest edge - a heading just below the
+     * fold would land at the bottom with none of its rows showing. Being exactly viewport-tall,
+     * the rect never trips the "larger than the viewport, leave it" rule.
+     */
+    fun headingRect(density: Density): Rect? {
+        val size = size.value
+        if (size.height <= 0) return null
+        val inset = with(density) { topInset.toPx() }
+        return Rect(0f, -inset, size.width.toFloat(), size.height - inset)
+    }
+}
+
+internal val LocalSettingsAnchorViewport = staticCompositionLocalOf<SettingsAnchorViewport?> { null }
+
+/**
  * The state produced by [rememberSettingsAnchorHighlight]: [modifier] must be applied to the
  * anchored element so it can be brought into view, and [highlighted] is true for ~5s after the
  * anchor is requested so the caller can tint its label with the accent colour.
@@ -143,10 +181,20 @@ internal data class SettingsAnchorHighlight(
     val modifier: Modifier,
 )
 
+/**
+ * [alignToTop] scrolls the element to the top of the viewport (see [SettingsAnchorViewport]) rather
+ * than just far enough to show it - for a section heading, whose rows sit beneath it and are what
+ * the jump was for. No effect without a [LocalSettingsAnchorViewport].
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun rememberSettingsAnchorHighlight(anchor: String): SettingsAnchorHighlight {
+internal fun rememberSettingsAnchorHighlight(
+    anchor: String,
+    alignToTop: Boolean = false,
+): SettingsAnchorHighlight {
     val requester = remember { BringIntoViewRequester() }
+    val viewport = if (alignToTop) LocalSettingsAnchorViewport.current else null
+    val density = LocalDensity.current
     val requested by SettingsScrollAnchor.requested.collectAsStateWithLifecycle()
     // Bump a local token (and consume the request) without keying the highlight timer on the
     // shared flow — otherwise consuming would cancel the in-flight highlight.
@@ -170,7 +218,7 @@ internal fun rememberSettingsAnchorHighlight(anchor: String): SettingsAnchorHigh
     }
     LaunchedEffect(highlightToken) {
         if (highlightToken == 0) return@LaunchedEffect
-        runCatching { requester.bringIntoView() }
+        runCatching { requester.bringIntoView(viewport?.headingRect(density)) }
         highlighted = true
         delay(SettingsScrollAnchorHighlightMillis)
         highlighted = false

@@ -21,6 +21,9 @@ internal data class DiscordRichPresenceActivity(
     val fallbackImageUrl: String? = null,
     val imageFit: DiscordRichPresenceImageFit = DiscordRichPresenceImageFit.Cover,
     val type: DiscordRichPresenceActivityType = DiscordRichPresenceActivityType.Playback,
+    // Playback only; browsing activities ignore it. See [DiscordActivityStyle].
+    val activityStyle: DiscordActivityStyle = DiscordActivityStyle.Watching,
+    val activityName: DiscordActivityName = DiscordActivityName.AppName,
     val isPlaying: Boolean = false,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,

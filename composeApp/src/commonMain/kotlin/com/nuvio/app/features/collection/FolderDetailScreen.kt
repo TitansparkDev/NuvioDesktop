@@ -89,6 +89,7 @@ import com.nuvio.app.core.ui.withDuplicateSafeLazyKeys
 import com.nuvio.app.features.home.HomeCatalogSection
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.home.HeroCastMember
+import com.nuvio.app.features.home.HeroDiscoveryFact
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
 import com.nuvio.app.features.home.canOpenCatalog
@@ -217,6 +218,7 @@ fun FolderDetailScreen(
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
     onCastClick: (HeroCastMember) -> Unit,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onPosterClick: (MetaPreview) -> Unit,
     onPosterLongClick: ((MetaPreview) -> Unit)? = null,
 ) {
@@ -228,6 +230,7 @@ fun FolderDetailScreen(
             onBack = onBack,
             onCatalogClick = onCatalogClick,
             onCastClick = onCastClick,
+            onBadgeClick = onBadgeClick,
             onPosterClick = onPosterClick,
             onPosterLongClick = onPosterLongClick,
         )
@@ -241,6 +244,7 @@ private fun FolderDetailScreenContent(
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
     onCastClick: (HeroCastMember) -> Unit,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onPosterClick: (MetaPreview) -> Unit,
     onPosterLongClick: ((MetaPreview) -> Unit)?,
 ) {
@@ -287,6 +291,7 @@ private fun FolderDetailScreenContent(
             onBack = onBack,
             onCatalogClick = onCatalogClick,
             onCastClick = onCastClick,
+            onBadgeClick = onBadgeClick,
             onPosterClick = onPosterClick,
             onPosterLongClick = onPosterLongClick,
         )
@@ -301,6 +306,7 @@ private fun FolderDetailScreenContent(
             onBack = onBack,
             onCatalogClick = onCatalogClick,
             onCastClick = onCastClick,
+            onBadgeClick = onBadgeClick,
             onPosterClick = onPosterClick,
             onPosterLongClick = onPosterLongClick,
         )
@@ -443,6 +449,7 @@ private fun ImmersiveCollectionContent(
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
     onCastClick: (HeroCastMember) -> Unit,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onPosterClick: (MetaPreview) -> Unit,
     onPosterLongClick: ((MetaPreview) -> Unit)?,
 ) {
@@ -627,7 +634,9 @@ private fun ImmersiveCollectionContent(
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.navigationKey()) {
                     Key.Backspace -> {
-                        onBack()
+                        // Dismiss first, navigate second — see HomeScreen. A controller has one B
+                        // button where the keyboard has Escape and Backspace.
+                        if (!handleTvKey(HomeTvKey.Dismiss)) onBack()
                         true
                     }
                     Key.DirectionDown -> handleTvKey(HomeTvKey.Down)
@@ -689,6 +698,7 @@ private fun ImmersiveCollectionContent(
                 activeHeroBackdrop = item.banner ?: item.poster
             },
             onCastClick = onCastClick,
+            onBadgeClick = onBadgeClick,
             onItemClick = onPosterClick,
         )
 
@@ -761,6 +771,7 @@ private fun AdaptiveCollectionContent(
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
     onCastClick: (HeroCastMember) -> Unit,
+    onBadgeClick: ((HeroDiscoveryFact, MetaPreview) -> Unit)? = null,
     onPosterClick: (MetaPreview) -> Unit,
     onPosterLongClick: ((MetaPreview) -> Unit)?,
 ) {
@@ -938,7 +949,10 @@ private fun AdaptiveCollectionContent(
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.navigationKey()) {
-                    Key.Backspace -> { onBack(); true }
+                    Key.Backspace -> {
+                        if (!handleTvKey(HomeTvKey.Dismiss)) onBack()
+                        true
+                    }
                     Key.DirectionDown -> handleTvKey(HomeTvKey.Down)
                     Key.DirectionUp -> handleTvKey(HomeTvKey.Up)
                     Key.DirectionRight -> handleTvKey(HomeTvKey.Right)
@@ -980,6 +994,7 @@ private fun AdaptiveCollectionContent(
                         activeHeroBackdrop = item.banner ?: item.poster
                     },
                     onCastClick = onCastClick,
+                    onBadgeClick = onBadgeClick,
                     onItemClick = onPosterClick,
                 )
                 NuvioBackButton(

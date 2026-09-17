@@ -49,9 +49,12 @@ import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.home.HeroBadgePlacement
 import com.nuvio.app.features.home.HomeCatalogSettingsItem
+import com.nuvio.app.features.home.HERO_CROSSFADE_MAX_MS
+import com.nuvio.app.features.home.HERO_CROSSFADE_MIN_MS
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.home.HomeDisplayMode
 import com.nuvio.app.features.home.HomeTvRowDotsAnchor
+import com.nuvio.app.features.home.HomeTvRowTransition
 import com.nuvio.app.features.home.homeDisplayModeOf
 import com.nuvio.app.features.home.hoverPreviewEnabledFor
 import com.nuvio.app.features.home.components.HomeEmptyStateCard
@@ -168,7 +171,43 @@ internal fun LazyListScope.homescreenSettingsContent(
                             modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.AdaptiveHeroHeight),
                         )
                     }
+                    val crossfadeOffLabel = stringResource(Res.string.settings_hero_backdrop_crossfade_off)
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSliderRow(
+                        title = stringResource(Res.string.settings_hero_backdrop_crossfade),
+                        description = stringResource(
+                            Res.string.settings_hero_backdrop_crossfade_description,
+                        ),
+                        value = homeSettings.heroBackdropCrossfadeMillis,
+                        valueText = heroCrossfadeLabel(
+                            homeSettings.heroBackdropCrossfadeMillis,
+                            crossfadeOffLabel,
+                        ),
+                        valueTextForValue = { heroCrossfadeLabel(it, crossfadeOffLabel) },
+                        valueRange = HERO_CROSSFADE_MIN_MS..HERO_CROSSFADE_MAX_MS,
+                        step = 50,
+                        isTablet = isTablet,
+                        modifier = Modifier.settingsScrollAnchor(
+                            SettingsScrollAnchor.searchKey("hero-backdrop-crossfade"),
+                        ),
+                        onValueChange = HomeCatalogSettingsRepository::setHeroBackdropCrossfadeMillis,
+                    )
                     if (currentMode == HomeDisplayMode.TvMode) {
+                        // Sits under Backdrop crossfade: both soften a swap that used to be a cut.
+                        SettingsGroupDivider(isTablet = isTablet)
+                        SettingsChoiceRow(
+                            title = stringResource(Res.string.settings_home_tv_row_transition),
+                            description = homeSettings.tvRowTransition.localizedDescription(),
+                            options = HomeTvRowTransition.entries.map {
+                                SettingsChoiceOption(it, it.localizedLabel())
+                            },
+                            selectedValue = homeSettings.tvRowTransition,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("home-tv-row-transition"),
+                            ),
+                            onSelected = HomeCatalogSettingsRepository::setTvRowTransition,
+                        )
                         SettingsGroupDivider(isTablet = isTablet)
                         SettingsSwitchRow(
                             title = stringResource(Res.string.settings_home_tv_full_backdrop),
@@ -493,16 +532,14 @@ internal fun LazyListScope.homescreenSettingsContent(
             ) {
                 val hapticFeedback = LocalHapticFeedback.current
                 val pinToMoveToast = stringResource(Res.string.settings_homescreen_pin_to_move_toast)
-                Text(
+                SettingsSectionNote(
                     text = stringResource(
                         Res.string.settings_homescreen_summary,
                         enabledCatalogCount,
                         items.size,
                         selectedHeroSourceCount,
                     ),
-                    modifier = Modifier.padding(bottom = 10.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    isTablet = isTablet,
                 )
 
                 HomescreenCatalogList(
@@ -546,6 +583,23 @@ private fun HomeTvRowDotsAnchor.localizedLabel(): String =
     when (this) {
         HomeTvRowDotsAnchor.RowTitle -> stringResource(Res.string.settings_home_row_jump_dot_position_row)
         HomeTvRowDotsAnchor.HeroBackdrop -> stringResource(Res.string.settings_home_row_jump_dot_position_backdrop)
+    }
+
+@Composable
+private fun HomeTvRowTransition.localizedLabel(): String =
+    when (this) {
+        HomeTvRowTransition.Off -> stringResource(Res.string.settings_home_tv_row_transition_off)
+        HomeTvRowTransition.Fade -> stringResource(Res.string.settings_home_tv_row_transition_fade)
+        HomeTvRowTransition.FadeNudge -> stringResource(Res.string.settings_home_tv_row_transition_fade_nudge)
+    }
+
+@Composable
+private fun HomeTvRowTransition.localizedDescription(): String =
+    when (this) {
+        HomeTvRowTransition.Off -> stringResource(Res.string.settings_home_tv_row_transition_off_description)
+        HomeTvRowTransition.Fade -> stringResource(Res.string.settings_home_tv_row_transition_fade_description)
+        HomeTvRowTransition.FadeNudge ->
+            stringResource(Res.string.settings_home_tv_row_transition_fade_nudge_description)
     }
 
 @Composable
@@ -661,7 +715,7 @@ private fun AdaptiveHeroHeightRow(
                     if (enabled) HomeCatalogSettingsRepository.setAdaptiveHeroHeightMultiplier(sliderValue)
                 },
                 enabled = enabled,
-                valueRange = 0.75f..1.75f,
+                valueRange = 0.5f..1.75f,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -1145,3 +1199,6 @@ private fun HomescreenCatalogList(
         }
     }
 }
+
+private fun heroCrossfadeLabel(millis: Int, offLabel: String): String =
+    if (millis <= 0) offLabel else "${millis}ms"

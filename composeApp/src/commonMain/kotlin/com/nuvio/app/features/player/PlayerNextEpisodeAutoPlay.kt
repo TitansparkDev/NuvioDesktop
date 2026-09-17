@@ -51,6 +51,27 @@ internal fun shouldPreferNextEpisodeBingeGroup(
     preferenceEnabled &&
     !scoreOverridesBingeGroup
 
+/**
+ * Whether a next-episode transition should hand the choice back to the user instead of picking a
+ * stream for them ("Apply To Next Episode", under Stream Auto-Play).
+ *
+ * This path has always substituted [StreamAutoPlayMode.FIRST_STREAM] over an unfiltered list when
+ * the mode is MANUAL, so a transition can never stall waiting on a picker. That is a sensible
+ * default and a surprising one: the setting whose whole meaning is "always let me choose" stopped
+ * applying the moment binge or the next-episode card advanced, and nothing on screen said so. The
+ * toggle makes the substitution a choice.
+ *
+ * Local affinity keeps the substitution unconditionally: it exists to take the on-disk file, which
+ * is not a source choice to offer.
+ */
+internal fun shouldOpenManualNextEpisodeSelection(
+    mode: StreamAutoPlayMode,
+    manualNextEpisodeEnabled: Boolean,
+    sourceAffinity: PlayerSourceAffinity,
+): Boolean = mode == StreamAutoPlayMode.MANUAL &&
+    manualNextEpisodeEnabled &&
+    sourceAffinity != PlayerSourceAffinity.Local
+
 internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     previousJob: Job?,
     nextEpisodeInfo: NextEpisodeInfo?,
@@ -85,6 +106,31 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     )
     if (downloadedNextEpisode != null) {
         onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
+        return null
+    }
+
+    // Opted in to choosing the source for every episode: open the picker straight away rather than
+    // running a 3-20s search whose result would be thrown away. Returns no job, which the callers
+    // already handle (they clear the loading card when nothing was launched).
+    if (
+        shouldOpenManualNextEpisodeSelection(
+            mode = settings.streamAutoPlayMode,
+            manualNextEpisodeEnabled = settings.streamAutoPlayManualNextEpisode,
+            sourceAffinity = sourceAffinity,
+        )
+    ) {
+        BingeAdvanceLog.i {
+            "manual next-episode selection for S${nextSeasonNumber}E${nextEpisodeNumber}; " +
+                "opening source list without searching"
+        }
+        previousJob?.cancel()
+        onSearchingChanged(false)
+        onSourceNameChanged(null)
+        onCountdownChanged(null)
+        // Deliberately leaves the next-episode card up, unlike every other exit from this
+        // function: the panel is a choice the user can back out of, and the card is how they get
+        // back to it. It clears on its own once the picked episode starts playing.
+        onManualSelectionRequired(nextVideo)
         return null
     }
 

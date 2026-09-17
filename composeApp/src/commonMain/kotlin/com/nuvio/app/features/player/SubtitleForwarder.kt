@@ -26,14 +26,14 @@ object SubtitleForwarder {
      *
      * The result is de-duplicated and ordered so that the cap above is spent on the tracks most
      * likely to be wanted: earlier targets first, the exact regional variant ahead of a loose
-     * match, and the viewer's SDH preference ahead of its opposite.
+     * match, and the viewer's preferred track kind ahead of the others.
      */
     suspend fun fetchForExternalPlayer(
         type: String,
         videoId: String,
         targets: List<String>,
         isRejected: (AddonSubtitle) -> Boolean = { false },
-        preferHearingImpaired: Boolean = false,
+        trackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
         timeoutMs: Long = 10_000L,
     ): List<SubtitleInput>? {
         if (targets.isEmpty()) return null
@@ -53,12 +53,10 @@ object SubtitleForwarder {
                         val isExact = targets.any { target ->
                             languageMatchesPreferenceExactly(subtitle.language, target)
                         }
-                        val matchesSdhPreference =
-                            subtitle.isHearingImpairedSubtitle() == preferHearingImpaired
                         subtitle to intArrayOf(
                             targetRank,
                             if (isExact) 0 else 1,
-                            if (matchesSdhPreference) 0 else 1,
+                            trackKind.rankOf(subtitle.subtitleTrackKind()),
                         )
                     }
                     // Stable, so addons' own "best match first" ordering survives inside each tier.

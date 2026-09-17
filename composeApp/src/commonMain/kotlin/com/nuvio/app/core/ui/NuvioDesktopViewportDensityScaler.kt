@@ -92,7 +92,7 @@ fun NuvioDesktopViewportDensityScaler(
             }
         }
         val userScale = remember(uiScalePercent) {
-            1f + uiScalePercent.coerceIn(-25, 25) / 100f
+            1f + uiScalePercent.coerceIn(-50, 50) / 100f
         }
         val viewportDensity = remember(baseDensity, viewportScale) {
             Density(

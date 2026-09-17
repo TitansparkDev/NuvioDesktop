@@ -46,6 +46,9 @@ actual fun ensurePlayerShortcutBindingsLoaded() = PlayerShortcutsRepository.ensu
 
 actual fun resetAllPlayerShortcuts() = PlayerShortcutsRepository.resetAll()
 
+actual fun resetPlayerShortcuts(actions: Collection<PlayerShortcutAction>) =
+    PlayerShortcutsRepository.resetToDefaults(actions)
+
 actual fun onPlayerShortcutsProfileChanged() {
     PlayerShortcutsRepository.onProfileChanged()
     AppShortcutsRepository.onProfileChanged()

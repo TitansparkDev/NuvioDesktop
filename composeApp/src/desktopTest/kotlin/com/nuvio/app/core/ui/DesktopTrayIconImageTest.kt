@@ -76,6 +76,26 @@ class DesktopTrayIconImageTest {
         assertTrue(partial >= 16, "expected antialiased edges, found $partial partially transparent pixels")
     }
 
+    /**
+     * The window icon list is what the taskbar draws from. Windows asks for 32px (ICON_BIG) at
+     * 100% and picks the nearest entry, so an exact 32 must exist and the glyph must fill it.
+     */
+    @Test
+    fun windowIconsCoverTheShellSizesAndFillTheSlot() {
+        val images = loadDesktopWindowIconImages(iconUrl)
+        val sizes = images.map { it.getWidth(null) }
+
+        assertEquals(sizes.sorted(), sizes, "window icons must be listed smallest first")
+        for (expected in intArrayOf(16, 32, 48, 256)) {
+            assertTrue(sizes.contains(expected), "missing the ${expected}px window icon: $sizes")
+        }
+        val big = images[sizes.indexOf(32)] as BufferedImage
+        val (minX, minY, maxX, maxY) = assertNotNull(opaqueBounds(big), "the 32px window icon is empty")
+        val covered = maxOf(maxX - minX + 1, maxY - minY + 1)
+        assertTrue(covered >= big.width - 3, "the glyph should fill ICON_BIG, covered ${covered}px of ${big.width}")
+        ImageIO.write(big, "png", File("build/test-artifacts/window-icon-32.png"))
+    }
+
     private data class OpaqueBounds(val minX: Int, val minY: Int, val maxX: Int, val maxY: Int)
 
     private fun opaqueBounds(image: BufferedImage): OpaqueBounds? {

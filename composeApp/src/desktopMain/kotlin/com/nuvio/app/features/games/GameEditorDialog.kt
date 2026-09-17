@@ -26,9 +26,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.FolderOpen
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -54,7 +57,6 @@ import com.nuvio.app.core.ui.NuvioModalDialog
 import com.nuvio.app.core.ui.NuvioTextField
 import com.nuvio.app.core.ui.nuvio
 import kotlinx.coroutines.launch
-import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
@@ -73,13 +75,18 @@ import com.nuvio.app.core.ui.accentBrush
 internal fun GameEditorDialog(
     title: String,
     initial: GameEntry?,
+    /** Shelf rows the game can be filed under; the defaults are always present. */
+    rows: List<GameRow>,
     lastExecutableDirectory: String,
     igdbConfigured: Boolean,
     steamGridDbConfigured: Boolean,
-    onSearch: suspend (String) -> List<IgdbGame>,
-    onLoadMetadata: suspend (Long) -> IgdbGame?,
+    metadataSource: GameMetadataSource,
+    onSearch: suspend (String) -> List<GameMetadata>,
+    onLoadMetadata: suspend (Long) -> GameMetadata?,
     onLoadLogos: suspend (String) -> List<LogoCandidate>,
     onLoadHeroes: suspend (String) -> List<ArtworkCandidate>,
+    onLoadSteamHeroes: suspend (SteamGameReference) -> List<ArtworkCandidate>,
+    onLoadSteamLogos: suspend (SteamGameReference) -> List<LogoCandidate>,
     onExecutableChosen: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onSave: (GameEntry) -> Unit,
@@ -88,15 +95,22 @@ internal fun GameEditorDialog(
 ) {
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.nuvio.colors
+    val providerName = metadataSource.providerName
     var executablePath by remember(initial) { mutableStateOf(initial?.executablePath.orEmpty()) }
     var gameTitle by remember(initial) { mutableStateOf(initial?.title.orEmpty()) }
     var arguments by remember(initial) {
         mutableStateOf(initial?.arguments?.joinToString(" ") { quoteArgument(it) }.orEmpty())
     }
     var workingDirectory by remember(initial) { mutableStateOf(initial?.workingDirectory.orEmpty()) }
+    // null = automatic (Installed / Uninstalled by whether it has an executable). A stored id whose
+    // row has since been removed reads back as automatic, which is also what it means on the shelf.
+    var selectedRowId by remember(initial, rows) {
+        mutableStateOf(initial?.rowId?.takeIf { id -> rows.any { it.id == id } })
+    }
+    var showRowMenu by remember { mutableStateOf(false) }
     var searchText by remember(initial) { mutableStateOf(initial?.title.orEmpty()) }
-    var results by remember { mutableStateOf<List<IgdbGame>>(emptyList()) }
-    var selectedMetadata by remember { mutableStateOf<IgdbGame?>(null) }
+    var results by remember { mutableStateOf<List<GameMetadata>>(emptyList()) }
+    var selectedMetadata by remember { mutableStateOf<GameMetadata?>(null) }
     var selectedBackdropUrl by remember(initial) { mutableStateOf(initial?.backdropUrl) }
     var showBackdropPicker by remember { mutableStateOf(false) }
     var selectedLogoUrl by remember(initial) { mutableStateOf(initial?.logoUrl) }
@@ -109,6 +123,17 @@ internal fun GameEditorDialog(
     var confirmDelete by remember { mutableStateOf(false) }
     var steamGridHeroes by remember(initial) { mutableStateOf<List<ArtworkCandidate>>(emptyList()) }
     var loadingHeroes by remember { mutableStateOf(false) }
+    var steamHeroes by remember(initial) { mutableStateOf<List<ArtworkCandidate>>(emptyList()) }
+    var loadingSteamHeroes by remember { mutableStateOf(false) }
+
+    // What the Steam lookup resolves an app id from: the executable's place in a Steam library, the
+    // launch arguments, or failing both the title. Read from the live fields, not from `initial`,
+    // so browsing to a game's exe and picking artwork in the same visit works.
+    fun steamReference() = steamGameReference(
+        title = gameTitle.trim(),
+        executablePath = executablePath.trim().takeIf(String::isNotBlank),
+        arguments = parseArguments(arguments),
+    )
 
     fun runSearch() {
         if (searchText.isBlank() || searching) return
@@ -116,23 +141,35 @@ internal fun GameEditorDialog(
             searching = true
             error = null
             results = runCatching { onSearch(searchText) }
-                .onFailure { error = it.message ?: "IGDB search failed" }
+                .onFailure { error = it.message ?: "$providerName search failed" }
                 .getOrDefault(emptyList())
             searching = false
         }
     }
 
+    /**
+     * Both logo sources, SteamGridDB first so an existing library never reorders under the user.
+     *
+     * Steam is queried whether or not a SteamGridDB key exists — it needs none — which is what
+     * makes the LOGO block worth pressing on a fresh install.
+     */
     fun loadLogos() {
-        if (gameTitle.isBlank() || loadingLogos || !steamGridDbConfigured) return
+        if (gameTitle.isBlank() || loadingLogos) return
         scope.launch {
             loadingLogos = true
             error = null
-            logoCandidates = runCatching { onLoadLogos(gameTitle) }
-                .onFailure { error = it.message ?: "SteamGridDB logo search failed" }
-                .getOrDefault(emptyList())
+            val steamGridLogos = if (steamGridDbConfigured) {
+                runCatching { onLoadLogos(gameTitle) }
+                    .onFailure { error = it.message ?: "SteamGridDB logo search failed" }
+                    .getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+            val steamLogos = runCatching { onLoadSteamLogos(steamReference()) }.getOrDefault(emptyList())
+            logoCandidates = (steamGridLogos + steamLogos).distinctBy(LogoCandidate::url)
             loadingLogos = false
             if (logoCandidates.isEmpty()) {
-                if (error == null) error = "SteamGridDB has no logos for $gameTitle."
+                if (error == null) error = "No logos found for $gameTitle."
             } else {
                 showLogoPicker = true
             }
@@ -151,10 +188,26 @@ internal fun GameEditorDialog(
         loadingHeroes = false
     }
 
-    LaunchedEffect(initial?.igdbId, igdbConfigured) {
-        val igdbId = initial?.igdbId ?: return@LaunchedEffect
-        if (!igdbConfigured || selectedMetadata != null) return@LaunchedEffect
-        runCatching { onLoadMetadata(igdbId) }.getOrNull()?.let { metadata ->
+    // Separate from the SteamGridDB effect on purpose: the two sources are independent, so a
+    // missing key or a failing search on one must not hold up or empty the other. Keyed on the
+    // executable as well, because that is what turns a title guess into an exact app id.
+    LaunchedEffect(showBackdropPicker, gameTitle, executablePath) {
+        if (!showBackdropPicker || gameTitle.isBlank()) return@LaunchedEffect
+        loadingSteamHeroes = true
+        steamHeroes = runCatching { onLoadSteamHeroes(steamReference()) }.getOrDefault(emptyList())
+        loadingSteamHeroes = false
+    }
+
+    // Reloads the stored match so the dialog opens showing what the game is matched to. Keyed on
+    // the source because each provider stores its id in its own field, and the id of the one the
+    // user has switched away from means nothing to the one now answering.
+    LaunchedEffect(initial?.id, metadataSource, igdbConfigured) {
+        val matchId = when (metadataSource) {
+            GameMetadataSource.Igdb -> initial?.igdbId.takeIf { igdbConfigured }
+            GameMetadataSource.Steam -> initial?.steamAppId
+        } ?: return@LaunchedEffect
+        if (selectedMetadata != null) return@LaunchedEffect
+        runCatching { onLoadMetadata(matchId) }.getOrNull()?.let { metadata ->
             selectedMetadata = metadata
             if (selectedBackdropUrl.isNullOrBlank()) selectedBackdropUrl = metadata.backdropUrl
         }
@@ -191,7 +244,11 @@ internal fun GameEditorDialog(
                     onSave(
                         GameEntry(
                             id = initial?.id ?: UUID.randomUUID().toString(),
-                            igdbId = metadata?.id ?: initial?.igdbId,
+                            igdbId = metadata?.takeIf { it.source == GameMetadataSource.Igdb }?.id
+                                ?: initial?.igdbId,
+                            steamAppId = metadata?.takeIf { it.source == GameMetadataSource.Steam }?.id
+                                ?: initial?.steamAppId,
+                            metadataSource = metadata?.source ?: initial?.metadataSource,
                             title = gameTitle.trim(),
                             executablePath = executablePath.trim().takeIf(String::isNotBlank),
                             arguments = parseArguments(arguments),
@@ -221,6 +278,7 @@ internal fun GameEditorDialog(
                                 logoUrlToSave = selectedLogoUrl ?: metadata?.logoUrl ?: initial?.logoUrl,
                             ),
                             addedAtEpochMillis = initial?.addedAtEpochMillis ?: System.currentTimeMillis(),
+                            rowId = selectedRowId,
                         ),
                     )
                 },
@@ -233,15 +291,17 @@ internal fun GameEditorDialog(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            FieldColumn("Executable (optional)", Modifier.weight(1f)) {
+            FieldColumn("Executable, shortcut or launch URL (optional)", Modifier.weight(1f)) {
                 NuvioTextField(
                     value = executablePath,
                     onValueChange = {
                         executablePath = it
-                        if (workingDirectory.isBlank()) workingDirectory = File(it).parent.orEmpty()
+                        if (workingDirectory.isBlank()) {
+                            workingDirectory = defaultWorkingDirectory(it).orEmpty()
+                        }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    placeholder = "C:\\Games\\Example\\game.exe",
+                    placeholder = "C:\\Games\\Example\\game.exe,  a .lnk shortcut,  or  steam://rungameid/620",
                 )
             }
             OutlinedButton(
@@ -255,7 +315,7 @@ internal fun GameEditorDialog(
                             onExecutableChosen(selected)
                             if (gameTitle.isBlank()) gameTitle = executableDisplayName(selected)
                             if (searchText.isBlank()) searchText = executableDisplayName(selected)
-                            workingDirectory = File(selected).parent.orEmpty()
+                            workingDirectory = defaultWorkingDirectory(selected).orEmpty()
                         }
                     }
                 },
@@ -285,17 +345,29 @@ internal fun GameEditorDialog(
             }
         }
 
-        FieldColumn("Working directory (optional)", Modifier.fillMaxWidth()) {
-            NuvioTextField(
-                value = workingDirectory,
-                onValueChange = { workingDirectory = it },
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = "Defaults to the folder holding the executable",
-            )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            FieldColumn("Working directory (optional)", Modifier.weight(1f)) {
+                NuvioTextField(
+                    value = workingDirectory,
+                    onValueChange = { workingDirectory = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = "Defaults to the folder holding the executable",
+                )
+            }
+            FieldColumn("Row", Modifier.weight(1f)) {
+                GameRowPicker(
+                    rows = rows,
+                    selectedRowId = selectedRowId,
+                    expanded = showRowMenu,
+                    onExpandedChange = { showRowMenu = it },
+                    onSelected = { selectedRowId = it },
+                )
+            }
         }
 
-        SectionLabel("IGDB METADATA")
-        if (!igdbConfigured) {
+        SectionLabel("$providerName METADATA".uppercase())
+        // Steam needs no credentials, so the only provider that can be unconfigured is IGDB.
+        if (metadataSource == GameMetadataSource.Igdb && !igdbConfigured) {
             Surface(
                 modifier = Modifier.background(
                     colors.accentFill(MaterialTheme.nuvio.opacity.pressed),
@@ -325,7 +397,7 @@ internal fun GameEditorDialog(
                     value = searchText,
                     onValueChange = { searchText = it },
                     modifier = Modifier.weight(1f),
-                    placeholder = "Search IGDB",
+                    placeholder = "Search $providerName",
                     onImeAction = ::runSearch,
                 )
                 Button(onClick = ::runSearch, enabled = searchText.isNotBlank() && !searching) {
@@ -353,14 +425,14 @@ internal fun GameEditorDialog(
                 searching -> CircularProgressIndicator(Modifier.align(Alignment.Center))
                 results.isEmpty() -> Text(
                     text = selectedMetadata?.let { "Metadata selected: ${it.title}" }
-                        ?: "Search results will appear here. You can also save a game without IGDB metadata.",
+                        ?: "Search results will appear here. You can also save a game without metadata.",
                     modifier = Modifier.align(Alignment.Center),
                     style = MaterialTheme.typography.bodyMedium,
                     color = colors.textMuted,
                 )
                 else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(results, key = IgdbGame::id) { item ->
-                        IgdbResultRow(
+                    items(results, key = GameMetadata::id) { item ->
+                        MetadataResultRow(
                             game = item,
                             selected = selectedMetadata?.id == item.id,
                             onClick = {
@@ -370,7 +442,7 @@ internal fun GameEditorDialog(
                                     .firstOrNull { it.url == selectedBackdropUrl }
                                     ?.url
                                     ?: item.backdropUrl
-                                selectedLogoUrl = if (initial?.igdbId == item.id) initial.logoUrl else item.logoUrl
+                                selectedLogoUrl = if (initial?.matchesMetadata(item) == true) initial.logoUrl else item.logoUrl
                                 logoCandidates = emptyList()
                                 logoManuallySelected = false
                             },
@@ -381,7 +453,8 @@ internal fun GameEditorDialog(
         }
 
         val backdrops = selectedMetadata?.backdrops.orEmpty()
-        val selectedBackdrop = backdrops.firstOrNull { it.url == selectedBackdropUrl }
+        val selectedBackdrop = (backdrops + steamGridHeroes + steamHeroes)
+            .firstOrNull { it.url == selectedBackdropUrl }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -389,14 +462,15 @@ internal fun GameEditorDialog(
             ArtworkChoice(
                 modifier = Modifier.weight(1f),
                 label = "BACKDROP",
-                count = (backdrops.size + steamGridHeroes.size).takeIf { it > 0 },
+                count = (backdrops.size + steamGridHeroes.size + steamHeroes.size).takeIf { it > 0 },
                 detail = when {
                     selectedBackdrop != null -> "${selectedBackdrop.source.label}  •  ${selectedBackdrop.resolutionLabel}"
                     !selectedBackdropUrl.isNullOrBlank() -> "Current backdrop"
-                    selectedMetadata == null -> "Match with IGDB to choose artwork"
-                    else -> "No backdrop available"
+                    else -> "Artwork from IGDB, Steam and SteamGridDB"
                 },
-                enabled = backdrops.isNotEmpty(),
+                // No longer gated on an IGDB match: Steam art is found from the executable or the
+                // title alone, so a game with no match at all can still have a backdrop.
+                enabled = gameTitle.isNotBlank(),
                 onClick = { showBackdropPicker = true },
             )
             ArtworkChoice(
@@ -404,24 +478,26 @@ internal fun GameEditorDialog(
                 label = "LOGO",
                 count = logoCandidates.size.takeIf { it > 0 },
                 detail = when {
-                    !steamGridDbConfigured -> "Add a SteamGridDB API key in Settings"
-                    logoManuallySelected -> "Chosen SteamGridDB artwork"
+                    logoManuallySelected -> "Chosen artwork"
                     !selectedLogoUrl.isNullOrBlank() -> "Current logo • choose another if needed"
+                    !steamGridDbConfigured -> "Steam logos • add a SteamGridDB key for more"
                     else -> "Automatic English-first selection on save"
                 },
-                enabled = steamGridDbConfigured && gameTitle.isNotBlank() && !loadingLogos,
+                enabled = gameTitle.isNotBlank() && !loadingLogos,
                 busy = loadingLogos,
                 onClick = ::loadLogos,
             )
         }
     }
 
-    selectedMetadata?.takeIf { showBackdropPicker }?.let { metadata ->
+    if (showBackdropPicker) {
         BackdropPickerDialog(
-            gameTitle = metadata.title,
-            igdbCandidates = metadata.backdrops,
+            gameTitle = selectedMetadata?.title ?: gameTitle,
+            igdbCandidates = selectedMetadata?.backdrops.orEmpty(),
             steamGridCandidates = steamGridHeroes,
             loadingSteamGrid = loadingHeroes,
+            steamCandidates = steamHeroes,
+            loadingSteam = loadingSteamHeroes,
             selectedUrl = selectedBackdropUrl,
             onSelect = { artwork ->
                 selectedBackdropUrl = artwork.url
@@ -443,6 +519,96 @@ internal fun GameEditorDialog(
             },
             onDismiss = { showLogoPicker = false },
         )
+    }
+}
+
+/**
+ * Which shelf the game is filed under. "Automatic" is the default and what every game starts
+ * with: Installed or Uninstalled by whether it has something to launch. Picking a row pins it
+ * there; the rows themselves are managed in Settings > Games.
+ */
+@Composable
+private fun GameRowPicker(
+    rows: List<GameRow>,
+    selectedRowId: String?,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSelected: (String?) -> Unit,
+) {
+    val tokens = MaterialTheme.nuvio
+    val automaticLabel = "Automatic (Installed / Uninstalled)"
+    val selectedLabel = rows.firstOrNull { it.id == selectedRowId }?.name ?: automaticLabel
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(tokens.colors.surface, tokens.shapes.compactCard)
+                .clickable { onExpandedChange(true) }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            val dotColor = rows.firstOrNull { it.id == selectedRowId }?.color
+            if (dotColor != null) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .background(Color(dotColor), RoundedCornerShape(50)),
+                )
+            }
+            Text(
+                text = selectedLabel,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                color = tokens.colors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Icon(
+                imageVector = Icons.Rounded.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = tokens.colors.textMuted,
+            )
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { onExpandedChange(false) }) {
+            DropdownMenuItem(
+                text = { Text(automaticLabel) },
+                trailingIcon = {
+                    if (selectedRowId == null) {
+                        Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                },
+                onClick = {
+                    onSelected(null)
+                    onExpandedChange(false)
+                },
+            )
+            rows.forEach { row ->
+                DropdownMenuItem(
+                    text = { Text(row.name) },
+                    leadingIcon = {
+                        Box(
+                            Modifier
+                                .size(10.dp)
+                                .background(
+                                    row.color?.let { Color(it) } ?: tokens.colors.textMuted,
+                                    RoundedCornerShape(50),
+                                ),
+                        )
+                    },
+                    trailingIcon = {
+                        if (selectedRowId == row.id) {
+                            Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                        }
+                    },
+                    onClick = {
+                        onSelected(row.id)
+                        onExpandedChange(false)
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -524,11 +690,12 @@ private fun ArtworkChoice(
 }
 
 /**
- * Backdrop options from both sources in one grid, each tile labelled with where it came from.
+ * Backdrop options from every source in one grid, each tile labelled with where it came from.
  *
- * Neither source wins automatically: IGDB artworks and screenshots keep the order they arrived in
- * so an existing library never shifts under the user, and SteamGridDB heroes are appended. The
- * subtitle breaks the count down by source so it is obvious which half is which before scrolling.
+ * No source wins automatically: IGDB artworks and screenshots keep the order they arrived in so an
+ * existing library never shifts under the user, and SteamGridDB heroes then Steam's own library
+ * art are appended. The subtitle breaks the count down by source so it is obvious which is which
+ * before scrolling.
  */
 @Composable
 private fun BackdropPickerDialog(
@@ -536,21 +703,28 @@ private fun BackdropPickerDialog(
     igdbCandidates: List<ArtworkCandidate>,
     steamGridCandidates: List<ArtworkCandidate>,
     loadingSteamGrid: Boolean,
+    steamCandidates: List<ArtworkCandidate>,
+    loadingSteam: Boolean,
     selectedUrl: String?,
     onSelect: (ArtworkCandidate) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val colors = MaterialTheme.nuvio.colors
-    // SteamGridDB occasionally mirrors an image IGDB also has; the first occurrence wins so the
-    // grid never shows the same picture twice under two different labels.
-    val candidates = remember(igdbCandidates, steamGridCandidates) {
-        (igdbCandidates + steamGridCandidates).distinctBy(ArtworkCandidate::url)
+    // SteamGridDB mirrors Steam's own library art, and occasionally an image IGDB also has; the
+    // first occurrence wins so the grid never shows the same picture twice under two labels.
+    val candidates = remember(igdbCandidates, steamGridCandidates, steamCandidates) {
+        (igdbCandidates + steamGridCandidates + steamCandidates).distinctBy(ArtworkCandidate::url)
     }
+    val loadingAnySource = loadingSteamGrid || loadingSteam
     val breakdown = buildList {
         add("${igdbCandidates.size} from IGDB")
         when {
             loadingSteamGrid -> add("searching SteamGridDB…")
             steamGridCandidates.isNotEmpty() -> add("${steamGridCandidates.size} from SteamGridDB")
+        }
+        when {
+            loadingSteam -> add("searching Steam…")
+            steamCandidates.isNotEmpty() -> add("${steamCandidates.size} from Steam")
         }
     }.joinToString("  •  ")
 
@@ -561,9 +735,17 @@ private fun BackdropPickerDialog(
         maxWidth = 1040.dp,
         actions = { TextButton(onClick = onDismiss) { Text("Close") } },
     ) {
-        if (candidates.isEmpty() && loadingSteamGrid) {
+        if (candidates.isEmpty()) {
             Box(Modifier.fillMaxWidth().height(520.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+                if (loadingAnySource) {
+                    CircularProgressIndicator()
+                } else {
+                    Text(
+                        text = "No artwork found for $gameTitle.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.textMuted,
+                    )
+                }
             }
             return@NuvioModalDialog
         }
@@ -589,7 +771,7 @@ private fun BackdropPickerDialog(
                     )
                 }
             }
-            if (loadingSteamGrid) {
+            if (loadingAnySource) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -599,7 +781,11 @@ private fun BackdropPickerDialog(
                         CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(10.dp))
                         Text(
-                            text = "Looking for SteamGridDB backdrops",
+                            text = if (loadingSteamGrid) {
+                                "Looking for SteamGridDB backdrops"
+                            } else {
+                                "Looking for Steam backdrops"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = colors.textMuted,
                         )
@@ -618,10 +804,16 @@ private fun LogoPickerDialog(
     onSelect: (LogoCandidate) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val breakdown = candidates
+        .groupingBy { it.source.label }
+        .eachCount()
+        .entries
+        .joinToString("  •  ") { (source, count) -> "$count from $source" }
+
     NuvioModalDialog(
         onDismissRequest = onDismiss,
         title = "Choose logo",
-        subtitle = "$gameTitle  •  ${candidates.size} SteamGridDB options",
+        subtitle = "$gameTitle  •  $breakdown",
         maxWidth = 1040.dp,
         actions = { TextButton(onClick = onDismiss) { Text("Close") } },
     ) {
@@ -636,9 +828,11 @@ private fun LogoPickerDialog(
                 ArtworkTile(
                     selected = logo.url == selectedUrl,
                     onClick = { onSelect(logo) },
+                    // Steam's own logos carry neither a language nor a style, so they fall back to
+                    // naming their source rather than to a bare "Logo" that says nothing.
                     leadingLabel = listOfNotNull(logo.languageLabel, logo.style?.takeIf(String::isNotBlank))
                         .joinToString("  •  ")
-                        .ifBlank { "Logo" },
+                        .ifBlank { logo.source.label },
                     trailingLabel = logo.resolutionLabel,
                 ) {
                     // Logos are transparent, so they need a dark plate and padding to read at all.
@@ -718,7 +912,7 @@ private fun ArtworkTile(
 }
 
 @Composable
-private fun IgdbResultRow(game: IgdbGame, selected: Boolean, onClick: () -> Unit) {
+private fun MetadataResultRow(game: GameMetadata, selected: Boolean, onClick: () -> Unit) {
     val colors = MaterialTheme.nuvio.colors
     val year = game.releaseDateEpochSeconds?.let {
         runCatching { Instant.ofEpochSecond(it).atZone(ZoneId.systemDefault()).year }.getOrNull()

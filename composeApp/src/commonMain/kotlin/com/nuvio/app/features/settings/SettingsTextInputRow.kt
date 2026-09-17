@@ -1,5 +1,6 @@
 package com.nuvio.app.features.settings
 
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -44,6 +45,11 @@ internal fun SettingsTextInputRow(
     maxLines: Int = if (singleLine) 1 else 6,
     keyboardType: KeyboardType = KeyboardType.Text,
     normalize: (String) -> String = String::trim,
+    /**
+     * Content shown at the trailing edge of the editor's text field, given the current draft and a
+     * setter for it — e.g. a colour swatch that fills the field from a picker.
+     */
+    trailingContent: (@Composable RowScope.(draft: String, onDraftChange: (String) -> Unit) -> Unit)? = null,
     onSave: (String) -> Unit,
 ) {
     var dialogVisible by rememberSaveable { mutableStateOf(false) }
@@ -97,6 +103,9 @@ internal fun SettingsTextInputRow(
                 keyboardType = keyboardType,
                 onImeAction = saveAndDismiss.takeIf { singleLine },
                 focusRequester = focusRequester,
+                trailingContent = trailingContent?.let { content ->
+                    { content(draft) { draft = it } }
+                },
             )
         }
     }

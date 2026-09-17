@@ -24,8 +24,16 @@ import com.nuvio.app.features.discord.DiscordRichPresenceController
 import com.nuvio.app.features.discord.DiscordRichPresenceActivityType
 import com.nuvio.app.features.discord.DiscordRichPresenceImageFit
 import com.nuvio.app.features.discord.isExternallyFetchableArtworkUrl
+import com.nuvio.app.features.lights.LightsController
+import com.nuvio.app.features.lights.LightsPlaybackSource
+import com.nuvio.app.features.mdblist.MdbListSettingsRepository
 import com.nuvio.app.features.metadata.AnimeArtworkService
 import com.nuvio.app.features.metadata.hasAnimeNamespacePrefix
+import com.nuvio.app.features.metadata.isAnimeNativeId
+import com.nuvio.app.features.tmdb.TmdbSettingsRepository
+import com.nuvio.app.features.tmdb.customPosterTemplateUsesNativeAnimeId
+import com.nuvio.app.features.tmdb.customPosterUrl
+import com.nuvio.app.features.tmdb.resolveCustomPosterIds
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamRequest
 import com.nuvio.app.features.p2p.P2pStreamingEngine
@@ -38,6 +46,7 @@ import com.nuvio.app.features.player.skip.SkipIntroRepository
 import com.nuvio.app.features.player.skip.SkipLookupTarget
 import com.nuvio.app.features.player.skip.resolveSkipLookupTarget
 import com.nuvio.app.features.player.skip.identityKey
+import com.nuvio.app.features.plugins.PluginRepository
 import com.nuvio.app.features.streams.StreamPrefetchService
 import com.nuvio.app.features.streams.BingeGroupCacheRepository
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
@@ -116,7 +125,10 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         preferredAudioSelectionApplied = false
         preferredSubtitleSelectionApplied = false
         secondarySubtitleSelectionApplied = false
-        showSourcesPanel = false
+        // Not cleared here: every switch entry point (switchToSource, the P2P and refreshed-URL
+        // paths, episode switches) clears it itself, and the desktop HUD's Sources sheet is
+        // allowed to stay open across a same-item swap (keepSourcesPanelOpen), which a blanket
+        // reset on the URL change would silently undo.
         showEpisodesPanel = false
         episodeStreamsPanelState = EpisodeStreamsPanelState()
         PlayerStreamsRepository.clearEpisodeStreams()
@@ -244,6 +256,28 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
             )
             controlsVisible = !playerControlsLocked
             initialLoadCompleted = true
+        }
+    }
+
+    // Ground truth for "it buffers": every time mpv enters loading during P2P playback, record
+    // where the playhead is, how much it has buffered ahead, and what the engine holds at that
+    // instant. Distinguishes "the swarm is too slow" (engine has nothing ahead either) from
+    // "mpv wanted bytes the engine was not fetching" (engine hundreds of MB ahead, player dry).
+    val p2pRebuffering = activeTorrentInfoHash != null && initialLoadCompleted && playbackSnapshot.isLoading
+    LaunchedEffect(p2pRebuffering) {
+        if (!p2pRebuffering) return@LaunchedEffect
+        val startedAt = playbackSnapshot.positionMs
+        val bufferedAheadMs = (playbackSnapshot.bufferedPositionMs - playbackSnapshot.positionMs).coerceAtLeast(0L)
+        val engine = p2pStreamingState as? P2pStreamingState.Streaming
+        P2pRebufferLog.i {
+            "P2P rebuffer begin: position=${startedAt / 1000}s bufferedAhead=${bufferedAheadMs}ms " +
+                "engine=${engine?.let { "peers=${it.peers} seeds=${it.seeds} downBps=${it.downloadSpeed} " +
+                    "downloaded=${it.downloadedBytes} delivered=${it.deliveredBytes} verified=${it.verifiedBytes}" } ?: "none"}"
+        }
+        try {
+            kotlinx.coroutines.awaitCancellation()
+        } finally {
+            P2pRebufferLog.i { "P2P rebuffer end: position=${playbackSnapshot.positionMs / 1000}s" }
         }
     }
 
@@ -398,6 +432,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     BindPlayerUiVisibilityEffects()
     BindPlayerMetadataAndSkipEffects()
     BindDiscordRichPresenceEffect()
+    BindLightsEffect()
     BindStreamFailoverWatchdogEffect()
 
     DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
@@ -422,11 +457,73 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         StreamPrefetchService.setPlaybackActive(true)
         onDispose {
             StreamPrefetchService.setPlaybackActive(false)
+            PluginRepository.setPlaybackStartupHold(false)
             P2pStreamingEngine.stopStream()
             PlayerStreamsRepository.clearAll()
         }
     }
+
+    // The still-running source search is a different matter from prefetch: failover walks its
+    // results and the binge search needs it mid-episode, so it is not parked. But each plugin
+    // scraper it starts is a fresh QuickJS runtime, and a dozen of those spinning up while mpv is
+    // opening the file starved playback start on a weak machine. Hold new scraper starts only for
+    // that window — attach to first rendered frame — and let the queue drain the moment video is
+    // up. Source-scoped like the watchdog: a failover switch resets the started marker and holds
+    // again for the replacement.
+    val playbackStartInFlight = activeSourceUrl != null &&
+        errorMessage == null &&
+        playerStartedAttemptId != playbackAttemptId
+    LaunchedEffect(playbackStartInFlight) {
+        PluginRepository.setPlaybackStartupHold(playbackStartInFlight)
+    }
 }
+
+/** The room's phase as the lights see it; deliberately coarser than the player's own state. */
+private enum class LightsPlaybackPhase { Idle, Loading, Playing, Paused, Ended }
+
+/**
+ * Reports playback to [LightsController] — the "lights out" feature. Fire-and-forget by design:
+ * the controller queues and serialises the cloud calls, so nothing here ever waits on a bulb.
+ *
+ * Loading is reported as nothing at all, which is what keeps the room dark across a binge
+ * advance: the source swap goes Playing → Loading → Playing without an End in between. Ended
+ * only brings the lights up when nothing follows, and after a beat, because the end-of-file
+ * fallback advance fires from the same state. Leaving the player is always an End.
+ */
+@Composable
+private fun PlayerScreenRuntime.BindLightsEffect() {
+    // A trailer is a preview, not a screening; the room stays as it is.
+    val isTrailer = disableProgressTracking && providerName.equals("YouTube", ignoreCase = true)
+    val phase = when {
+        isTrailer || isProviderDiagnosticVideoPlayback || errorMessage != null -> LightsPlaybackPhase.Idle
+        playbackSnapshot.isEnded -> LightsPlaybackPhase.Ended
+        playbackSnapshot.isLoading -> LightsPlaybackPhase.Loading
+        playbackSnapshot.isPlaying -> LightsPlaybackPhase.Playing
+        else -> LightsPlaybackPhase.Paused
+    }
+    LaunchedEffect(phase) {
+        when (phase) {
+            LightsPlaybackPhase.Playing -> LightsController.playing(LightsPlaybackSource.Player)
+            // A short hold so a seek or a double-tap does not flicker the room.
+            LightsPlaybackPhase.Paused -> {
+                delay(LIGHTS_PAUSE_SETTLE_MS)
+                LightsController.paused(LightsPlaybackSource.Player)
+            }
+            LightsPlaybackPhase.Ended -> {
+                delay(LIGHTS_END_SETTLE_MS)
+                // Read after the hold: an advance may have populated or consumed it meanwhile.
+                if (nextEpisodeInfo?.hasAired != true) LightsController.ended(LightsPlaybackSource.Player)
+            }
+            LightsPlaybackPhase.Idle, LightsPlaybackPhase.Loading -> Unit
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { LightsController.ended(LightsPlaybackSource.Player) }
+    }
+}
+
+private const val LIGHTS_PAUSE_SETTLE_MS = 800L
+private const val LIGHTS_END_SETTLE_MS = 1_500L
 
 @Composable
 private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
@@ -517,6 +614,41 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
         discordAnimePosterUrl = resolved?.takeIf { isExternallyFetchableArtworkUrl(it) }
     }
 
+    // The user's custom poster service, applied the way the Library applies it. Playback is handed
+    // the addon's plain poster (details never route through the template), so without this the
+    // styled art a user configured never appears on Discord. Ids follow the Library rule: the
+    // meta record's own imdb/tmdb ids first, then whichever half a query-form template still
+    // needs via the cached TMDB /find lookup; native anime ids opt out unless the template names
+    // them, since a franchise-level TMDB id would fetch another season's art. Self-hosted LAN
+    // instances fail `isExternallyFetchableArtworkUrl` and fall through to the plain poster.
+    LaunchedEffect(parentMetaId, parentMetaType, discordSettings.showPlaybackPresence) {
+        discordCustomPosterUrl = null
+        if (!discordSettings.showPlaybackPresence) return@LaunchedEffect
+        val settings = TmdbSettingsRepository.snapshot()
+        if (!settings.libraryPosterEnabled || settings.libraryPosterUrlTemplate.isBlank()) return@LaunchedEffect
+        val metaId = parentMetaId.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        val metaType = parentMetaType.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        if (metaId.isAnimeNativeId() && !settings.customPosterTemplateUsesNativeAnimeId()) return@LaunchedEffect
+        val meta = MetaDetailsRepository.peek(type = metaType, id = metaId)
+            ?: runCatching { MetaDetailsRepository.fetch(type = metaType, id = metaId) }.getOrNull()
+        val ids = resolveCustomPosterIds(
+            settings = settings,
+            imdbId = meta?.imdbId ?: metaId.takeIf { it.startsWith("tt") },
+            tmdbId = meta?.tmdbId
+                ?: metaId.takeIf { it.startsWith("tmdb:") }?.removePrefix("tmdb:")?.substringBefore(":")?.toIntOrNull(),
+            type = metaType,
+        )
+        val custom = customPosterUrl(
+            settings = settings,
+            imdbId = ids.imdbId,
+            tmdbId = ids.tmdbId?.toString(),
+            type = metaType,
+            stremioId = metaId,
+            mdbListApiKey = MdbListSettingsRepository.snapshot().apiKey,
+        )
+        discordCustomPosterUrl = custom?.takeIf { isExternallyFetchableArtworkUrl(it) }
+    }
+
     // Metadata-less direct playback (a pasted stream URL / dropped file) carries no poster, so its
     // Discord presence would fall back to the Nuvio logo. Best-effort resolve real art from the
     // parsed title via the user's search addons so it matches how library playback presents.
@@ -539,6 +671,8 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
     LaunchedEffect(
         discordSettings.showPlaybackPresence,
         discordSettings.episodeArtwork,
+        discordSettings.activityStyle,
+        discordSettings.activityName,
         title,
         activeVideoId,
         activeSeasonNumber,
@@ -548,6 +682,7 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
         presenceReconcileTick,
         pausedAnchorTick,
         poster,
+        discordCustomPosterUrl,
         discordMetaPosterUrl,
         discordAnimePosterUrl,
         activeEpisodeThumbnail,
@@ -602,6 +737,8 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
                 fallbackImageUrl = discordPresenceFallbackImageUrl(discordSettings.episodeArtwork),
                 imageFit = discordPresenceImageFit(discordSettings.episodeArtwork),
                 type = DiscordRichPresenceActivityType.Playback,
+                activityStyle = discordSettings.activityStyle,
+                activityName = discordSettings.activityName,
                 isPlaying = playbackSnapshot.isPlaying,
                 positionMs = playbackSnapshot.positionMs.coerceAtLeast(0L),
                 durationMs = playbackSnapshot.durationMs.coerceAtLeast(0L),
@@ -807,6 +944,7 @@ private fun PlayerScreenRuntime.discordPresenceArtworkCandidates(
     val ordered = if (preferEpisodeStill) {
         listOf(
             activeEpisodeThumbnail,
+            discordCustomPosterUrl,
             poster,
             discordMetaPosterUrl,
             discordAnimePosterUrl,
@@ -815,6 +953,7 @@ private fun PlayerScreenRuntime.discordPresenceArtworkCandidates(
         )
     } else {
         listOf(
+            discordCustomPosterUrl,
             poster,
             discordMetaPosterUrl,
             discordAnimePosterUrl,
@@ -849,7 +988,8 @@ private fun PlayerScreenRuntime.discordPresenceImageFit(
     val chosen = discordPresenceImageUrl(episodeArtwork)
     val isPortraitPoster = chosen != null &&
         (
-            chosen == poster?.trim() ||
+            chosen == discordCustomPosterUrl?.trim() ||
+                chosen == poster?.trim() ||
                 chosen == discordMetaPosterUrl?.trim() ||
                 chosen == discordAnimePosterUrl?.trim() ||
                 chosen == adHocArtworkImageUrl?.trim()
@@ -1209,16 +1349,30 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdPercent,
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
     ) {
-        if (
-            isProviderDiagnosticVideoPlayback ||
+        val cardBlocked = isProviderDiagnosticVideoPlayback ||
             playbackSourceFailureActive ||
             errorMessage != null ||
             nextEpisodeInfo == null ||
-            playbackSnapshot.isEnded ||
             playbackSnapshot.durationMs <= 0L
-        ) {
+        // "Apply To Next Episode" never advances on its own, so the card is the only control the
+        // user has left once the episode ends — and clearing it here (the card normally dies with
+        // playback, because something else was always about to advance) took it away at exactly the
+        // moment it was needed. Hold it instead, until they click it or dismiss it.
+        val holdCardAtEnd = !cardBlocked &&
+            playbackSnapshot.isEnded &&
+            nextEpisodeInfo?.hasAired == true &&
+            shouldOpenManualNextEpisodeSelection(
+                mode = playerSettingsUiState.streamAutoPlayMode,
+                manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                sourceAffinity = sourceAffinity,
+            )
+        if (cardBlocked || (playbackSnapshot.isEnded && !holdCardAtEnd)) {
             showNextEpisodeCard = false
             nextEpisodeThresholdStableSamples = 0
+            return@LaunchedEffect
+        }
+        if (holdCardAtEnd) {
+            showNextEpisodeCard = true
             return@LaunchedEffect
         }
         val shouldShow = PlayerNextEpisodeRules.shouldShowNextEpisodeCard(
@@ -1233,7 +1387,16 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             val thresholdWasNew = !showNextEpisodeCard
             showNextEpisodeCard = true
             nextEpisodeThresholdStableSamples++
+            // Binge Mode advances early, before the file ends, so the next stream is ready by the
+            // time the credits are. That is incompatible with "Apply To Next Episode": there is no
+            // search to run ahead, and firing here would pop the source list over the last minute
+            // of the episode. Let the end-of-file path open it instead.
             val willTrigger = playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
+                !shouldOpenManualNextEpisodeSelection(
+                    mode = playerSettingsUiState.streamAutoPlayMode,
+                    manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                    sourceAffinity = sourceAffinity,
+                ) &&
                 nextEpisodeInfo?.hasAired == true &&
                 !nextEpisodeAdvanceInProgress &&
                 isPlaybackPositionSupportedByRecentProgress(
@@ -1255,7 +1418,9 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                 // it can briefly publish a near-end position even though playback remains in the
                 // middle of the episode. Consecutive threshold samples filter out that spike.
                 if (!playbackSnapshot.isLoading) {
-                    nextEpisodeAdvanceInProgress = true
+                    // playNextEpisode owns the latch: it engages it only once it has resolved a
+                    // real next episode, and skips it entirely when the transition is going to open
+                    // the source list instead of advancing. Setting it here pre-empted both.
                     playNextEpisode()
                 }
             }
@@ -1263,6 +1428,52 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             showNextEpisodeCard = false
             nextEpisodeThresholdStableSamples = 0
         }
+    }
+
+    // Prewarm the next episode's sources while the card is on screen.
+    //
+    // "Apply To Next Episode" runs no search of its own, so without this the click paid a full cold
+    // fan-out with an empty panel on screen. The card is shown from the threshold onwards, which is
+    // the headroom this uses. `openSourcesPanelForEpisode` issues the same non-forced request, so
+    // once this has run the click dedups against it and the panel opens already populated.
+    //
+    // Deliberately loads into the sources state rather than the prefetch cache: only
+    // StreamPrefetchService writes that cache, and it is gated behind a user setting that is off by
+    // default and disabled outright during playback.
+    LaunchedEffect(
+        showNextEpisodeCard,
+        nextEpisodeInfo,
+        showSourcesPanel,
+        playerSettingsUiState.streamAutoPlayMode,
+        playerSettingsUiState.streamAutoPlayManualNextEpisode,
+        sourceAffinity,
+    ) {
+        val target = nextEpisodeInfo
+            ?.takeIf { showNextEpisodeCard && it.hasAired == true }
+            ?.let { info -> playerMetaVideos.firstOrNull { video -> video.id == info.videoId } }
+        if (
+            target == null ||
+            // The panel is showing the playing item's sources; loading over it would swap the list.
+            showSourcesPanel ||
+            !shouldOpenManualNextEpisodeSelection(
+                mode = playerSettingsUiState.streamAutoPlayMode,
+                manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                sourceAffinity = sourceAffinity,
+            )
+        ) {
+            return@LaunchedEffect
+        }
+        BingeAdvanceLog.i {
+            "prewarming sources for S${target.playbackSeasonNumber()}E${target.playbackEpisodeNumber()}"
+        }
+        PlayerStreamsRepository.loadSources(
+            type = contentType ?: parentMetaType,
+            videoId = target.id,
+            parentMetaId = parentMetaId,
+            title = title,
+            season = target.playbackSeasonNumber(),
+            episode = target.playbackEpisodeNumber(),
+        )
     }
 
     LaunchedEffect(
@@ -1297,8 +1508,16 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             // end-of-file — which lingers while the next stream loads — from advancing twice and
             // skipping an episode. This effect also re-runs when nextEpisodeInfo changes to the
             // following episode, which is exactly the path that produced the skip.
+            // Same reasoning as the threshold path: with "Apply To Next Episode" on, advancing
+            // here would pop the source list by itself the instant the file ended, which is the
+            // behaviour the setting exists to stop. The held card is the way forward instead.
             val willTrigger = isStableRealEnd &&
                 hasPlayableNextEpisode &&
+                !shouldOpenManualNextEpisodeSelection(
+                    mode = playerSettingsUiState.streamAutoPlayMode,
+                    manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                    sourceAffinity = sourceAffinity,
+                ) &&
                 nextEpisodeAutoPlayJob?.isActive != true &&
                 !nextEpisodeAdvanceInProgress
             val willExit = isStableRealEnd &&
@@ -1313,7 +1532,6 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                     "-> triggering=$willTrigger exiting=$willExit"
             }
             if (willTrigger) {
-                nextEpisodeAdvanceInProgress = true
                 playNextEpisode()
             } else if (willExit) {
                 playbackEndExitRequested = true
@@ -1597,3 +1815,5 @@ private const val DISCORD_PLAYBACK_RECONCILE_MS = 10_000L
 // latch is released. Long enough to clear the stale end-of-file loading gap, short enough to re-arm
 // well before the new episode itself ends.
 private const val NEXT_EPISODE_ADVANCE_RESET_POSITION_MS = 3_000L
+
+internal val P2pRebufferLog = Logger.withTag("P2pRebuffer")

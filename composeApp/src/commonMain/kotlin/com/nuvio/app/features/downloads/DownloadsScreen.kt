@@ -195,7 +195,9 @@ private fun LazyListScope.downloadsRootContent(
     onOpenShow: (String) -> Unit,
     onDeleteShow: (String, List<DownloadItem>) -> Unit,
 ) {
-    val activeItems = uiState.activeItems
+    // Live transfers on top, then queued/paused, then failed — a 50-episode pack otherwise lands
+    // newest-first with the episodes actually transferring at the very bottom.
+    val activeItems = uiState.activeItems.sortedWith(downloadActivityComparator)
     val completedMovies = uiState.completedItems.filterNot(DownloadItem::isEpisode)
     val completedShows = uiState.completedItems
         .filter(DownloadItem::isEpisode)
@@ -586,8 +588,20 @@ private fun statusText(item: DownloadItem): String {
     }
 
     return when (item.status) {
-        DownloadStatus.Downloading -> stringResource(Res.string.downloads_status_downloading, size)
-        DownloadStatus.Paused -> stringResource(Res.string.downloads_status_paused, size)
+        DownloadStatus.Downloading -> {
+            // Percent + speed + ETA are what a transfer list is for; size alone said nothing about
+            // whether the download was moving.
+            val live = listOfNotNull(
+                item.progressPercent?.let { "$it%" },
+                item.bytesPerSecond?.takeIf { it > 0L }?.let(::formatDownloadSpeed),
+                item.etaSeconds?.let { stringResource(Res.string.downloads_status_eta, formatDownloadDuration(it)) },
+            )
+            stringResource(Res.string.downloads_status_downloading, (listOf(size) + live).joinToString(" • "))
+        }
+        DownloadStatus.Paused -> stringResource(
+            if (item.isQueuedForSlot) Res.string.downloads_status_queued else Res.string.downloads_status_paused,
+            size,
+        )
         DownloadStatus.Completed -> stringResource(
             Res.string.downloads_status_completed,
             formatBytes(item.totalBytes ?: item.downloadedBytes),

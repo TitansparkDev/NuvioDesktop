@@ -70,6 +70,25 @@ object TraktCalendarRepository {
         ensureMonthsAround(today.year, today.month)
     }
 
+    /**
+     * Loads every month from today through [untilEpochMs], so a lookup of "what airs within the
+     * next N days" finds the data. Used by the Continue Watching window, whose horizon is the
+     * day cap ahead of now; the month grid's own ±1 month load does not reach a 60-day cap.
+     */
+    fun ensureMonthsThrough(untilEpochMs: Long) {
+        val nowEpochMs = TraktPlatformClock.nowEpochMs()
+        val today = epochMsToUtcDate(nowEpochMs)
+        val until = epochMsToUtcDate(maxOf(untilEpochMs, nowEpochMs))
+        var year = today.year
+        var month = today.month
+        while (year < until.year || (year == until.year && month <= until.month)) {
+            ensureMonth(year, month)
+            val next = addMonth(year, month, 1)
+            year = next.first
+            month = next.second
+        }
+    }
+
     /** Ensures [year]/[month] and its immediate neighbours are loaded. */
     fun ensureMonthsAround(year: Int, month: Int) {
         val prev = addMonth(year, month, -1)

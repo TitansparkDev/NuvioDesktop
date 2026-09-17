@@ -50,6 +50,12 @@ data class DownloadItem(
     val bandwidthLimitMbps: Int? = null,
     val maximumSizeBytes: Long? = null,
     val isAutomaticDownload: Boolean = false,
+    /**
+     * A pack grab enqueues every episode paused and resumes them one by one as concurrency slots
+     * free up. Those rows are queued, not paused by the user: they read as "Queued", sort behind
+     * the live transfers, and lose the flag the moment anything resumes or pauses them.
+     */
+    val awaitingSlot: Boolean = false,
     val status: DownloadStatus,
     val downloadedBytes: Long = 0L,
     val totalBytes: Long? = null,
@@ -80,6 +86,32 @@ data class DownloadItem(
             return (downloadedBytes.toDouble() / total.toDouble())
                 .toFloat()
                 .coerceIn(0f, 1f)
+        }
+
+    /** Paused only because the pack drain has not reached it yet. */
+    val isQueuedForSlot: Boolean
+        get() = status == DownloadStatus.Paused && awaitingSlot
+
+    /**
+     * Whole-percent progress, or null when the total is unknown so callers can fall back to
+     * something other than a fake 0%.
+     */
+    val progressPercent: Int?
+        get() {
+            val total = totalBytes?.takeIf { it > 0L } ?: return null
+            return (downloadedBytes * 100L / total).coerceIn(0L, 100L).toInt()
+        }
+
+    /**
+     * Time-remaining estimate in seconds from the live speed sample. Null whenever it would be a
+     * guess — no known total, no speed sample yet, or the remaining bytes are already covered.
+     */
+    val etaSeconds: Long?
+        get() {
+            val total = totalBytes?.takeIf { it > 0L } ?: return null
+            val speed = bytesPerSecond?.takeIf { it > 0L } ?: return null
+            val remaining = (total - downloadedBytes).takeIf { it > 0L } ?: return null
+            return remaining / speed
         }
 
     val logicalContentKey: String
@@ -154,3 +186,48 @@ internal val downloadSeriesEpisodeComparator: Comparator<DownloadItem> =
         .thenBy { it.episodeTitle?.trim().orEmpty().lowercase() }
         .thenBy { it.title.trim().lowercase() }
         .thenBy { it.id }
+
+/**
+ * Live transfers first, then rows waiting on a slot or paused by hand, then failures — so a
+ * 50-episode pack reads "what is moving now" before "what is still to come". Each group keeps
+ * show/season/episode order rather than the newest-first insertion order, which put the last
+ * episode of a pack at the top while the first episodes (the ones actually transferring) sat at the
+ * bottom.
+ */
+internal val downloadActivityComparator: Comparator<DownloadItem> =
+    compareBy<DownloadItem> { it.activityRank }
+        .thenBy { it.title.trim().lowercase() }
+        .then(downloadSeriesEpisodeComparator)
+
+private val DownloadItem.activityRank: Int
+    get() = when (status) {
+        DownloadStatus.Downloading -> 0
+        DownloadStatus.Paused -> 1
+        DownloadStatus.Failed -> 2
+        DownloadStatus.Completed -> 3
+    }
+
+/** "12.4 Mbps" — bits per second, the unit a user compares against their connection. */
+internal fun formatDownloadSpeed(bytesPerSecond: Long): String = when {
+    bytesPerSecond >= 125_000L ->
+        "${formatOneDecimal(bytesPerSecond * 8.0 / 1_000_000.0)} Mbps"
+    bytesPerSecond >= 125L ->
+        "${formatOneDecimal(bytesPerSecond * 8.0 / 1_000.0)} Kbps"
+    else -> "${bytesPerSecond * 8L} bps"
+}
+
+internal fun formatDownloadDuration(totalSeconds: Long): String {
+    val seconds = totalSeconds.coerceAtLeast(1L)
+    val hours = seconds / 3600L
+    val minutes = (seconds % 3600L) / 60L
+    return when {
+        hours > 0L -> "${hours}h ${minutes}m"
+        minutes > 0L -> "${minutes}m ${seconds % 60L}s"
+        else -> "${seconds}s"
+    }
+}
+
+private fun formatOneDecimal(value: Double): String {
+    val roundedTenths = (value * 10.0).toLong()
+    return "${roundedTenths / 10}.${roundedTenths % 10}"
+}

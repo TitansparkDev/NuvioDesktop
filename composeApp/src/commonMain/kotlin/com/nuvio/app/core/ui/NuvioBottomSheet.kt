@@ -76,12 +76,15 @@ fun NuvioBottomSheetActionRow(
     // picker previews each family by drawing its name in it.
     titleFontFamily: FontFamily? = null,
     trailingContent: (@Composable RowScope.() -> Unit)? = null,
+    /** Right-click (desktop) alternative to [onClick]. */
+    onSecondaryClick: (() -> Unit)? = null,
 ) {
     val tokens = MaterialTheme.nuvio
     Row(
         modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
+            .secondaryClick(onSecondaryClick)
             .padding(horizontal = tokens.spacing.screenHorizontal, vertical = tokens.spacing.screenHorizontal),
         horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s14),
         verticalAlignment = Alignment.CenterVertically,

@@ -188,6 +188,7 @@ enum class DesktopColorProfile(val label: String, val description: String) {
     Neutral("Neutral", "No color adjustments applied. Accurate to the source."),
     Cinematic("Cinematic", "Slightly deeper contrast with richer colors for a cinematic look."),
     Vivid("Vivid", "Boosted contrast and saturation for a punchier image."),
+    Custom("Custom", "Your own contrast, brightness, saturation and gamma offsets."),
 }
 
 /**

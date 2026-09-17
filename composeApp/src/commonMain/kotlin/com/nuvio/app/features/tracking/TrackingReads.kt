@@ -106,6 +106,15 @@ interface TrackingLibraryProvider {
 /** Provider adapter for watched-history projection and explicit history mutations. */
 interface TrackingWatchedProvider : WatchedSyncAdapter {
     val providerId: TrackingProviderId
+
+    /**
+     * Drops whatever change-detection state makes the next [pull] cheap, so it re-reads in full.
+     *
+     * Default no-op: only a provider that skips its own fetch when the service reports nothing has
+     * changed has anything to drop. Called for a user-initiated resync, where "nothing changed"
+     * is the answer the user is asking us to stop trusting.
+     */
+    fun invalidateChangeDetection() = Unit
 }
 
 data class TrackingProgressSnapshot(

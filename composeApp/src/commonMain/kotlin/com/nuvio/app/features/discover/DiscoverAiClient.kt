@@ -38,7 +38,15 @@ object DiscoverAiClient {
      */
     private val inFlight = Mutex()
 
-    private const val TIMEOUT_MS = 60_000L
+    /**
+     * The ceiling on one request.
+     *
+     * Enforced by [httpRequestRaw]'s `callTimeoutMs` as well as by `withTimeoutOrNull`. The
+     * coroutine timeout alone is not enough and never was: the HTTP call underneath blocks a
+     * thread, so cancellation is not delivered until it returns on its own, and the per-read
+     * timeouts it does have are refreshed by any traffic at all.
+     */
+    private const val TIMEOUT_MS = 90_000L
 
     /**
      * Anthropic's ceiling. Generous on purpose: on current models thinking is on by default and its
@@ -63,9 +71,16 @@ object DiscoverAiClient {
         settings: DiscoverAiSettings,
         prompt: DiscoverAiPromptText,
     ): Result<String> {
-        if (!settings.isReady) {
+        // `isConfigured`, not `isReady`: this checks that a request *can* be made, and leaves
+        // "should this feature make one" to the caller. Recaps and Discover rows share the
+        // credential and have separate switches.
+        if (!settings.isConfigured) {
             return Result.failure(DiscoverAiException(DiscoverAiError.NotConfigured))
         }
+        // Logged on both sides of the wait. A request that never comes back used to leave no trace
+        // at all, which made "it just spun forever" indistinguishable from "nothing was ever sent".
+        log.i { "request -> ${settings.effectiveModel} at ${settings.effectiveBaseUrl}" }
+        val startedAt = System.currentTimeMillis()
         return inFlight.withLock {
             val outcome = withTimeoutOrNull(TIMEOUT_MS) {
                 runCatching {
@@ -74,8 +89,25 @@ object DiscoverAiClient {
                         DiscoverAiProvider.OpenAiCompat -> callOpenAiCompat(settings, prompt)
                     }
                 }
-            } ?: return@withLock Result.failure(DiscoverAiException(DiscoverAiError.Timeout))
+            }
+            if (outcome == null) {
+                log.w { "timed out after ${System.currentTimeMillis() - startedAt}ms" }
+                return@withLock Result.failure(DiscoverAiException(DiscoverAiError.Timeout))
+            }
+
             outcome
+                .onSuccess { log.i { "reply in ${System.currentTimeMillis() - startedAt}ms, ${it.length} chars" } }
+                // Anything that is not already typed is a transport failure — a socket timeout, a
+                // DNS or TLS error. Left raw it reached the error mapper as "not a
+                // DiscoverAiException" and was reported to the user as *not configured*, sending
+                // them to check a key that was fine.
+                .recoverCatching { error ->
+                    if (error is DiscoverAiException) throw error
+                    log.w(error) { "transport failure after ${System.currentTimeMillis() - startedAt}ms" }
+                    throw DiscoverAiException(
+                        DiscoverAiError.Transport(error::class.simpleName.orEmpty(), error.message.orEmpty()),
+                    )
+                }
         }
     }
 
@@ -106,6 +138,7 @@ object DiscoverAiClient {
                 "anthropic-version" to ANTHROPIC_VERSION,
             ),
             body = body,
+            callTimeoutMs = TIMEOUT_MS,
         )
         if (response.status !in 200..299) throw httpFailure(response)
 
@@ -174,25 +207,59 @@ object DiscoverAiClient {
                 "Authorization" to "Bearer ${settings.apiKey}",
             ),
             body = body,
+            callTimeoutMs = TIMEOUT_MS,
         )
         if (response.status !in 200..299) throw httpFailure(response)
 
         val parsed = json.parseToJsonElement(response.body) as? JsonObject
             ?: throw DiscoverAiException(DiscoverAiError.Unreadable)
-        val text = (parsed["choices"] as? JsonArray)
-            ?.firstNotNullOfOrNull { choice ->
-                ((choice as? JsonObject)?.get("message") as? JsonObject)
-                    ?.let { (it["content"] as? JsonPrimitive)?.contentOrNull }
-            }
-            .orEmpty()
+
+        // **A 2xx is not proof of success here.** OpenRouter answers some upstream failures — a
+        // free-tier daily cap, an exhausted credit balance, no provider currently serving the
+        // model — with HTTP 200 and an `error` object where `choices` should be. Checked before
+        // the content is read, because the alternative is what actually shipped: the real reason
+        // sitting in the body while the user is told the model "replied but not with suggestions".
+        //
+        // This is the same lesson as Anthropic's `stop_reason: "refusal"` above, on the other
+        // provider. Status alone answers neither.
+        (parsed["error"] as? JsonObject)?.let { error ->
+            val message = (error["message"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+            val code = (error["code"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
+            log.w { "OpenAI-compat returned an error inside a ${response.status}: code=$code $message" }
+            throw DiscoverAiException(
+                when (code) {
+                    401, 403 -> DiscoverAiError.Unauthorized(message)
+                    429 -> DiscoverAiError.RateLimited(retryAfterSeconds = null, detail = message)
+                    else -> DiscoverAiError.Http(code ?: response.status, message)
+                },
+            )
+        }
+
+        val message = (parsed["choices"] as? JsonArray)
+            ?.firstNotNullOfOrNull { choice -> (choice as? JsonObject)?.get("message") as? JsonObject }
+        val text = (message?.get("content") as? JsonPrimitive)?.contentOrNull.orEmpty()
 
         if (text.isBlank()) {
-            // The most common real cause is a reasoning model on an endpoint that spent the whole
-            // budget before emitting content — see OPENAI_MAX_TOKENS's note about
-            // `max_completion_tokens`. Naming the model in the log is what makes that visible.
+            val finishReason = (parsed["choices"] as? JsonArray)
+                ?.firstNotNullOfOrNull { choice ->
+                    ((choice as? JsonObject)?.get("finish_reason") as? JsonPrimitive)?.contentOrNull
+                }
+            // Reasoning models put their thinking in a sibling field. Content empty *and*
+            // reasoning present means the budget went entirely on thinking — a different fix
+            // (raise the cap, or pick a non-reasoning model) from "the provider sent nothing".
+            val reasoningLength =
+                (message?.get("reasoning") as? JsonPrimitive)?.contentOrNull?.length ?: 0
+
+            // The body is logged, not just measured. A length alone cost a whole round trip of
+            // diagnosis when the answer was sitting in 158 characters of JSON; this is a provider
+            // response, so it carries no prompt and no watch history.
             log.w {
                 "OpenAI-compat returned no content: model=${settings.effectiveModel} " +
-                    "host=${settings.effectiveBaseUrl} bodyLength=${response.body.length}"
+                    "host=${settings.effectiveBaseUrl} finishReason=$finishReason " +
+                    "reasoningChars=$reasoningLength body=${response.body.take(400)}"
+            }
+            if (finishReason == "length" || reasoningLength > 0) {
+                throw DiscoverAiException(DiscoverAiError.Truncated)
             }
             throw DiscoverAiException(DiscoverAiError.Empty)
         }
@@ -267,8 +334,16 @@ sealed interface DiscoverAiError {
      */
     data class RateLimited(val retryAfterSeconds: Int?, val detail: String) : DiscoverAiError
 
-    /** 60 seconds with no answer. */
+    /** [DiscoverAiClient.TIMEOUT_MS] with no answer. */
     data object Timeout : DiscoverAiError
+
+    /**
+     * The request never reached a reply: socket timeout, DNS, TLS, connection reset.
+     *
+     * Its own case because the three plausible fixes — check the network, check the base URL, wait
+     * and retry — are none of the things any other failure here asks for.
+     */
+    data class Transport(val kind: String, val detail: String) : DiscoverAiError
 
     /** 2xx whose body was not the documented shape — usually a base URL pointing at something else. */
     data object Unreadable : DiscoverAiError

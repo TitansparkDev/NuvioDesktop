@@ -18,6 +18,11 @@ import coil3.decode.ImageSource
 import coil3.fetch.SourceFetchResult
 import coil3.request.ImageRequest
 import coil3.request.Options
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -234,6 +239,21 @@ internal fun physicalMemoryBytes(): Long? = runCatching {
 }.getOrNull()?.takeIf { it > 0L }
 
 /**
+ * Touches the OS bean on a background thread at startup, so its native library is already loaded
+ * by the time the image caches ask for [physicalMemoryBytes] from inside Home's first composition.
+ *
+ * The first call loads `management_ext.dll`, and on the first launch after an update that is a
+ * freshly written file the antivirus scans before it may be mapped: measured at **6.4 seconds** on
+ * the UI thread (2026-09-14, `(LaunchStall)` sampler, 255 of 292 samples in `NativeLibraries.load`
+ * under this function). Off the UI thread the same wait costs nobody a frame, and a caller that
+ * arrives while it is still in flight blocks on the class-initialisation lock for only the
+ * remainder.
+ */
+internal fun warmPhysicalMemoryProbe() {
+    Thread({ physicalMemoryBytes() }, "nuvio-memory-probe-warm").apply { isDaemon = true }.start()
+}
+
+/**
  * Physical memory the OS currently reports as available, or null if it cannot be read.
  *
  * On Windows this is `GlobalMemoryStatusEx.ullAvailPhys`, which counts the standby list as
@@ -265,6 +285,7 @@ private object DecodedImageCache {
     // accessOrder=true makes iteration return least-recently-used first, so eviction is true LRU.
     private val map = object : LinkedHashMap<String, SkiaAnimatedImage>(16, 0.75f, true) {}
     private var currentBytes = 0L
+    private var backgroundMode = false
 
     @Synchronized
     fun get(key: String): SkiaAnimatedImage? = map[key]
@@ -280,14 +301,18 @@ private object DecodedImageCache {
     }
 
     /**
-     * Drops back to the floor. Called when the window is hidden or minimised, where holding several
-     * hundred megabytes of frames for a window nobody is looking at is the clearest case of memory
-     * this cache does not currently need. Restoring re-decodes only the tiles actually on screen, in
-     * the background, behind the stills that already cover a cold tile.
+     * Pins the cache to its floor, or releases it back to the full ceiling.
+     *
+     * Restricted covers the two states where holding several hundred megabytes of frames buys
+     * nothing: a hidden or minimised window, and full-screen playback. It is a mode rather than a
+     * one-shot trim so that decodes still in flight when it starts are bounded too. Releasing
+     * re-decodes only the tiles actually on screen, in the background, behind the stills that
+     * already cover a cold tile.
      */
     @Synchronized
-    fun trimToFloor() {
-        evictDownTo(MinCacheBudgetBytes)
+    fun setBackgroundMode(restricted: Boolean) {
+        backgroundMode = restricted
+        evictDownTo(budgetBytes())
     }
 
     /**
@@ -305,9 +330,10 @@ private object DecodedImageCache {
      * on a machine already short of memory.
      */
     private fun budgetBytes(): Long {
-        val available = availablePhysicalMemoryBytes() ?: return CEILING_BYTES
+        val ceiling = if (backgroundMode) MinCacheBudgetBytes else CEILING_BYTES
+        val available = availablePhysicalMemoryBytes() ?: return ceiling
         val spareCeiling = currentBytes + available - AvailableMemoryHeadroomBytes
-        return minOf(CEILING_BYTES, spareCeiling).coerceAtLeast(MinCacheBudgetBytes)
+        return minOf(ceiling, spareCeiling).coerceAtLeast(MinCacheBudgetBytes)
     }
 
     /** Caller must hold the monitor. */
@@ -324,22 +350,136 @@ private object DecodedImageCache {
 /**
  * Releases decoded animation frames the app is not currently showing.
  *
- * Exposed for `DesktopIdleHeapTrim`, which already knows the one moment this is free: the window is
- * hidden or minimised, so nothing on screen is animating and no re-decode can be seen.
+ * DesktopArtworkCaches coordinates this with the static cache on playback and visibility changes.
+ * Keeping the smaller limit active also bounds decodes already in flight when trimming started.
  */
-internal fun trimDecodedAnimationCache() {
-    DecodedImageCache.trimToFloor()
+internal fun limitDecodedAnimationCache(restricted: Boolean) {
+    DecodedImageCache.setBackgroundMode(restricted)
 }
+
+/**
+ * One decode per animation at a time, however many cards ask for it at once.
+ *
+ * [decodedImageCache] is only written when a decode FINISHES, so every request arriving while one
+ * is running missed the cache and started its own. Scrolling a row of animated art up and down is
+ * exactly that pattern, and it runs away: each duplicate makes the others slower, which widens the
+ * window in which more duplicates start.
+ *
+ * Measured before this existed — three minutes of scrolling animated rows: **2,261 decodes** of
+ * three distinct source sizes, mean 2,286 ms each. That is ~5,170 seconds of decode work inside a
+ * 180-second window, roughly 29 cores' worth, against a machine that has far fewer. The UI thread
+ * was being starved by duplicated work, and the frame rate fell from 117 to 20.
+ *
+ * Same shape as the metadata single-flight elsewhere in the app: a mutex around a map of in-flight
+ * `Deferred`s, joined rather than restarted.
+ */
+/**
+ * How many animations may decode at once.
+ *
+ * Decoding is a long blocking CPU job, and running an unbounded number of them was the original
+ * problem: contention stretched a 750 ms decode to 5,600 ms, which widened the window for yet more
+ * duplicates.
+ *
+ * Two was the defensive choice while a session could produce 2,261 decodes. With deduplication in
+ * place that fell to 228, and decodes returned to ~300 ms, so the total work is now bounded by the
+ * number of distinct animations rather than by how hard the user scrolls. Four recovers an evicted
+ * row twice as fast without being able to reopen the storm.
+ */
+private const val AnimationDecodeConcurrency = 4
+
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+private val AnimationDecodeDispatcher =
+    Dispatchers.IO.limitedParallelism(AnimationDecodeConcurrency)
+
+internal class SingleFlight<T : Any>(
+    // IO, not Default: the work is a blocking call, and Default is bounded by core count. Putting
+    // multi-second blocking decodes on it starved every other coroutine in the app of a thread,
+    // which is what froze the window outright.
+    context: kotlin.coroutines.CoroutineContext = AnimationDecodeDispatcher,
+) {
+    private val scope = CoroutineScope(SupervisorJob() + context)
+    private val mutex = Mutex()
+    // Concurrent, so completion can retire an entry without needing to suspend for the lock.
+    private val flights = java.util.concurrent.ConcurrentHashMap<String, Deferred<T?>>()
+
+    /**
+     * Runs [work] for [key], or joins the run already under way.
+     *
+     * The winner runs in [scope], not in its caller: a losing card that scrolls out of view has its
+     * request cancelled, and the decode every other card is waiting on must not die with it.
+     */
+    /**
+     * Runs [work] for [key], or joins the run already under way, calling [onJoined] if it joined.
+     *
+     * [onJoined] is invoked **under the lock, before awaiting** — that is the whole point of its
+     * existence. The previous design set a flag inside [work] to decide afterwards whether this
+     * caller had won, and that is racy: [work] is queued on a bounded dispatcher and may not start
+     * for seconds, while a caller whose card scrolled offscreen is cancelled immediately. It then
+     * concluded it had lost, closed the codec, and the queued decode later read it — a
+     * use-after-free that killed the JVM. Winning must be decided synchronously, where the decision
+     * is actually made.
+     */
+    suspend fun run(key: String, work: () -> T?, onJoined: () -> Unit = {}): T? {
+        var started: Deferred<T?>? = null
+        val flight = mutex.withLock {
+            flights[key] ?: scope.async { work() }.also { fresh ->
+                flights[key] = fresh
+                started = fresh
+                // Retired when the WORK finishes, not when a caller stops waiting. Cards scroll
+                // offscreen and their requests are cancelled constantly; retiring on a caller's
+                // exit would drop the flight while it was still running and let the next card
+                // start a duplicate of it — the storm this class exists to stop.
+                fresh.invokeOnCompletion { flights.remove(key, fresh) }
+            }
+        }
+        if (started == null) onJoined()
+        return flight.await()
+    }
+
+    /** Flights still registered. Test seam: this draining is what proves nothing is leaked. */
+    internal fun activeFlights(): Int = flights.size
+}
+
+private val AnimatedDecodeFlights = SingleFlight<SkiaAnimatedImage>()
 
 internal class AnimatedSkiaImageDecoder(
     private val codec: Codec,
     private val cacheKey: String,
 ) : Decoder {
     override suspend fun decode(): DecodeResult {
-        val decodeStartedAtMs = System.currentTimeMillis()
         decodedImageCache.get(cacheKey)?.let { cached ->
             codec.close()
             return DecodeResult(image = cached, isSampled = true)
+        }
+        // Read BEFORE the flight. If this caller wins, decodeFrames() closes the codec in its
+        // `finally`, and touching it afterwards is a use-after-free: measured as
+        // EXCEPTION_ACCESS_VIOLATION in Codec_nGetImageInfo, which killed the JVM outright.
+        val sourceWidth = codec.width
+        // Deduplicated by cache key: only the first caller decodes, the rest await its result.
+        //
+        // Ownership of `codec` follows the flight, decided synchronously: if this caller starts the
+        // flight, `decodeFrames()` owns and closes it; if it joins one, `onJoined` closes it here
+        // and nothing else ever touches it. Cancellation cannot confuse the two, which is what the
+        // previous flag-based version got wrong.
+        val image = AnimatedDecodeFlights.run(
+            key = cacheKey,
+            work = { decodeFrames() },
+            onJoined = { codec.close() },
+        ) ?: throw IllegalStateException("animated decode produced no frames for $cacheKey")
+        return DecodeResult(image = image, isSampled = image.width < sourceWidth)
+    }
+
+    /**
+     * The decode proper. Returns null only if it produced nothing at all.
+     *
+     * Not suspending: it runs inside [AnimatedDecodeFlights]' own scope, and a losing caller's
+     * cancellation must not tear down the work everyone else is waiting on.
+     */
+    private fun decodeFrames(): SkiaAnimatedImage? {
+        val decodeStartedAtMs = System.currentTimeMillis()
+        decodedImageCache.get(cacheKey)?.let { cached ->
+            codec.close()
+            return cached
         }
 
         val width = codec.width
@@ -414,10 +554,7 @@ internal class AnimatedSkiaImageDecoder(
                 "(readPixels=${readPixelsMs}ms scale=${scaleMs}ms) ${decodedImageCache.stats()}"
         }
 
-        return DecodeResult(
-            image = image,
-            isSampled = scale < 1f,
-        )
+        return image
     }
 
     class Factory : Decoder.Factory {
@@ -626,27 +763,56 @@ internal class SkiaAnimatedImage(
 
     private val totalDurationMs: Int = frameDurationsMs.sum().coerceAtLeast(1)
 
-    private fun currentFrame(): ImageBitmap {
-        if (frames.size <= 1) return frames[0]
-        val t = (System.currentTimeMillis() % totalDurationMs).toInt()
+    /**
+     * One Skia [SkiaImage] per frame, built once.
+     *
+     * Both draw paths used to call `Image.makeFromBitmap(...)` and `close()` **on every draw**. A
+     * fresh `Image` has a fresh unique id, so Skia's texture cache cannot recognise it: every
+     * animated poster re-uploaded its whole frame to the GPU on every frame it was visible, then
+     * discarded the texture. At 320x320 that is 400 KB per poster per frame — a row of ten at 120 Hz
+     * is roughly half a gigabyte a second of upload for pixels that never changed.
+     *
+     * The bitmaps are marked immutable first, which is what lets `makeFromBitmap` share their pixel
+     * storage instead of copying it — without that this would double the memory of a cache that
+     * already runs to hundreds of megabytes.
+     */
+    private val skiaFrames: List<SkiaImage> = frames.map { frame ->
+        SkiaImage.makeFromBitmap(frame.asSkiaBitmap().apply { setImmutable() })
+    }
+
+    /**
+     * The frame [elapsedMs] into playback, where 0 is the frame the animation opens on.
+     *
+     * This used to take its phase from `System.currentTimeMillis() % totalDurationMs` — absolute
+     * wall-clock time. An animation appearing on screen therefore began at whatever frame the clock
+     * happened to be on, never at frame 0. The card showed the still, then cut to frame 47: the
+     * "jump" that made playback look janky no matter how the loading was layered underneath it.
+     * Phase belongs to the thing being played, not to the hour of the day.
+     */
+    internal fun frameIndexAt(elapsedMs: Long): Int {
+        if (frames.size <= 1) return 0
+        val t = (elapsedMs.coerceAtLeast(0L) % totalDurationMs).toInt()
         var acc = 0
         for ((index, duration) in frameDurationsMs.withIndex()) {
             acc += duration
-            if (t < acc) return frames[index]
+            if (t < acc) return index
         }
-        return frames.last()
+        return frames.lastIndex
     }
+
+    /** Playback origin for the coil [Image] contract, which has no painter to own the phase. */
+    private val createdAtMs = System.currentTimeMillis()
 
     override fun draw(canvas: org.jetbrains.skia.Canvas) {
-        val skiaImage = org.jetbrains.skia.Image.makeFromBitmap(currentFrame().asSkiaBitmap())
-        try {
-            canvas.drawImage(skiaImage, 0f, 0f)
-        } finally {
-            skiaImage.close()
-        }
+        canvas.drawImage(currentSkiaFrame(), 0f, 0f)
     }
 
-    internal fun currentFrameForCompose(): ImageBitmap = currentFrame()
+    internal fun skiaFrameAt(elapsedMs: Long): SkiaImage = skiaFrames[frameIndexAt(elapsedMs)]
+
+    internal fun currentSkiaFrame(): SkiaImage = skiaFrameAt(System.currentTimeMillis() - createdAtMs)
+
+    internal fun currentFrameForCompose(): ImageBitmap =
+        frames[frameIndexAt(System.currentTimeMillis() - createdAtMs)]
 
     internal val isAnimated: Boolean get() = frames.size > 1
 }
@@ -662,25 +828,34 @@ internal class SkiaAnimatedPainter(
 
     override val intrinsicSize: Size = Size(image.width.toFloat(), image.height.toFloat())
 
+    // Hoisted: this was allocated per draw alongside the image.
+    private val paint = Paint().apply { isDither = true }
+
+    /**
+     * When this painter started playing, so it opens on frame 0.
+     *
+     * The painter is built once per successful load per card, which is exactly the lifetime
+     * playback should be phased against: the card shows the animation's first frame while it
+     * loads, and playback then continues from that same frame instead of cutting to the middle.
+     * A decoded animation is shared between cards through the frame cache, so the phase cannot
+     * live on the image without every card that shares it inheriting someone else's position.
+     */
+    private val startedAtMs = System.currentTimeMillis()
+
     override fun DrawScope.onDraw() {
         if (image.isAnimated) {
             AnimatedImageClock.tick.value
         }
-        val frame = image.currentFrameForCompose()
+        val frame = image.skiaFrameAt(System.currentTimeMillis() - startedAtMs)
         drawIntoCanvas { canvas ->
-            val skiaImage = SkiaImage.makeFromBitmap(frame.asSkiaBitmap())
-            try {
-                canvas.nativeCanvas.drawImageRect(
-                    skiaImage,
-                    Rect.makeWH(frame.width.toFloat(), frame.height.toFloat()),
-                    Rect.makeWH(size.width, size.height),
-                    SamplingMode.LINEAR,
-                    Paint().apply { isDither = true },
-                    true,
-                )
-            } finally {
-                skiaImage.close()
-            }
+            canvas.nativeCanvas.drawImageRect(
+                frame,
+                Rect.makeWH(frame.width.toFloat(), frame.height.toFloat()),
+                Rect.makeWH(size.width, size.height),
+                SamplingMode.LINEAR,
+                paint,
+                true,
+            )
         }
     }
 }

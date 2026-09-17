@@ -168,7 +168,7 @@ object WatchedRepository {
         // Provider history is merged additively after the account's primary watched store. A
         // missing row from SIMKL, MDBList or Floppy must never erase a tick written locally or by
         // another service; those APIs are independent histories, not mirrors of one another.
-        pullConnectedProviderHistoryAdditively(profileId)
+        pullConnectedProviderHistoryAdditively(profileId, force = false)
     }
 
     /**
@@ -207,7 +207,7 @@ object WatchedRepository {
             claimedAtMs = now
             lastProviderHistoryPullAtMs.also { lastProviderHistoryPullAtMs = now }
         }
-        val requested = pullConnectedProviderHistoryAdditively(profileId)
+        val requested = pullConnectedProviderHistoryAdditively(profileId, force = force)
         if (!requested) {
             // Nothing was spent, so nothing should be charged. The startup import runs before the
             // tracking registry reports any connected provider, and charging that no-op used to
@@ -233,7 +233,7 @@ object WatchedRepository {
      * door, by the one provider read that never asked which source was selected. Trakt has always
      * followed the selection (see [activeRemoteWatchedAdapter]); the additive providers now do too.
      */
-    private suspend fun pullConnectedProviderHistoryAdditively(profileId: Int): Boolean {
+    private suspend fun pullConnectedProviderHistoryAdditively(profileId: Int, force: Boolean): Boolean {
         val importProviderId = activeWatchedHistoryImportProviderId()
         val connected = TrackingProviderRegistry.connectedWatchedProviders()
         val provider = connected.firstOrNull { candidate -> candidate.providerId == importProviderId }
@@ -252,6 +252,10 @@ object WatchedRepository {
         }
         var changed = withdrawForeignImportedHistory(importProviderId)
         if (provider != null) {
+            // A provider may skip its own fetch when the service reports nothing has changed. That
+            // is the right default for a poll and the wrong one for a resync the user asked for,
+            // so a forced pull drops that state first and makes the provider read in full.
+            if (force) provider.invalidateChangeDetection()
             val remoteItems = try {
                 provider.pull(profileId = profileId, pageSize = watchedItemsPageSize)
             } catch (error: CancellationException) {

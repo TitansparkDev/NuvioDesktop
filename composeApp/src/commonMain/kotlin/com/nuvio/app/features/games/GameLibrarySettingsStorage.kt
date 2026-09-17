@@ -9,4 +9,6 @@ internal expect object GameLibrarySettingsStorage {
     fun saveSteamGridDbApiKey(value: String)
     fun loadBackdropStyle(): String?
     fun saveBackdropStyle(value: String)
+    fun loadMetadataSource(): String?
+    fun saveMetadataSource(value: String)
 }

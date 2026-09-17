@@ -56,7 +56,7 @@ enum class AppShortcutAction(val id: String, val displayName: String) {
     ToggleTrailer("toggle_trailer", "Play / dismiss focused trailer"),
     ToggleTrailerMute("toggle_trailer_mute", "Toggle trailer mute"),
     TogglePeoplePanel("toggle_people_panel", "Swap Starring / Production in hero"),
-    ToggleGameMode("toggle_game_mode", "Toggle game mode (Umbra)"),
+    ToggleGameMode("toggle_game_mode", "Toggle game mode"),
     ToggleFullscreen("toggle_fullscreen", "Toggle fullscreen / windowed"),
     SelectFocused("select_focused", "Select / open focused item"),
     GoBack("go_back", "Go back"),

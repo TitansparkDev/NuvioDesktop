@@ -5,6 +5,7 @@ import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.httpRequestRaw
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsRepository
+import com.nuvio.app.features.trakt.parseTraktIsoDateTimeToEpochMs
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import kotlinx.coroutines.CancellationException
@@ -239,7 +240,7 @@ internal object SimklProgressRepository {
         // for the existing up-next pipeline.
         // Rule: check /sync/activities before /sync/all-items to avoid unnecessary full downloads.
         val activities = SimklAuthRepository.fetchActivities()
-        val latestCwTs = activities?.tvShows?.watching
+        val latestCwTs = simklWatchingSeedActivitiesStamp(activities)
         val savedCwTs = SimklSettingsRepository.lastCwActivitiesAt()
         if (shouldReuseSimklWatchingSeedCache(latestCwTs, savedCwTs, hasLoadedWatchingSeeds)) {
             log.d { "SIMKL CW: watching-list activities unchanged, skipping re-fetch" }
@@ -249,7 +250,11 @@ internal object SimklProgressRepository {
             log.d { "SIMKL CW: watching-list activities unchanged but seed cache is unavailable; re-fetching" }
         }
 
-        val watchingUrl = SimklAuthRepository.appendParams("$BASE_URL/sync/all-items/all/watching")
+        // `next_watch_info` attaches each show's next unwatched episode, air date included, to the
+        // same response — the Continue Watching window needs that date to keep a returning show.
+        val watchingUrl = SimklAuthRepository.appendParams(
+            "$BASE_URL/sync/all-items/all/watching?next_watch_info=yes",
+        )
         val watchingSeeds = try {
             val resp = httpRequestRaw(method = "GET", url = watchingUrl, headers = headers, body = "")
             if (resp.status !in 200..299) {
@@ -257,8 +262,13 @@ internal object SimklProgressRepository {
             }
             val parsed = json.decodeFromString<SimklAllItemsResponse>(resp.body)
             val playbackVideoIds = playbackEntries.map { it.videoId }.toSet()
-            (parsed.shows + parsed.anime).mapNotNull { entry ->
-                entry.toLastWatchedSeedEntry(playbackVideoIds)
+            // The array is the anime signal — see SimklAllItemsEntry.showMedia. Concatenating the
+            // two and asking each entry what it is threw that away, and every anime came back down
+            // the non-anime branch with the wrong id namespace.
+            parsed.shows.mapNotNull { entry ->
+                entry.toLastWatchedSeedEntry(playbackVideoIds, isAnime = false)
+            } + parsed.anime.mapNotNull { entry ->
+                entry.toLastWatchedSeedEntry(playbackVideoIds, isAnime = true)
             }
         } catch (error: CancellationException) {
             throw error
@@ -300,12 +310,36 @@ internal object SimklProgressRepository {
 
     private fun SimklAllItemsEntry.toLastWatchedSeedEntry(
         playbackVideoIds: Set<String>,
+        isAnime: Boolean,
     ): WatchProgressEntry? {
-        val marker = lastWatched?.takeIf { it.isNotBlank() } ?: return null
-        val (rawSeason, rawEpisode) = parseSimklEpisodeMarker(marker) ?: return null
-        val isAnime = anime != null
-        val s = show ?: anime ?: return null
-        val showId = (if (isAnime) s.ids.toBestAnimeContentId() else s.ids.toBestContentId()) ?: return null
+        // Every branch below used to discard an entry in silence, which is how a title can vanish
+        // from Continue Watching with the seed count still looking healthy — one dropped entry is
+        // invisible in "105 up-next seeds". The title is logged with the reason so a repro says
+        // which branch ate it instead of leaving it to be guessed at.
+        val debugTitle = showMedia?.title ?: "<untitled>"
+        val marker = lastWatched?.takeIf { it.isNotBlank() }
+            ?: run {
+                log.d { "SIMKL seed dropped ($debugTitle): no last_watched marker" }
+                return null
+            }
+        val (rawSeason, rawEpisode) = parseSimklEpisodeMarker(marker)
+            ?: run {
+                log.d { "SIMKL seed dropped ($debugTitle): unparseable last_watched marker '$marker'" }
+                return null
+            }
+        val s = showMedia
+            ?: run {
+                log.d { "SIMKL seed dropped ($debugTitle): entry carries neither a show nor an anime node" }
+                return null
+            }
+        val showId = (if (isAnime) s.ids.toBestAnimeContentId() else s.ids.toBestContentId())
+            ?: run {
+                log.d {
+                    "SIMKL seed dropped ($debugTitle): no usable content id " +
+                        "(isAnime=$isAnime ids=${s.ids})"
+                }
+                return null
+            }
         // The id decides the coordinate space, so it is resolved first — see episodeCoordinatesFor.
         val (season, episode) = s.ids.episodeCoordinatesFor(
             contentId = showId,
@@ -313,11 +347,23 @@ internal object SimklProgressRepository {
             entrySeason = rawSeason,
             entryEpisode = rawEpisode,
         )
-        if (season == 0) return null // specials
+        if (season == 0) {
+            log.d { "SIMKL seed dropped ($debugTitle): specials only (season 0)" }
+            return null // specials
+        }
         val videoId = "$showId:$season:$episode"
         // Skip if this exact episode is already an active playback session — the in-progress
         // card is more useful, and it already serves as an implicit up-next seed.
-        if (videoId in playbackVideoIds) return null
+        if (videoId in playbackVideoIds) {
+            log.d { "SIMKL seed skipped ($debugTitle): $videoId already has a playback session" }
+            return null
+        }
+        val nextAirEpochMs = nextToWatchInfo?.date?.let { parseSimklAirDate(it) }
+        log.d {
+            "SIMKL seed ($debugTitle): $videoId isAnime=$isAnime marker=$marker " +
+                "next=${nextToWatchInfo?.let { "S${it.season}E${it.episode}" } ?: "-"} " +
+                "nextAir=${nextToWatchInfo?.date ?: "-"}"
+        }
         // No fabricated "now" here, unlike an active playback session. This is a historical marker
         // from the watching list, and stamping an undateable one with the current time makes it
         // beat every dated row in the sort *and* pass the Continue Watching window unconditionally
@@ -344,6 +390,7 @@ internal object SimklProgressRepository {
             progressPercent = 100f,
             lastUpdatedEpochMs = watchedMs,
             source = WatchProgressSourceSimkl,
+            nextEpisodeAirEpochMs = nextAirEpochMs,
         )
     }
 
@@ -464,6 +511,35 @@ internal fun withoutSuppressedSimklSeeds(
     }
 }
 
+/**
+ * The activities stamp that decides whether the cached watching-list seeds are still current.
+ *
+ * SIMKL reports activity per category, and the request this gates — `/sync/all-items/all/watching`
+ * — is parsed as `shows + anime`. Gating on `tv_shows.watching` alone therefore went blind to every
+ * anime: finishing an episode elsewhere bumps `anime.watching` and leaves `tv_shows.watching`
+ * untouched, so the cache was reused and the new episode never reached Continue Watching. It
+ * survived a manual resync too, because the seed cache is in memory — only a restart cleared it.
+ *
+ * `completed` is folded in for the same reason in the other direction: a show finished on another
+ * device leaves the watching list, and nothing guarantees SIMKL bumps `watching` when an entry is
+ * removed from it rather than changed within it.
+ *
+ * The parts are joined rather than compared, because only equality with the saved stamp matters —
+ * no ordering, no timestamp parsing. A stamp saved by an older build simply mismatches once and
+ * costs a single extra fetch.
+ */
+internal fun simklWatchingSeedActivitiesStamp(activities: SimklActivities?): String? {
+    if (activities == null) return null
+    val parts = listOf(
+        "shows.watching" to activities.tvShows?.watching,
+        "shows.completed" to activities.tvShows?.completed,
+        "anime.watching" to activities.anime?.watching,
+        "anime.completed" to activities.anime?.completed,
+    )
+    if (parts.all { (_, value) -> value == null }) return null
+    return parts.joinToString("|") { (name, value) -> "$name=${value.orEmpty()}" }
+}
+
 internal fun shouldReuseSimklWatchingSeedCache(
     latestActivitiesAt: String?,
     savedActivitiesAt: String?,
@@ -481,3 +557,11 @@ internal fun requireSuccessfulSimklPlaybackDelete(response: RawHttpResponse, ses
         )
     }
 }
+
+/**
+ * `next_to_watch_info.date` carries an offset (`2023-08-07T00:00:00-05:00`), which
+ * [parseSimklTimestamp] ignores — a day's error is enough to move a premiere across the window
+ * edge, so the offset-aware parser goes first and the lenient one only catches odd shapes.
+ */
+internal fun parseSimklAirDate(iso: String): Long? =
+    parseTraktIsoDateTimeToEpochMs(iso) ?: parseSimklTimestamp(iso)

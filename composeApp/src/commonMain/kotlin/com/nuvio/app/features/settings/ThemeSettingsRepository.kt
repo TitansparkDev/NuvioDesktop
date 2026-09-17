@@ -48,6 +48,10 @@ object ThemeSettingsRepository {
     private val _desktopColumnGuidesVisible = MutableStateFlow(true)
     val desktopColumnGuidesVisible: StateFlow<Boolean> = _desktopColumnGuidesVisible.asStateFlow()
 
+    /** Settings shell spans the whole window instead of a centred fixed-width column set. */
+    private val _desktopSettingsFullWidth = MutableStateFlow(false)
+    val desktopSettingsFullWidth: StateFlow<Boolean> = _desktopSettingsFullWidth.asStateFlow()
+
     private val _wasdNavigationEnabled = MutableStateFlow(false)
     val wasdNavigationEnabled: StateFlow<Boolean> = _wasdNavigationEnabled.asStateFlow()
 
@@ -97,6 +101,7 @@ object ThemeSettingsRepository {
         _amoledEnabled.value = false
         _liquidGlassNativeTabBarEnabled.value = false
         _desktopColumnGuidesVisible.value = true
+        _desktopSettingsFullWidth.value = false
         _wasdNavigationEnabled.value = false
         WasdNavigation.enabled = false
         _desktopNavigationLayout.value = DesktopNavigationLayout.Default
@@ -152,6 +157,7 @@ object ThemeSettingsRepository {
         _liquidGlassNativeTabBarEnabled.value = liquidGlassEnabled
         NativeTabBridge.publishLiquidGlassEnabled(liquidGlassEnabled)
         _desktopColumnGuidesVisible.value = ThemeSettingsStorage.loadDesktopColumnGuidesVisible() ?: true
+        _desktopSettingsFullWidth.value = ThemeSettingsStorage.loadDesktopSettingsFullWidth() ?: false
         val wasdEnabled = ThemeSettingsStorage.loadWasdNavigationEnabled() ?: false
         _wasdNavigationEnabled.value = wasdEnabled
         WasdNavigation.enabled = wasdEnabled
@@ -161,7 +167,7 @@ object ThemeSettingsRepository {
         _desktopTopBarAlwaysVisible.value = ThemeSettingsStorage.loadDesktopTopBarAlwaysVisible() ?: false
         _desktopDiscoverTabVisible.value = ThemeSettingsStorage.loadDesktopDiscoverTabVisible() ?: true
         _desktopAppUiScalePercent.value =
-            ThemeSettingsStorage.loadDesktopAppUiScalePercent()?.coerceIn(-25, 25) ?: 0
+            ThemeSettingsStorage.loadDesktopAppUiScalePercent()?.coerceIn(-50, 50) ?: 0
         _desktopAppUiScaleAppliesToDetails.value =
             ThemeSettingsStorage.loadDesktopAppUiScaleAppliesToDetails() ?: true
         _appFontFamily.value = ThemeSettingsStorage.loadAppFontFamily()?.trim().orEmpty()
@@ -270,6 +276,13 @@ object ThemeSettingsRepository {
         ThemeSettingsStorage.saveDesktopColumnGuidesVisible(visible)
     }
 
+    fun setDesktopSettingsFullWidth(enabled: Boolean) {
+        ensureLoaded()
+        if (_desktopSettingsFullWidth.value == enabled) return
+        _desktopSettingsFullWidth.value = enabled
+        ThemeSettingsStorage.saveDesktopSettingsFullWidth(enabled)
+    }
+
     fun setWasdNavigationEnabled(enabled: Boolean) {
         ensureLoaded()
         if (_wasdNavigationEnabled.value == enabled) return
@@ -301,7 +314,7 @@ object ThemeSettingsRepository {
 
     fun setDesktopAppUiScalePercent(percent: Int) {
         ensureLoaded()
-        val clamped = percent.coerceIn(-25, 25)
+        val clamped = percent.coerceIn(-50, 50)
         if (_desktopAppUiScalePercent.value == clamped) return
         _desktopAppUiScalePercent.value = clamped
         ThemeSettingsStorage.saveDesktopAppUiScalePercent(clamped)

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 import com.nuvio.app.core.ui.NuvioKeyCap
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
@@ -37,15 +39,27 @@ import com.nuvio.app.features.player.AppShortcutRebindDialog
 import com.nuvio.app.features.player.PlayerShortcutRebindDialog
 import com.nuvio.app.features.player.ensurePlayerShortcutBindingsLoaded
 import com.nuvio.app.features.player.playerShortcutKeyLabels
-import com.nuvio.app.features.player.resetAllPlayerShortcuts
+import com.nuvio.app.features.player.resetPlayerShortcuts
 import com.nuvio.app.features.player.appShortcutKeyLabels
 import com.nuvio.app.features.player.ensureAppShortcutBindingsLoaded
 import com.nuvio.app.features.player.resetAllAppShortcuts
+import com.nuvio.app.features.input.ensureGamepadSettingsLoaded
+import com.nuvio.app.features.input.gamepadConnectedState
+import com.nuvio.app.features.input.gamepadDeadZoneRange
+import com.nuvio.app.features.input.gamepadDeadZoneState
+import com.nuvio.app.features.input.gamepadEnabledState
+import com.nuvio.app.features.input.gamepadMappingRows
+import com.nuvio.app.features.input.gamepadRepeatIntervalRange
+import com.nuvio.app.features.input.gamepadRepeatIntervalState
+import com.nuvio.app.features.input.gamepadSupported
+import com.nuvio.app.features.input.resetGamepadSettings
+import com.nuvio.app.features.input.setGamepadDeadZone
+import com.nuvio.app.features.input.setGamepadEnabled
+import com.nuvio.app.features.input.setGamepadRepeatIntervalMs
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
-import com.nuvio.app.core.ui.accentBrush
-import androidx.compose.material3.LocalTextStyle
+import com.nuvio.app.core.ui.NuvioActionLabel
 
 /**
  * Read-only reference of every desktop keyboard shortcut, and the single authoritative inventory
@@ -142,7 +156,7 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(
-                    horizontal = if (isTablet) 0.dp else NuvioTokens.Space.s12,
+                    horizontal = ShortcutRowHorizontalPadding(isTablet),
                     vertical = NuvioTokens.Space.s4,
                 ),
         )
@@ -153,7 +167,11 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
         val wasdEnabled by ThemeSettingsRepository.wasdNavigationEnabled.collectAsState()
         val appLabels by appShortcutKeyLabels().collectAsState()
         var rebindingApp by remember { mutableStateOf<AppShortcutAction?>(null) }
-        SettingsSection(title = stringResource(Res.string.settings_shortcuts_navigation), isTablet = isTablet) {
+        SettingsSection(
+            title = stringResource(Res.string.settings_shortcuts_navigation),
+            isTablet = isTablet,
+            actions = { ShortcutsResetLabel(onClick = { resetAllAppShortcuts() }) },
+        ) {
             SettingsGroup(isTablet = isTablet) {
                 SettingsChoiceRow(
                     title = stringResource(Res.string.settings_shortcuts_move_focus),
@@ -164,7 +182,6 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
                     ),
                     selectedValue = wasdEnabled,
                     isTablet = isTablet,
-                    flushContent = true,
                     onSelected = { enabled ->
                         ThemeSettingsRepository.setWasdNavigationEnabled(enabled)
                         ensureAppShortcutBindingsLoaded()
@@ -180,12 +197,6 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
                 }
             }
         }
-        Text(
-            text = stringResource(Res.string.settings_shortcuts_reset_navigation),
-            color = MaterialTheme.nuvio.colors.accent,
-            style = LocalTextStyle.current.accentBrush(),
-            modifier = Modifier.clickable { resetAllAppShortcuts() }.padding(NuvioTokens.Space.s12),
-        )
         rebindingApp?.let { action ->
             AppShortcutRebindDialog(action, onDismiss = { rebindingApp = null })
         }
@@ -197,7 +208,12 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
         var rebinding by remember { mutableStateOf<PlayerShortcutAction?>(null) }
         Column(verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s18)) {
             playerRowSections.forEach { (title, specs) ->
-                SettingsSection(title = title, isTablet = isTablet) {
+                val sectionActions = specs.mapNotNull { it.action }
+                SettingsSection(
+                    title = title,
+                    isTablet = isTablet,
+                    actions = { ShortcutsResetLabel(onClick = { resetPlayerShortcuts(sectionActions) }) },
+                ) {
                     SettingsGroup(isTablet = isTablet) {
                         specs.forEachIndexed { index, spec ->
                             if (index > 0) SettingsGroupDivider(isTablet = isTablet)
@@ -210,34 +226,54 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
                     }
                 }
             }
-            ResetAllShortcutsRow(isTablet = isTablet, onResetAll = { resetAllPlayerShortcuts() })
         }
         rebinding?.let { action ->
             PlayerShortcutRebindDialog(action = action, onDismiss = { rebinding = null })
         }
     }
+
+    // Last on the page: the keyboard sections read as one continuous inventory, and slotting the
+    // controller between them broke that in half.
+    if (gamepadSupported()) {
+        item(key = "keyboard-shortcuts-gamepad") { GamepadSection(isTablet = isTablet) }
+    }
 }
 
+/** The desktop rows carry the 16.dp every settings row does, so they line up with the section
+ * heading and the Controller rows rather than hugging the card edge. */
+private fun ShortcutRowHorizontalPadding(isTablet: Boolean) = if (isTablet) 16.dp else NuvioTokens.Space.s12
+
 @Composable
-private fun ShortcutRow(shortcut: Shortcut, isTablet: Boolean, onRebind: (() -> Unit)? = null) {
+private fun ShortcutRow(
+    shortcut: Shortcut,
+    isTablet: Boolean,
+    onRebind: (() -> Unit)? = null,
+    /** Optional second line under the action, for a row that means two things (see the pad rows). */
+    description: String? = null,
+) {
     val tokens = MaterialTheme.nuvio
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .then(if (onRebind != null) Modifier.clickable(onClick = onRebind) else Modifier)
             .padding(
-                horizontal = if (isTablet) 0.dp else NuvioTokens.Space.s12,
+                horizontal = ShortcutRowHorizontalPadding(isTablet),
                 vertical = NuvioTokens.Space.s10,
             ),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
     ) {
-        Text(
-            text = shortcut.action,
-            style = MaterialTheme.typography.bodyLarge,
-            color = tokens.colors.textPrimary,
+        Column(
             modifier = Modifier.weight(1f),
-        )
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = shortcut.action,
+                style = MaterialTheme.typography.bodyLarge,
+                color = tokens.colors.textPrimary,
+            )
+            description?.let { SettingsSubtext(text = it, isTablet = isTablet) }
+        }
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s4),
@@ -264,20 +300,141 @@ private fun ShortcutRow(shortcut: Shortcut, isTablet: Boolean, onRebind: (() -> 
     }
 }
 
+/** The heading-level reset every section of this page carries, on the far right of its title. */
 @Composable
-private fun ResetAllShortcutsRow(isTablet: Boolean, onResetAll: () -> Unit) {
+private fun ShortcutsResetLabel(onClick: () -> Unit) {
+    NuvioActionLabel(text = stringResource(Res.string.action_reset), onClick = onClick)
+}
+
+
+/**
+ * Controller settings live on the shortcuts page rather than a page of their own because a pad is
+ * not a separate input model here — every button is replayed as the keystroke listed beside it, so
+ * this inventory and the keyboard inventory describe the same bindings.
+ *
+ * The mapping list is read-only: rebinding a button means rebinding the underlying shortcut in the
+ * sections above, which moves both at once.
+ */
+@Composable
+private fun GamepadSection(isTablet: Boolean) {
+    LaunchedEffect(Unit) { ensureGamepadSettingsLoaded() }
+    val enabled by gamepadEnabledState().collectAsState()
+    val connected by gamepadConnectedState().collectAsState()
+    val deadZone by gamepadDeadZoneState().collectAsState()
+    val repeatInterval by gamepadRepeatIntervalState().collectAsState()
+    val rows = remember { gamepadMappingRows() }
+
+    Column(verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s18)) {
+        SettingsSection(
+            title = "Controller",
+            isTablet = isTablet,
+            actions = { ShortcutsResetLabel(onClick = { resetGamepadSettings() }) },
+        ) {
+            SettingsGroup(isTablet = isTablet) {
+                SettingsSwitchRow(
+                    title = "Gamepad control",
+                    description = when {
+                        !enabled -> "Drive Nuvio with a PlayStation or Xbox controller, wired or over Bluetooth."
+                        connected -> "Controller connected."
+                        else -> "No controller detected. Connect one over USB or Bluetooth — no extra drivers needed."
+                    },
+                    checked = enabled,
+                    isTablet = isTablet,
+                    onCheckedChange = { setGamepadEnabled(it) },
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                GamepadSliderRow(
+                    title = "Stick dead zone",
+                    description = "How far the left stick must move before it counts. Raise this if the UI drifts on its own.",
+                    value = deadZone,
+                    valueRange = gamepadDeadZoneRange(),
+                    valueLabel = "${(deadZone * 100).roundToInt()}%",
+                    enabled = enabled,
+                    isTablet = isTablet,
+                    onValueChange = { setGamepadDeadZone(it) },
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                GamepadSliderRow(
+                    title = "Repeat speed",
+                    description = "Gap between steps while a direction is held.",
+                    value = repeatInterval.toFloat(),
+                    valueRange = gamepadRepeatIntervalRange().let { it.first.toFloat()..it.last.toFloat() },
+                    valueLabel = "$repeatInterval ms",
+                    enabled = enabled,
+                    isTablet = isTablet,
+                    onValueChange = { setGamepadRepeatIntervalMs(it.roundToInt()) },
+                )
+            }
+        }
+
+        SettingsSection(title = "Controller · Buttons", isTablet = isTablet) {
+            SettingsSectionNote(
+                text = "While a panel is open during playback, the D-pad navigates the panel instead.",
+                isTablet = isTablet,
+            )
+            SettingsGroup(isTablet = isTablet) {
+                rows.forEachIndexed { index, row ->
+                    if (index > 0) SettingsGroupDivider(isTablet = isTablet)
+                    // Rendered through the same row as every keyboard shortcut above: action on the
+                    // left, the thing you press on the right. The pad button is the key cap here.
+                    ShortcutRow(
+                        shortcut = Shortcut(row.browsingLabel, key(row.button.displayName)),
+                        isTablet = isTablet,
+                        description = "In player: ${row.playerLabel}",
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GamepadSliderRow(
+    title: String,
+    description: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    valueLabel: String,
+    enabled: Boolean,
+    isTablet: Boolean,
+    onValueChange: (Float) -> Unit,
+) {
     val tokens = MaterialTheme.nuvio
-    Text(
-        text = stringResource(Res.string.settings_shortcuts_reset_player),
-        style = MaterialTheme.typography.bodyMedium.accentBrush(),
-        color = tokens.colors.accent,
-        fontWeight = FontWeight.SemiBold,
+    // Held locally so the thumb tracks the drag; the repository only sees the settled value.
+    var draft by remember(value) { mutableStateOf(value) }
+    Row(
         modifier = Modifier
-            .clickable(onClick = onResetAll)
-            .padding(
-                horizontal = if (isTablet) 0.dp else NuvioTokens.Space.s12,
-                vertical = NuvioTokens.Space.s10,
-            ),
-    )
+            .fillMaxWidth()
+            .padding(horizontal = if (isTablet) 16.dp else NuvioTokens.Space.s12, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(
+            modifier = Modifier.weight(1f).padding(end = NuvioTokens.Space.s12),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
+                color = if (enabled) tokens.colors.textPrimary else tokens.colors.textMuted,
+                fontWeight = FontWeight.Medium,
+            )
+            SettingsSubtext(text = description, isTablet = isTablet)
+        }
+        Column(
+            modifier = Modifier.width(if (isTablet) 210.dp else 220.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            ValueBox(text = valueLabel)
+            SettingsModernSlider(
+                value = draft,
+                onValueChange = { if (enabled) draft = it },
+                onValueChangeFinished = { if (enabled) onValueChange(draft) },
+                enabled = enabled,
+                valueRange = valueRange,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
 }
 

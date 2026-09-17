@@ -149,7 +149,7 @@ internal object SimklScrobbleRepository {
                 return TrackingScrobbleResult.Declined
             }
 
-            log.d { "SIMKL scrobble $action response: ${response.status}" }
+            log.d { "SIMKL scrobble $action response: ${response.status} ${response.body.take(300)}" }
 
             when (response.status) {
                 in 200..299 -> {

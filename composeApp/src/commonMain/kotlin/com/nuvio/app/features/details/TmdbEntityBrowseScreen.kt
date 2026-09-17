@@ -15,15 +15,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,41 +30,36 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioBackButton
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 import com.nuvio.app.core.ui.landscapePosterHeightForWidth
 import com.nuvio.app.core.ui.landscapePosterWidth
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
-import com.nuvio.app.features.details.components.DetailPosterRailSection
+import com.nuvio.app.features.home.HeroDiscoveryBadgeTarget
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.HomeCatalogSection
 import com.nuvio.app.features.home.HomeContentMode
 import com.nuvio.app.features.home.HomeScreen
 import com.nuvio.app.features.home.stableKey
-import com.nuvio.app.features.tmdb.TmdbEntityBrowseData
 import com.nuvio.app.features.tmdb.TmdbEntityKind
 import com.nuvio.app.features.tmdb.TmdbEntityMediaType
+import com.nuvio.app.features.tmdb.TmdbEntityRail
+import com.nuvio.app.features.tmdb.TmdbEntityRailPageResult
 import com.nuvio.app.features.tmdb.TmdbEntityRailType
 import com.nuvio.app.features.tmdb.TmdbMetadataService
 import com.nuvio.app.features.watched.WatchedRepository
 import kotlinx.coroutines.launch
 
-private sealed interface EntityBrowseUiState {
-    data object Loading : EntityBrowseUiState
-    data class Error(val message: String) : EntityBrowseUiState
-    data class Success(val data: TmdbEntityBrowseData) : EntityBrowseUiState
+private sealed interface RailBrowseUiState {
+    data object Loading : RailBrowseUiState
+    data class Error(val message: String) : RailBrowseUiState
+    data class Success(val rails: List<TmdbEntityRail>) : RailBrowseUiState
 }
 
+/** The production-company / network browse opened from a details-page logo. */
 @Composable
 fun TmdbEntityBrowseScreen(
     entityKind: TmdbEntityKind,
@@ -81,102 +70,156 @@ fun TmdbEntityBrowseScreen(
     onOpenMeta: (MetaPreview) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var uiState by remember(entityKind, entityId) {
-        mutableStateOf<EntityBrowseUiState>(EntityBrowseUiState.Loading)
-    }
+    // The header name TMDB returns can differ from the name the logo carried; keep whichever the
+    // fetch settled on so the rail titles and the load-failed message agree.
+    var resolvedName by remember(entityKind, entityId) { mutableStateOf(entityName) }
+    TmdbRailBrowseScreen(
+        key = "${entityKind.routeValue}:$entityId",
+        name = resolvedName,
+        loadRails = {
+            TmdbMetadataService.fetchEntityBrowse(
+                entityKind = entityKind,
+                entityId = entityId,
+                sourceType = sourceType,
+                fallbackName = entityName,
+            )?.also { resolvedName = it.header.name }?.rails
+        },
+        loadNextPage = { rail ->
+            TmdbMetadataService.fetchNextEntityRailPage(
+                entityKind = entityKind,
+                entityId = entityId,
+                rail = rail,
+            )
+        },
+        onBack = onBack,
+        onOpenMeta = onOpenMeta,
+        modifier = modifier,
+    )
+}
+
+/** The browse opened by clicking a hero discovery badge — see [HeroDiscoveryBadgeTarget]. */
+@Composable
+fun HeroBadgeBrowseScreen(
+    target: HeroDiscoveryBadgeTarget,
+    title: String,
+    sourceType: String,
+    onBack: () -> Unit,
+    onOpenMeta: (MetaPreview) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    TmdbRailBrowseScreen(
+        key = "badge:$target",
+        name = title,
+        loadRails = { TmdbMetadataService.fetchBadgeBrowse(target = target, sourceType = sourceType) },
+        loadNextPage = { rail -> TmdbMetadataService.fetchNextBadgeRailPage(target = target, rail = rail) },
+        onBack = onBack,
+        onOpenMeta = onOpenMeta,
+        modifier = modifier,
+    )
+}
+
+/**
+ * A full-screen set of paginated TMDB rails with a back button: the shell shared by the
+ * company/network browse and the hero badge browse. Callers supply the two fetches; everything
+ * else — load state, retry, per-rail paging, the Home-style catalog rendering — is the same.
+ *
+ * [loadRails] returns null when the source is unavailable (no TMDB key) and an empty list when
+ * it answered with nothing; both show the error state, since a badge browse with no rails is
+ * indistinguishable from a failed one to the viewer.
+ */
+@Composable
+internal fun TmdbRailBrowseScreen(
+    key: String,
+    name: String,
+    loadRails: suspend () -> List<TmdbEntityRail>?,
+    loadNextPage: suspend (TmdbEntityRail) -> TmdbEntityRailPageResult,
+    onBack: () -> Unit,
+    onOpenMeta: (MetaPreview) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var uiState by remember(key) { mutableStateOf<RailBrowseUiState>(RailBrowseUiState.Loading) }
     val watchedUiState by remember {
         WatchedRepository.ensureLoaded()
         WatchedRepository.uiState
     }.collectAsStateWithLifecycle()
-    val loadFailedMessage = stringResource(Res.string.details_browse_load_failed, entityName)
+    val loadFailedMessage = stringResource(Res.string.details_browse_load_failed, name)
     val coroutineScope = rememberCoroutineScope()
-    // Retry has no other key to change: the entity is the same one that just failed, so without a
+    // Retry has no other key to change: the source is the same one that just failed, so without a
     // generation counter the effect below never re-runs and the button only ever redraws the
-    // skeleton. Reset with the entity so a fresh screen starts from zero.
-    var loadGeneration by remember(entityKind, entityId) { mutableStateOf(0) }
+    // skeleton. Reset with the key so a fresh screen starts from zero.
+    var loadGeneration by remember(key) { mutableStateOf(0) }
 
-    LaunchedEffect(entityKind, entityId, loadGeneration) {
-        uiState = EntityBrowseUiState.Loading
-        val data = TmdbMetadataService.fetchEntityBrowse(
-            entityKind = entityKind,
-            entityId = entityId,
-            sourceType = sourceType,
-            fallbackName = entityName,
-        )
-        uiState = if (data != null) {
-            EntityBrowseUiState.Success(data)
+    LaunchedEffect(key, loadGeneration) {
+        uiState = RailBrowseUiState.Loading
+        val rails = loadRails()
+        uiState = if (!rails.isNullOrEmpty()) {
+            RailBrowseUiState.Success(rails)
         } else {
-            EntityBrowseUiState.Error(loadFailedMessage)
+            RailBrowseUiState.Error(loadFailedMessage)
         }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
         Crossfade(
             targetState = uiState,
-            label = "EntityBrowseCrossfade",
+            label = "RailBrowseCrossfade",
         ) { state ->
             when (state) {
-                is EntityBrowseUiState.Loading -> EntityBrowseSkeleton()
-                is EntityBrowseUiState.Error -> EntityBrowseError(
+                is RailBrowseUiState.Loading -> EntityBrowseSkeleton()
+                is RailBrowseUiState.Error -> EntityBrowseError(
                     message = state.message,
                     onRetry = { loadGeneration += 1 },
                 )
-                is EntityBrowseUiState.Success -> {
+                is RailBrowseUiState.Success -> {
                     val labels = EntityCatalogLabels(
                         movies = stringResource(Res.string.media_movies),
                         series = stringResource(Res.string.media_series),
                         popular = stringResource(Res.string.details_browse_rail_popular),
                         topRated = stringResource(Res.string.details_browse_rail_top_rated),
                         recent = stringResource(Res.string.details_browse_rail_recent),
+                        winners = stringResource(Res.string.details_browse_rail_winners),
+                        nominees = stringResource(Res.string.details_browse_rail_nominees),
                     )
-                    val sections = remember(state.data, labels) {
-                        buildEntityCatalogSections(state.data, labels)
+                    val sections = remember(state.rails, labels, name) {
+                        buildEntityCatalogSections(state.rails, name, labels)
                     }
                     HomeScreen(
                         contentMode = HomeContentMode.Catalogs(
-                            key = "${entityKind.routeValue}:$entityId",
+                            key = key,
                             sections = sections,
                         ),
                         topChromePadding = 72.dp,
                         onBack = onBack,
                         onLoadMoreCatalog = { section ->
-                            val current = (uiState as? EntityBrowseUiState.Success)?.data
+                            val current = (uiState as? RailBrowseUiState.Success)?.rails
                                 ?: return@HomeScreen
-                            val railIndex = current.rails.indexOfFirst { entityRailKey(it) == section.key }
-                            val rail = current.rails.getOrNull(railIndex)
+                            val railIndex = current.indexOfFirst { entityRailKey(it) == section.key }
+                            val rail = current.getOrNull(railIndex)
                                 ?: return@HomeScreen
                             if (rail.isLoading || !rail.hasMore) return@HomeScreen
 
-                            uiState = EntityBrowseUiState.Success(
-                                current.copy(
-                                    rails = current.rails.toMutableList().also { rails ->
-                                        rails[railIndex] = rail.copy(isLoading = true)
-                                    },
-                                ),
+                            uiState = RailBrowseUiState.Success(
+                                current.toMutableList().also { rails ->
+                                    rails[railIndex] = rail.copy(isLoading = true)
+                                },
                             )
                             coroutineScope.launch {
-                                val page = TmdbMetadataService.fetchNextEntityRailPage(
-                                    entityKind = entityKind,
-                                    entityId = entityId,
-                                    rail = rail,
-                                )
-                                val latest = (uiState as? EntityBrowseUiState.Success)?.data
+                                val page = loadNextPage(rail)
+                                val latest = (uiState as? RailBrowseUiState.Success)?.rails
                                     ?: return@launch
-                                val latestIndex = latest.rails.indexOfFirst { entityRailKey(it) == section.key }
-                                val latestRail = latest.rails.getOrNull(latestIndex) ?: return@launch
+                                val latestIndex = latest.indexOfFirst { entityRailKey(it) == section.key }
+                                val latestRail = latest.getOrNull(latestIndex) ?: return@launch
                                 val mergedItems = (latestRail.items + page.items)
                                     .distinctBy(MetaPreview::stableKey)
-                                uiState = EntityBrowseUiState.Success(
-                                    latest.copy(
-                                        rails = latest.rails.toMutableList().also { rails ->
-                                            rails[latestIndex] = latestRail.copy(
-                                                items = mergedItems,
-                                                currentPage = rail.currentPage + 1,
-                                                hasMore = page.hasMore,
-                                                isLoading = false,
-                                            )
-                                        },
-                                    ),
+                                uiState = RailBrowseUiState.Success(
+                                    latest.toMutableList().also { rails ->
+                                        rails[latestIndex] = latestRail.copy(
+                                            items = mergedItems,
+                                            currentPage = rail.currentPage + 1,
+                                            hasMore = page.hasMore,
+                                            isLoading = false,
+                                        )
+                                    },
                                 )
                             }
                         },
@@ -203,12 +246,20 @@ internal data class EntityCatalogLabels(
     val popular: String,
     val topRated: String,
     val recent: String,
+    val winners: String = "Winners",
+    val nominees: String = "Nominees",
 )
 
+/**
+ * Rails → Home catalog sections. Titles read `Movies • Popular • HBO`; a
+ * [TmdbEntityRailType.FEATURED] rail has no rail label of its own (the name *is* the list), so it
+ * reads `Movies • Trending`.
+ */
 internal fun buildEntityCatalogSections(
-    data: TmdbEntityBrowseData,
+    rails: List<TmdbEntityRail>,
+    name: String,
     labels: EntityCatalogLabels,
-): List<HomeCatalogSection> = data.rails.map { rail ->
+): List<HomeCatalogSection> = rails.map { rail ->
     val mediaLabel = when (rail.mediaType) {
         TmdbEntityMediaType.MOVIE -> labels.movies
         TmdbEntityMediaType.TV -> labels.series
@@ -217,12 +268,15 @@ internal fun buildEntityCatalogSections(
         TmdbEntityRailType.POPULAR -> labels.popular
         TmdbEntityRailType.TOP_RATED -> labels.topRated
         TmdbEntityRailType.RECENT -> labels.recent
+        TmdbEntityRailType.WINNERS -> labels.winners
+        TmdbEntityRailType.NOMINEES -> labels.nominees
+        TmdbEntityRailType.FEATURED -> null
     }
     HomeCatalogSection(
         key = entityRailKey(rail),
-        title = "$mediaLabel • $railLabel • ${data.header.name}",
+        title = listOfNotNull(mediaLabel, railLabel, name).joinToString(" • "),
         subtitle = "",
-        addonName = data.header.name,
+        addonName = name,
         items = rail.items,
         availableItemCount = rail.items.size + if (rail.hasMore) 1 else 0,
         hasMore = rail.hasMore,
@@ -233,181 +287,8 @@ internal fun buildEntityCatalogSections(
     )
 }
 
-private fun entityRailKey(rail: com.nuvio.app.features.tmdb.TmdbEntityRail): String =
+private fun entityRailKey(rail: TmdbEntityRail): String =
     "tmdb-entity:${rail.mediaType.value}:${rail.railType.value}"
-
-@Composable
-private fun EntityBrowseContent(
-    data: TmdbEntityBrowseData,
-    sourceType: String,
-    watchedKeys: Set<String>,
-    onOpenMeta: (MetaPreview) -> Unit,
-) {
-    val backgroundUrl = remember(data.rails, sourceType) {
-        val preferredMediaType = if (sourceType.trim().equals("movie", ignoreCase = true)) {
-            TmdbEntityMediaType.MOVIE
-        } else {
-            TmdbEntityMediaType.TV
-        }
-        data.rails.firstOrNull { it.mediaType == preferredMediaType }
-            ?.items?.firstOrNull()?.poster
-            ?: data.rails.firstOrNull()?.items?.firstOrNull()?.poster
-    }
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        if (backgroundUrl != null) {
-            AsyncImage(
-                model = backgroundUrl,
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-                alpha = 0.10f,
-            )
-        }
-
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        0f to MaterialTheme.colorScheme.background.copy(alpha = 0.7f),
-                        0.3f to MaterialTheme.colorScheme.background.copy(alpha = 0.95f),
-                        1f to MaterialTheme.colorScheme.background,
-                    ),
-                ),
-        )
-
-        if (data.rails.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = stringResource(Res.string.catalog_empty_title),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .windowInsetsPadding(WindowInsets.statusBars)
-                    .padding(top = 56.dp),
-            ) {
-                EntityHeroSection(
-                    header = data.header,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 16.dp),
-                )
-
-                data.rails.forEach { rail ->
-                    val mediaLabel = when (rail.mediaType) {
-                        TmdbEntityMediaType.MOVIE -> stringResource(Res.string.media_movies)
-                        TmdbEntityMediaType.TV -> stringResource(Res.string.media_series)
-                    }
-                    val railLabel = when (rail.railType) {
-                        TmdbEntityRailType.POPULAR -> stringResource(Res.string.details_browse_rail_popular)
-                        TmdbEntityRailType.TOP_RATED -> stringResource(Res.string.details_browse_rail_top_rated)
-                        TmdbEntityRailType.RECENT -> stringResource(Res.string.details_browse_rail_recent)
-                    }
-                    val railTitle = stringResource(Res.string.details_browse_rail_title, mediaLabel, railLabel)
-
-                    DetailPosterRailSection(
-                        title = railTitle,
-                        items = rail.items,
-                        watchedKeys = watchedKeys,
-                        headerHorizontalPadding = 20.dp,
-                        onPosterClick = onOpenMeta,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
-
-                Spacer(modifier = Modifier.height(32.dp))
-            }
-        }
-    }
-}
-
-@Composable
-private fun EntityHeroSection(
-    header: com.nuvio.app.features.tmdb.TmdbEntityHeader,
-    modifier: Modifier = Modifier,
-) {
-    val hasLogo = !header.logo.isNullOrBlank()
-
-    Column(modifier = modifier.padding(horizontal = 20.dp)) {
-        Text(
-            text = when (header.kind) {
-                TmdbEntityKind.COMPANY -> stringResource(Res.string.details_browse_kind_company)
-                TmdbEntityKind.NETWORK -> stringResource(Res.string.details_browse_kind_network)
-            },
-            style = MaterialTheme.typography.labelLarge.copy(
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 0.4.sp,
-            ),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        if (hasLogo) {
-            Box(
-                modifier = Modifier
-                    .height(60.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.White)
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                AsyncImage(
-                    model = header.logo,
-                    contentDescription = header.name,
-                    modifier = Modifier.height(44.dp),
-                    contentScale = ContentScale.Fit,
-                )
-            }
-            Spacer(modifier = Modifier.height(12.dp))
-        }
-
-        Text(
-            text = header.name,
-            style = MaterialTheme.typography.headlineLarge.copy(
-                fontWeight = FontWeight.ExtraBold,
-                letterSpacing = (-0.5).sp,
-            ),
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-
-        val metaLine = listOfNotNull(
-            header.originCountry?.takeIf { it.isNotBlank() },
-            header.secondaryLabel?.takeIf { it.isNotBlank() },
-        ).joinToString(" • ")
-        if (metaLine.isNotBlank()) {
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = metaLine,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        header.description?.takeIf { it.isNotBlank() }?.let { description ->
-            Spacer(modifier = Modifier.height(10.dp))
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodyMedium.copy(lineHeight = 20.sp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
 
 @Composable
 private fun EntityBrowseSkeleton() {

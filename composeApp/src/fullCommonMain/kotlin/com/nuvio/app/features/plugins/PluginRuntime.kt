@@ -5,7 +5,6 @@ import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
 import com.dokar.quickjs.binding.define
 import com.dokar.quickjs.binding.function
-import com.dokar.quickjs.quickJs
 import com.fleeksoft.ksoup.Ksoup
 import com.fleeksoft.ksoup.nodes.Document
 import com.fleeksoft.ksoup.nodes.Element
@@ -21,6 +20,9 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -44,6 +46,20 @@ private const val PLUGIN_TIMEOUT_MS = 60_000L
 // QuickJS interrupts itself and throws, which unwinds the native stack cleanly — unlike cancelling
 // the coroutine from outside while native code is mid-call, which is what used to corrupt state.
 private const val PLUGIN_JS_EXECUTION_TIMEOUT_MS = 15_000L
+
+// Per-fetch ceilings, well inside PLUGIN_TIMEOUT_MS. The shared client's 60 s connect timeout was
+// sized for streaming, but a scraper fanning out over provider sites is dominated by hosts that
+// are simply gone: Windows spends ~21 s per SYN attempt before reporting a connect failure, and
+// with ~200 scrapers sharing MAX_CONCURRENT_PLUGIN_RUNTIMES slots each dead host held a slot for
+// that long. Plugin bodies are capped at MAX_FETCH_BODY_CHARS, so a healthy transfer never needs
+// anything like the call ceiling.
+private const val PLUGIN_FETCH_CONNECT_TIMEOUT_MS = 8_000L
+private const val PLUGIN_FETCH_CALL_TIMEOUT_MS = 20_000L
+
+// Longest a playback-startup hold (see PluginRepository.setPlaybackStartupHold) may defer a
+// scraper. A source that never renders is the stream-failover watchdog's job; this only makes
+// sure a missed release cannot turn into a scraper that waits out its whole PLUGIN_TIMEOUT_MS.
+private const val PLAYBACK_STARTUP_HOLD_CAP_MS = 30_000L
 
 // Caps the JS heap of a single scraper so a runaway allocation surfaces as a catchable JS error
 // instead of exhausting the process. Generous: response bodies are already capped at 1 MB each.
@@ -95,6 +111,56 @@ internal object PluginRuntime {
     // evaluation. Not a correctness guard — see MAX_CONCURRENT_PLUGIN_RUNTIMES.
     private val runtimeSlots = Semaphore(MAX_CONCURRENT_PLUGIN_RUNTIMES)
 
+    // quickjs-kt (1.0.8) keeps its JNI class cache (`jclass` global refs for String, QuickJs, ...)
+    // and a plain `static int instance_count` as process-wide statics with no locking. When a
+    // runtime closes and that count reads <= 0 it deletes every cached global ref and forgets the
+    // JavaVM. Two runtimes creating or closing at the same moment race the count, and two closing
+    // at once can both take the "last one out" branch and DeleteGlobalRef the same handle twice.
+    // The JVM recycles global-ref slots, so the second delete frees whatever ref took the slot in
+    // between — seen in the wild on 2026-09-14 as the AWT toolkit thread dying with
+    // `NoSuchMethodError: com/dokar/quickjs/QuickJs.postEvent(AWTEvent)`: AWT's own cached class
+    // ref now pointed at the QuickJs class. The app simply closed, from the Home page, with no
+    // crash dump, which is the shape of the plugin-only silent CTD reports. Two guards, both
+    // outside the library: creates and closes take [runtimeLifecycleLock] so the count is never
+    // updated concurrently, and [sentinelRuntime] is never closed so the count never reaches zero
+    // and the cache-clearing branch is unreachable. Evaluation itself stays concurrent.
+    private val runtimeLifecycleLock = Any()
+    private val sentinelRuntime: QuickJs by lazy { QuickJs.create(jobDispatcher = pluginDispatcher) }
+
+    /**
+     * The library's `quickJs(dispatcher) { }` DSL with the runtime's creation and close serialised
+     * across all runtimes; see [runtimeLifecycleLock]. Inline so [block] may suspend.
+     */
+    private inline fun <T> withPluginRuntime(dispatcher: CoroutineDispatcher, block: QuickJs.() -> T): T {
+        val runtime = synchronized(runtimeLifecycleLock) {
+            sentinelRuntime
+            QuickJs.create(jobDispatcher = dispatcher)
+        }
+        return try {
+            runtime.block()
+        } finally {
+            synchronized(runtimeLifecycleLock) { runtime.close() }
+        }
+    }
+
+    private val playbackStartupHold = MutableStateFlow(false)
+    @Volatile
+    private var playbackStartupHoldSinceMs = 0L
+
+    fun setPlaybackStartupHold(active: Boolean) {
+        if (active && !playbackStartupHold.value) playbackStartupHoldSinceMs = System.currentTimeMillis()
+        playbackStartupHold.value = active
+    }
+
+    // Sits in front of the slot queue, not inside it: a held scraper must not occupy a runtime
+    // slot, or the hold would also block the settings-layout evaluation that shares the pool.
+    private suspend fun awaitPlaybackStartupHoldRelease() {
+        if (!playbackStartupHold.value) return
+        val remainingMs = PLAYBACK_STARTUP_HOLD_CAP_MS - (System.currentTimeMillis() - playbackStartupHoldSinceMs)
+        if (remainingMs <= 0) return
+        withTimeoutOrNull(remainingMs) { playbackStartupHold.first { !it } }
+    }
+
     suspend fun executePlugin(
         code: String,
         tmdbId: String,
@@ -104,6 +170,7 @@ internal object PluginRuntime {
         scraperId: String,
         scraperSettings: Map<String, Any> = emptyMap(),
     ): List<PluginRuntimeResult> = withContext(pluginDispatcher) {
+        awaitPlaybackStartupHoldRelease()
         // The slot is taken outside the timeout on purpose. Charging queue time to the budget only
         // works when the queue is short; with more enabled scrapers than slots the ones at the back
         // spent their entire budget waiting and timed out having never run a line of JavaScript.
@@ -162,7 +229,7 @@ internal object PluginRuntime {
             withConfinedRuntimeThread(scraperId) { confined ->
                 withTimeout(PLUGIN_TIMEOUT_MS) {
                     var layoutJson: String? = null
-                    quickJs(confined) {
+                    withPluginRuntime(confined) {
                         applyPluginRuntimeLimits()
                         // onSettings implementations fetch remote option lists and parse them, so
                         // they need the same host API surface the scraper entry point gets.
@@ -172,7 +239,7 @@ internal object PluginRuntime {
                             null
                         }
 
-                        evaluate<Any?>(buildPolyfillCode(scraperId, "{}"))
+                        evaluatePolyfill(scraperId, "{}")
                         evaluate<Any?>(wrapPluginModule(code))
                         evaluate<Any?>(
                             """
@@ -206,10 +273,17 @@ internal object PluginRuntime {
         runtimeDispatcher: CoroutineDispatcher,
     ): List<PluginRuntimeResult> {
         val dom = PluginDomCache()
-        var resultJson = "[]"
+        // Null until the plugin actually reports, so "returned no streams" and "never reported at
+        // all" stay distinguishable. They used to share the initial "[]", which made a dropped
+        // result completely silent — `parseJsonResults` only complains when the payload is
+        // something other than "[]", so the one case worth shouting about was the one case it
+        // stayed quiet for. `overlapping scraper runtimes all complete` fails intermittently with
+        // exactly this shape (one scraper of forty returning nothing) and could not be diagnosed
+        // from a log because of it.
+        var resultJson: String? = null
 
         try {
-            quickJs(runtimeDispatcher) {
+            withPluginRuntime(runtimeDispatcher) {
                 applyPluginRuntimeLimits()
                 registerPluginBindings(scraperId, dom)
 
@@ -219,7 +293,7 @@ internal object PluginRuntime {
                 }
 
                 val settingsJson = toJsonElement(scraperSettings).toString()
-                evaluate<Any?>(buildPolyfillCode(scraperId, settingsJson))
+                evaluatePolyfill(scraperId, settingsJson)
                 evaluate<Any?>(wrapPluginModule(code))
 
                 val tmdbIdArg = JsonPrimitive(tmdbId).toString()
@@ -247,7 +321,14 @@ internal object PluginRuntime {
                 )
             }
 
-            return parseJsonResults(resultJson, scraperId)
+            val captured = resultJson
+            if (captured == null) {
+                // Not "the scraper found nothing": the capture binding never ran. Loud, because it
+                // means a result was lost somewhere between the JS returning and this line.
+                log.e { "Plugin:$scraperId produced no result payload — capture never ran" }
+                return emptyList()
+            }
+            return parseJsonResults(captured, scraperId)
         } finally {
             dom.clear()
         }
@@ -300,22 +381,23 @@ internal object PluginRuntime {
             val headersJson = args.getOrNull(2)?.toString() ?: "{}"
             val body = args.getOrNull(3)?.toString() ?: ""
             val followRedirects = args.getOrNull(4) as? Boolean ?: true
+            val host = PluginHostFailureCache.hostOf(url)
+            val cachedFailure = host?.let(PluginHostFailureCache::recentFailure)
+            if (cachedFailure != null) {
+                // Same shape as a real failure so the scraper's own error handling runs unchanged;
+                // it just does not wait out the connect timeout a sibling already paid for.
+                log.d { "Plugin:$scraperId fetch skipped for $method $url — $host recently unreachable ($cachedFailure)" }
+                return@asyncFunction failedFetchResult(url, "Host unreachable ($cachedFailure)")
+            }
             try {
                 performNativeFetch(url, method, headersJson, body, followRedirects)
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (error: Throwable) {
                 log.e(error) { "Plugin:$scraperId fetch failed for $method $url" }
-                JsonObject(
-                    mapOf(
-                        "ok" to JsonPrimitive(false),
-                        "status" to JsonPrimitive(0),
-                        "statusText" to JsonPrimitive(error.message ?: "Fetch failed"),
-                        "url" to JsonPrimitive(url),
-                        "body" to JsonPrimitive(""),
-                        "headers" to JsonObject(emptyMap()),
-                    ),
-                ).toString()
+                val reason = PluginHostFailureCache.unreachableReason(error)
+                if (host != null && reason != null) PluginHostFailureCache.recordFailure(host, reason)
+                failedFetchResult(url, error.message ?: "Fetch failed")
             }
         }
 
@@ -488,6 +570,17 @@ internal object PluginRuntime {
             "[" + ids.joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" } + "]"
     }
 
+    private fun failedFetchResult(url: String, statusText: String): String = JsonObject(
+        mapOf(
+            "ok" to JsonPrimitive(false),
+            "status" to JsonPrimitive(0),
+            "statusText" to JsonPrimitive(statusText),
+            "url" to JsonPrimitive(url),
+            "body" to JsonPrimitive(""),
+            "headers" to JsonObject(emptyMap()),
+        ),
+    ).toString()
+
     private suspend fun performNativeFetch(
         url: String,
         method: String,
@@ -506,6 +599,8 @@ internal object PluginRuntime {
             headers = headers,
             body = body,
             followRedirects = followRedirects,
+            callTimeoutMs = PLUGIN_FETCH_CALL_TIMEOUT_MS,
+            connectTimeoutMs = PLUGIN_FETCH_CONNECT_TIMEOUT_MS,
         )
 
         val truncated = response.body.length > MAX_FETCH_BODY_CHARS
@@ -679,10 +774,32 @@ internal object PluginRuntime {
         else -> JsonPrimitive(value.toString())
     }
 
-    private fun buildPolyfillCode(scraperId: String, settingsJson: String): String {
-        return """
-            globalThis.SCRAPER_ID = "$scraperId";
-            globalThis.SCRAPER_SETTINGS = $settingsJson;
+    /** The only per-scraper part of the polyfill; everything else is [STATIC_POLYFILL_CODE]. */
+    private fun buildPolyfillPrelude(scraperId: String, settingsJson: String): String = """
+        globalThis.SCRAPER_ID = "$scraperId";
+        globalThis.SCRAPER_SETTINGS = $settingsJson;
+    """.trimIndent()
+
+    // Compiled once per process. Every scraper run starts a fresh runtime, and parsing ~25 KB of
+    // polyfill source each time was pure repeated work — on a slow CPU with a few hundred scrapers
+    // per search it is a measurable slice of the CPU the runtimes take from the UI and decoder.
+    // QuickJS bytecode is runtime-independent within one QuickJS build, so one compile serves
+    // every runtime. Compiled lazily on the first runtime rather than at class load so a compile
+    // failure (it should not happen — the source is ours) degrades to evaluating the source.
+    @Volatile
+    private var cachedStaticPolyfillBytecode: ByteArray? = null
+
+    private suspend fun QuickJs.evaluatePolyfill(scraperId: String, settingsJson: String) {
+        evaluate<Any?>(buildPolyfillPrelude(scraperId, settingsJson))
+        val bytecode = cachedStaticPolyfillBytecode
+            ?: runCatching { compile(STATIC_POLYFILL_CODE, "polyfill.js", false) }
+                .onFailure { error -> log.w(error) { "Static polyfill bytecode compile failed; evaluating source" } }
+                .getOrNull()
+                ?.also { cachedStaticPolyfillBytecode = it }
+        if (bytecode != null) evaluate<Any?>(bytecode) else evaluate<Any?>(STATIC_POLYFILL_CODE)
+    }
+
+    private val STATIC_POLYFILL_CODE: String = """
             if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
             if (typeof globalThis.window === 'undefined') globalThis.window = globalThis;
             if (typeof globalThis.self === 'undefined') globalThis.self = globalThis;
@@ -1186,7 +1303,6 @@ internal object PluginRuntime {
                 };
             }
         """.trimIndent()
-    }
 }
 
 internal fun sanitizePluginRequestHeaders(headers: Map<String, String>): Map<String, String> =

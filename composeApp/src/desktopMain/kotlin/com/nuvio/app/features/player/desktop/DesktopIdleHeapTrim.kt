@@ -1,6 +1,6 @@
 package com.nuvio.app.features.player.desktop
 
-import com.nuvio.app.core.ui.trimDecodedAnimationCache
+import com.nuvio.app.core.ui.DesktopArtworkCaches
 
 /**
  * Returns committed-but-unused heap to the OS at the one moment a collection pause cannot be seen:
@@ -38,17 +38,20 @@ internal object DesktopIdleHeapTrim {
      * Latched so a run of visibility events cannot chain full collections back to back: hiding
      * trims once, and nothing trims again until the window has been shown and hidden anew. The
      * latch is unsynchronised because every caller is on the AWT event thread; keep it that way.
+     * (The artwork caches below take their own lock, so keep that call cheap — it runs on the event
+     * thread too.)
      */
     fun onWindowVisibilityChanged(visible: Boolean) {
+        DesktopArtworkCaches.onWindowVisibilityChanged(visible)
         if (visible) {
             trimmedWhileHidden = false
             return
         }
         if (trimmedWhileHidden) return
         trimmedWhileHidden = true
-        // Native frames first: this is the bigger reclaim, and unlike the heap it is unaffected by
-        // whether the collection below actually decides to uncommit anything.
-        trimDecodedAnimationCache()
+        // Native frames went first, in the artwork-cache call above: that is the bigger reclaim,
+        // and unlike the heap it is unaffected by whether this collection decides to uncommit
+        // anything at all.
         System.gc()
     }
 }

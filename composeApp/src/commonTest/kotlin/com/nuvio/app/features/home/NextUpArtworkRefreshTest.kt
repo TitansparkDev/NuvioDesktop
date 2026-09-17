@@ -414,4 +414,35 @@ class NextUpArtworkRefreshTest {
 
         assertEquals(listOf("tt1"), plan.candidatesToResolve.map { it.content.id })
     }
+
+    @Test
+    fun `a still that failed to load is queued for another resolve`() {
+        val dead = "https://episodes.metahub.space/tt1/1/5/w780.jpg"
+
+        val plan = planNextUpResolution(
+            completedSeriesCandidates = listOf(candidate("tt1")),
+            cachedNextUpItems = mapOf(cachedCard(contentId = "tt1", episodeThumbnail = dead)),
+            hasArtworkLoadFailed = { url -> url == dead },
+        )
+
+        assertEquals(setOf("tt1"), plan.staleArtworkContentIds)
+        assertEquals(listOf("tt1"), plan.candidatesToResolve.map { it.content.id })
+    }
+
+    @Test
+    fun `a still that loads keeps the card finished`() {
+        val plan = planNextUpResolution(
+            completedSeriesCandidates = listOf(candidate("tt1")),
+            cachedNextUpItems = mapOf(
+                cachedCard(
+                    contentId = "tt1",
+                    episodeThumbnail = "https://episodes.metahub.space/tt1/1/5/w780.jpg",
+                ),
+            ),
+            hasArtworkLoadFailed = { false },
+        )
+
+        assertEquals(emptySet(), plan.staleArtworkContentIds)
+        assertTrue(plan.candidatesToResolve.isEmpty())
+    }
 }

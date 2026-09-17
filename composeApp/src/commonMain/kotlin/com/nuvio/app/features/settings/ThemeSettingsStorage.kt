@@ -23,6 +23,8 @@ internal expect object ThemeSettingsStorage {
     fun saveLiquidGlassNativeTabBarEnabled(enabled: Boolean)
     fun loadDesktopColumnGuidesVisible(): Boolean?
     fun saveDesktopColumnGuidesVisible(visible: Boolean)
+    fun loadDesktopSettingsFullWidth(): Boolean?
+    fun saveDesktopSettingsFullWidth(enabled: Boolean)
     fun loadWasdNavigationEnabled(): Boolean?
     fun saveWasdNavigationEnabled(enabled: Boolean)
     fun loadDesktopNavigationLayout(): String?

@@ -18,6 +18,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
@@ -34,6 +36,10 @@ internal actual object DiscordRichPresencePlatform {
     private var connection: DiscordIpcConnection? = null
     private var connectedClientId: String? = null
     private var lastPayloadKey: String? = null
+    private val artworkProbeCache = object : LinkedHashMap<String, ArtworkProbe>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArtworkProbe>): Boolean =
+            size > ARTWORK_PROBE_CACHE_LIMIT
+    }
 
     actual fun update(activity: DiscordRichPresenceActivity?) {
         scope.launch {
@@ -57,6 +63,7 @@ internal actual object DiscordRichPresencePlatform {
                 }
 
                 runCatching {
+                    val activity = activity.withResolvedArtwork()
                     val discordActivity = activity.toDiscordActivity()
                     try {
                         activeConnection.setActivity(discordActivity)
@@ -142,6 +149,73 @@ internal actual object DiscordRichPresencePlatform {
         connection = null
         connectedClientId = null
     }
+
+    /**
+     * Turns the artwork candidates into the URLs Discord is actually handed.
+     *
+     * A portrait poster goes through the resizing proxy so Discord's square slot letterboxes it
+     * instead of centre-cropping it. The proxy is asked first whether it can serve the image,
+     * because its failure modes are otherwise invisible: it refuses whole TLDs and hosts by
+     * policy (`.cc` among them) and with a `default=` attached it would quietly 302 Discord to
+     * the raw fallback — a plain poster, un-letterboxed — which looked like the custom poster
+     * service being ignored. So the fallback walk happens here, one HEAD per URL, cached:
+     *   proxy 2xx  → the proxied URL;
+     *   proxy 400  → the proxy's own policy refusal, not the origin's — send the raw URL and
+     *                accept the crop, Discord fetches it itself;
+     *   proxy 404  → the origin cannot be fetched at all — step to the next candidate;
+     *   no answer  → the proxy is down; the raw URL is still better than the logo.
+     * Landscape art (`Cover`) is sent raw as before.
+     */
+    private fun DiscordRichPresenceActivity.withResolvedArtwork(): DiscordRichPresenceActivity {
+        if (imageFit != DiscordRichPresenceImageFit.Contain) return this
+        val candidates = listOfNotNull(imageUrl, fallbackImageUrl)
+            .map { it.trim() }
+            .filter { it.startsWith("https://") || it.startsWith("http://") }
+            .distinct()
+        candidates.forEachIndexed { index, candidate ->
+            val remaining = candidates.drop(index + 1).firstOrNull()
+            val proxied = fittedDiscordImageUrl(candidate)
+            val probe = artworkProbeCache[proxied] ?: probeArtworkProxy(proxied).also { result ->
+                artworkProbeCache[proxied] = result
+                println("[nuvio-discord] artwork ${artworkHost(candidate)}: ${result.name.lowercase()}")
+            }
+            when (probe) {
+                ArtworkProbe.Proxied -> return copy(imageUrl = proxied, fallbackImageUrl = remaining)
+                ArtworkProbe.ProxyRefused,
+                ArtworkProbe.ProxyUnavailable,
+                -> return copy(imageUrl = candidate, fallbackImageUrl = remaining)
+                ArtworkProbe.Unfetchable -> Unit
+            }
+        }
+        return copy(imageUrl = null, fallbackImageUrl = null)
+    }
+
+    private fun probeArtworkProxy(proxiedUrl: String): ArtworkProbe {
+        val connection = runCatching {
+            (URL(proxiedUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "HEAD"
+                connectTimeout = ARTWORK_PROBE_TIMEOUT_MS
+                readTimeout = ARTWORK_PROBE_TIMEOUT_MS
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "Nuvio")
+            }
+        }.getOrElse { return ArtworkProbe.ProxyUnavailable }
+        return try {
+            when (connection.responseCode) {
+                in 200..299 -> ArtworkProbe.Proxied
+                400 -> ArtworkProbe.ProxyRefused
+                in 500..599 -> ArtworkProbe.ProxyUnavailable
+                else -> ArtworkProbe.Unfetchable
+            }
+        } catch (_: IOException) {
+            ArtworkProbe.ProxyUnavailable
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun artworkHost(url: String): String =
+        url.substringAfter("://").substringBefore('/').substringBefore('?')
 
     private fun discordIpcPipeCandidates(): List<String> {
         val osName = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
@@ -271,9 +345,13 @@ private fun DiscordRichPresenceActivity.toDiscordActivity(): JsonObject {
     val episodeTitleText = episodeTitle?.trim()?.takeIf { it.isNotBlank() }
     if (type == DiscordRichPresenceActivityType.Browsing) {
         return buildJsonObject {
+            // Watching rather than Playing so the header carries an eye icon instead of a game
+            // controller while browsing; no per-activity name, so Discord shows the application
+            // name here. (Contributed by codeine.)
+            put("type", DISCORD_ACTIVITY_TYPE_WATCHING)
             put("details", truncateDiscordText(titleText))
             subtitleText?.let { put("state", truncateDiscordText(it)) }
-            put("assets", discordPresenceAssets(titleText, imageUrl, fallbackImageUrl, imageFit))
+            put("assets", discordPresenceAssets(titleText, imageUrl))
         }
     }
 
@@ -311,14 +389,36 @@ private fun DiscordRichPresenceActivity.toDiscordActivity(): JsonObject {
     val displayedState = pausedText?.state ?: subtitleText
 
     return buildJsonObject {
-        // Watching activities render start + end as a media progress bar in Discord clients.
-        // Newer clients also honour the per-activity name; older RPC clients retain the
-        // application name configured for this client ID and still show the title in details.
-        put("type", DISCORD_ACTIVITY_TYPE_WATCHING)
-        put("name", truncateDiscordText(titleText))
+        // Watching and Listening both render start + end as a media progress bar. Discord
+        // prefixes the name with the type's verb, so the header reads "Watching on Nuvio HTPC" /
+        // "Listening to Nuvio HTPC" and the title lives on the details line beneath it instead of
+        // being repeated. status_display_type = DETAILS keeps the member-list status on the title
+        // ("Watching Inception") rather than the name. Older RPC clients ignore both and fall
+        // back to the application name. (Layout contributed by codeine.)
+        val listening = activityStyle == DiscordActivityStyle.Listening
+        put("type", if (listening) DISCORD_ACTIVITY_TYPE_LISTENING else DISCORD_ACTIVITY_TYPE_WATCHING)
+        put(
+            "name",
+            when {
+                activityName == DiscordActivityName.Title -> truncateDiscordText(titleText)
+                listening -> DISCORD_LISTENING_ACTIVITY_NAME
+                else -> DISCORD_WATCHING_ACTIVITY_NAME
+            },
+        )
+        put("status_display_type", DISCORD_STATUS_DISPLAY_DETAILS)
         put("details", truncateDiscordText(displayedDetails))
         displayedState?.let { put("state", truncateDiscordText(it)) }
-        put("assets", discordPresenceAssets(titleText, imageUrl, fallbackImageUrl, imageFit, isPaused = !isPlaying))
+        // The Listening layout prints large_text as a third row (Spotify's album line), which
+        // for us would just repeat the title, so it carries no hover text in that style.
+        put(
+            "assets",
+            discordPresenceAssets(
+                title = titleText,
+                imageUrl = imageUrl,
+                isPaused = !isPlaying,
+                includeLargeText = !listening,
+            ),
+        )
         if (startEpochSeconds != null && endEpochSeconds != null && endEpochSeconds > startEpochSeconds) {
             put(
                 "timestamps",
@@ -381,29 +481,26 @@ private fun formatDiscordPlaybackTime(timeMs: Long): String {
 private fun discordPresenceAssets(
     title: String,
     imageUrl: String?,
-    fallbackImageUrl: String?,
-    imageFit: DiscordRichPresenceImageFit,
     isPaused: Boolean = false,
+    includeLargeText: Boolean = true,
 ): JsonObject =
     buildJsonObject {
+        // Already resolved by `withResolvedArtwork`: proxied, raw, or absent.
         val externalImage = imageUrl
             ?.trim()
             ?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
-        val displayImage = externalImage?.let { url ->
-            if (imageFit == DiscordRichPresenceImageFit.Contain) {
-                fittedDiscordImageUrl(url, fallbackImageUrl)
-            } else {
-                url
-            }
+        put("large_image", externalImage ?: DISCORD_LARGE_IMAGE_KEY)
+        if (includeLargeText) {
+            put("large_text", truncateDiscordText(if (externalImage != null) title else "Nuvio"))
         }
-        put("large_image", displayImage ?: DISCORD_LARGE_IMAGE_KEY)
-        put("large_text", truncateDiscordText(if (externalImage != null) title else "Nuvio"))
         // Keep the poster unobstructed while paused; the text rows already communicate that state.
         if (externalImage != null && !isPaused) {
             put("small_image", DISCORD_LARGE_IMAGE_KEY)
             put("small_text", "Nuvio")
         }
     }
+
+private enum class ArtworkProbe { Proxied, ProxyRefused, Unfetchable, ProxyUnavailable }
 
 private fun DiscordRichPresenceActivity.toPayloadKey(): String =
     listOf(
@@ -419,20 +516,18 @@ private fun DiscordRichPresenceActivity.toPayloadKey(): String =
         (positionMs.coerceAtLeast(0L) / 15_000L).toString(),
         durationMs.coerceAtLeast(0L).toString(),
         refreshNonce.toString(),
+        activityStyle.name,
+        activityName.name,
     ).joinToString("|")
 
 /**
- * Squares a portrait poster without cropping it, via the same proxy that also gives us a
- * server-side fallback: `default` is served whenever the primary cannot be fetched, so a poster
- * service that answers 404 for this particular title degrades to the episode thumbnail or backdrop
- * instead of leaving Discord with nothing. Discord follows the redirect the proxy issues for it.
+ * Squares a portrait poster without cropping it. No `default=` fallback on purpose: the proxy
+ * serves that as a bare redirect to the raw fallback, un-letterboxed and indistinguishable from
+ * the primary having worked. `withResolvedArtwork` walks the candidates itself instead.
  */
-private fun fittedDiscordImageUrl(sourceUrl: String, fallbackUrl: String?): String = buildString {
+private fun fittedDiscordImageUrl(sourceUrl: String): String = buildString {
     append("https://images.weserv.nl/?url=")
     append(URLEncoder.encode(sourceUrl, StandardCharsets.UTF_8))
-    fallbackUrl?.takeIf { it.isNotBlank() && it != sourceUrl }?.let { fallback ->
-        append("&default=").append(URLEncoder.encode(fallback, StandardCharsets.UTF_8))
-    }
     append("&w=512&h=512&fit=contain&bg=transparent")
 }
 
@@ -446,7 +541,13 @@ private const val OPCODE_PING = 3
 private const val OPCODE_PONG = 4
 private const val DISCORD_FRAME_HEADER_BYTES = 8
 private const val DISCORD_MAX_FRAME_BYTES = 1_048_576
+private const val DISCORD_ACTIVITY_TYPE_LISTENING = 2
 private const val DISCORD_ACTIVITY_TYPE_WATCHING = 3
+private const val DISCORD_STATUS_DISPLAY_DETAILS = 2
+private const val DISCORD_WATCHING_ACTIVITY_NAME = "on Nuvio HTPC"
+private const val DISCORD_LISTENING_ACTIVITY_NAME = "Nuvio HTPC"
 private const val DISCORD_TEXT_LIMIT = 128
+private const val ARTWORK_PROBE_TIMEOUT_MS = 5_000
+private const val ARTWORK_PROBE_CACHE_LIMIT = 128
 private const val DISCORD_APPLICATION_ID = "1522129829363843195"
 private const val DISCORD_LARGE_IMAGE_KEY = "nuvio_logo"

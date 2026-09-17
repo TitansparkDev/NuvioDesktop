@@ -22,8 +22,33 @@ internal object SimklWatchedRepository {
     private val log = Logger.withTag("SimklWatched")
     private val json = Json { ignoreUnknownKeys = true }
 
-    suspend fun watchedItems(): List<WatchedItem> {
+    private var cachedStampProfileId: Int? = null
+    private var cachedStamp: String? = null
+
+    /** See [invalidate]; also called when the pulled profile is not the one the stamp belongs to. */
+    fun invalidate() {
+        cachedStampProfileId = null
+        cachedStamp = null
+    }
+
+    suspend fun watchedItems(profileId: Int): List<WatchedItem> {
         val headers = SimklAuthRepository.authorizedHeaders() ?: return emptyList()
+        // This is the most expensive read in the app — the full history, ~14k rows on a real
+        // account, plus an episode-catalog backfill pass over every season-less show. It used to
+        // run once per launch, so its cost never mattered; it is now on a five-minute poll, where
+        // it very much does. SIMKL's own change stamp answers "is any of that worth downloading"
+        // in one small request, the same way the Continue Watching seeds and the library already
+        // gate themselves.
+        //
+        // An empty list is the correct "nothing changed" answer, not a degraded one: the caller
+        // merges additively, so it leaves the local store exactly as it is. Handing back a cached
+        // snapshot instead would re-add every tick the user has removed since — see the class
+        // comment.
+        val stamp = simklWatchedHistoryActivitiesStamp(SimklAuthRepository.fetchActivities())
+        if (stamp != null && stamp == cachedStamp && profileId == cachedStampProfileId) {
+            log.d { "SIMKL watched history: activities unchanged, skipping full fetch" }
+            return emptyList()
+        }
         // `extended=full` supplies seasons/episodes and `episode_watched_at=yes` distinguishes
         // watched episodes from the unwatched episode rows included in that extended response.
         val url = SimklAuthRepository.appendParams(
@@ -39,7 +64,12 @@ internal object SimklWatchedRepository {
             if (failure is CancellationException) throw failure
             error("SIMKL watched-history payload could not be parsed: ${failure.message}")
         }
-        return payload.toWatchedItems() + backfillSeasonlessEntries(payload)
+        val items = payload.toWatchedItems() + backfillSeasonlessEntries(payload)
+        // Stamped only after a fully successful read, so a failed backfill cannot mark a partial
+        // history as current and suppress the retry.
+        cachedStamp = stamp
+        cachedStampProfileId = profileId
+        return items
     }
 
     /**
@@ -82,6 +112,29 @@ internal object SimklWatchedRepository {
     private const val BACKFILL_CONCURRENCY = 6
 }
 
+/**
+ * The activities stamp that decides whether the full watched history is worth re-downloading.
+ *
+ * Deliberately the account-wide `all` rather than the per-category stamps used by the Continue
+ * Watching seed gate: watched history spans every list and every type, including the `dropped` and
+ * `hold` states [SimklCategoryActivity] does not model, so anything narrower risks missing a change
+ * — and the failure mode of this gate is silence, exactly the one that made the original bug so
+ * hard to see. Over-fetching when an unrelated setting changes is the cheaper mistake.
+ */
+internal fun simklWatchedHistoryActivitiesStamp(activities: SimklActivities?): String? {
+    if (activities == null) return null
+    activities.all?.takeIf { it.isNotBlank() }?.let { return "all=$it" }
+    val parts = listOf(
+        "shows" to activities.tvShows?.all,
+        "movies" to activities.movies?.all,
+        "anime" to activities.anime?.all,
+    )
+    if (parts.all { (_, value) -> value.isNullOrBlank() }) return null
+    return parts.joinToString("|") { (name, value) -> "$name=${value.orEmpty()}" }
+}
+
+private val watchedImportLog = Logger.withTag("SimklWatchedImport")
+
 internal fun SimklAllItemsResponse.toWatchedItems(): List<WatchedItem> = buildList {
     movies.forEach { entry ->
         if (entry.isRewatch) return@forEach
@@ -106,9 +159,19 @@ internal fun SimklAllItemsResponse.toWatchedItems(): List<WatchedItem> = buildLi
 
     fun addEpisodes(entry: SimklAllItemsEntry, anime: Boolean) {
         if (entry.isRewatch) return
-        val show = (if (anime) entry.anime else entry.show) ?: return
+        val show = entry.showMedia ?: return
         val id = (if (anime) show.ids.toBestAnimeContentId() else show.ids.toBestContentId())
-            ?: return
+            ?: run {
+                // A show whose id will not resolve contributes no watched rows at all, and did so
+                // without a word — the store simply never gains a tick for it, which reads as "the
+                // client says unwatched" and sends you looking at the sync path instead of the id
+                // mapping. Named, with its ids, so the mapping gap is the first thing you see.
+                watchedImportLog.i {
+                    "SIMKL history: no usable content id for ${show.title ?: "<untitled>"} " +
+                        "(isAnime=$anime ids=${show.ids}); its episodes import as nothing"
+                }
+                return
+            }
         entry.seasons.forEach { season ->
             val rawSeason = season.number ?: return@forEach
             season.episodes.forEach { episode ->

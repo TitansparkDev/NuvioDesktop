@@ -26,7 +26,6 @@ import androidx.compose.material3.contentColorFor
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,6 +50,7 @@ import com.nuvio.app.core.ui.NuvioCardDepthSurface
 import com.nuvio.app.core.ui.nuvioCardDepth
 import com.nuvio.app.core.ui.NuvioShelfSection
 import com.nuvio.app.core.ui.PosterLandscapeAspectRatio
+import com.nuvio.app.core.ui.PosterLandscapeWidthScale
 import com.nuvio.app.core.ui.ExtraLargePosterCardWidthDp
 import com.nuvio.app.core.ui.landscapePosterHeightForWidth
 import com.nuvio.app.core.ui.landscapePosterWidth
@@ -60,7 +60,7 @@ import com.nuvio.app.core.ui.rememberHomePosterCardStyleUiState
 import com.nuvio.app.features.cloud.CloudLibraryContentType
 import com.nuvio.app.features.cloud.cloudLibraryDisplayArtworkUrl
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
-import com.nuvio.app.features.watchprogress.ContinueWatchingArtworkDiagnostics
+import com.nuvio.app.features.watchprogress.ContinueWatchingArtworkFailures
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
 import com.nuvio.app.features.watchprogress.ContinueWatchingSectionStyle
 import com.nuvio.app.features.watchprogress.computeAirDateBadgeText
@@ -196,30 +196,6 @@ private fun firstNonBlank(vararg values: String?): String? =
     values.firstOrNull { value -> !value.isNullOrBlank() }?.trim()
 
 /**
- * Artwork URLs that failed to load this session.
- *
- * A Continue Watching card is the one surface in the app where a dead artwork URL leaves nothing
- * at all on screen — every other card draws its title over the image. Episode stills are also the
- * most fragile artwork the app handles: providers publish them late, swap CDN hosts, and hand back
- * URLs for images that were never uploaded. Remembering the failures lets every card for the same
- * show skip straight to the fallback instead of each one re-requesting the dead URL.
- *
- * Session-scoped on purpose: a URL that failed because the network was down deserves a fresh try
- * on the next launch.
- */
-private object ContinueWatchingArtworkFailures {
-    private val failedUrls = mutableStateMapOf<String, Unit>()
-
-    fun hasFailed(url: String): Boolean = url in failedUrls
-
-    fun markFailed(url: String) {
-        if (failedUrls.put(url, Unit) == null) {
-            ContinueWatchingArtworkDiagnostics.logArtworkLoadFailure(url)
-        }
-    }
-}
-
-/**
  * The first URL in [candidates] that has not already failed to load, plus the callback that
  * retires it when it fails too. Returns null only once every candidate is exhausted.
  */
@@ -244,12 +220,20 @@ internal fun HomeContinueWatchingSection(
     sectionPadding: Dp? = null,
     layout: ContinueWatchingLayout? = null,
     basePosterWidthDpOverride: Int? = null,
+    /**
+     * TV Mode: the tallest a card may be and still sit inside the shelf under the row header. The
+     * Card and Poster styles size themselves from the poster-width setting, not from the shelf,
+     * so at a raised UI scale they outgrew it and clipped the header above and their own episode
+     * title below. Cards that already fit are left exactly as they were.
+     */
+    maxCardHeight: Dp? = null,
     focusedItemIndex: Int? = null,
     rowState: androidx.compose.foundation.lazy.LazyListState? = null,
     onHoverItem: ((Int) -> Unit)? = null,
     isKeyboardNavigation: Boolean = false,
     // TV Mode's row-jump dots, rendered on the header line next to the title. Null everywhere else.
     headerTrailingContent: (@Composable () -> Unit)? = null,
+    bodyModifier: Modifier = Modifier,
     onItemClick: ((ContinueWatchingItem) -> Unit)? = null,
     onItemLongPress: ((ContinueWatchingItem) -> Unit)? = null,
 ) {
@@ -267,11 +251,13 @@ internal fun HomeContinueWatchingSection(
             sectionPadding = sectionPadding,
             layout = layout,
             basePosterWidthDpOverride = basePosterWidthDpOverride,
+            maxCardHeight = maxCardHeight,
             focusedItemIndex = focusedItemIndex,
             rowState = effectiveRowState,
             onHoverItem = onHoverItem,
             isKeyboardNavigation = isKeyboardNavigation,
             headerTrailingContent = headerTrailingContent,
+            bodyModifier = bodyModifier,
             onItemClick = onItemClick,
             onItemLongPress = onItemLongPress,
         )
@@ -287,11 +273,13 @@ internal fun HomeContinueWatchingSection(
                 sectionPadding = homeSectionHorizontalPaddingForWidth(maxWidth.value),
                 layout = rememberContinueWatchingLayout(maxWidth.value),
                 basePosterWidthDpOverride = basePosterWidthDpOverride,
+                maxCardHeight = maxCardHeight,
                 focusedItemIndex = focusedItemIndex,
                 rowState = effectiveRowState,
                 onHoverItem = onHoverItem,
                 isKeyboardNavigation = isKeyboardNavigation,
                 headerTrailingContent = headerTrailingContent,
+                bodyModifier = bodyModifier,
                 onItemClick = onItemClick,
                 onItemLongPress = onItemLongPress,
             )
@@ -310,11 +298,13 @@ private fun HomeContinueWatchingSectionContent(
     sectionPadding: Dp,
     layout: ContinueWatchingLayout,
     basePosterWidthDpOverride: Int?,
+    maxCardHeight: Dp?,
     focusedItemIndex: Int?,
     rowState: androidx.compose.foundation.lazy.LazyListState,
     onHoverItem: ((Int) -> Unit)?,
     isKeyboardNavigation: Boolean,
     headerTrailingContent: (@Composable () -> Unit)?,
+    bodyModifier: Modifier,
     onItemClick: ((ContinueWatchingItem) -> Unit)?,
     onItemLongPress: ((ContinueWatchingItem) -> Unit)?,
 ) {
@@ -328,6 +318,18 @@ private fun HomeContinueWatchingSectionContent(
         tvModeEnabled = homeCatalogSettings.tvModeEnabled,
         catalogLandscapeModeEnabled = posterCardStyle.catalogLandscapeModeEnabled,
     )
+    val fittedPosterWidthDpOverride = basePosterWidthDpOverride
+        ?: maxCardHeight?.let { limit ->
+            continueWatchingCardBaseWidthDpFittingHeight(
+                naturalBaseWidthDp = effectiveContinueWatchingCardBaseWidthDp(
+                    basePosterWidthDpOverride = null,
+                    savedPosterWidthDp = posterCardStyle.widthDp,
+                    tvModeEnabled = homeCatalogSettings.tvModeEnabled,
+                ),
+                maxHeight = limit,
+            )
+        }
+    val fittedLayout = maxCardHeight?.let { layout.fittingPosterCardHeight(it) } ?: layout
 
     val itemOrderKey = remember(items) {
         items.joinToString(separator = "|") { item -> item.continueWatchingRowOrderKey() }
@@ -346,13 +348,14 @@ private fun HomeContinueWatchingSectionContent(
             onHoverItem = onHoverItem,
             isKeyboardNavigation = isKeyboardNavigation,
             headerTrailingContent = headerTrailingContent,
+            bodyModifier = bodyModifier,
             key = { item -> item.videoId },
             rowState = rowState,
         ) { item ->
             when (effectiveStyle) {
                 ContinueWatchingSectionStyle.Card -> ContinueWatchingCard(
                     item = item,
-                    basePosterWidthDpOverride = basePosterWidthDpOverride,
+                    basePosterWidthDpOverride = fittedPosterWidthDpOverride,
                     useEpisodeThumbnails = useEpisodeThumbnails,
                     blurNextUp = blurNextUp,
                     onClick = onItemClick?.let { { it(item) } },
@@ -368,7 +371,7 @@ private fun HomeContinueWatchingSectionContent(
                 )
                 ContinueWatchingSectionStyle.Poster -> ContinueWatchingPosterCard(
                     item = item,
-                    layout = layout,
+                    layout = fittedLayout,
                     useEpisodeThumbnails = useEpisodeThumbnails,
                     blurNextUp = blurNextUp,
                     onClick = onItemClick?.let { { it(item) } },
@@ -377,6 +380,25 @@ private fun HomeContinueWatchingSectionContent(
             }
         }
     }
+}
+
+/**
+ * The poster base width whose Card-style card (as [ContinueWatchingCard] sizes an override —
+ * [landscapePosterWidth], without the 1.2x the un-overridden TV card gets) is no taller than
+ * [maxHeight]. Null when the natural card already fits, so nothing changes for it.
+ */
+internal fun continueWatchingCardBaseWidthDpFittingHeight(naturalBaseWidthDp: Int, maxHeight: Dp): Int? {
+    if (continueWatchingLandscapeCardHeight(naturalBaseWidthDp) <= maxHeight) return null
+    return (maxHeight.value * PosterLandscapeAspectRatio / PosterLandscapeWidthScale).toInt()
+}
+
+/** The Poster style shrunk (keeping its aspect) until poster plus title block fit [maxHeight]. */
+internal fun ContinueWatchingLayout.fittingPosterCardHeight(maxHeight: Dp): ContinueWatchingLayout {
+    val natural = posterCardHeight + posterTitleBlockHeight
+    if (natural <= maxHeight) return this
+    val posterHeight = (maxHeight - posterTitleBlockHeight).coerceAtLeast(posterCardHeight / 2)
+    val scale = posterHeight / posterCardHeight
+    return copy(posterCardWidth = posterCardWidth * scale, posterCardHeight = posterHeight)
 }
 
 private val TvModeContinueWatchingStyles = setOf(

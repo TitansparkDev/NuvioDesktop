@@ -16,6 +16,11 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.runtime.LaunchedEffect
+import coil3.SingletonImageLoader
+import coil3.compose.LocalPlatformContext
+import coil3.request.ImageRequest
+import com.nuvio.app.core.ui.nuvioArtworkRequestSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -53,10 +58,12 @@ fun HomeCollectionRowSection(
     rowNumber: Int? = null,
     // TV Mode's row-jump dots, rendered on the header line next to the title. Null everywhere else.
     headerTrailingContent: (@Composable () -> Unit)? = null,
+    bodyModifier: Modifier = Modifier,
     onFolderClick: ((collectionId: String, folderId: String) -> Unit)? = null,
 ) {
     if (collection.folders.isEmpty()) return
     val effectiveRowState = rowState ?: rememberLazyListState()
+    PrefetchCollectionArtwork(collection, animateGifs)
 
     if (sectionPadding != null) {
         HomeCollectionRowSectionContent(
@@ -71,6 +78,7 @@ fun HomeCollectionRowSection(
             isKeyboardNavigation = isKeyboardNavigation,
             rowNumber = rowNumber,
             headerTrailingContent = headerTrailingContent,
+            bodyModifier = bodyModifier,
             onFolderClick = onFolderClick,
         )
     } else {
@@ -87,6 +95,7 @@ fun HomeCollectionRowSection(
                 isKeyboardNavigation = isKeyboardNavigation,
                 rowNumber = rowNumber,
                 headerTrailingContent = headerTrailingContent,
+                bodyModifier = bodyModifier,
                 onFolderClick = onFolderClick,
             )
         }
@@ -106,6 +115,7 @@ private fun HomeCollectionRowSectionContent(
     isKeyboardNavigation: Boolean,
     rowNumber: Int?,
     headerTrailingContent: (@Composable () -> Unit)?,
+    bodyModifier: Modifier,
     onFolderClick: ((collectionId: String, folderId: String) -> Unit)?,
 ) {
     val homeCatalogSettings by remember {
@@ -131,6 +141,7 @@ private fun HomeCollectionRowSectionContent(
         onHoverItem = onHoverItem,
         isKeyboardNavigation = isKeyboardNavigation,
         headerTrailingContent = headerTrailingContent,
+        bodyModifier = bodyModifier,
         key = { folder -> "collection_${collection.id}_folder_${folder.id}" },
         rowState = rowState,
     ) { folder ->
@@ -261,6 +272,51 @@ private fun CollectionFolderCard(
  * The GIF stays as a last resort so a folder whose only artwork is animated still shows something -
  * the card asks the decoder for a still in that case rather than animating anyway.
  */
+/**
+ * Warms the compressed bytes for a collection row's artwork.
+ *
+ * A collection row holds far more folders than fit on screen — commonly forty against eight
+ * visible — and nothing was prefetching them, so scrolling right hit the network for every card
+ * that came into view. The card draws its `surface` colour until the image arrives, which is the
+ * grey people describe as a flicker: not the animation swapping, just an image that is not there
+ * yet. The equivalent prefetch already existed for Library rows and simply never reached here.
+ *
+ * Disk only, deliberately: no card has been laid out when this runs, so the size it will ask for is
+ * unknown, and artwork bitmaps are cached per requested size — decoding now would warm an entry
+ * nothing can reach. Warming the bytes removes the network round trip, which is the part measured
+ * in hundreds of milliseconds; the decode that remains is a few.
+ *
+ * Animated folders warm their cover as well as the animation, because the cover is what the card
+ * shows first while the animation's frames are still being decoded.
+ */
+@Composable
+private fun PrefetchCollectionArtwork(collection: Collection, animateGifs: Boolean) {
+    val platformContext = LocalPlatformContext.current
+    val imageLoader = SingletonImageLoader.get(platformContext)
+    LaunchedEffect(collection.folders, animateGifs) {
+        collection.folders
+            .take(COLLECTION_ARTWORK_PREFETCH_LIMIT)
+            .flatMap { folder ->
+                listOfNotNull(
+                    collectionFolderCardImageUrl(folder, animateGifs),
+                    folder.coverImageUrl?.takeIf { it.isNotBlank() },
+                )
+            }
+            .distinct()
+            .forEach { url ->
+                imageLoader.enqueue(
+                    ImageRequest.Builder(platformContext)
+                        .data(url)
+                        .nuvioArtworkRequestSize()
+                        .build(),
+                )
+            }
+    }
+}
+
+/** Enough to cover a long row without turning one screen into a hundred queued requests. */
+private const val COLLECTION_ARTWORK_PREFETCH_LIMIT = 40
+
 internal fun collectionFolderCardImageUrl(folder: CollectionFolder, animateGifs: Boolean): String? {
     return if (folder.mobileFocusGifEnabled && animateGifs) {
         firstNonBlank(folder.focusGifUrl, folder.coverImageUrl)

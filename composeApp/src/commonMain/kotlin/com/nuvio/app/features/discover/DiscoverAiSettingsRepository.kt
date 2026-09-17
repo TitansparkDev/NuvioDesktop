@@ -32,10 +32,13 @@ object DiscoverAiSettingsRepository {
         val trimmed = value.trim()
         DiscoverAiSettingsStorage.saveApiKey(trimmed)
         // Clearing the key is as good as switching the feature off, and leaving `enabled` true would
-        // leave rows that can never build sitting in the row list looking broken.
+        // leave rows that can never build sitting in the row list looking broken. The recap switch
+        // goes with it for the same reason: left on, it would read as an enabled feature whose row
+        // has silently stopped appearing.
         if (trimmed.isBlank()) {
             DiscoverAiSettingsStorage.saveEnabled(false)
-            it.copy(apiKey = "", enabled = false)
+            DiscoverAiSettingsStorage.saveRecapEnabled(false)
+            it.copy(apiKey = "", enabled = false, recapEnabled = false)
         } else {
             it.copy(apiKey = trimmed)
         }
@@ -76,6 +79,18 @@ object DiscoverAiSettingsRepository {
         it.copy(dailyRefresh = value)
     }
 
+    /** Same backstop as [setEnabled]: a switch that turns on a feature which cannot run is a bug. */
+    fun setRecapEnabled(value: Boolean) = update {
+        if (value && (it.apiKey.isBlank() || !it.consentGiven)) return@update it
+        DiscoverAiSettingsStorage.saveRecapEnabled(value)
+        it.copy(recapEnabled = value)
+    }
+
+    fun setRecapUseModelKnowledge(value: Boolean) = update {
+        DiscoverAiSettingsStorage.saveRecapUseModelKnowledge(value)
+        it.copy(recapUseModelKnowledge = value)
+    }
+
     private inline fun update(transform: (DiscoverAiSettings) -> DiscoverAiSettings) {
         ensureLoaded()
         val next = transform(_uiState.value)
@@ -96,6 +111,9 @@ object DiscoverAiSettingsRepository {
             consentGiven = DiscoverAiSettingsStorage.loadConsentGiven() ?: false,
             enabled = DiscoverAiSettingsStorage.loadEnabled() ?: false,
             dailyRefresh = DiscoverAiSettingsStorage.loadDailyRefresh() ?: false,
+            recapEnabled = DiscoverAiSettingsStorage.loadRecapEnabled() ?: false,
+            recapUseModelKnowledge =
+                DiscoverAiSettingsStorage.loadRecapUseModelKnowledge() ?: false,
         )
     }
 

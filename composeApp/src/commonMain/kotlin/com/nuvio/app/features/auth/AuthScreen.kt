@@ -34,6 +34,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,12 +59,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.ui.nuvioOverlayGradientBrush
 import com.nuvio.app.core.ui.NuvioPrimaryButton
 import com.nuvio.app.core.ui.NuvioSurfaceCard
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
-import nuvio.composeapp.generated.resources.app_logo_wordmark
+import nuvio.composeapp.generated.resources.app_logo_wordmark_htpc
 import nuvio.composeapp.generated.resources.compose_auth_already_have_account
 import nuvio.composeapp.generated.resources.compose_auth_continue_without_account
 import nuvio.composeapp.generated.resources.compose_auth_create_account
@@ -88,6 +90,7 @@ fun AuthScreen(
     modifier: Modifier = Modifier,
 ) {
     val authError by AuthRepository.error.collectAsStateWithLifecycle()
+    val serverConnectionState by ServerConnectionController.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     var isSignUp by rememberSaveable { mutableStateOf(false) }
@@ -96,6 +99,16 @@ fun AuthScreen(
     var isLoading by rememberSaveable { mutableStateOf(false) }
     var emailFieldBounds by remember { mutableStateOf<Rect?>(null) }
     var passwordFieldBounds by remember { mutableStateOf<Rect?>(null) }
+    var showServerDialog by rememberSaveable { mutableStateOf(false) }
+    var showOfficialServerDialog by rememberSaveable { mutableStateOf(false) }
+
+    // A completed switch resets the controller to a fresh state, which clears discoveredServer.
+    // Without also clearing these flags the URL prompt springs straight back open behind the
+    // closing trust dialog, so a successful switch looks like nothing happened.
+    LaunchedEffect(serverConnectionState.activeServer.backendUrl) {
+        showServerDialog = false
+        showOfficialServerDialog = false
+    }
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -136,7 +149,7 @@ fun AuthScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
             Image(
-                painter = painterResource(Res.drawable.app_logo_wordmark),
+                painter = painterResource(Res.drawable.app_logo_wordmark_htpc),
                 contentDescription = null,
                 modifier = Modifier
                     .fillMaxWidth(0.6f)
@@ -366,6 +379,63 @@ fun AuthScreen(
                 textAlign = TextAlign.Center,
             )
             }
+        }
+
+        if (AppFeaturePolicy.customServerConnectionsEnabled) {
+            ServerConnectionMenu(
+                activeServer = serverConnectionState.activeServer,
+                onUseOfficial = {
+                    ServerConnectionController.resetDiscovery()
+                    showOfficialServerDialog = true
+                },
+                onConnectCustom = {
+                    ServerConnectionController.resetDiscovery()
+                    showServerDialog = true
+                },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 8.dp, top = statusBarTop + 4.dp),
+            )
+        }
+    }
+
+    if (AppFeaturePolicy.customServerConnectionsEnabled) {
+        // The URL prompt gives way to the trust dialog as soon as discovery succeeds, so the two
+        // are mutually exclusive rather than stacked.
+        if (showServerDialog && serverConnectionState.discoveredServer == null) {
+            ServerConnectionDialog(
+                state = serverConnectionState,
+                onDiscover = ServerConnectionController::discover,
+                onDismiss = {
+                    showServerDialog = false
+                    ServerConnectionController.resetDiscovery()
+                },
+            )
+        }
+
+        serverConnectionState.discoveredServer?.let { server ->
+            ServerTrustDialog(
+                server = server,
+                isSwitching = serverConnectionState.isSwitching,
+                switchFailure = serverConnectionState.switchFailure,
+                onConfirm = ServerConnectionController::connectDiscovered,
+                onDismiss = {
+                    showServerDialog = false
+                    ServerConnectionController.resetDiscovery()
+                },
+            )
+        }
+
+        if (showOfficialServerDialog) {
+            OfficialServerDialog(
+                isSwitching = serverConnectionState.isSwitching,
+                switchFailure = serverConnectionState.switchFailure,
+                onConfirm = ServerConnectionController::useOfficial,
+                onDismiss = {
+                    showOfficialServerDialog = false
+                    ServerConnectionController.resetDiscovery()
+                },
+            )
         }
     }
 }

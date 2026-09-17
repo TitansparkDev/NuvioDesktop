@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.nativeKeyCode
 import androidx.compose.ui.input.key.onKeyEvent
@@ -36,12 +37,16 @@ import java.awt.datatransfer.DataFlavor
 import java.awt.dnd.DnDConstants
 import java.awt.dnd.DropTargetDragEvent
 import java.awt.dnd.DropTargetDropEvent
+import com.nuvio.app.core.sync.AppForegroundMonitor
 import com.nuvio.app.core.build.AppVersionPolicy
 import com.nuvio.app.core.ui.DesktopNavigationGestureBridge
 import com.nuvio.app.core.ui.DesktopBackRequestSource
 import com.nuvio.app.core.ui.DesktopTrayMenu
 import com.nuvio.app.core.ui.DesktopTrayMenuEntry
 import com.nuvio.app.core.ui.loadDesktopTrayIconImage
+import com.nuvio.app.core.ui.loadDesktopWindowIconImages
+import com.nuvio.app.features.input.GamepadInput
+import com.nuvio.app.features.input.GamepadSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.player.DesktopRendererApi
 import com.nuvio.app.features.player.PlatformPlayerSurface
@@ -52,6 +57,7 @@ import com.nuvio.app.features.mdblist.MdbListMetadataService
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import com.nuvio.app.features.player.desktop.DesktopIdleHeapTrim
+import com.nuvio.app.features.player.desktop.DesktopBorderlessFullscreenWatchdog
 import com.nuvio.app.features.player.desktop.DesktopWindowGeometry
 import com.nuvio.app.features.player.desktop.DesktopWindowMinHeight
 import com.nuvio.app.features.player.desktop.DesktopWindowMinWidth
@@ -98,6 +104,8 @@ import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseWheelEvent
+import java.awt.event.WindowEvent
+import java.awt.event.WindowFocusListener
 import java.awt.event.WindowStateListener
 import javax.swing.JComponent
 
@@ -220,7 +228,7 @@ private fun installDesktopTray(
     val renderedIcon = loadDesktopTrayIconImage(iconUrl, tray.trayIconSize)
     val trayIcon = TrayIcon(
         renderedIcon ?: Toolkit.getDefaultToolkit().getImage(iconUrl),
-        "Nuvio",
+        "Nuvio HTPC",
     ).apply {
         isImageAutoSize = renderedIcon == null
     }
@@ -386,7 +394,20 @@ fun main() {
     desktopStartupStep("app identity") {
         runCatching { com.nuvio.app.features.player.desktop.registerDesktopAppIdentity() }
     }
+    // Immediately after: every millisecond of head start is a class the UI thread will not have
+    // to load itself when Home first composes. Non-blocking; see StartupClassPreloader.
+    desktopStartupStep("startup class preload") { com.nuvio.app.core.build.StartupClassPreloader.start() }
+    // Same idea for the one native library Home's first composition loads: see warmPhysicalMemoryProbe.
+    desktopStartupStep("memory probe warm") { com.nuvio.app.core.ui.warmPhysicalMemoryProbe() }
     desktopStartupStep("configure renderer") { configureDesktopRenderer() }
+    // Before the first Skia layer exists: the vsync properties this flips are read at layer
+    // construction. Always reported, so a benchmark log can never be misread as a vsync-capped one.
+    System.out.println(
+        "Info: (DesktopStartup) " + com.nuvio.app.core.ui.FrameBenchMode.applyIfRequested()
+    )
+    System.out.println(
+        "Info: (DesktopStartup) " + com.nuvio.app.core.ui.FrameProfiler.startIfBenching()
+    )
     desktopStartupStep("configure chrome") { configureDesktopChrome() }
     desktopStartupStep("subtitle font warm request") { com.nuvio.app.features.player.warmSubtitleFontCache() }
     desktopStartupStep("app font warm request") { com.nuvio.app.core.ui.warmSystemFontCache() }
@@ -469,7 +490,7 @@ fun main() {
                     exitDesktopApplication()
                 }
             },
-            title = if (smokePlayerUrl == null) "Nuvio" else "Nuvio Player Smoke",
+            title = if (smokePlayerUrl == null) "Nuvio HTPC" else "Nuvio Player Smoke",
             state = windowState,
             icon = painterResource(NuvioDesktopIconPath),
         ) {
@@ -493,6 +514,16 @@ fun main() {
                 window.rootPane.background = NuvioDesktopNativeBackground
                 window.contentPane.background = NuvioDesktopNativeBackground
                 (window.contentPane as? JComponent)?.isOpaque = true
+            }
+            // Replaces the single 192dp render Compose gave AWT for `icon` with one image per size
+            // the shell asks for, cropped to the glyph like the tray icon - otherwise the taskbar
+            // shows the master's transparent margin as a visibly smaller icon. Decoded off the UI
+            // thread; the Compose icon stays as the fallback if the resource cannot be read.
+            LaunchedEffect(window) {
+                val iconUrl = Thread.currentThread().contextClassLoader.getResource(NuvioDesktopIconPath)
+                    ?: return@LaunchedEffect
+                val images = withContext(Dispatchers.IO) { loadDesktopWindowIconImages(iconUrl) }
+                if (images.isNotEmpty()) window.iconImages = images
             }
             DisposableEffect(window, closeToTray) {
                 val uninstallTray = if (closeToTray) {
@@ -532,6 +563,13 @@ fun main() {
             }
             DisposableEffect(window, windowState) {
                 val uninstallDisplayMetricsTracking = installDesktopDisplayMetricsTracking(window)
+                // An external player that changes the display mode (or an AV receiver that
+                // re-handshakes HDMI on stop) makes Windows rebuild the desktop and hand every
+                // window back its remembered windowed rect — silently, with the app still flagged
+                // fullscreen. PiP is excluded because it deliberately leaves the window small.
+                val uninstallFullscreenWatchdog = DesktopBorderlessFullscreenWatchdog.install(window) {
+                    isBorderlessFullscreen.value && !desktopPictureInPictureState.value
+                }
                 var pictureInPictureRestore: DesktopPictureInPictureRestore? = null
                 val unregisterPictureInPicture = registerDesktopPictureInPictureHandler { active, targetWindow ->
                     if (targetWindow != null && targetWindow !== window) return@registerDesktopPictureInPictureHandler
@@ -645,7 +683,30 @@ fun main() {
                         DesktopIdleHeapTrim.onWindowVisibilityChanged(visible = !isIconified)
                     }
                 }
+                // "The user came back to the app" — the signal AppForegroundMonitor exists to
+                // provide and, until now, never did on desktop. Coming back is the moment a remote
+                // Continue Watching source is most likely to be stale, because the usual reason for
+                // leaving is watching something on another device.
+                val windowFocusListener = object : WindowFocusListener {
+                    override fun windowGainedFocus(event: WindowEvent) {
+                        AppForegroundMonitor.onWindowGainedFocus()
+                    }
+
+                    override fun windowLostFocus(event: WindowEvent) = Unit
+                }
+                window.addWindowFocusListener(windowFocusListener)
                 window.addWindowStateListener(windowStateListener)
+                // Gamepad support replays XInput as synthetic key events, so it has to be live
+                // wherever the keyboard is — not only in the player. Starting it here ties it to
+                // the window: the poll thread parks immediately unless the user enabled it.
+                GamepadSettingsRepository.ensureLoaded()
+                GamepadInput.start()
+                // Same reasoning: idle is idle wherever the user is in the app, and the shade has
+                // to cover the native player as much as the browsing screens.
+                val uninstallScreensaver = com.nuvio.app.features.screensaver.DesktopScreensaver.install(
+                    window,
+                    exitDesktopApplication,
+                )
                 KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(backNavigationDispatcher)
                 Toolkit.getDefaultToolkit().systemEventQueue.push(mouseFiveShiftEventQueue)
                 Toolkit.getDefaultToolkit().addAWTEventListener(
@@ -653,8 +714,12 @@ fun main() {
                     AWTEvent.MOUSE_EVENT_MASK,
                 )
                 onDispose {
+                    uninstallScreensaver()
+                    GamepadInput.stop()
                     DesktopNavigationGestureBridge.setHorizontalScrollModifierActive(false)
+                    uninstallFullscreenWatchdog()
                     uninstallDisplayMetricsTracking()
+                    window.removeWindowFocusListener(windowFocusListener)
                     window.removeWindowStateListener(windowStateListener)
                     KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(backNavigationDispatcher)
                     Toolkit.getDefaultToolkit().removeAWTEventListener(mouseBackButtonListener)
@@ -751,6 +816,24 @@ fun main() {
                                 LocalFileDrop.emit(webStream)
                                 return@onKeyEvent true
                             }
+                            // Ctrl+Shift+W cycles which parts of the ambient wash are drawn, so
+                            // each can be priced against the frame budget in one session rather
+                            // than one restart per variant. Inert unless frame probes are enabled,
+                            // so it cannot leave an ordinary user in a degraded rendering mode.
+                            if (event.isCtrlPressed && event.isShiftPressed && event.key == Key.W) {
+                                val next = com.nuvio.app.core.ui.AmbientWashProbe.cycle()
+                                    ?: return@onKeyEvent false
+                                co.touchlab.kermit.Logger.withTag("FrameBudget")
+                                    .i { "ambient wash variant -> ${next.label}" }
+                                return@onKeyEvent true
+                            }
+                            // Ctrl+Shift+F suspends the telemetry's own frame-clock loops, so what
+                            // an idle window costs without them can be read off directly.
+                            if (event.isCtrlPressed && event.isShiftPressed && event.key == Key.F) {
+                                com.nuvio.app.core.ui.FrameClockProbes.toggle()
+                                    ?: return@onKeyEvent false
+                                return@onKeyEvent true
+                            }
                             if (event.isCtrlPressed) return@onKeyEvent false
                             // Compose text fields may leave ordinary key-down events unconsumed.
                             // Do not turn content searches or Settings edits into global navigation.
@@ -812,6 +895,11 @@ fun main() {
                         ),
                 ) {
                     App()
+                    // Above the app so it covers whatever screen owns the focused field, and hosted
+                    // here rather than inside App() because it is desktop-only.
+                    com.nuvio.app.features.input.OnScreenKeyboardOverlay()
+                    com.nuvio.app.core.ui.FrameCadenceTelemetry()
+                    com.nuvio.app.core.ui.FrameBudgetTelemetry()
                 }
             } else {
                 PlatformPlayerSurface(
@@ -862,8 +950,11 @@ private fun configureDesktopRenderer() {
     runCatching {
         val stored = PlayerSettingsStorage.loadDesktopRendererApi()
             ?.let { runCatching { DesktopRendererApi.valueOf(it) }.getOrNull() }
-        val renderer = stored
-            ?: DesktopRendererApi.OpenGL.takeIf { System.getProperty("skiko.renderApi").isNullOrBlank() }
+        // Unconditional fallback. It used to defer to whatever `skiko.renderApi` the launcher had
+        // already set, which on Windows was the DIRECT3D jvmArg — so a fresh install ran Direct3D
+        // while Settings displayed "OpenGL" (the value PlayerSettingsRepository defaults to) until
+        // the user saved the setting once. OpenGL is the intended default; say so in one place.
+        val renderer = stored ?: DesktopRendererApi.OpenGL
         renderer?.let { System.setProperty("skiko.renderApi", it.skikoRenderApi) }
     }
 }

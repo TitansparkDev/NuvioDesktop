@@ -181,7 +181,10 @@ internal fun PlayerScreenRuntime.saveP2pStreamForReuse(
     )
 }
 
-internal fun PlayerScreenRuntime.switchToP2pSourceStream(stream: StreamItem) {
+internal fun PlayerScreenRuntime.switchToP2pSourceStream(
+    stream: StreamItem,
+    keepSourcesPanelOpen: Boolean = false,
+) {
     val infoHash = stream.p2pInfoHash ?: return
     if (!P2pSettingsRepository.isVisible) return
     if (!P2pSettingsRepository.uiState.value.p2pEnabled) {
@@ -213,7 +216,7 @@ internal fun PlayerScreenRuntime.switchToP2pSourceStream(stream: StreamItem) {
     currentStreamBingeGroup = stream.behaviorHints.bingeGroup
     activeInitialPositionMs = currentPositionMs
     activeInitialProgressFraction = null
-    showSourcesPanel = false
+    if (!keepSourcesPanelOpen) showSourcesPanel = false
     controlsVisible = true
     beginPlaybackAttempt()
     activeSourceUrl = p2pSentinelUrl(infoHash, stream.p2pFileIdx)
@@ -260,6 +263,11 @@ internal fun PlayerScreenRuntime.switchToSource(
     stream: StreamItem,
     sourceIdentityKey: String? = stream.playerSourceIdentityKey(),
     resumePositionOverrideMs: Long? = null,
+    // The desktop HUD's Sources sheet stays open across a same-item swap so the new stream can be
+    // checked and swapped again. [showSourcesPanel] is Kotlin's only record that the sheet is open
+    // (the next-episode prewarm reads it), so it must survive the switch — including the deferred
+    // one that follows a debrid resolve.
+    keepSourcesPanelOpen: Boolean = false,
 ) {
     if (
         resolveDebridForPlayer(
@@ -269,7 +277,9 @@ internal fun PlayerScreenRuntime.switchToSource(
             // The playable result usually has a short-lived resolved URL and no longer has the
             // identity fields of the card the user selected. Keep the original card identity so
             // the Sources UI can mark the source MPV is actually using.
-            onResolved = { switchToSource(it, sourceIdentityKey, resumePositionOverrideMs) },
+            onResolved = {
+                switchToSource(it, sourceIdentityKey, resumePositionOverrideMs, keepSourcesPanelOpen)
+            },
             onStale = {
                 val vid = activeVideoId
                 if (vid != null) {
@@ -287,7 +297,7 @@ internal fun PlayerScreenRuntime.switchToSource(
         )
     ) return
     if (isP2pStream(stream)) {
-        switchToP2pSourceStream(stream)
+        switchToP2pSourceStream(stream, keepSourcesPanelOpen)
         return
     }
     val url = stream.playableDirectUrl ?: return
@@ -316,7 +326,7 @@ internal fun PlayerScreenRuntime.switchToSource(
     currentStreamBingeGroup = stream.behaviorHints.bingeGroup
     activeInitialPositionMs = currentPositionMs
     activeInitialProgressFraction = null
-    showSourcesPanel = false
+    if (!keepSourcesPanelOpen) showSourcesPanel = false
     controlsVisible = true
     beginPlaybackAttempt()
     activeSourceUrl = url
@@ -726,8 +736,23 @@ internal fun nextFailoverStream(
     // primary/secondary audio language is safer than an unknown source, and an unknown source is
     // safer than one explicitly advertising a different language. minByOrNull keeps the first
     // minimum, so within a tier the order above decides.
+    //
+    // With a scoring profile in charge, only an *explicit* mismatch keeps its own tier. Scoring
+    // already prices language in, and most releases carry no language tag at all — so treating
+    // "unknown" as a lower tier than "tagged English" let a 400-point 1080p whose title happened
+    // to say "English" beat every untagged 1500-point remux (Friends, 2026-09-14). A source that
+    // says it is in a different language is still never chosen ahead of one that doesn't.
+    val explicitMismatchRank = preferredAudioLanguages
+        .mapNotNull(::normalizeLanguageCode)
+        .distinct()
+        .size + 1
     return ordered.minByOrNull { stream ->
-        stream.preferredAudioLanguageRank(preferredAudioLanguages)
+        val rank = stream.preferredAudioLanguageRank(preferredAudioLanguages)
+        if (scoreProfile.appliesToFailover()) {
+            if (rank >= explicitMismatchRank) 1 else 0
+        } else {
+            rank
+        }
     }
 }
 
@@ -835,6 +860,34 @@ internal fun selectFailoverResumePositionMs(
     ?: initialPositionMs?.coerceAtLeast(0L)
     ?: snapshotPositionMs.coerceAtLeast(0L)
 
+/**
+ * Opens the Sources panel on a given episode's streams, rather than the playing item's.
+ *
+ * Two things this must do that setting panel state alone does not. The load is one: the panel
+ * renders whatever `PlayerStreamsRepository` is holding, so without it you get the episode you were
+ * watching (or nothing) and Reload as the only way out. The token is the other: on desktop the
+ * panels are HTML modals owned by the HUD, and Kotlin's only pre-existing channel was
+ * `closeModalsToken` — raising Compose state there is silently inert.
+ *
+ * [pendingSourcesEpisode] is what redirects the panel's selection and Reload at that episode; it is
+ * cleared by anything that reopens the panel for the playing item, or that changes what is playing.
+ */
+internal fun PlayerScreenRuntime.openSourcesPanelForEpisode(episode: MetaVideo) {
+    pendingSourcesEpisode = episode
+    PlayerStreamsRepository.loadSources(
+        type = contentType ?: parentMetaType,
+        videoId = episode.id,
+        parentMetaId = parentMetaId,
+        title = title,
+        season = episode.playbackSeasonNumber(),
+        episode = episode.playbackEpisodeNumber(),
+    )
+    showSourcesPanel = true
+    showEpisodesPanel = false
+    controlsVisible = false
+    playerControlsOpenSourcesToken += 1
+}
+
 internal fun PlayerScreenRuntime.playNextEpisode() {
     // Mirror launchPlayerNextEpisodeAutoPlay's own early-exit checks: when there's clearly no
     // episode to advance to, bail out before engaging the latch at all. Engaging it here and
@@ -844,21 +897,35 @@ internal fun PlayerScreenRuntime.playNextEpisode() {
     val nextVideoId = nextEpisodeInfo?.videoId
     val nextVideo = nextVideoId?.let { id -> playerMetaVideos.firstOrNull { video -> video.id == id } }
     BingeAdvanceLog.i {
-        "playNextEpisode nextVideoId=$nextVideoId resolved=${nextVideo != null} hasAired=${nextEpisodeInfo?.hasAired}"
+        "playNextEpisode nextVideoId=$nextVideoId resolved=${nextVideo != null} " +
+            "hasAired=${nextEpisodeInfo?.hasAired} mode=${playerSettingsUiState.streamAutoPlayMode} " +
+            "manualNextEpisode=${playerSettingsUiState.streamAutoPlayManualNextEpisode} " +
+            "affinity=$sourceAffinity"
     }
     if (nextVideo == null || nextEpisodeInfo?.hasAired != true) {
         BingeAdvanceLog.i { "playNextEpisode early return (no next video or not aired) — latch NOT engaged" }
         return
     }
 
-    // Engage the advance latch for every path (auto and manual) so a stale end-of-file can't
-    // trigger a second advance and skip an episode. Cleared once the new episode is playing.
-    nextEpisodeAdvanceInProgress = true
-    nextEpisodeAdvanceTargetVideoId = nextVideo.id
-    // Surface the next-episode card as loading feedback while streams resolve. Harmless on the
-    // auto-advance path (same episode, card already shown); the win is the manual next-episode
-    // button mid-episode, where nothing was shown before. Cleared when the switch resolves.
-    manualEpisodeSwitchInfo = nextEpisodeInfo
+    // "Apply To Next Episode" opens the picker instead of advancing, so there is no advance to
+    // latch and nothing to show a loading card for. Latching it anyway would strand the latch when
+    // the user dismisses the picker (it clears only once the target episode is genuinely playing),
+    // silently disabling auto-advance for the rest of the session.
+    val opensManualSelection = shouldOpenManualNextEpisodeSelection(
+        mode = playerSettingsUiState.streamAutoPlayMode,
+        manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+        sourceAffinity = sourceAffinity,
+    )
+    if (!opensManualSelection) {
+        // Engage the advance latch for every path (auto and manual) so a stale end-of-file can't
+        // trigger a second advance and skip an episode. Cleared once the new episode is playing.
+        nextEpisodeAdvanceInProgress = true
+        nextEpisodeAdvanceTargetVideoId = nextVideo.id
+        // Surface the next-episode card as loading feedback while streams resolve. Harmless on the
+        // auto-advance path (same episode, card already shown); the win is the manual next-episode
+        // button mid-episode, where nothing was shown before. Cleared when the switch resolves.
+        manualEpisodeSwitchInfo = nextEpisodeInfo
+    }
     scope.launchPlayerNextEpisodeAutoPlay(
         previousJob = nextEpisodeAutoPlayJob,
         nextEpisodeInfo = nextEpisodeInfo,
@@ -874,11 +941,7 @@ internal fun PlayerScreenRuntime.playNextEpisode() {
         onManualSelectionRequired = { nextVideo ->
             // Auto-select failed: the manual stream list is now the feedback, so drop the card.
             manualEpisodeSwitchInfo = null
-            episodeStreamsPanelState = EpisodeStreamsPanelState(
-                showStreams = true,
-                selectedEpisode = nextVideo,
-            )
-            showEpisodesPanel = true
+            openSourcesPanelForEpisode(nextVideo)
         },
         onSearchingChanged = { nextEpisodeAutoPlaySearching = it },
         onSourceNameChanged = { nextEpisodeAutoPlaySourceName = it },
@@ -934,11 +997,7 @@ internal fun PlayerScreenRuntime.autoPlaySelectedEpisode(episode: MetaVideo) {
         onManualSelectionRequired = { video ->
             // Auto-select failed: the manual stream list is now the feedback, so drop the card.
             manualEpisodeSwitchInfo = null
-            episodeStreamsPanelState = EpisodeStreamsPanelState(
-                showStreams = true,
-                selectedEpisode = video,
-            )
-            showEpisodesPanel = true
+            openSourcesPanelForEpisode(video)
         },
         onSearchingChanged = { nextEpisodeAutoPlaySearching = it },
         onSourceNameChanged = { nextEpisodeAutoPlaySourceName = it },
@@ -956,6 +1015,7 @@ internal fun PlayerScreenRuntime.autoPlaySelectedEpisode(episode: MetaVideo) {
 
 internal fun PlayerScreenRuntime.openSourcesPanel() {
     val vid = activeVideoId ?: return
+    pendingSourcesEpisode = null
     PlayerStreamsRepository.loadSources(
         type = contentType ?: parentMetaType,
         videoId = vid,
@@ -983,6 +1043,7 @@ internal fun PlayerScreenRuntime.openEpisodesPanel() {
 private data class EpisodeResume(val positionMs: Long, val fraction: Float?)
 
 private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
+    pendingSourcesEpisode = null
     showNextEpisodeCard = false
     manualEpisodeSwitchInfo = null
     showSourcesPanel = false

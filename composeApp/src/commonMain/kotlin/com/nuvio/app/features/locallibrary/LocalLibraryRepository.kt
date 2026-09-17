@@ -78,17 +78,26 @@ object LocalLibraryRepository {
     private var autoConsideredKeys: Set<String> = emptySet()
     private var scanJob: Job? = null
 
+    // Startup loads this from the deferred warm on a background thread; screens still call
+    // ensureLoaded from composition, and the lock stops one of them re-reading the store (and
+    // starting a second scan) under a load that is already in flight.
+    private val loadLock = Any()
+
     fun ensureLoaded() {
-        if (hasLoaded) return
-        loadFromDisk(ProfileRepository.activeProfileId)
-        if (folders.isNotEmpty()) rescan()
+        synchronized(loadLock) {
+            if (hasLoaded) return
+            loadFromDisk(ProfileRepository.activeProfileId)
+            if (folders.isNotEmpty()) rescan()
+        }
     }
 
     fun onProfileChanged(newProfileId: Int) {
-        if (newProfileId == profileId && hasLoaded) return
-        scanJob?.cancel()
-        loadFromDisk(newProfileId)
-        if (folders.isNotEmpty()) rescan()
+        synchronized(loadLock) {
+            if (newProfileId == profileId && hasLoaded) return
+            scanJob?.cancel()
+            loadFromDisk(newProfileId)
+            if (folders.isNotEmpty()) rescan()
+        }
     }
 
     private fun loadFromDisk(profileId: Int) {

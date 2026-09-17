@@ -19,6 +19,7 @@ import kotlin.test.assertTrue
 
 @OptIn(ExperimentalComposeUiApi::class)
 class PosterHighlightSweepRenderTest {
+
     /**
      * A 256x8 card — wider than it is tall, so the band travels the horizontal axis and one pixel
      * row samples the whole of it. At progress 0.5 the band spans the card exactly, putting its
@@ -57,6 +58,30 @@ class PosterHighlightSweepRenderTest {
             val worst = (0 until 256).maxOf { abs(rendered[it] - plain[it]) }
             assertTrue(worst <= 1, "progress $progress altered the card by $worst")
         }
+    }
+
+
+    /**
+     * The band must still travel: at some point in the pass it has to reach the card's middle, and
+     * at the ends it must be off the card entirely.
+     *
+     * This replaces an earlier guard that capped how much of the card the band could alter. That
+     * cap came from believing the sweep's painted area caused the poster-row flicker; it did not -
+     * an instantaneous hero backdrop swap did, on a variable-refresh OLED - so the cap was pinning
+     * a workaround rather than a real invariant.
+     */
+    @Test
+    fun `the band crosses the card during the pass`() {
+        val plain = render(progress = null)
+        val altered = (1..19).map { it / 20f }.map { progress ->
+            val swept = render(progress = progress)
+            (0 until 256).count { kotlin.math.abs(swept[it] - plain[it]) > 1 }
+        }
+        assertTrue(altered.any { it > 0 }, "the band never touched a pixel across the whole pass")
+        assertTrue(
+            altered.max() > 256 / 4,
+            "the band only ever reached ${altered.max()} of 256 columns - it is a streak, not a wash",
+        )
     }
 
     private fun render(

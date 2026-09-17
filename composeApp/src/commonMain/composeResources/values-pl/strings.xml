@@ -856,8 +856,6 @@
     <string name="settings_playback_subtitle_show_preferred_only_description">Pokaż tylko napisy pasujące do preferowanych języków.</string>
     <string name="settings_playback_subtitle_size">Rozmiar napisów</string>
     <string name="settings_playback_subtitle_text_color">Kolor tekstu</string>
-    <string name="settings_playback_subtitle_use_forced">Używaj wymuszonych napisów</string>
-    <string name="settings_playback_subtitle_use_forced_description">Preferuj wymuszone napisy pasujące do ustawień języka napisów.</string>
     <string name="settings_playback_subtitle_vertical_offset">Przesunięcie pionowe</string>
     <string name="settings_playback_skip_intro_outro_recap">Pomiń intro/outro/podsumowanie</string>
     <string name="settings_playback_skip_intro_outro_recap_description">Pokaż przycisk pomijania podczas wykrytych segmentów intro, outro i podsumowania.</string>

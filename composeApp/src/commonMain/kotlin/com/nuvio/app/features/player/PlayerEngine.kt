@@ -118,6 +118,11 @@ data class PlayerControlsState(
     val pictureInPictureActive: Boolean = false,
     val desktopHdrModeLabel: String = "Auto",
     val desktopColorProfileLabel: String = "Neutral",
+    /** Custom-profile offsets, so the HUD's grade panel can show live values. */
+    val desktopColorContrast: Int = 0,
+    val desktopColorBrightness: Int = 0,
+    val desktopColorSaturation: Int = 0,
+    val desktopColorGamma: Int = 0,
     val desktopAnimeModeLabel: String = "Off",
     val desktopAnimeSvpEnabled: Boolean = false,
     /** Opt-in "what am I actually watching" summary, shown when playback starts. */
@@ -228,9 +233,12 @@ data class PlayerControlsState(
     val playbackSpeedToggleLow: Float = 1f,
     val playbackSpeedToggleHigh: Float = 2f,
     val uiScalePercent: Int = 0,
+    // Extra scale for the bottom control row's buttons only, on top of uiScalePercent.
+    val controlIconScalePercent: Int = 0,
     // The app font, as a CSS family name. "" leaves the HUD on the bundled JetBrains Sans.
     val uiFontFamily: String = "",
     val sourceNotchPosition: String = "right",
+    val sourceNotchHoverEnabled: Boolean = true,
     val notificationPosition: String = "center",
     val parentalWarnings: List<ParentalWarning> = emptyList(),
     val showParentalGuide: Boolean = false,
@@ -309,6 +317,15 @@ data class PlayerControlsState(
     val subtitleAutoSyncIsLoading: Boolean = false,
     val subtitleAutoSyncErrorMessage: String = "",
     val closeModalsToken: Long = 0L,
+    val openSourcesToken: Long = 0L,
+    /**
+     * Desktop only: Kotlin's record that the Sources sheet is open. A stream swap rebuilds the whole
+     * native bridge (new mpv, new WebView, fresh HUD), so the sheet cannot survive on its own; the
+     * new HUD reads this on its first state push and re-opens the sheet. Only consulted on that
+     * first push — afterwards the tokens above drive open/close, so a stale true cannot reopen a
+     * sheet the user has since dismissed.
+     */
+    val sourcesPanelOpen: Boolean = false,
     /**
      * Desktop only: when true the native controls overlay hides all chrome and renders just
      * the hero-trailer fade gradients (used by the TV-mode home hero trailer surface).

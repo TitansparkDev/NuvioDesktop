@@ -49,6 +49,10 @@ import com.nuvio.app.features.watched.WatchedRepository
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_done
+import nuvio.composeapp.generated.resources.settings_ai_recap_enabled
+import nuvio.composeapp.generated.resources.settings_ai_recap_enabled_description
+import nuvio.composeapp.generated.resources.settings_ai_recap_model_knowledge
+import nuvio.composeapp.generated.resources.settings_ai_recap_model_knowledge_description
 import nuvio.composeapp.generated.resources.settings_discover_ai_add_row
 import nuvio.composeapp.generated.resources.settings_discover_ai_add_row_description
 import nuvio.composeapp.generated.resources.settings_discover_ai_base_url
@@ -68,6 +72,7 @@ import nuvio.composeapp.generated.resources.settings_discover_ai_error_rate_limi
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_rate_limited_wait
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_refused
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_timeout
+import nuvio.composeapp.generated.resources.settings_discover_ai_error_transport
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_truncated
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_unauthorized
 import nuvio.composeapp.generated.resources.settings_discover_ai_error_unreadable
@@ -456,7 +461,9 @@ internal fun AddAiDiscoverRowButton(
 @Composable
 internal fun DiscoverAiProviderSection(isTablet: Boolean) {
     val settings by DiscoverAiSettingsRepository.uiState.collectAsStateWithLifecycle()
-    var consentPrompt by remember { mutableStateOf(false) }
+    // Which switch is waiting on consent. Two features share one credential and one dialog, so
+    // "the dialog is open" is no longer enough to know what accepting it should turn on.
+    var consentPromptFor by remember { mutableStateOf<AiConsentTarget?>(null) }
 
     SettingsSection(
         title = stringResource(Res.string.settings_discover_ai_section),
@@ -475,11 +482,47 @@ internal fun DiscoverAiProviderSection(isTablet: Boolean) {
                     when {
                         !wanted -> DiscoverAiSettingsRepository.setEnabled(false)
                         // Consent first, and only once. The dialog does the enabling.
-                        !settings.consentGiven -> consentPrompt = true
+                        !settings.consentGiven -> consentPromptFor = AiConsentTarget.Rows
                         else -> DiscoverAiSettingsRepository.setEnabled(true)
                     }
                 },
             )
+            SettingsGroupDivider(isTablet = isTablet)
+            // Beside the rows switch rather than on the details page: this is the second consumer
+            // of the credential below, and the two questions a user has ("what may spend my key"
+            // and "how is my key reached") are worth keeping in that order on one page.
+            SettingsSwitchRow(
+                title = stringResource(Res.string.settings_ai_recap_enabled),
+                description = stringResource(Res.string.settings_ai_recap_enabled_description),
+                checked = settings.recapEnabled,
+                isTablet = isTablet,
+                modifier = Modifier.settingsScrollAnchor(
+                    SettingsScrollAnchor.searchKey("ai-recap-enabled"),
+                ),
+                onCheckedChange = { wanted ->
+                    when {
+                        !wanted -> DiscoverAiSettingsRepository.setRecapEnabled(false)
+                        !settings.consentGiven -> consentPromptFor = AiConsentTarget.Recap
+                        else -> DiscoverAiSettingsRepository.setRecapEnabled(true)
+                    }
+                },
+            )
+            // Only offered once recaps are on: on its own it controls nothing, and a live switch
+            // under a disabled feature is the "control that silently does nothing" shape again.
+            if (settings.recapEnabled) {
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_ai_recap_model_knowledge),
+                    description =
+                        stringResource(Res.string.settings_ai_recap_model_knowledge_description),
+                    checked = settings.recapUseModelKnowledge,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(
+                        SettingsScrollAnchor.searchKey("ai-recap-model-knowledge"),
+                    ),
+                    onCheckedChange = DiscoverAiSettingsRepository::setRecapUseModelKnowledge,
+                )
+            }
             SettingsGroupDivider(isTablet = isTablet)
             SettingsChoiceRow(
                 title = stringResource(Res.string.settings_discover_ai_provider),
@@ -546,22 +589,28 @@ internal fun DiscoverAiProviderSection(isTablet: Boolean) {
         }
     }
 
-    if (!consentPrompt) return
+    val consentTarget = consentPromptFor ?: return
     NuvioModalDialog(
-        onDismissRequest = { consentPrompt = false },
+        onDismissRequest = { consentPromptFor = null },
         title = stringResource(Res.string.settings_discover_ai_consent_title),
         subtitle = null,
         maxWidth = 560.dp,
         modifier = Modifier.width(560.dp),
         actions = {
-            TextButton(onClick = { consentPrompt = false }) {
+            TextButton(onClick = { consentPromptFor = null }) {
                 Text(stringResource(Res.string.action_done))
             }
             TextButton(
                 onClick = {
-                    consentPrompt = false
+                    consentPromptFor = null
                     DiscoverAiSettingsRepository.setConsentGiven(true)
-                    DiscoverAiSettingsRepository.setEnabled(true)
+                    // Accepting turns on only the switch that asked. Consent covers both features
+                    // from here — it is about the key leaving this PC — but agreeing to that is not
+                    // the same as asking for a feature nobody touched.
+                    when (consentTarget) {
+                        AiConsentTarget.Rows -> DiscoverAiSettingsRepository.setEnabled(true)
+                        AiConsentTarget.Recap -> DiscoverAiSettingsRepository.setRecapEnabled(true)
+                    }
                 },
             ) { Text(stringResource(Res.string.settings_discover_ai_consent_accept)) }
         },
@@ -581,6 +630,9 @@ internal fun DiscoverAiProviderSection(isTablet: Boolean) {
         )
     }
 }
+
+/** Which switch opened the shared consent dialog. */
+private enum class AiConsentTarget { Rows, Recap }
 
 /** Each failure says what to do about it — they need different things from the user. */
 internal suspend fun discoverAiErrorMessage(error: Throwable): String =
@@ -610,6 +662,8 @@ internal suspend fun discoverAiErrorMessage(error: Throwable): String =
         } ?: getString(Res.string.settings_discover_ai_error_rate_limited, reason.detail)
 
         DiscoverAiError.Timeout -> getString(Res.string.settings_discover_ai_error_timeout)
+        is DiscoverAiError.Transport ->
+            getString(Res.string.settings_discover_ai_error_transport, reason.kind, reason.detail)
         DiscoverAiError.Unreadable -> getString(Res.string.settings_discover_ai_error_unreadable)
         DiscoverAiError.Empty -> getString(Res.string.settings_discover_ai_error_empty)
         DiscoverAiError.Truncated -> getString(Res.string.settings_discover_ai_error_truncated)

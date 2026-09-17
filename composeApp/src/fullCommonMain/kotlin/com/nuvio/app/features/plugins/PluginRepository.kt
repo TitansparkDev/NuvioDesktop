@@ -1,7 +1,6 @@
 package com.nuvio.app.features.plugins
 
 import co.touchlab.kermit.Logger
-import com.nuvio.app.isDesktop
 import com.nuvio.app.core.network.SupabaseProvider
 import com.nuvio.app.features.addons.encodeUnsafeHttpUrlCharacters
 import com.nuvio.app.features.addons.httpGetText
@@ -97,9 +96,6 @@ actual object PluginRepository {
     }
 
     actual suspend fun pullFromServer(profileId: Int) {
-        // Plugin repositories are a fork-only feature. Keep them device-local even if this method
-        // is reached outside SyncManager so they can never affect an official client's database.
-        if (isDesktop) return
         val effectiveProfileId = resolveEffectiveProfileId(profileId)
         ensureStateLoadedForProfile(effectiveProfileId)
         runCatching {
@@ -111,16 +107,25 @@ actual object PluginRepository {
                 }
                 .decodeList<PluginRow>()
 
-            val urls = dedupeManifestUrls(rows.map { it.url })
-            if (urls.isEmpty() && !pulledFromServer) {
-                val localUrls = _uiState.value.repositories.map { it.manifestUrl }
-                if (localUrls.isNotEmpty()) {
-                    initialize()
-                    pulledFromServer = true
-                    pushToServer()
-                    return
-                }
+            val serverUrls = dedupeManifestUrls(rows.map { it.url })
+
+            // The first pull after launch or a profile change MERGES; later pulls replace.
+            //
+            // Merging matters because this device can legitimately hold repositories the server has
+            // never seen - added while plugin sync was off, or on a machine that has not synced yet -
+            // and a straight replace would drop them silently the moment the server returned any row
+            // at all. Later pulls must still replace, or a repository deliberately removed on another
+            // device would be resurrected from this one's local state on every sync.
+            //
+            // Both sides go through dedupeManifestUrls first so the comparison is on the normalized
+            // manifest form rather than whatever the user originally typed.
+            val localOnlyUrls = if (pulledFromServer) {
+                emptyList()
+            } else {
+                dedupeManifestUrls(_uiState.value.repositories.map { it.manifestUrl })
+                    .filterNot { it in serverUrls }
             }
+            val urls = dedupeManifestUrls(serverUrls + localOnlyUrls)
 
             val existingReposByUrl = _uiState.value.repositories.associateBy { it.manifestUrl }
             val nextRepos = urls.map { url ->
@@ -149,6 +154,13 @@ actual object PluginRepository {
 
             pulledFromServer = true
             initialized = true
+
+            // Tell the server about anything only this device had, so the merge is not one-sided
+            // and the next device to sync sees the union too.
+            if (localOnlyUrls.isNotEmpty()) {
+                log.i { "Merged ${localOnlyUrls.size} local-only plugin repositories into the server list" }
+                pushToServer()
+            }
         }.onFailure { error ->
             log.e(error) { "pullFromServer failed" }
         }
@@ -297,12 +309,34 @@ actual object PluginRepository {
         persist()
     }
 
+    actual fun setSkipDuplicateScrapers(enabled: Boolean) {
+        initialize()
+        _uiState.update { it.copy(skipDuplicateScrapers = enabled) }
+        persist()
+    }
+
+    actual fun setPlaybackStartupHold(active: Boolean) {
+        PluginRuntime.setPlaybackStartupHold(active)
+    }
+
     actual fun getEnabledScrapersForType(type: String): List<PluginScraper> {
         initialize()
-        if (!_uiState.value.pluginsEnabled) return emptyList()
-        return _uiState.value.scrapers.filter { scraper ->
+        val state = _uiState.value
+        if (!state.pluginsEnabled) return emptyList()
+        val enabled = state.scrapers.filter { scraper ->
             scraper.enabled && scraper.supportsType(type)
         }
+        if (!state.skipDuplicateScrapers) return enabled
+        val (kept, skipped) = dedupeScrapersAcrossRepositories(enabled)
+        if (skipped.isNotEmpty()) {
+            log.i {
+                "Skipping ${skipped.size} duplicate scraper(s) for $type: " +
+                    skipped.groupBy(PluginScraper::duplicateKey).entries.joinToString { (key, copies) ->
+                        "$key×${copies.size + 1}"
+                    }
+            }
+        }
+        return kept
     }
 
     actual suspend fun testScraper(scraperId: String): Result<List<PluginRuntimeResult>> {
@@ -442,7 +476,6 @@ actual object PluginRepository {
     }
 
     private fun pushToServer() {
-        if (isDesktop) return
         scope.launch {
             runCatching {
                 val repos = _uiState.value.repositories.mapIndexed { index, repo ->
@@ -470,6 +503,7 @@ actual object PluginRepository {
         val payload = StoredPluginsState(
             pluginsEnabled = state.pluginsEnabled,
             groupStreamsByRepository = state.groupStreamsByRepository,
+            skipDuplicateScrapers = state.skipDuplicateScrapers,
             repositories = state.repositories.map { repo ->
                 StoredPluginRepository(
                     manifestUrl = repo.manifestUrl,
@@ -533,6 +567,7 @@ actual object PluginRepository {
         return PluginsUiState(
             pluginsEnabled = stored?.pluginsEnabled ?: true,
             groupStreamsByRepository = stored?.groupStreamsByRepository ?: false,
+            skipDuplicateScrapers = stored?.skipDuplicateScrapers ?: true,
             repositories = stored?.repositories
                 ?.map {
                     PluginRepositoryItem(

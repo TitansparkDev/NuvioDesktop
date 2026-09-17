@@ -4,6 +4,12 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import com.nuvio.app.features.metadata.migrateLegacyAnimeContentId
 import com.nuvio.app.features.metadata.migrateLegacyAnimeVideoId
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,16 +31,26 @@ object DownloadsRepository {
     private var hasLoaded = false
     private var nextDownloadOrdinal = 0L
 
+    // Startup loads this from the deferred warm on a background thread while screens may still
+    // call ensureLoaded from composition; the lock keeps a screen from decoding the store a
+    // second time under a load already in flight.
+    private val loadLock = Any()
+    private val fileResolveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var fileResolveJob: Job? = null
+
     fun ensureLoaded() {
-        if (hasLoaded) return
-        loadFromDisk()
+        synchronized(loadLock) {
+            if (hasLoaded) return
+            loadFromDisk()
+        }
     }
 
     fun onProfileChanged() {
-        loadFromDisk()
+        synchronized(loadLock) { loadFromDisk() }
     }
 
     fun clearLocalState() {
+        fileResolveJob?.cancel()
         activeHandles.values.forEach(DownloadsTaskHandle::cancel)
         activeHandles.clear()
         interruptedAutomaticDownloadIds = emptySet()
@@ -230,6 +246,7 @@ object DownloadsRepository {
             bandwidthLimitMbps = bandwidthLimitMbps?.takeIf { it > 0 },
             maximumSizeBytes = maximumSizeBytes?.takeIf { it > 0L },
             isAutomaticDownload = isAutomaticDownload,
+            awaitingSlot = startPaused,
             status = if (startPaused) DownloadStatus.Paused else DownloadStatus.Downloading,
             downloadedBytes = 0L,
             totalBytes = null,
@@ -259,6 +276,7 @@ object DownloadsRepository {
         mutateItem(downloadId) { current ->
             current.copy(
                 status = DownloadStatus.Paused,
+                awaitingSlot = false,
                 bytesPerSecond = null,
                 updatedAtEpochMs = DownloadsClock.nowEpochMs(),
                 errorMessage = null,
@@ -281,6 +299,7 @@ object DownloadsRepository {
 
         val reset = item.copy(
             status = DownloadStatus.Downloading,
+            awaitingSlot = false,
             errorMessage = null,
             localFileUri = null,
             bytesPerSecond = null,
@@ -395,6 +414,7 @@ object DownloadsRepository {
 
     private fun loadFromDisk() {
         hasLoaded = true
+        fileResolveJob?.cancel()
         val payload = DownloadsStorage.loadPayload().orEmpty().trim()
         if (payload.isEmpty()) {
             interruptedAutomaticDownloadIds = emptySet()
@@ -413,18 +433,22 @@ object DownloadsRepository {
             .mapTo(mutableSetOf()) { it.id }
         val normalized = decoded
             .map { item ->
+                // The pack drain that would have resumed a queued row died with the old process,
+                // so it is honestly just paused now — same as an interrupted transfer.
                 val statusNormalized = if (item.status == DownloadStatus.Downloading) {
                     item.copy(
                         status = DownloadStatus.Paused,
+                        awaitingSlot = false,
                         bytesPerSecond = null,
                         errorMessage = null,
                     )
+                } else if (item.awaitingSlot) {
+                    item.copy(awaitingSlot = false)
                 } else {
                     item
                 }
 
-                val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized)
-                val idNormalized = localUriNormalized.withMigratedAnimeIds()
+                val idNormalized = statusNormalized.withMigratedAnimeIds()
                 if (idNormalized != item) {
                     shouldPersistNormalized = true
                 }
@@ -434,6 +458,54 @@ object DownloadsRepository {
         _uiState.value = DownloadsUiState(normalized)
         notifyLiveStatusPlatform()
         if (shouldPersistNormalized) {
+            persist()
+        }
+        resolveCompletedLocalFilesAsync(normalized)
+    }
+
+    /**
+     * Re-resolves each completed download's on-disk path after the list is already published.
+     *
+     * Resolving stats the file, and the files live wherever the user's library folders are — a
+     * sleeping HDD answers the first stat only once it has spun up. Doing this inline in
+     * [loadFromDisk] held the UI thread for the whole spin-up on launch (the deferred warm loads
+     * this repository, but a screen's `ensureLoaded` call could win the race and pay on Main).
+     * Nothing needs the resolved path before it lands: playback lookups resolve on demand through
+     * [hasPlayableLocalFile], and the downloads screen shows the stored path meanwhile.
+     */
+    private fun resolveCompletedLocalFilesAsync(items: List<DownloadItem>) {
+        val completed = items.filter { it.status == DownloadStatus.Completed }
+        if (completed.isEmpty()) return
+        fileResolveJob = fileResolveScope.launch {
+            val resolvedById = HashMap<String, String>()
+            for (item in completed) {
+                ensureActive()
+                val resolved = normalizeCompletedLocalFileUri(item).localFileUri ?: continue
+                if (resolved != item.localFileUri) resolvedById[item.id] = resolved
+            }
+            if (resolvedById.isEmpty()) return@launch
+            ensureActive()
+            applyResolvedLocalFileUris(resolvedById)
+        }
+    }
+
+    private fun applyResolvedLocalFileUris(resolvedById: Map<String, String>) {
+        var changed = false
+        _uiState.update { state ->
+            changed = false
+            val items = state.items.map { item ->
+                val resolved = resolvedById[item.id]
+                if (resolved == null || item.status != DownloadStatus.Completed || item.localFileUri == resolved) {
+                    item
+                } else {
+                    changed = true
+                    item.copy(localFileUri = resolved)
+                }
+            }
+            if (changed) state.copy(items = items) else state
+        }
+        if (changed) {
+            notifyLiveStatusPlatform()
             persist()
         }
     }

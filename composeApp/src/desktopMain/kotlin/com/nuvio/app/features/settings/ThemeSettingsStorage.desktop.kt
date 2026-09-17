@@ -22,6 +22,7 @@ internal actual object ThemeSettingsStorage {
     private const val amoledEnabledKey = "amoled_enabled"
     private const val liquidGlassNativeTabBarEnabledKey = "liquid_glass_native_tab_bar_enabled"
     private const val desktopColumnGuidesVisibleKey = "desktop_column_guides_visible"
+    private const val desktopSettingsFullWidthKey = "desktop_settings_full_width"
     private const val wasdNavigationEnabledKey = "wasd_navigation_enabled"
     private const val desktopNavigationLayoutKey = "desktop_navigation_layout"
     private const val desktopTopBarAlwaysVisibleKey = "desktop_top_bar_always_visible"
@@ -30,18 +31,22 @@ internal actual object ThemeSettingsStorage {
     private const val desktopAppUiScaleAppliesToDetailsKey = "desktop_app_ui_scale_applies_to_details"
     private const val appFontFamilyKey = "app_font_family"
     private const val selectedAppLanguageKey = "selected_app_language"
-    // Only keys understood by the official applications belong in the shared mobile payload.
     // Desktop layout, scaling, navigation, and native-tab-bar flags remain device-local. The
-    // accent gradient stop is fork-only, so it is never exported — it is listed here purely so an
-    // incoming replace clears it and a synced accent cannot inherit a stale local gradient.
+    // custom colours travel twice: as our own per-key form (read back by other desktop-fork
+    // installs) and as the official apps' single `custom_theme_colors` accent gradient, which is
+    // the only form the phone and TV apps read or write — see [OfficialCustomThemeColors].
     private val portableSyncKeys = listOf(
         selectedThemeKey,
         customThemeAccentKey,
         customThemeAccentEndKey,
+        amoledEnabledKey,
+    )
+    // Surfaces the official apps have no notion of. A blob they wrote says nothing about them, so
+    // they are only replaced (or cleared) when the blob came from another desktop-fork install.
+    private val forkOnlySurfaceKeys = listOf(
         customThemeBackgroundKey,
         customThemeElevatedKey,
         customThemeCardKey,
-        amoledEnabledKey,
     )
     private val store = DesktopStorage.store("nuvio_theme_settings")
 
@@ -113,6 +118,13 @@ internal actual object ThemeSettingsStorage {
 
     actual fun saveDesktopColumnGuidesVisible(visible: Boolean) {
         store.putBoolean(ProfileScopedKey.of(desktopColumnGuidesVisibleKey), visible)
+    }
+
+    actual fun loadDesktopSettingsFullWidth(): Boolean? =
+        store.getBoolean(ProfileScopedKey.of(desktopSettingsFullWidthKey))
+
+    actual fun saveDesktopSettingsFullWidth(enabled: Boolean) {
+        store.putBoolean(ProfileScopedKey.of(desktopSettingsFullWidthKey), enabled)
     }
 
     actual fun loadWasdNavigationEnabled(): Boolean? =
@@ -187,7 +199,14 @@ internal actual object ThemeSettingsStorage {
 
     actual fun exportToSyncPayload(): JsonObject = buildJsonObject {
         loadSelectedTheme()?.let { put(selectedThemeKey, encodeSyncString(it)) }
-        loadCustomThemeAccent()?.let { put(customThemeAccentKey, encodeSyncString(it)) }
+        val accent = loadCustomThemeAccent()
+        val accentEnd = loadCustomThemeAccentEnd() ?: accent
+        accent?.let { put(customThemeAccentKey, encodeSyncString(it)) }
+        accentEnd?.let { put(customThemeAccentEndKey, encodeSyncString(it)) }
+        if (accent != null) {
+            OfficialCustomThemeColors.encode(accent, accentEnd ?: accent)
+                ?.let { put(OfficialCustomThemeColors.KEY, encodeSyncString(it)) }
+        }
         loadCustomThemeBackground()?.let { put(customThemeBackgroundKey, encodeSyncString(it)) }
         loadCustomThemeElevated()?.let { put(customThemeElevatedKey, encodeSyncString(it)) }
         loadCustomThemeCard()?.let { put(customThemeCardKey, encodeSyncString(it)) }
@@ -197,10 +216,29 @@ internal actual object ThemeSettingsStorage {
     actual fun replaceFromSyncPayload(payload: JsonObject) {
         store.removeAll(portableSyncKeys.map(ProfileScopedKey::of))
         payload.decodeSyncString(selectedThemeKey)?.let(::saveSelectedTheme)
-        payload.decodeSyncString(customThemeAccentKey)?.let(::saveCustomThemeAccent)
-        payload.decodeSyncString(customThemeBackgroundKey)?.let(::saveCustomThemeBackground)
-        payload.decodeSyncString(customThemeElevatedKey)?.let(::saveCustomThemeElevated)
-        payload.decodeSyncString(customThemeCardKey)?.let(::saveCustomThemeCard)
+
+        // Our per-key accent wins when present (a desktop-fork blob carries both forms); otherwise
+        // take the official gradient so a theme chosen on the phone lands here with its colours.
+        val ownAccent = payload.decodeSyncString(customThemeAccentKey)
+        if (ownAccent != null) {
+            saveCustomThemeAccent(ownAccent)
+            payload.decodeSyncString(customThemeAccentEndKey)?.let(::saveCustomThemeAccentEnd)
+        } else {
+            OfficialCustomThemeColors.decode(payload.decodeSyncString(OfficialCustomThemeColors.KEY))
+                ?.let { (accent, accentEnd) ->
+                    saveCustomThemeAccent(accent)
+                    saveCustomThemeAccentEnd(accentEnd)
+                }
+        }
+
+        val fromDesktopFork = ownAccent != null || forkOnlySurfaceKeys.any { payload.containsKey(it) }
+        if (fromDesktopFork) {
+            store.removeAll(forkOnlySurfaceKeys.map(ProfileScopedKey::of))
+            payload.decodeSyncString(customThemeBackgroundKey)?.let(::saveCustomThemeBackground)
+            payload.decodeSyncString(customThemeElevatedKey)?.let(::saveCustomThemeElevated)
+            payload.decodeSyncString(customThemeCardKey)?.let(::saveCustomThemeCard)
+        }
+
         payload.decodeSyncBoolean(amoledEnabledKey)?.let(::saveAmoledEnabled)
         applySelectedAppLanguage(loadSelectedAppLanguage() ?: AppLanguage.ENGLISH.code)
     }

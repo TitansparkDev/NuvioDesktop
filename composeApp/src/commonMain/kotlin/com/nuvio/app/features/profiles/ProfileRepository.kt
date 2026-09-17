@@ -110,6 +110,13 @@ object ProfileRepository {
 
     val activeProfileId: Int get() = activeProfileIndexBacking
 
+    /**
+     * Owner of the cached profile payload, if one is loaded. Lets callers attribute a local edit
+     * to an account while the session is Loading/Unauthenticated (a signed-out-but-cached user is
+     * deliberately kept inside the app rather than yanked back to the sign-in gate).
+     */
+    val cachedUserId: String? get() = loadedCacheForUserId
+
     fun setRememberLastProfileEnabled(enabled: Boolean) {
         if (_state.value.rememberLastProfileEnabled == enabled) return
 

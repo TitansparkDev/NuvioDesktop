@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.HistoryEdu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAddCheckCircle
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
@@ -50,6 +51,12 @@ fun EpisodeWatchedActionSheet(
     // local-library routes, it is the one that overrides stream auto-play, so it is offered
     // whether or not this episode has a local file to alternate to.
     onChooseSource: (() -> Unit)? = null,
+    /**
+     * Null when there is no earlier story with synopses behind this episode, or the feature is off.
+     * This is the mid-season half of the recap: the boundary is the episode about to be played,
+     * which is more precise than "before season N" and is what someone resuming actually wants.
+     */
+    onRecap: (() -> Unit)? = null,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
@@ -131,6 +138,19 @@ fun EpisodeWatchedActionSheet(
                     },
                 )
             }
+            if (onRecap != null) {
+                NuvioBottomSheetDivider()
+                NuvioBottomSheetActionRow(
+                    icon = Icons.Default.HistoryEdu,
+                    title = stringResource(Res.string.recap_action),
+                    onClick = {
+                        onRecap()
+                        coroutineScope.launch {
+                            dismissNuvioBottomSheet(sheetState = sheetState, onDismiss = onDismiss)
+                        }
+                    },
+                )
+            }
             if (onChooseSource != null) {
                 NuvioBottomSheetDivider()
                 NuvioBottomSheetActionRow(
@@ -157,6 +177,12 @@ fun SeasonWatchedActionSheet(
     onDismiss: () -> Unit,
     onToggleSeasonWatched: () -> Unit,
     onMarkPreviousSeasonsWatched: () -> Unit,
+    /**
+     * Null when there is nothing to recap or the feature is off — an absent row rather than a
+     * disabled one, because a season 1 long-press has no earlier story by definition and a row
+     * that is always greyed out there reads as broken.
+     */
+    onRecap: (() -> Unit)? = null,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
@@ -198,6 +224,19 @@ fun SeasonWatchedActionSheet(
                     }
                 },
             )
+            if (onRecap != null) {
+                NuvioBottomSheetDivider()
+                NuvioBottomSheetActionRow(
+                    icon = Icons.Default.HistoryEdu,
+                    title = stringResource(Res.string.recap_action),
+                    onClick = {
+                        onRecap()
+                        coroutineScope.launch {
+                            dismissNuvioBottomSheet(sheetState = sheetState, onDismiss = onDismiss)
+                        }
+                    },
+                )
+            }
             if (canMarkPreviousSeasons) {
                 NuvioBottomSheetDivider()
                 NuvioBottomSheetActionRow(

@@ -9,9 +9,15 @@ import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.quarantineMismatchedImdbTmdbIdentity
 import com.nuvio.app.features.details.MoreLikeThisSource
 import com.nuvio.app.features.details.PersonDetail
+import com.nuvio.app.features.home.HeroAward
+import com.nuvio.app.features.home.HeroDiscoveryAwards
+import com.nuvio.app.features.home.HeroDiscoveryBadgeTarget
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.home.cacheKey
 import com.nuvio.app.features.home.PosterShape
 import com.nuvio.app.features.mdblist.MdbListSettingsRepository
+import com.nuvio.app.features.watchprogress.CurrentDateProvider
+import com.nuvio.app.features.watchprogress.WatchProgressClock
 import com.nuvio.app.features.watchprogress.preferPreciseReleaseDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -97,6 +103,7 @@ object TmdbMetadataService {
     private val entityBrowseCache = mutableMapOf<String, TmdbEntityBrowseData>()
     private val entityHeaderCache = mutableMapOf<String, TmdbEntityHeader>()
     private val entityRailCache = mutableMapOf<String, TmdbEntityRailPageResult>()
+    private val badgeRailCache = mutableMapOf<String, TmdbEntityRailPageResult>()
     private val entityPosterIdSemaphore = Semaphore(4)
 
     suspend fun fetchPersonDetail(
@@ -405,17 +412,13 @@ object TmdbMetadataService {
         val voteCountFloor = if (railType == TmdbEntityRailType.TOP_RATED) ENTITY_TOP_RATED_VOTE_FLOOR else null
 
         val result = try {
-            val sortBy = when (mediaType) {
-                TmdbEntityMediaType.MOVIE -> when (railType) {
-                    TmdbEntityRailType.POPULAR -> "popularity.desc"
-                    TmdbEntityRailType.TOP_RATED -> "vote_average.desc"
-                    TmdbEntityRailType.RECENT -> "primary_release_date.desc"
+            val sortBy = when (railType) {
+                TmdbEntityRailType.TOP_RATED -> "vote_average.desc"
+                TmdbEntityRailType.RECENT -> when (mediaType) {
+                    TmdbEntityMediaType.MOVIE -> "primary_release_date.desc"
+                    TmdbEntityMediaType.TV -> "first_air_date.desc"
                 }
-                TmdbEntityMediaType.TV -> when (railType) {
-                    TmdbEntityRailType.POPULAR -> "popularity.desc"
-                    TmdbEntityRailType.TOP_RATED -> "vote_average.desc"
-                    TmdbEntityRailType.RECENT -> "first_air_date.desc"
-                }
+                else -> "popularity.desc"
             }
 
             val queryParams = buildMap {
@@ -494,6 +497,363 @@ object TmdbMetadataService {
         )
     }
 
+    // ─── Hero badge browse ───
+
+    /**
+     * The rails behind a clickable hero discovery badge — the same shape as [fetchEntityBrowse]
+     * so both share one screen. Which rails exist depends on the target: the award lists get one
+     * "Winners"/"Nominees" rail per media type, discover-backed targets get the usual
+     * Popular / Top Rated / Recent trio, and the single-list targets (trending, new at home, now
+     * playing, upcoming) get one [TmdbEntityRailType.FEATURED] rail. Empty rails are dropped.
+     */
+    suspend fun fetchBadgeBrowse(
+        target: HeroDiscoveryBadgeTarget,
+        sourceType: String,
+    ): List<TmdbEntityRail>? = withContext(Dispatchers.Default) {
+        val settings = TmdbSettingsRepository.snapshot()
+        if (!settings.enabled || !settings.hasApiKey) return@withContext null
+        val language = normalizeTmdbLanguage(settings.language)
+        val mediaOrder = badgeMediaOrder(target, normalizeEntitySourceType(sourceType))
+        val rails = coroutineScope {
+            mediaOrder.flatMap { mediaType ->
+                badgeRailTypes(target).map { railType ->
+                    async {
+                        val pageResult = fetchBadgeRailPage(
+                            target = target,
+                            mediaType = mediaType,
+                            railType = railType,
+                            language = language,
+                            page = 1,
+                        )
+                        if (pageResult.items.isEmpty()) {
+                            null
+                        } else {
+                            TmdbEntityRail(
+                                mediaType = mediaType,
+                                railType = railType,
+                                items = pageResult.items,
+                                currentPage = 1,
+                                hasMore = pageResult.hasMore,
+                            )
+                        }
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+        rails
+    }
+
+    suspend fun fetchNextBadgeRailPage(
+        target: HeroDiscoveryBadgeTarget,
+        rail: TmdbEntityRail,
+    ): TmdbEntityRailPageResult {
+        val settings = TmdbSettingsRepository.snapshot()
+        if (!settings.enabled || !settings.hasApiKey || !rail.hasMore) {
+            return TmdbEntityRailPageResult(items = emptyList(), hasMore = false)
+        }
+        return fetchBadgeRailPage(
+            target = target,
+            mediaType = rail.mediaType,
+            railType = rail.railType,
+            language = normalizeTmdbLanguage(settings.language),
+            page = rail.currentPage + 1,
+        )
+    }
+
+    private fun badgeMediaOrder(target: HeroDiscoveryBadgeTarget, sourceType: String): List<TmdbEntityMediaType> {
+        val both = when (sourceType) {
+            "movie" -> listOf(TmdbEntityMediaType.MOVIE, TmdbEntityMediaType.TV)
+            else -> listOf(TmdbEntityMediaType.TV, TmdbEntityMediaType.MOVIE)
+        }
+        val movieOnly = listOf(TmdbEntityMediaType.MOVIE)
+        return when (target) {
+            is HeroDiscoveryBadgeTarget.AwardList -> when (target.award) {
+                HeroAward.BEST_PICTURE -> movieOnly
+                HeroAward.EMMY -> listOf(TmdbEntityMediaType.TV)
+                HeroAward.GOLDEN_GLOBE -> both
+            }
+            is HeroDiscoveryBadgeTarget.Keyword -> if (target.movieOnly) movieOnly else both
+            is HeroDiscoveryBadgeTarget.Language -> both
+            HeroDiscoveryBadgeTarget.Trending -> both
+            HeroDiscoveryBadgeTarget.NewAtHome,
+            HeroDiscoveryBadgeTarget.NowPlaying,
+            HeroDiscoveryBadgeTarget.Upcoming,
+            HeroDiscoveryBadgeTarget.ShortFilm -> movieOnly
+            is HeroDiscoveryBadgeTarget.Company, is HeroDiscoveryBadgeTarget.Director -> emptyList()
+        }
+    }
+
+    private fun badgeRailTypes(target: HeroDiscoveryBadgeTarget): List<TmdbEntityRailType> = when (target) {
+        is HeroDiscoveryBadgeTarget.AwardList ->
+            listOf(if (target.won) TmdbEntityRailType.WINNERS else TmdbEntityRailType.NOMINEES)
+        is HeroDiscoveryBadgeTarget.Keyword,
+        is HeroDiscoveryBadgeTarget.Language,
+        HeroDiscoveryBadgeTarget.ShortFilm ->
+            listOf(TmdbEntityRailType.POPULAR, TmdbEntityRailType.TOP_RATED, TmdbEntityRailType.RECENT)
+        HeroDiscoveryBadgeTarget.Trending,
+        HeroDiscoveryBadgeTarget.NewAtHome,
+        HeroDiscoveryBadgeTarget.NowPlaying,
+        HeroDiscoveryBadgeTarget.Upcoming -> listOf(TmdbEntityRailType.FEATURED)
+        is HeroDiscoveryBadgeTarget.Company, is HeroDiscoveryBadgeTarget.Director -> emptyList()
+    }
+
+    private suspend fun fetchBadgeRailPage(
+        target: HeroDiscoveryBadgeTarget,
+        mediaType: TmdbEntityMediaType,
+        railType: TmdbEntityRailType,
+        language: String,
+        page: Int,
+    ): TmdbEntityRailPageResult {
+        val posterSettings = TmdbSettingsRepository.snapshot()
+        val cacheKey = "${target.cacheKey()}:${mediaType.value}:${railType.value}:$language:" +
+            "${entityPosterCacheKey(posterSettings)}:page:$page"
+        badgeRailCache[cacheKey]?.let { return it }
+
+        val result = try {
+            when (target) {
+                is HeroDiscoveryBadgeTarget.AwardList -> fetchAwardListPage(target, mediaType, language, page, posterSettings)
+                HeroDiscoveryBadgeTarget.Trending -> fetchTrendingRail(mediaType, posterSettings)
+                else -> fetchBadgeDiscoverPage(target, mediaType, railType, language, page, posterSettings)
+            }
+        } catch (e: Exception) {
+            log.w(e) { "Failed to fetch badge rail ${railType.value}/${mediaType.value} for ${target.cacheKey()}" }
+            TmdbEntityRailPageResult(items = emptyList(), hasMore = false)
+        }
+
+        if (result.items.isNotEmpty()) {
+            badgeRailCache[cacheKey] = result
+        }
+        return result
+    }
+
+    /**
+     * The hardcoded award sets, hydrated one `/movie/{id}` or `/tv/{id}` at a time under the same
+     * permit the poster lookups use. Paged over the id list so opening "Emmy Winners" costs one
+     * page of requests, not the whole set.
+     */
+    private suspend fun fetchAwardListPage(
+        target: HeroDiscoveryBadgeTarget.AwardList,
+        mediaType: TmdbEntityMediaType,
+        language: String,
+        page: Int,
+        posterSettings: TmdbSettings,
+    ): TmdbEntityRailPageResult {
+        val ids = HeroDiscoveryAwards.browseIds(
+            award = target.award,
+            won = target.won,
+            tv = mediaType == TmdbEntityMediaType.TV,
+        )
+        val from = (page - 1) * ENTITY_RAIL_MAX_ITEMS
+        if (from >= ids.size) return TmdbEntityRailPageResult(items = emptyList(), hasMore = false)
+        val pageIds = ids.subList(from, minOf(from + ENTITY_RAIL_MAX_ITEMS, ids.size))
+        val endpointPrefix = if (mediaType == TmdbEntityMediaType.TV) "tv" else "movie"
+        val items = coroutineScope {
+            pageIds.map { id ->
+                async {
+                    entityPosterIdSemaphore.withPermit {
+                        fetch<TmdbDiscoverResult>(
+                            endpoint = "$endpointPrefix/$id",
+                            query = mapOf("language" to language),
+                        )?.let { mapEntityDiscoverResult(it, mediaType, posterSettings) }
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+        return TmdbEntityRailPageResult(
+            items = items,
+            hasMore = from + ENTITY_RAIL_MAX_ITEMS < ids.size,
+        )
+    }
+
+    private suspend fun fetchTrendingRail(
+        mediaType: TmdbEntityMediaType,
+        posterSettings: TmdbSettings,
+    ): TmdbEntityRailPageResult {
+        val results = TmdbService.fetchTrending(mediaType.value)
+        val items = coroutineScope {
+            results
+                .asSequence()
+                .filter { it.id > 0 }
+                .take(ENTITY_RAIL_MAX_ITEMS)
+                .map { result ->
+                    async {
+                        entityPosterIdSemaphore.withPermit {
+                            mapEntitySearchResult(result, mediaType, posterSettings)
+                        }
+                    }
+                }
+                .toList()
+                .awaitAll()
+                .filterNotNull()
+        }
+        return TmdbEntityRailPageResult(items = items, hasMore = false)
+    }
+
+    private suspend fun fetchBadgeDiscoverPage(
+        target: HeroDiscoveryBadgeTarget,
+        mediaType: TmdbEntityMediaType,
+        railType: TmdbEntityRailType,
+        language: String,
+        page: Int,
+        posterSettings: TmdbSettings,
+    ): TmdbEntityRailPageResult {
+        val requiredStatus = when (target) {
+            HeroDiscoveryBadgeTarget.NowPlaying -> "Cinema"
+            HeroDiscoveryBadgeTarget.Upcoming -> "Production"
+            else -> null
+        }
+        if (requiredStatus != null) {
+            return fetchReleaseStatusFilteredPage(target, mediaType, railType, language, page, posterSettings, requiredStatus)
+        }
+        val (endpoint, queryParams) = badgeDiscoverQuery(target, mediaType, railType, language, page)
+            ?: return TmdbEntityRailPageResult(items = emptyList(), hasMore = false)
+        val response = fetch<TmdbDiscoverResponse>(endpoint = endpoint, query = queryParams)
+        val results = response?.results.orEmpty()
+        val totalPages = response?.totalPages ?: page
+        val mappedItems = coroutineScope {
+            results
+                .asSequence()
+                .filter { it.id > 0 }
+                .take(ENTITY_RAIL_MAX_ITEMS)
+                .map { item ->
+                    async {
+                        entityPosterIdSemaphore.withPermit {
+                            mapEntityDiscoverResult(item, mediaType, posterSettings)
+                        }
+                    }
+                }
+                .toList()
+                .awaitAll()
+                .filterNotNull()
+        }
+        return TmdbEntityRailPageResult(
+            items = mappedItems,
+            hasMore = page < totalPages && mappedItems.isNotEmpty(),
+        )
+    }
+
+    /**
+     * `now_playing` / `upcoming` are theatrical-window lists: a film stays on `now_playing` for
+     * weeks after it has gone digital. The badge itself decides "Cinema" per title from
+     * `release_dates` ([TmdbService.fetchMovieReleaseStatus]), so the rail must apply the same
+     * rule or it lists films the app itself no longer badges as in cinemas. Each rail page reads
+     * [RELEASE_STATUS_SOURCE_PAGES_PER_RAIL_PAGE] source pages and keeps the titles whose status
+     * matches; the per-title lookups share the badge's 6-hour release_dates cache.
+     */
+    private suspend fun fetchReleaseStatusFilteredPage(
+        target: HeroDiscoveryBadgeTarget,
+        mediaType: TmdbEntityMediaType,
+        railType: TmdbEntityRailType,
+        language: String,
+        page: Int,
+        posterSettings: TmdbSettings,
+        requiredStatus: String,
+    ): TmdbEntityRailPageResult {
+        val firstSourcePage = (page - 1) * RELEASE_STATUS_SOURCE_PAGES_PER_RAIL_PAGE + 1
+        val lastSourcePage = firstSourcePage + RELEASE_STATUS_SOURCE_PAGES_PER_RAIL_PAGE - 1
+        var totalPages = lastSourcePage
+        val candidates = mutableListOf<TmdbDiscoverResult>()
+        for (sourcePage in firstSourcePage..lastSourcePage) {
+            if (sourcePage > totalPages) break
+            val (endpoint, queryParams) = badgeDiscoverQuery(target, mediaType, railType, language, sourcePage)
+                ?: break
+            val response = fetch<TmdbDiscoverResponse>(endpoint = endpoint, query = queryParams) ?: break
+            totalPages = response.totalPages ?: sourcePage
+            candidates += response.results.filter { it.id > 0 }
+        }
+        val items = coroutineScope {
+            candidates
+                .distinctBy { it.id }
+                .map { item ->
+                    async {
+                        entityPosterIdSemaphore.withPermit {
+                            val status = TmdbService.fetchMovieReleaseStatus(tmdbId = item.id, tmdbStatus = null)
+                            if (status == requiredStatus) mapEntityDiscoverResult(item, mediaType, posterSettings) else null
+                        }
+                    }
+                }
+                .awaitAll()
+                .filterNotNull()
+        }
+        return TmdbEntityRailPageResult(
+            items = items,
+            hasMore = lastSourcePage < totalPages,
+        )
+    }
+
+    /** Endpoint plus query for the discover-shaped badge targets; null when the target has no query. */
+    private fun badgeDiscoverQuery(
+        target: HeroDiscoveryBadgeTarget,
+        mediaType: TmdbEntityMediaType,
+        railType: TmdbEntityRailType,
+        language: String,
+        page: Int,
+    ): Pair<String, Map<String, String>>? {
+        val isTv = mediaType == TmdbEntityMediaType.TV
+        val base = mutableMapOf(
+            "language" to language,
+            "page" to page.toString(),
+            "include_adult" to "false",
+        )
+        when (target) {
+            HeroDiscoveryBadgeTarget.NowPlaying -> return "movie/now_playing" to base
+            HeroDiscoveryBadgeTarget.Upcoming -> return "movie/upcoming" to base
+            HeroDiscoveryBadgeTarget.NewAtHome -> {
+                // `release_date.*` (not `primary_release_date.*`) is what scopes the window to
+                // the release types asked for — otherwise the filter is on the cinema date.
+                val now = WatchProgressClock.nowEpochMs()
+                base["with_release_type"] = "4|5|6"
+                base["release_date.gte"] = CurrentDateProvider.localIsoDateAt(now - NEW_AT_HOME_WINDOW_DAYS * 86_400_000L)
+                base["release_date.lte"] = CurrentDateProvider.localIsoDateAt(now)
+                base["sort_by"] = "release_date.desc"
+                base["vote_count.gte"] = BADGE_DISCOVER_VOTE_FLOOR.toString()
+                return "discover/movie" to base
+            }
+            else -> Unit
+        }
+
+        base["sort_by"] = when (railType) {
+            TmdbEntityRailType.TOP_RATED -> "vote_average.desc"
+            TmdbEntityRailType.RECENT -> if (isTv) "first_air_date.desc" else "primary_release_date.desc"
+            else -> "popularity.desc"
+        }
+        base["vote_count.gte"] = when (railType) {
+            TmdbEntityRailType.TOP_RATED -> ENTITY_TOP_RATED_VOTE_FLOOR
+            else -> BADGE_DISCOVER_VOTE_FLOOR
+        }.toString()
+        if (railType == TmdbEntityRailType.RECENT) {
+            // Discover happily sorts unreleased titles first; cap at today like the badge does.
+            val today = CurrentDateProvider.localIsoDateAt(WatchProgressClock.nowEpochMs())
+            base[if (isTv) "first_air_date.lte" else "primary_release_date.lte"] = today
+        }
+        when (target) {
+            is HeroDiscoveryBadgeTarget.Keyword -> base["with_keywords"] = target.keywordIds.joinToString("|")
+            is HeroDiscoveryBadgeTarget.Language -> base["with_original_language"] = tmdbLanguageCode(target.code)
+            HeroDiscoveryBadgeTarget.ShortFilm -> {
+                base["with_runtime.gte"] = "1"
+                base["with_runtime.lte"] = SHORT_FILM_MAX_MINUTES.toString()
+            }
+            else -> return null
+        }
+        return (if (isTv) "discover/tv" else "discover/movie") to base
+    }
+
+    /** `with_original_language` wants ISO 639-1; metadata sometimes carries the 639-2 form. */
+    private fun tmdbLanguageCode(code: String): String {
+        val normalized = code.trim().lowercase()
+        return if (normalized.length == 3) ISO_639_2_TO_1[normalized] ?: normalized else normalized
+    }
+
+    private val ISO_639_2_TO_1 = mapOf(
+        "eng" to "en", "fre" to "fr", "fra" to "fr", "ger" to "de", "deu" to "de", "spa" to "es",
+        "ita" to "it", "por" to "pt", "jpn" to "ja", "kor" to "ko", "zho" to "zh", "chi" to "zh",
+        "dan" to "da", "swe" to "sv", "nor" to "no", "fin" to "fi", "dut" to "nl", "nld" to "nl",
+        "pol" to "pl", "rus" to "ru", "tur" to "tr", "ara" to "ar", "hin" to "hi", "per" to "fa",
+        "fas" to "fa", "rum" to "ro", "ron" to "ro", "hun" to "hu", "cze" to "cs", "ces" to "cs",
+        "heb" to "he", "gre" to "el", "ell" to "el", "tha" to "th", "vie" to "vi", "ind" to "id",
+        "tam" to "ta", "tel" to "te", "ben" to "bn", "ukr" to "uk",
+    )
+
     private suspend fun fetchEntityHeader(
         entityKind: TmdbEntityKind,
         entityId: Int,
@@ -563,49 +923,88 @@ object TmdbMetadataService {
         result: TmdbDiscoverResult,
         mediaType: TmdbEntityMediaType,
         posterSettings: TmdbSettings,
-    ): MetaPreview? {
-        val title = result.title?.takeIf { it.isNotBlank() }
+    ): MetaPreview? = buildEntityPreview(
+        tmdbId = result.id,
+        title = result.title?.takeIf { it.isNotBlank() }
             ?: result.name?.takeIf { it.isNotBlank() }
             ?: result.originalTitle?.takeIf { it.isNotBlank() }
-            ?: result.originalName?.takeIf { it.isNotBlank() }
-            ?: return null
+            ?: result.originalName?.takeIf { it.isNotBlank() },
+        posterPath = result.posterPath,
+        backdropPath = result.backdropPath,
+        overview = result.overview,
+        date = when (mediaType) {
+            TmdbEntityMediaType.MOVIE -> result.releaseDate
+            TmdbEntityMediaType.TV -> result.firstAirDate
+        },
+        mediaType = mediaType,
+        posterSettings = posterSettings,
+    )
 
-        val poster = buildImageUrl(result.posterPath, "w500")
-            ?: buildImageUrl(result.backdropPath, "w780")
+    private suspend fun mapEntitySearchResult(
+        result: TmdbSearchResult,
+        mediaType: TmdbEntityMediaType,
+        posterSettings: TmdbSettings,
+    ): MetaPreview? = buildEntityPreview(
+        tmdbId = result.id,
+        title = result.title?.takeIf { it.isNotBlank() } ?: result.name?.takeIf { it.isNotBlank() },
+        posterPath = result.posterPath,
+        backdropPath = result.backdropPath,
+        overview = result.overview,
+        date = when (mediaType) {
+            TmdbEntityMediaType.MOVIE -> result.releaseDate
+            TmdbEntityMediaType.TV -> result.firstAirDate
+        },
+        mediaType = mediaType,
+        posterSettings = posterSettings,
+    )
+
+    /**
+     * One rail card from the fields every TMDB list-shaped payload carries (discover, trending,
+     * `/movie/{id}`), with the library poster template applied the same way for all of them.
+     */
+    private suspend fun buildEntityPreview(
+        tmdbId: Int,
+        title: String?,
+        posterPath: String?,
+        backdropPath: String?,
+        overview: String?,
+        date: String?,
+        mediaType: TmdbEntityMediaType,
+        posterSettings: TmdbSettings,
+    ): MetaPreview? {
+        if (tmdbId <= 0 || title.isNullOrBlank()) return null
+        val poster = buildImageUrl(posterPath, "w500")
+            ?: buildImageUrl(backdropPath, "w780")
             ?: return null
-        val releaseInfo = when (mediaType) {
-            TmdbEntityMediaType.MOVIE -> result.releaseDate?.take(4)
-            TmdbEntityMediaType.TV -> result.firstAirDate?.take(4)
-        }
         val type = if (mediaType == TmdbEntityMediaType.TV) "series" else "movie"
         val base = MetaPreview(
-            id = "tmdb:${result.id}",
+            id = "tmdb:$tmdbId",
             type = type,
             name = title,
             poster = poster,
-            banner = buildImageUrl(result.backdropPath, "w780"),
+            banner = buildImageUrl(backdropPath, "w780"),
             logo = null,
-            description = result.overview?.takeIf { it.isNotBlank() },
-            releaseInfo = releaseInfo,
+            description = overview?.takeIf { it.isNotBlank() },
+            releaseInfo = date?.take(4),
         )
         val mdbListApiKey = MdbListSettingsRepository.snapshot().apiKey
         var styled = base.withCustomLibraryPoster(
             settings = posterSettings,
             imdbId = null,
-            tmdbId = result.id,
+            tmdbId = tmdbId,
             mdbListApiKey = mdbListApiKey,
         )
         if (styled === base && posterSettings.customPosterTemplateNeedsImdbId()) {
             val posterIds = resolveCustomPosterIds(
                 settings = posterSettings,
                 imdbId = null,
-                tmdbId = result.id,
+                tmdbId = tmdbId,
                 type = type,
             )
             styled = base.withCustomLibraryPoster(
                 settings = posterSettings,
                 imdbId = posterIds.imdbId,
-                tmdbId = posterIds.tmdbId ?: result.id,
+                tmdbId = posterIds.tmdbId ?: tmdbId,
                 mdbListApiKey = mdbListApiKey,
             )
         }
@@ -846,6 +1245,7 @@ object TmdbMetadataService {
                 imdbRating = updated.imdbRating?.takeIf { it.isNotBlank() }
                     ?: enrichment.rating?.formatRating(),
                 genres = enrichment.genres.ifEmpty { updated.genres },
+                tmdbKeywords = enrichment.keywords.ifEmpty { updated.tmdbKeywords },
             )
         }
 
@@ -1005,7 +1405,9 @@ object TmdbMetadataService {
             val details = async {
                 fetch<TmdbDetailsResponse>(
                     endpoint = "$mediaType/$numericId",
-                    query = mapOf("language" to normalizedLanguage),
+                    // Keywords ride along on the call already being made — a separate
+                    // /keywords request per title would double the details fetch for no reason.
+                    query = mapOf("language" to normalizedLanguage, "append_to_response" to "keywords"),
                 )
             }
             val credits = async {
@@ -1114,6 +1516,7 @@ object TmdbMetadataService {
             },
             moreLikeThis = response.fourth.moreLikeThis,
             trailers = response.fourth.trailers,
+            keywords = details.keywords?.names().orEmpty(),
         )
 
         if (!enrichment.hasContent()) return@withContext null
@@ -1432,6 +1835,7 @@ internal data class TmdbEnrichment(
     val collectionItems: List<MetaPreview> = emptyList(),
     val moreLikeThis: List<MetaPreview> = emptyList(),
     val trailers: List<MetaTrailer> = emptyList(),
+    val keywords: List<String> = emptyList(),
 ) {
     fun hasContent(): Boolean =
         localizedTitle != null ||
@@ -1741,7 +2145,19 @@ private data class TmdbDetailsResponse(
     val networks: List<TmdbCompany> = emptyList(),
     @SerialName("belongs_to_collection") val belongsToCollection: TmdbCollectionRef? = null,
     @SerialName("number_of_seasons") val numberOfSeasons: Int? = null,
+    /** Present only with `append_to_response=keywords`. */
+    val keywords: TmdbAppendedKeywords? = null,
 )
+
+/** TMDB puts a movie's keywords under `keywords` and a show's under `results`. */
+@Serializable
+private data class TmdbAppendedKeywords(
+    val keywords: List<TmdbNamedItem> = emptyList(),
+    val results: List<TmdbNamedItem> = emptyList(),
+) {
+    fun names(): List<String> =
+        (keywords + results).mapNotNull { it.name?.trim()?.takeIf(String::isNotBlank) }
+}
 
 @Serializable
 private data class TmdbVideosResponse(
@@ -1984,6 +2400,13 @@ private data class TmdbPersonCreditCrew(
 private const val ENTITY_RAIL_MAX_ITEMS = 20
 private const val ENTITY_TOP_RATED_VOTE_FLOOR = 200
 
+// Hero badge browse. The vote floor keeps a language or keyword "Popular" rail from filling with
+// untitled uploads; the window and runtime cap mirror the badge rules in HeroDiscoveryMetadataService.
+private const val BADGE_DISCOVER_VOTE_FLOOR = 50
+private const val NEW_AT_HOME_WINDOW_DAYS = 30
+private const val SHORT_FILM_MAX_MINUTES = 39
+private const val RELEASE_STATUS_SOURCE_PAGES_PER_RAIL_PAGE = 2
+
 enum class TmdbEntityKind(val routeValue: String) {
     COMPANY("company"),
     NETWORK("network");
@@ -2005,6 +2428,13 @@ enum class TmdbEntityRailType(val value: String) {
     POPULAR("popular"),
     TOP_RATED("top_rated"),
     RECENT("recent"),
+
+    // Emitted only by the hero badge browse (see fetchBadgeBrowse); the company/network rails
+    // never use them.
+    WINNERS("winners"),
+    NOMINEES("nominees"),
+    /** A single rail whose label is the badge itself — trending, new at home, now playing. */
+    FEATURED("featured"),
 }
 
 data class TmdbEntityHeader(

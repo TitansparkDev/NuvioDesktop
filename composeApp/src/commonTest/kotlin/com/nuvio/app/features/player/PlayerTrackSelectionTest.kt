@@ -16,14 +16,12 @@ class PlayerTrackSelectionTest {
         showOnlyPreferred: Boolean,
         preferred: String = "en",
         secondary: String? = null,
-        useForced: Boolean = false,
+        trackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
     ) = PlayerSettingsUiState(
         preferredSubtitleLanguage = preferred,
         secondaryPreferredSubtitleLanguage = secondary,
-        subtitleStyle = SubtitleStyleState(
-            showOnlyPreferredLanguages = showOnlyPreferred,
-            useForcedSubtitles = useForced,
-        ),
+        preferredSubtitleTrackKind = trackKind,
+        subtitleStyle = SubtitleStyleState(showOnlyPreferredLanguages = showOnlyPreferred),
     )
 
     private fun addonSubtitle(
@@ -70,16 +68,41 @@ class PlayerTrackSelectionTest {
     }
 
     @Test
-    fun `forced tracks survive the preferred-only filter while forced subtitles are on`() {
-        // With forced mode on the primary preference resolves to FORCED (dropped), so a secondary
-        // language is what supplies the concrete target — English here keeps track 0, and the
-        // forced French track is kept because forced-subtitle mode is on.
+    fun `the preferred track kind never widens the preferred-only filter`() {
+        // The reported case: English preferred, forced preferred, filter on. The kind is a
+        // selection tiebreaker, so the list still shows English alone — not every language, and
+        // not the forced French track either.
         val result = filterBuiltInSubtitlesForSettings(
             tracks = englishSpanishTracks,
-            settings = settings(showOnlyPreferred = true, secondary = "en", useForced = true),
+            settings = settings(showOnlyPreferred = true, trackKind = SubtitleTrackKind.FORCED),
             selectedIndex = -1,
         )
-        assertEquals(listOf(0, 2), result.map { it.index })
+        assertEquals(listOf(0), result.map { it.index })
+
+        val addons = listOf(
+            addonSubtitle(id = "pt", language = "pob"),
+            addonSubtitle(id = "en", language = "eng"),
+        )
+        assertEquals(
+            listOf("en"),
+            filterAddonSubtitlesForSettings(
+                subtitles = addons,
+                settings = settings(showOnlyPreferred = true, trackKind = SubtitleTrackKind.FORCED),
+                selectedAddonSubtitleId = null,
+            ).map { it.id },
+        )
+    }
+
+    @Test
+    fun `a legacy forced language value resolves to no target rather than a language`() {
+        assertEquals(
+            listOf("en"),
+            resolvePreferredSubtitleLanguageTargets(
+                preferredSubtitleLanguage = SubtitleLanguageOption.FORCED,
+                secondaryPreferredSubtitleLanguage = "en",
+                deviceLanguages = emptyList(),
+            ),
+        )
     }
 
     @Test
@@ -149,8 +172,93 @@ class PlayerTrackSelectionTest {
             findPreferredSubtitleTrackIndex(
                 tracks = tracks,
                 targets = listOf("en"),
-                preferHearingImpaired = true,
+                trackKind = SubtitleTrackKind.SDH,
             ),
+        )
+    }
+
+    @Test
+    fun `forced preference chooses the forced track in the preferred language`() {
+        val tracks = listOf(
+            SubtitleTrack(index = 0, id = "1", label = "French forced", language = "fre", isForced = true),
+            SubtitleTrack(index = 1, id = "2", label = "English", language = "eng"),
+            SubtitleTrack(index = 2, id = "3", label = "English", language = "eng", isForced = true),
+        )
+
+        // A forced track in another language is not a match; the English forced one is.
+        assertEquals(
+            2,
+            findPreferredSubtitleTrackIndex(
+                tracks = tracks,
+                targets = listOf("en"),
+                trackKind = SubtitleTrackKind.FORCED,
+            ),
+        )
+    }
+
+    @Test
+    fun `forced preference falls back to a full track in the same language before the secondary`() {
+        val tracks = listOf(
+            SubtitleTrack(index = 0, id = "1", label = "Spanish forced", language = "spa", isForced = true),
+            SubtitleTrack(index = 1, id = "2", label = "English SDH", language = "eng"),
+            SubtitleTrack(index = 2, id = "3", label = "English", language = "eng"),
+        )
+
+        // No English forced track: plain English outranks English SDH, and both outrank the
+        // forced track in the secondary language.
+        assertEquals(
+            2,
+            findPreferredSubtitleTrackIndex(
+                tracks = tracks,
+                targets = listOf("en", "es"),
+                trackKind = SubtitleTrackKind.FORCED,
+            ),
+        )
+    }
+
+    @Test
+    fun `forced tracks are avoided under the standard and SDH preferences`() {
+        val tracks = listOf(
+            SubtitleTrack(index = 0, id = "1", label = "English", language = "eng", isForced = true),
+            SubtitleTrack(index = 1, id = "2", label = "English SDH", language = "eng"),
+            SubtitleTrack(index = 2, id = "3", label = "English", language = "eng"),
+        )
+
+        assertEquals(
+            2,
+            findPreferredSubtitleTrackIndex(tracks, listOf("en"), trackKind = SubtitleTrackKind.STANDARD),
+        )
+        assertEquals(
+            1,
+            findPreferredSubtitleTrackIndex(tracks, listOf("en"), trackKind = SubtitleTrackKind.SDH),
+        )
+        // With only forced and SDH on offer, a Standard viewer gets the full SDH transcript
+        // rather than the fragment.
+        assertEquals(
+            1,
+            findPreferredSubtitleTrackIndex(tracks.take(2), listOf("en"), trackKind = SubtitleTrackKind.STANDARD),
+        )
+    }
+
+    @Test
+    fun `addon selection applies the same kind cascade`() {
+        val subtitles = listOf(
+            addonSubtitle(id = "sdh", language = "eng", display = "English SDH"),
+            addonSubtitle(id = "plain", language = "eng", display = "English"),
+        )
+
+        assertEquals(
+            "sdh",
+            findPreferredAddonSubtitle(subtitles, listOf("en"), trackKind = SubtitleTrackKind.SDH)?.id,
+        )
+        assertEquals(
+            "plain",
+            findPreferredAddonSubtitle(subtitles, listOf("en"), trackKind = SubtitleTrackKind.STANDARD)?.id,
+        )
+        // Addons serve no forced tracks, so the forced viewer simply gets the plain one.
+        assertEquals(
+            "plain",
+            findPreferredAddonSubtitle(subtitles, listOf("en"), trackKind = SubtitleTrackKind.FORCED)?.id,
         )
     }
 
@@ -290,7 +398,7 @@ class PlayerTrackSelectionTest {
             findPreferredSubtitleTrackIndex(
                 tracks = tracks,
                 targets = listOf("en"),
-                preferHearingImpaired = false,
+                trackKind = SubtitleTrackKind.STANDARD,
             ),
         )
     }
@@ -306,7 +414,7 @@ class PlayerTrackSelectionTest {
             findPreferredSubtitleTrackIndex(
                 tracks = tracks,
                 targets = listOf("en"),
-                preferHearingImpaired = false,
+                trackKind = SubtitleTrackKind.STANDARD,
             ),
         )
     }
@@ -352,11 +460,11 @@ class PlayerTrackSelectionTest {
     }
 
     @Test
-    fun `forced-subtitle mode forwards nothing to an external player`() {
+    fun `a forced preference still forwards the preferred language to an external player`() {
         assertEquals(
-            emptyList(),
+            listOf("en"),
             externalPlayerSubtitleTargets(
-                settings = settings(showOnlyPreferred = false, secondary = "en", useForced = true),
+                settings = settings(showOnlyPreferred = false, trackKind = SubtitleTrackKind.FORCED),
                 originalLanguage = null,
             ),
         )

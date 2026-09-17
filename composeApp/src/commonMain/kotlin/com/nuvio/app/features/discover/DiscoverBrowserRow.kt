@@ -26,6 +26,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
@@ -34,6 +37,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.core.i18n.localizedMediaTypeLabel
 import com.nuvio.app.core.ui.accentFill
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.search.DiscoverCatalogOption
@@ -45,19 +49,20 @@ import nuvio.composeapp.generated.resources.discover_all_filters
 import org.jetbrains.compose.resources.stringResource
 
 /**
- * The two header segments. The second is called Filter, not Genre: the addon protocol calls this
- * extra "genre", but its values are routinely years, decades, or providers, so "genre" is
- * misleading in the UI. Wire-level naming (SearchRepository.selectDiscoverGenre) keeps the
- * protocol term.
+ * The three header segments, in display order: media type, catalog, filter. The last is called
+ * Filter, not Genre: the addon protocol calls this extra "genre", but its values are routinely
+ * years, decades, or providers, so "genre" is misleading in the UI. Wire-level naming
+ * (SearchRepository.selectDiscoverGenre) keeps the protocol term.
  */
 enum class DiscoverPickerSegment {
+    Type,
     Catalog,
     Filter,
 }
 
 /**
- * One selectable entry in the picker panel. Catalog rows carry the disambiguated display label
- * computed over the *full* catalog list, so mixed-type lists read unambiguously.
+ * One selectable entry in the picker panel. Catalog rows carry a display label disambiguated
+ * against their neighbours; type rows carry the localized media-type name.
  */
 data class DiscoverPickerEntry(
     val key: String,
@@ -65,14 +70,23 @@ data class DiscoverPickerEntry(
     val selected: Boolean,
 )
 
+/** Media types offered by the installed addons' discover catalogs, in the repository's order. */
+fun DiscoverUiState.typePickerEntries(): List<DiscoverPickerEntry> =
+    typeOptions.map { type ->
+        DiscoverPickerEntry(
+            key = type,
+            label = localizedMediaTypeLabel(type),
+            selected = type == selectedType,
+        )
+    }
+
 /**
- * Catalog labels for the picker, computed over every available catalog rather than the
- * type-filtered subset. There is no separate type selector — the catalog's own name carries its
- * type ("Simkl Trending Movies - Films"), and [discoverCatalogDisplayLabels] appends a type
- * qualifier only where two catalogs would otherwise read identically.
+ * Catalog labels for the picker, scoped to the selected type — the Type segment owns the
+ * cross-type choice. [discoverCatalogDisplayLabels] still appends a type qualifier where two
+ * neighbouring names would otherwise read identically (an addon can expose "tv" and "series").
  */
 fun DiscoverUiState.catalogPickerEntries(): List<DiscoverPickerEntry> {
-    val catalogs = availableCatalogs
+    val catalogs = catalogOptions
     val labels = discoverCatalogDisplayLabels(catalogs)
     return catalogs.mapIndexed { index, catalog ->
         DiscoverPickerEntry(
@@ -108,24 +122,39 @@ fun DiscoverUiState.filterPickerEntries(): List<DiscoverPickerEntry> {
 }
 
 /**
- * The row-1 header: the catalog name, then — once a catalog is chosen — the filter, both clickable
- * and both opening their list into the row body. Rendered through `NuvioShelfSection`'s
- * `titleContent` slot so it keeps the shelf's header line, accent bar, and view-all pill.
+ * The row-1 header: the media type, the catalog name, then — once a catalog is chosen — the
+ * filter, all clickable and each opening its list into the row body. Rendered through
+ * `NuvioShelfSection`'s `titleContent` slot so it keeps the shelf's header line, accent bar, and
+ * view-all pill.
  */
 @Composable
 fun DiscoverRowHeader(
+    typeLabel: String?,
     catalogLabel: String,
     filterLabel: String?,
     activeSegment: DiscoverPickerSegment?,
     onSegmentClick: (DiscoverPickerSegment) -> Unit,
     onSegmentPositioned: (DiscoverPickerSegment, Float) -> Unit,
+    onHeaderBoundsChanged: (Rect) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
-        modifier = modifier,
+        // Root-space bounds, so the screen can tell a press on the header (which still toggles
+        // segments while a picker is open) from a press anywhere else (which only closes it).
+        modifier = modifier.onGloballyPositioned { onHeaderBoundsChanged(it.boundsInRoot()) },
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // The type segment only exists once the addons have been scanned and a type resolved.
+        if (typeLabel != null) {
+            DiscoverHeaderSegment(
+                label = typeLabel,
+                active = activeSegment == DiscoverPickerSegment.Type,
+                onClick = { onSegmentClick(DiscoverPickerSegment.Type) },
+                onPositioned = { x -> onSegmentPositioned(DiscoverPickerSegment.Type, x) },
+            )
+            DiscoverHeaderDivider()
+        }
         DiscoverHeaderSegment(
             label = catalogLabel,
             active = activeSegment == DiscoverPickerSegment.Catalog,
@@ -135,11 +164,7 @@ fun DiscoverRowHeader(
         // The filter segment only exists once a catalog is selected and that catalog exposes
         // filter values.
         if (filterLabel != null) {
-            Text(
-                text = "·",
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.nuvio.colors.textMuted,
-            )
+            DiscoverHeaderDivider()
             DiscoverHeaderSegment(
                 label = filterLabel,
                 active = activeSegment == DiscoverPickerSegment.Filter,
@@ -148,6 +173,15 @@ fun DiscoverRowHeader(
             )
         }
     }
+}
+
+@Composable
+private fun DiscoverHeaderDivider() {
+    Text(
+        text = "·",
+        style = MaterialTheme.typography.titleLarge,
+        color = MaterialTheme.nuvio.colors.textMuted,
+    )
 }
 
 @Composable
@@ -199,6 +233,7 @@ fun BoxScope.DiscoverPickerPanel(
     horizontalPadding: Dp,
     anchorX: Dp,
     onEntryClick: (DiscoverPickerEntry) -> Unit,
+    onPanelBoundsChanged: (Rect) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val tokens = MaterialTheme.nuvio
@@ -230,7 +265,8 @@ fun BoxScope.DiscoverPickerPanel(
         modifier = modifier
             .align(Alignment.TopStart)
             .padding(start = horizontalPadding + offsetX, end = horizontalPadding)
-            .width(panelWidth),
+            .width(panelWidth)
+            .onGloballyPositioned { onPanelBoundsChanged(it.boundsInRoot()) },
         color = tokens.colors.surfaceCard,
         shape = RoundedCornerShape(12.dp),
         tonalElevation = 0.dp,
@@ -302,6 +338,7 @@ fun BoxScope.DiscoverRowBody(
     horizontalPadding: Dp,
     anchorX: Dp,
     onSegmentChange: (DiscoverPickerSegment?) -> Unit,
+    onPanelBoundsChanged: (Rect) -> Unit,
     emptyText: String,
     loadingText: String,
 ) {
@@ -315,6 +352,7 @@ fun BoxScope.DiscoverRowBody(
         return
     }
     val entries = when (segment) {
+        DiscoverPickerSegment.Type -> state.typePickerEntries()
         DiscoverPickerSegment.Catalog -> state.catalogPickerEntries()
         DiscoverPickerSegment.Filter -> state.filterPickerEntries()
     }
@@ -325,21 +363,30 @@ fun BoxScope.DiscoverRowBody(
         horizontalPadding = horizontalPadding,
         anchorX = anchorX,
         onEntryClick = { entry ->
+            // Every pick closes the panel. Choosing a type or catalog resets the filter to "All"
+            // (or the first value where the catalog demands one) and shows the row straight
+            // away; the filter segment stays a click away for anyone who wants to narrow it.
             when (segment) {
-                DiscoverPickerSegment.Catalog -> {
-                    SearchRepository.selectDiscoverCatalog(entry.key)
-                    // Advance to the filter step rather than closing: picking a catalog is rarely
-                    // the whole intent.
-                    onSegmentChange(DiscoverPickerSegment.Filter)
-                }
-                DiscoverPickerSegment.Filter -> {
-                    SearchRepository.selectDiscoverGenre(entry.key.ifBlank { null })
-                    onSegmentChange(null)
-                }
+                DiscoverPickerSegment.Type -> SearchRepository.selectDiscoverType(entry.key)
+                DiscoverPickerSegment.Catalog -> SearchRepository.selectDiscoverCatalog(entry.key)
+                DiscoverPickerSegment.Filter -> SearchRepository.selectDiscoverGenre(entry.key.ifBlank { null })
             }
+            onSegmentChange(null)
         },
+        onPanelBoundsChanged = onPanelBoundsChanged,
     )
 }
+
+/**
+ * Whether a press at [position] (root coordinates) should close an open picker instead of
+ * reaching whatever is under it.
+ *
+ * The panel and the header keep their own behaviour — an entry picks, a segment toggles. Anything
+ * else is a miss: the posters are still there at [DiscoverPostersDimmedAlpha] and would otherwise
+ * open a title the user was only trying to click past the panel to dismiss.
+ */
+fun discoverPickerPressDismisses(position: Offset, panelBounds: Rect?, headerBounds: Rect?): Boolean =
+    panelBounds?.contains(position) != true && headerBounds?.contains(position) != true
 
 /** Alpha the posters fade to while a picker owns the row body. Not 0 — the row stays legible as context. */
 const val DiscoverPostersDimmedAlpha = 0.12f

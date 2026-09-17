@@ -77,6 +77,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
@@ -450,8 +451,9 @@ private fun SettingsCard(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    // Desktop is edge-to-edge: no card surface, no border, rows flow directly on the
-    // page background and are separated only by SettingsGroupDivider hairlines.
+    // Desktop is edge-to-edge: no card surface, no border, rows flow directly on the page
+    // background (or, in the card layout, on the section card) and are separated only by
+    // SettingsGroupDivider hairlines.
     if (isTablet) {
         Column(modifier = modifier.fillMaxWidth(), content = content)
         return
@@ -487,10 +489,13 @@ internal fun SettingsGroup(
 @Composable
 internal fun SettingsGroupDivider(isTablet: Boolean) {
     val tokens = MaterialTheme.nuvio
+    // The subtle border all but vanishes on the card surface, which is a step lighter than the
+    // page background the edge-to-edge layout draws on.
+    val cards = isTablet && LocalSettingsSectionCards.current
     HorizontalDivider(
         modifier = Modifier.padding(start = if (isTablet) 0.dp else NuvioTokens.Space.s64 + NuvioTokens.Space.s2),
         thickness = tokens.borders.hairline,
-        color = tokens.colors.borderSubtle,
+        color = if (cards) tokens.colors.borderDefault else tokens.colors.borderSubtle,
     )
 }
 
@@ -596,6 +601,53 @@ internal fun SettingsSidebarItem(
 internal val LocalSettingsPage = staticCompositionLocalOf<SettingsPage?> { null }
 
 /**
+ * Whether the desktop page being rendered draws each [SettingsSection] as its own card - one
+ * bordered surface with the heading as a band across the top and the section's rows flush beneath
+ * it - instead of the edge-to-edge heading-over-rows layout. Provided by the desktop settings
+ * screen for every page; the components read it so no page has to change.
+ */
+internal val LocalSettingsSectionCards = staticCompositionLocalOf { false }
+
+/** The heading band's inset. Horizontal matches the 16.dp every row carries so the title sits on
+ * the same column as the row titles under it. */
+private val SettingsSectionCardHeaderPaddingHorizontal = 16.dp
+private val SettingsSectionCardHeaderPaddingVertical = 12.dp
+
+/**
+ * A muted paragraph inside a [SettingsSection] - a summary line above the rows, or a footnote after
+ * them. In the card layout it carries the same inset as a row so it lands on the row title column
+ * with room to breathe under the heading band; edge-to-edge it sits bare, as it always did.
+ */
+@Composable
+internal fun SettingsSectionNote(
+    text: String,
+    isTablet: Boolean,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.bodySmall,
+) {
+    val cards = isTablet && LocalSettingsSectionCards.current
+    Text(
+        text = text,
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (cards) {
+                    Modifier.padding(
+                        horizontal = SettingsSectionCardHeaderPaddingHorizontal,
+                        vertical = SettingsSectionNotePaddingVertical,
+                    )
+                } else {
+                    Modifier
+                },
+            ),
+        style = style,
+        color = MaterialTheme.nuvio.colors.textMuted,
+    )
+}
+
+private val SettingsSectionNotePaddingVertical = 10.dp
+
+/**
  * Gap the settings list puts between sections. Exposed because a page that has to place two
  * sections inside one lazy item (to share remembered state between them) has to reproduce it by
  * hand, and a literal there would silently drift from the list's own spacing.
@@ -615,7 +667,11 @@ internal fun SettingsSection(
 ) {
     val tokens = MaterialTheme.nuvio
     val displayTitle = settingsTitleCase(title)
-    val sectionHighlight = rememberSettingsAnchorHighlight(SettingsScrollAnchor.section(title))
+    // Both anchors land the heading at the top of the page so the rows it names are in view.
+    val sectionHighlight = rememberSettingsAnchorHighlight(
+        SettingsScrollAnchor.section(title),
+        alignToTop = true,
+    )
     if (isTablet) {
         // Edge-to-edge desktop header: a real heading sitting directly on the page
         // background, not a small boxed label — rows below flow with no card wrapper.
@@ -623,7 +679,7 @@ internal fun SettingsSection(
         // Stable id for this heading, used both to scroll here from a pinned favorite and as the
         // favorite's identity. Empty string when there's no page context (favoriting disabled).
         val anchor = if (page != null) "heading:${page.name}:$title" else ""
-        val highlight = rememberSettingsAnchorHighlight(anchor)
+        val highlight = rememberSettingsAnchorHighlight(anchor, alignToTop = true)
         // The heading turns accent while it is the search or favourite target, so it follows a
         // gradient accent for the same reason a filled accent surface does. Masked rather than
         // coloured because Text takes a Color and cannot express a Brush; at most one heading is
@@ -635,11 +691,24 @@ internal fun SettingsSection(
             tokens.colors.textPrimary
         }
         val titleAccentMask = if (titleHighlighted) Modifier.accentGradientMask() else Modifier
-        Column {
+        val cards = LocalSettingsSectionCards.current
+        SettingsSectionContainer(cards = cards) {
+            // Card layout: the heading is a band across the top of the card, a step lighter than
+            // the rows so it reads as the card's header rather than a first row.
+            val headerModifier = if (cards) {
+                Modifier
+                    .background(tokens.colors.surfaceCard)
+                    .padding(
+                        horizontal = SettingsSectionCardHeaderPaddingHorizontal,
+                        vertical = SettingsSectionCardHeaderPaddingVertical,
+                    )
+            } else {
+                Modifier.padding(top = 6.dp, bottom = 10.dp)
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 6.dp, bottom = 10.dp),
+                    .then(headerModifier),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -647,7 +716,7 @@ internal fun SettingsSection(
                 Box {
                     Text(
                         text = displayTitle,
-                        style = MaterialTheme.nuvioTypeScale.titleSm,
+                        style = if (cards) MaterialTheme.nuvioTypeScale.titleMd else MaterialTheme.nuvioTypeScale.titleSm,
                         color = titleColor,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
@@ -725,6 +794,34 @@ internal fun SettingsSection(
             }
         }
         content()
+    }
+}
+
+/**
+ * Card layout wraps the heading band and the rows in one surface, clipped so the band's fill
+ * follows the top corners; the edge-to-edge layout is a bare column. Split out so
+ * [SettingsSection] has one body for both.
+ *
+ * No border: the hairline composites to almost exactly the heading band's colour on the row
+ * surface, so it read as the band running down both edges of the rows. The band and the surface
+ * step from the page background carry the card's outline on their own.
+ */
+@Composable
+private fun SettingsSectionContainer(
+    cards: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    if (!cards) {
+        Column(content = content)
+        return
+    }
+    val tokens = MaterialTheme.nuvio
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = tokens.colors.surface,
+        shape = RoundedCornerShape(NuvioTokens.Radius.lg),
+    ) {
+        Column(content = content)
     }
 }
 

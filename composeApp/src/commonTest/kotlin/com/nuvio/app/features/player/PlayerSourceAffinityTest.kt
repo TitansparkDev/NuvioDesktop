@@ -3,6 +3,7 @@ package com.nuvio.app.features.player
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamAutoPlaySource
 import com.nuvio.app.features.streams.StreamItem
+import com.nuvio.app.features.streams.StreamAutoPlayMode
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -36,6 +37,44 @@ class PlayerSourceAffinityTest {
     fun `initial local selection creates local affinity`() {
         assertEquals(PlayerSourceAffinity.Local, PlayerSourceAffinity.fromInitialStreamType("LOCAL"))
         assertEquals(PlayerSourceAffinity.Stream, PlayerSourceAffinity.fromInitialStreamType("url"))
+    }
+
+    @Test
+    fun `manual next episode selection needs manual mode and the opt-in`() {
+        // Manual mode + opt-in → hand the choice back instead of substituting FIRST_STREAM.
+        assertTrue(
+            shouldOpenManualNextEpisodeSelection(
+                mode = StreamAutoPlayMode.MANUAL,
+                manualNextEpisodeEnabled = true,
+                sourceAffinity = PlayerSourceAffinity.Stream,
+            ),
+        )
+        // Opt-in off → the long-standing substitution stands, so transitions never stall.
+        assertFalse(
+            shouldOpenManualNextEpisodeSelection(
+                mode = StreamAutoPlayMode.MANUAL,
+                manualNextEpisodeEnabled = false,
+                sourceAffinity = PlayerSourceAffinity.Stream,
+            ),
+        )
+        // The opt-in is meaningless for the auto-play modes: they already pick for you by design.
+        for (mode in StreamAutoPlayMode.entries.filter { it != StreamAutoPlayMode.MANUAL }) {
+            assertFalse(
+                shouldOpenManualNextEpisodeSelection(
+                    mode = mode,
+                    manualNextEpisodeEnabled = true,
+                    sourceAffinity = PlayerSourceAffinity.Stream,
+                ),
+            )
+        }
+        // Local affinity takes the on-disk file; there is no source choice to offer.
+        assertFalse(
+            shouldOpenManualNextEpisodeSelection(
+                mode = StreamAutoPlayMode.MANUAL,
+                manualNextEpisodeEnabled = true,
+                sourceAffinity = PlayerSourceAffinity.Local,
+            ),
+        )
     }
 
     @Test

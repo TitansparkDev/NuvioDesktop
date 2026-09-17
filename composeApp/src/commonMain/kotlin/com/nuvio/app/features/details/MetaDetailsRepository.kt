@@ -763,6 +763,7 @@ object MetaDetailsRepository {
     private const val FETCH_TIMEOUT_MS = 12_000L
     private const val TMDB_ENRICH_TIMEOUT_MS = 5_000L
     private const val MDBLIST_ENRICH_TIMEOUT_MS = 5_000L
+    private const val IMDB_INTERESTS_TIMEOUT_MS = 6_000L
     private const val LOGO_FALLBACK_TIMEOUT_MS = 5_000L
 
     /**
@@ -943,6 +944,20 @@ object MetaDetailsRepository {
         activeRequestKey = requestKey
     }
 
+    /**
+     * IMDb's sub-genre tags for the genre hover. Needs an IMDb id: the addon's own when it gave
+     * one (anime records keep it beside a kitsu/mal route id), else a trusted `tt` item id.
+     * Empty, never an error, when the title has neither — the hover then falls back to themes.
+     */
+    private suspend fun fetchImdbInterests(meta: MetaDetails, fallbackItemId: String): List<ImdbInterest> {
+        val fromItemId = fallbackItemId.split("_").firstOrNull { it.startsWith("tt", ignoreCase = true) }
+            ?.takeIf { meta.imdbTmdbIdentityTrusted }
+        val imdbId = meta.imdbId?.trim()?.takeIf { it.startsWith("tt", ignoreCase = true) }
+            ?: fromItemId
+            ?: return emptyList()
+        return withTimeoutOrNull(IMDB_INTERESTS_TIMEOUT_MS) { ImdbInterestsService.fetch(imdbId) }.orEmpty()
+    }
+
     private suspend fun enrichForMetaScreen(
         requestKey: String,
         meta: MetaDetails,
@@ -951,13 +966,19 @@ object MetaDetailsRepository {
         settings: com.nuvio.app.features.mdblist.MdbListSettings,
         settingsFingerprint: String,
     ): MetaDetails {
-        val mdbListEnrichedMeta = withTimeoutOrNull(MDBLIST_ENRICH_TIMEOUT_MS) {
-            MdbListMetadataService.enrichMeta(
-                meta = meta,
-                fallbackItemId = fallbackItemId,
-                settings = settings,
-            )
-        } ?: meta
+        val mdbListEnrichedMeta = coroutineScope {
+            // The IMDb sub-genre lookup rides alongside MDBList rather than after it: both are
+            // hover-only data the page can open without, and neither waits on the other.
+            val interests = async { fetchImdbInterests(meta, fallbackItemId) }
+            val mdbEnriched = withTimeoutOrNull(MDBLIST_ENRICH_TIMEOUT_MS) {
+                MdbListMetadataService.enrichMeta(
+                    meta = meta,
+                    fallbackItemId = fallbackItemId,
+                    settings = settings,
+                )
+            } ?: meta
+            mdbEnriched.copy(imdbInterests = interests.await().ifEmpty { mdbEnriched.imdbInterests })
+        }
         val moreLikeThisEnrichedMeta = applyMoreLikeThisSource(
             meta = mdbListEnrichedMeta,
             fallbackItemId = fallbackItemId,

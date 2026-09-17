@@ -17,6 +17,9 @@ import com.nuvio.app.features.player.AppShortcutsRepository
 import com.nuvio.app.features.player.DesktopAnimeMode
 import com.nuvio.app.features.player.DesktopAnimeSessionOverride
 import com.nuvio.app.features.player.DesktopBufferPreset
+import com.nuvio.app.features.player.DesktopColorGrade
+import com.nuvio.app.features.player.desktopColorGrade
+import com.nuvio.app.features.player.presetGrade
 import com.nuvio.app.features.player.DesktopColorProfile
 import com.nuvio.app.features.player.DesktopCustomShaderCatalog
 import com.nuvio.app.features.player.DesktopHdrMode
@@ -86,7 +89,7 @@ internal class NativePlayerController(
 
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
-        const val CONTROLS_PAGE_REVISION = "20260728-track-reject-1"
+        const val CONTROLS_PAGE_REVISION = "20260914-seek-thumbs-2"
         const val MPV_STARTUP_ERROR_EVENT_PREFIX = "mpvStartupError:"
         const val MPV_PLAYBACK_ERROR_EVENT_PREFIX = "mpvPlaybackError:"
 
@@ -503,6 +506,10 @@ internal class NativePlayerController(
         videoLabel: String,
         shaderLabel: String?,
     ) {
+        // The same signal drives the pad's right stick: with a shader running its down direction
+        // cycles the shader chain, and the HDR mode when none is. This pass is the only place that
+        // knows which, and it re-runs on every settings change and file load.
+        com.nuvio.app.features.input.GamepadContext.animeShaderActive = !shaderLabel.isNullOrBlank()
         val current = handle.takeIf { it != 0L } ?: return
         val payload = "{\"session\":${session.toJsonString()}," +
             "\"hdr\":${(hdrLabel ?: "").toJsonString()}," +
@@ -576,6 +583,40 @@ internal class NativePlayerController(
         val next = profiles[(profiles.indexOf(current) + 1) % profiles.size]
         PlayerSettingsRepository.setDesktopColorProfile(next)
         showPresetPill("Color Profile", next.label)
+    }
+
+    /**
+     * Nudges one channel of the Custom grade from the HUD's colour panel, and makes Custom the
+     * active profile so the change is actually on screen.
+     *
+     * A grade that has never been touched is seeded from whichever preset was showing, so nudging
+     * saturation while on Cinematic starts from Cinematic instead of snapping the picture back to
+     * neutral for the one frame before the nudge lands. A grade the user has already dialled in is
+     * theirs — that gets adjusted as-is rather than being overwritten by a preset.
+     */
+    private fun adjustDesktopColorGrade(command: String, delta: Int) {
+        val settings = PlayerSettingsRepository.uiState.value
+        val current = settings.desktopColorGrade()
+        val neutral = DesktopColorGrade(0, 0, 0, 0)
+        val base = if (settings.desktopColorProfile != DesktopColorProfile.Custom && current == neutral) {
+            settings.desktopColorProfile.presetGrade()
+        } else {
+            current
+        }
+        val next = when (command) {
+            "adjustDesktopColorContrast" -> base.copy(contrast = base.contrast + delta)
+            "adjustDesktopColorBrightness" -> base.copy(brightness = base.brightness + delta)
+            "adjustDesktopColorSaturation" -> base.copy(saturation = base.saturation + delta)
+            "adjustDesktopColorGamma" -> base.copy(gamma = base.gamma + delta)
+            else -> return
+        }
+        // Values before the profile: switching to Custom last means the picture never shows a
+        // half-applied grade, and each setter no-ops when its value is unchanged.
+        PlayerSettingsRepository.setDesktopColorContrast(next.contrast)
+        PlayerSettingsRepository.setDesktopColorBrightness(next.brightness)
+        PlayerSettingsRepository.setDesktopColorSaturation(next.saturation)
+        PlayerSettingsRepository.setDesktopColorGamma(next.gamma)
+        PlayerSettingsRepository.setDesktopColorProfile(DesktopColorProfile.Custom)
     }
 
     private fun selectDesktopColorProfile(index: Int) {
@@ -842,6 +883,14 @@ internal class NativePlayerController(
             pendingSource?.onError(message)
             return
         }
+        if (type == "audioPassthroughFallback") {
+            // The bridge already rebuilt the audio chain as PCM (value=1) or found no track to
+            // reload (0). Either way video is still buffering, so hold the notice for the first
+            // rendered frame like the failover pill — shown now it would expire unseen.
+            audioPassthroughLog.i { "rejected by output device; bridge fell back to PCM (trackReloaded=${value >= 1.0})" }
+            transientMessageForNextAttach = "Audio passthrough" to "Not supported by output device — decoding to PCM"
+            return
+        }
         if (type == "keyboardCycleHdrMode") {
             cycleDesktopHdrMode()
             return
@@ -878,12 +927,25 @@ internal class NativePlayerController(
             selectDesktopColorProfile(value.toInt())
             return
         }
+        if (type in DESKTOP_COLOR_GRADE_COMMANDS) {
+            adjustDesktopColorGrade(type, value.toInt())
+            return
+        }
+        if (type == "resetDesktopColorGrade") {
+            PlayerSettingsRepository.resetDesktopColorTuning()
+            return
+        }
         if (type == "setDesktopUiScalePercent") {
             PlayerSettingsRepository.setDesktopUiScalePercent(value.toInt())
             return
         }
         if (type == "seekThumbnail") {
-            if (PlayerSettingsRepository.uiState.value.desktopBufferPreset == DesktopBufferPreset.Metered) {
+            // Belt and braces with the HUD flag: the preview decoder is a second stream opened
+            // against the same host, so a stale controls page must not be able to start it.
+            val settings = PlayerSettingsRepository.uiState.value
+            if (!settings.desktopSeekThumbnailsEnabled ||
+                settings.desktopBufferPreset == DesktopBufferPreset.Metered
+            ) {
                 return
             }
             handle.takeIf { it != 0L }?.let { current ->
@@ -1556,6 +1618,14 @@ internal fun desktopCustomMpvOptionNames(options: String): Set<String> =
         }
         .toSet()
 
+/** The four HUD colour-panel steppers. Each carries its delta as the command value. */
+private val DESKTOP_COLOR_GRADE_COMMANDS = setOf(
+    "adjustDesktopColorContrast",
+    "adjustDesktopColorBrightness",
+    "adjustDesktopColorSaturation",
+    "adjustDesktopColorGamma",
+)
+
 internal fun shouldApplyNuvioRuntimeMpvProperty(
     configMode: DesktopMpvConfigMode,
     customOptionNames: Set<String>,
@@ -1732,7 +1802,7 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
  * `proxyHeaders` didn't specify one. ffmpeg's http protocol only adds its own User-Agent when the
  * custom header block lacks one, so an addon-supplied UA (or this default) is sent exactly once.
  */
-private const val DESKTOP_PLAYBACK_FALLBACK_USER_AGENT =
+internal const val DESKTOP_PLAYBACK_FALLBACK_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 private fun Map<String, String>.withDefaultPlaybackUserAgent(sourceUrl: String): Map<String, String> {
@@ -1787,6 +1857,8 @@ private fun String.toPlayerControlsAction(): PlayerControlsAction? =
     }
 
 private val controlsJsonLog = Logger.withTag("PlayerControlsJson")
+
+private val audioPassthroughLog = Logger.withTag("PlayerAudioPassthrough")
 
 private val episodeArtworkLog = Logger.withTag("PlayerEpisodeArtwork")
 
@@ -1893,6 +1965,14 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonField("desktopHdrModeLabel", desktopHdrModeLabel)
         append(',')
         appendJsonField("desktopColorProfileLabel", desktopColorProfileLabel)
+        append(',')
+        appendJsonField("desktopColorContrast", desktopColorContrast)
+        append(',')
+        appendJsonField("desktopColorBrightness", desktopColorBrightness)
+        append(',')
+        appendJsonField("desktopColorSaturation", desktopColorSaturation)
+        append(',')
+        appendJsonField("desktopColorGamma", desktopColorGamma)
         append(',')
         appendJsonField("desktopAnimeModeLabel", desktopAnimeModeLabel)
         append(',')
@@ -2100,9 +2180,13 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("uiScalePercent", uiScalePercent)
         append(',')
+        appendJsonField("controlIconScalePercent", controlIconScalePercent)
+        append(',')
         appendJsonField("uiFontFamily", uiFontFamily)
         append(',')
         appendJsonField("sourceNotchPosition", sourceNotchPosition)
+        append(',')
+        appendJsonField("sourceNotchHoverEnabled", sourceNotchHoverEnabled)
         append(',')
         appendJsonField("notificationPosition", notificationPosition)
         append(',')
@@ -2239,6 +2323,10 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonArrayField("subtitleShadowColorSwatches", SubtitleShadowColorSwatches.map { it.toStorageHexString() }) { append(it.toJsonString()) }
         append(',')
         appendJsonField("closeModalsToken", closeModalsToken)
+        append(',')
+        appendJsonField("openSourcesToken", openSourcesToken)
+        append(',')
+        appendJsonField("sourcesPanelOpen", sourcesPanelOpen)
         append(',')
         appendJsonField("heroTrailerMode", heroTrailerMode)
         append(',')

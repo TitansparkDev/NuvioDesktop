@@ -90,23 +90,24 @@ private fun languageMatches(trackLanguage: String?, targetLanguage: String, exac
         languageMatchesPreference(trackLanguage, targetLanguage)
     }
 
-/** See [findPreferredTrackIndex] for why [isRejected] is a predicate rather than a pre-filter. */
+/**
+ * See [findPreferredTrackIndex] for why [isRejected] is a predicate rather than a pre-filter.
+ *
+ * [trackKind] only ever breaks ties inside a language: the first target with any acceptable track
+ * wins, and the kind decides which of that language's tracks it is. The preference cuts both ways —
+ * releases routinely list the SDH or forced track first, so taking list order for a Standard
+ * viewer would hand them captions, or a track that translates a tenth of the dialogue, unasked.
+ */
 internal fun findPreferredSubtitleTrackIndex(
     tracks: List<SubtitleTrack>,
     targets: List<String>,
     isRejected: (SubtitleTrack) -> Boolean = { false },
-    preferHearingImpaired: Boolean = false,
+    trackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
 ): Int {
     if (targets.isEmpty()) return -1
 
-    for ((targetPosition, target) in targets.withIndex()) {
+    for (target in targets) {
         val normalizedTarget = normalizeLanguageCode(target) ?: continue
-        if (normalizedTarget == SubtitleLanguageOption.FORCED) {
-            val forcedIndex = tracks.indexOfFirst { it.isForced && !isRejected(it) }
-            if (forcedIndex >= 0) return forcedIndex
-            if (targetPosition == 0) return -1
-            continue
-        }
 
         fun candidates(exactOnly: Boolean) = tracks.withIndex().filter { (_, track) ->
             !isRejected(track) &&
@@ -117,15 +118,8 @@ internal fun findPreferredSubtitleTrackIndex(
                 )
         }
         val matchingTracks = candidates(exactOnly = true).ifEmpty { candidates(exactOnly = false) }
-        // The SDH preference cuts both ways: releases routinely list the SDH track first, so taking
-        // the list order when the option is off hands captions to someone who did not ask for them.
-        val match = if (preferHearingImpaired) {
-            matchingTracks.firstOrNull { (_, track) -> track.isHearingImpairedSubtitle() }
-                ?: matchingTracks.firstOrNull()
-        } else {
-            matchingTracks.firstOrNull { (_, track) -> !track.isHearingImpairedSubtitle() }
-                ?: matchingTracks.firstOrNull()
-        }
+        // minBy keeps the first of equals, so the release's own order survives inside each kind.
+        val match = matchingTracks.minByOrNull { (_, track) -> trackKind.rankOf(track.subtitleTrackKind()) }
         if (match != null) return match.index
     }
 
@@ -134,14 +128,14 @@ internal fun findPreferredSubtitleTrackIndex(
 
 /**
  * The addon subtitle to use for [targets], applying the same tie-breaks as the built-in pass:
- * targets in priority order, the exact regional variant before the loose one, and the SDH
- * preference in whichever direction the viewer set it.
+ * targets in priority order, the exact regional variant before the loose one, and the viewer's
+ * [trackKind] inside the language.
  */
 internal fun findPreferredAddonSubtitle(
     subtitles: List<AddonSubtitle>,
     targets: List<String>,
     isRejected: (AddonSubtitle) -> Boolean = { false },
-    preferHearingImpaired: Boolean = false,
+    trackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
 ): AddonSubtitle? {
     for (target in targets) {
         fun candidates(exactOnly: Boolean) = subtitles.filter { subtitle ->
@@ -153,11 +147,7 @@ internal fun findPreferredAddonSubtitle(
                 )
         }
         val matching = candidates(exactOnly = true).ifEmpty { candidates(exactOnly = false) }
-        val match = if (preferHearingImpaired) {
-            matching.firstOrNull(AddonSubtitle::isHearingImpairedSubtitle) ?: matching.firstOrNull()
-        } else {
-            matching.firstOrNull { !it.isHearingImpairedSubtitle() } ?: matching.firstOrNull()
-        }
+        val match = matching.minByOrNull { trackKind.rankOf(it.subtitleTrackKind()) }
         if (match != null) return match
     }
     return null
@@ -189,6 +179,28 @@ internal fun SubtitleTrack.isHearingImpairedSubtitle(): Boolean =
 
 internal fun AddonSubtitle.isHearingImpairedSubtitle(): Boolean =
     subtitleLooksHearingImpaired(display, id)
+
+/**
+ * Forced is checked first because the container's flag is authoritative, and a forced track that
+ * happens to carry "SDH" in its name is still not a full transcript.
+ */
+internal fun SubtitleTrack.subtitleTrackKind(): SubtitleTrackKind = when {
+    inferForcedSubtitleTrack(
+        label = label,
+        language = language,
+        trackId = id,
+        hasForcedSelectionFlag = isForced,
+    ) -> SubtitleTrackKind.FORCED
+    isHearingImpairedSubtitle() -> SubtitleTrackKind.SDH
+    else -> SubtitleTrackKind.STANDARD
+}
+
+/** Addons rarely serve forced tracks, but the ones that do name them, and the name is all there is. */
+internal fun AddonSubtitle.subtitleTrackKind(): SubtitleTrackKind = when {
+    inferForcedSubtitleTrack(label = display, language = language, trackId = id) -> SubtitleTrackKind.FORCED
+    isHearingImpairedSubtitle() -> SubtitleTrackKind.SDH
+    else -> SubtitleTrackKind.STANDARD
+}
 
 /**
  * The addon subtitle a saved selection refers to, or null when nothing identifies one.
@@ -246,11 +258,11 @@ internal fun findPersistedAddonSubtitle(
 /**
  * The subtitle rejections that actually apply.
  *
- * "Use Forced Subtitles" is an explicit request for forced tracks, so it overrides a blanket
- * rejection of them rather than cancelling out with it and leaving no subtitles at all.
+ * Preferring forced tracks is an explicit request for them, so it overrides a blanket rejection
+ * of them rather than cancelling out with it and leaving no subtitles at all.
  */
 internal fun PlayerSettingsUiState.effectiveRejectedSubtitleKeywords(): Set<SubtitleRejectKeyword> =
-    if (subtitleStyle.useForcedSubtitles) {
+    if (preferredSubtitleTrackKind == SubtitleTrackKind.FORCED) {
         rejectedSubtitleKeywords - SubtitleRejectKeyword.FORCED
     } else {
         rejectedSubtitleKeywords
@@ -326,11 +338,11 @@ internal fun filterAudioTracksForSettings(
  * built-in (embedded) subtitle list shown in the player. Mirrors [filterAddonSubtitlesForSettings]
  * but for on-disc tracks:
  *  - The currently selected track is always kept, so the user is never locked out of their choice.
- *  - Forced tracks are kept while forced-subtitle mode is on, since that is a preference in itself.
  *  - When no preferred languages resolve at all the language filter is skipped — hiding every
  *    embedded track on an ill-defined filter would be worse than showing them — but the keyword
  *    rejections still apply, since those name a track kind rather than a language.
- * This is a display-only concern; automatic track selection applies the rejections separately.
+ * This is a display-only concern; automatic track selection applies the rejections separately,
+ * and the preferred track kind is a selection tiebreaker that the lists never filter on.
  */
 internal fun filterBuiltInSubtitlesForSettings(
     tracks: List<SubtitleTrack>,
@@ -352,15 +364,12 @@ internal fun filterBuiltInSubtitlesForSettings(
         track.index == selectedIndex ||
             (
                 !rejected.rejectsSubtitleTrack(track) &&
-                    (
-                        (settings.subtitleStyle.useForcedSubtitles && track.isForced) ||
-                            targets.any { target ->
-                                languageMatchesPreference(
-                                    trackLanguage = track.language,
-                                    targetLanguage = target,
-                                )
-                            }
+                    targets.any { target ->
+                        languageMatchesPreference(
+                            trackLanguage = track.language,
+                            targetLanguage = target,
                         )
+                    }
                 )
     }
 }
@@ -379,20 +388,13 @@ internal fun preferredSubtitleTargetsForSettings(
     settings: PlayerSettingsUiState,
     originalLanguage: String? = OriginalLanguageCache.current,
     includeSecondary: Boolean = true,
-): List<String> {
-    val preferredLanguage = if (settings.subtitleStyle.useForcedSubtitles) {
-        SubtitleLanguageOption.FORCED
-    } else {
-        settings.preferredSubtitleLanguage
-    }
-    return resolvePreferredSubtitleLanguageTargets(
-        preferredSubtitleLanguage = preferredLanguage,
-        secondaryPreferredSubtitleLanguage = settings.secondaryPreferredSubtitleLanguage
-            .takeIf { includeSecondary },
-        deviceLanguages = DeviceLanguagePreferences.preferredLanguageCodes(),
-        originalLanguage = originalLanguage,
-    ).filterNot { it == SubtitleLanguageOption.FORCED }
-}
+): List<String> = resolvePreferredSubtitleLanguageTargets(
+    preferredSubtitleLanguage = settings.preferredSubtitleLanguage,
+    secondaryPreferredSubtitleLanguage = settings.secondaryPreferredSubtitleLanguage
+        .takeIf { includeSecondary },
+    deviceLanguages = DeviceLanguagePreferences.preferredLanguageCodes(),
+    originalLanguage = originalLanguage,
+)
 
 /**
  * The concrete language the dual-subtitle secondary track should use, or null when the preference

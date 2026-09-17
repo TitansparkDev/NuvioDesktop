@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.ui.frameBudgetSetProbesEnabled
 import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.features.player.skip.NextEpisodeThresholdMode
 import com.nuvio.app.features.player.skip.SkipAutoAcceptMode
@@ -22,6 +23,13 @@ val STREAM_AUTO_PLAY_TIMEOUT_VALUES: List<Int> = listOf(
 /** Seek-button / arrow-key jump distance, in seconds. */
 const val DefaultSeekStepSeconds = 10
 val SEEK_STEP_SECONDS_RANGE: IntRange = 1..60
+
+/**
+ * Range of the [DesktopColorProfile.Custom] equalizer offsets. mpv accepts +/-100 on contrast,
+ * brightness, saturation and gamma, but the shipped presets live inside +/-15 and anything past 50
+ * destroys the image rather than grading it, so the sliders stop there.
+ */
+val DESKTOP_COLOR_OFFSET_RANGE: IntRange = -50..50
 
 /** Allowed wait durations (seconds) before failover gives up on a stalling stream and tries the next. */
 val STREAM_FAILOVER_TIMEOUT_VALUES: List<Int> = listOf(5, 10, 15, 20, 25, 30, 45, 60)
@@ -77,9 +85,15 @@ data class PlayerSettingsUiState(
     val desktopVerboseMpvLoggingEnabled: Boolean = false,
     // Extra user UI-scale for the desktop/legacy player HUD, in percent (-50..50); 0 = unchanged.
     val desktopUiScalePercent: Int = 0,
+    // Extra scale for just the bottom control row's buttons (transport + action icons), in percent
+    // (-50..50) on top of desktopUiScalePercent; 0 = unchanged.
+    val desktopControlIconScalePercent: Int = 0,
     // How far the seek buttons / arrow-key shortcuts jump, in seconds.
     val seekStepSeconds: Int = DefaultSeekStepSeconds,
     val desktopSourceNotchPosition: DesktopSourceNotchPosition = DesktopSourceNotchPosition.Right,
+    // When false the notch only opens Sources on a click, so a pointer crossing that screen edge on
+    // its way to another monitor no longer pulls the panel open.
+    val desktopSourceNotchHoverEnabled: Boolean = true,
     // Where the transient player pills (playback speed, volume, aspect ratio) are drawn.
     val desktopPlayerNotificationPosition: DesktopPlayerNotificationPosition =
         DesktopPlayerNotificationPosition.Center,
@@ -91,7 +105,7 @@ data class PlayerSettingsUiState(
     val preferredSubtitleLanguage: String = SubtitleLanguageOption.NONE,
     val secondaryPreferredSubtitleLanguage: String? = null,
     val dualSubtitlesEnabled: Boolean = false,
-    val preferHearingImpairedSubtitles: Boolean = false,
+    val preferredSubtitleTrackKind: SubtitleTrackKind = SubtitleTrackKind.DEFAULT,
     val subtitleStyle: SubtitleStyleState = SubtitleStyleState.DEFAULT,
     val addonSubtitleStartupMode: AddonSubtitleStartupMode = AddonSubtitleStartupMode.ALL_SUBTITLES,
     // Track kinds ruled out by name — signs/songs/karaoke/forced subtitles, commentary and
@@ -123,6 +137,11 @@ data class PlayerSettingsUiState(
     val skipDbApiKey: String = "",
     val introSubmitEnabled: Boolean = false,
     val streamAutoPlayNextEpisodeEnabled: Boolean = false,
+    // Whether MANUAL stream selection also governs next-episode transitions. The in-player
+    // next-episode path has always substituted FIRST_STREAM for MANUAL so a transition can never
+    // stall on a picker; this opts out of that substitution. Off by default: it changes what a
+    // default install does at every episode boundary.
+    val streamAutoPlayManualNextEpisode: Boolean = false,
     val streamAutoPlayPreferBingeGroup: Boolean = true,
     val streamAutoPlayReuseBingeGroup: Boolean = true,
     // If a stream fails (playback error or never starts within the timeout), automatically try the
@@ -151,8 +170,18 @@ data class PlayerSettingsUiState(
     val iosGamma: Int = 0,
     val desktopHdrMode: DesktopHdrMode = DesktopHdrMode.Auto,
     val desktopColorProfile: DesktopColorProfile = DesktopColorProfile.Neutral,
+    /**
+     * mpv equalizer offsets for [DesktopColorProfile.Custom]. Ignored by every other profile, so
+     * they survive a trip through the presets and come back unchanged.
+     */
+    val desktopColorContrast: Int = 0,
+    val desktopColorBrightness: Int = 0,
+    val desktopColorSaturation: Int = 0,
+    val desktopColorGamma: Int = 0,
     val desktopBufferPreset: DesktopBufferPreset = DesktopBufferPreset.Balanced,
     val desktopRendererApi: DesktopRendererApi = DesktopRendererApi.OpenGL,
+    /** Desktop diagnostics: frame-budget telemetry. Off unless someone is investigating. */
+    val desktopPerformanceLoggingEnabled: Boolean = false,
     val desktopLowVramMode: DesktopLowVramMode = DesktopLowVramMode.Auto,
     val desktopAnimeMode: DesktopAnimeMode = DesktopAnimeMode.Off,
     val desktopAnimeModeAutoEnabled: Boolean = false,
@@ -178,6 +207,10 @@ data class PlayerSettingsUiState(
     val desktopCustomShaderSelectedPath: String = "",
     // Bitstream/passthrough of compressed audio (AC3/DTS/E-AC3/TrueHD/DTS-HD) to a receiver.
     val desktopAudioPassthroughEnabled: Boolean = false,
+    // Seek-bar hover previews. They come from a second libmpv instance that opens the same stream
+    // and issues a byte-range request per hovered position, so a remote source pays for them in
+    // connection opens — the currency debrid CDNs rate-limit. Off is the escape hatch for that.
+    val desktopSeekThumbnailsEnabled: Boolean = true,
     val desktopMpvConfigMode: DesktopMpvConfigMode = DesktopMpvConfigMode.Off,
     // Free-form mpv options, one `key=value` per line, applied just before mpv_initialize so a
     // power user can override any of Nuvio's built-in options.
@@ -209,8 +242,10 @@ object PlayerSettingsRepository {
     private var playbackSpeedToggleHigh = 2f
     private var desktopVerboseMpvLoggingEnabled = false
     private var desktopUiScalePercent = 0
+    private var desktopControlIconScalePercent = 0
     private var seekStepSeconds = DefaultSeekStepSeconds
     private var desktopSourceNotchPosition = DesktopSourceNotchPosition.Right
+    private var desktopSourceNotchHoverEnabled = true
     private var desktopPlayerNotificationPosition = DesktopPlayerNotificationPosition.Center
     private var externalPlayerEnabled = false
     private var externalPlayerForwardSubtitles = false
@@ -220,7 +255,7 @@ object PlayerSettingsRepository {
     private var preferredSubtitleLanguage = SubtitleLanguageOption.NONE
     private var secondaryPreferredSubtitleLanguage: String? = null
     private var dualSubtitlesEnabled = false
-    private var preferHearingImpairedSubtitles = false
+    private var preferredSubtitleTrackKind = SubtitleTrackKind.DEFAULT
     private var subtitleStyle = SubtitleStyleState.DEFAULT
     private var addonSubtitleStartupMode = AddonSubtitleStartupMode.ALL_SUBTITLES
     private var rejectedSubtitleKeywords: Set<SubtitleRejectKeyword> = emptySet()
@@ -249,6 +284,7 @@ object PlayerSettingsRepository {
     private var skipDbApiKey = ""
     private var introSubmitEnabled = false
     private var streamAutoPlayNextEpisodeEnabled = false
+    private var streamAutoPlayManualNextEpisode = false
     private var streamAutoPlayPreferBingeGroup = true
     private var streamAutoPlayReuseBingeGroup = true
     private var streamFailoverEnabled = false
@@ -275,8 +311,13 @@ object PlayerSettingsRepository {
     private var iosGamma = 0
     private var desktopHdrMode = DesktopHdrMode.Auto
     private var desktopColorProfile = DesktopColorProfile.Neutral
+    private var desktopColorContrast = 0
+    private var desktopColorBrightness = 0
+    private var desktopColorSaturation = 0
+    private var desktopColorGamma = 0
     private var desktopBufferPreset = DesktopBufferPreset.Balanced
     private var desktopRendererApi = DesktopRendererApi.OpenGL
+    private var desktopPerformanceLoggingEnabled = false
     private var desktopLowVramMode = DesktopLowVramMode.Auto
     private var desktopAnimeMode = DesktopAnimeMode.Off
     private var desktopAnimeModeAutoEnabled = false
@@ -291,6 +332,7 @@ object PlayerSettingsRepository {
     private var desktopCustomShaderPaths = ""
     private var desktopCustomShaderSelectedPath = ""
     private var desktopAudioPassthroughEnabled = false
+    private var desktopSeekThumbnailsEnabled = true
     private var desktopMpvConfigMode = DesktopMpvConfigMode.Off
     private var desktopCustomMpvOptions = ""
     private var desktopMpvPropertyOverrides: Map<String, String> = emptyMap()
@@ -327,8 +369,10 @@ object PlayerSettingsRepository {
         playbackSpeedToggleHigh = 2f
         desktopVerboseMpvLoggingEnabled = false
         desktopUiScalePercent = 0
+        desktopControlIconScalePercent = 0
         seekStepSeconds = DefaultSeekStepSeconds
         desktopSourceNotchPosition = DesktopSourceNotchPosition.Right
+        desktopSourceNotchHoverEnabled = true
         desktopPlayerNotificationPosition = DesktopPlayerNotificationPosition.Center
         externalPlayerEnabled = false
         externalPlayerForwardSubtitles = false
@@ -338,7 +382,7 @@ object PlayerSettingsRepository {
         preferredSubtitleLanguage = SubtitleLanguageOption.NONE
         secondaryPreferredSubtitleLanguage = null
         dualSubtitlesEnabled = false
-        preferHearingImpairedSubtitles = false
+        preferredSubtitleTrackKind = SubtitleTrackKind.DEFAULT
         subtitleStyle = SubtitleStyleState.DEFAULT
         addonSubtitleStartupMode = AddonSubtitleStartupMode.ALL_SUBTITLES
         rejectedSubtitleKeywords = emptySet()
@@ -367,6 +411,7 @@ object PlayerSettingsRepository {
         skipDbApiKey = ""
         introSubmitEnabled = false
         streamAutoPlayNextEpisodeEnabled = false
+        streamAutoPlayManualNextEpisode = false
         streamAutoPlayPreferBingeGroup = true
         streamAutoPlayReuseBingeGroup = true
         streamFailoverEnabled = false
@@ -393,8 +438,13 @@ object PlayerSettingsRepository {
         iosGamma = 0
         desktopHdrMode = DesktopHdrMode.Auto
         desktopColorProfile = DesktopColorProfile.Neutral
+        desktopColorContrast = 0
+        desktopColorBrightness = 0
+        desktopColorSaturation = 0
+        desktopColorGamma = 0
         desktopBufferPreset = DesktopBufferPreset.Balanced
         desktopRendererApi = DesktopRendererApi.OpenGL
+        desktopPerformanceLoggingEnabled = false
         desktopLowVramMode = DesktopLowVramMode.Auto
         desktopAnimeMode = DesktopAnimeMode.Off
         desktopAnimeModeAutoEnabled = false
@@ -408,6 +458,7 @@ object PlayerSettingsRepository {
         desktopCustomShaderPaths = ""
         desktopCustomShaderSelectedPath = ""
         desktopAudioPassthroughEnabled = false
+        desktopSeekThumbnailsEnabled = true
         desktopMpvConfigMode = DesktopMpvConfigMode.Off
         desktopCustomMpvOptions = ""
         desktopMpvPropertyOverrides = emptyMap()
@@ -440,11 +491,15 @@ object PlayerSettingsRepository {
         playbackSpeedToggleHigh = toggleRange.second
         desktopVerboseMpvLoggingEnabled = PlayerSettingsStorage.loadDesktopVerboseMpvLoggingEnabled() ?: false
         desktopUiScalePercent = (PlayerSettingsStorage.loadDesktopUiScalePercent() ?: 0).coerceIn(-50, 50)
+        desktopControlIconScalePercent =
+            (PlayerSettingsStorage.loadDesktopControlIconScalePercent() ?: 0).coerceIn(-50, 50)
         seekStepSeconds = (PlayerSettingsStorage.loadSeekStepSeconds() ?: DefaultSeekStepSeconds)
             .coerceIn(SEEK_STEP_SECONDS_RANGE.first, SEEK_STEP_SECONDS_RANGE.last)
         desktopSourceNotchPosition = DesktopSourceNotchPosition.fromStorage(
             PlayerSettingsStorage.loadDesktopSourceNotchPosition(),
         )
+        desktopSourceNotchHoverEnabled =
+            PlayerSettingsStorage.loadDesktopSourceNotchHoverEnabled() ?: true
         desktopPlayerNotificationPosition = DesktopPlayerNotificationPosition.fromStorage(
             PlayerSettingsStorage.loadDesktopPlayerNotificationPosition(),
         )
@@ -463,8 +518,7 @@ object PlayerSettingsRepository {
         secondaryPreferredSubtitleLanguage =
             normalizeLanguageCode(PlayerSettingsStorage.loadSecondaryPreferredSubtitleLanguage())
         dualSubtitlesEnabled = PlayerSettingsStorage.loadDualSubtitlesEnabled() ?: false
-        preferHearingImpairedSubtitles =
-            PlayerSettingsStorage.loadPreferHearingImpairedSubtitles() ?: false
+        preferredSubtitleTrackKind = loadOrMigrateSubtitleTrackKind()
         subtitleStyle = SubtitleStyleState(
             textColor = subtitleColorFromStorage(PlayerSettingsStorage.loadSubtitleTextColor())
                 ?: SubtitleStyleState.DEFAULT.textColor,
@@ -500,8 +554,6 @@ object PlayerSettingsRepository {
             assScalePercent = PlayerSettingsStorage.loadSubtitleAssScalePercent()
                 ?.coerceIn(SUBTITLE_ASS_SCALE_MIN, SUBTITLE_ASS_SCALE_MAX)
                 ?: SubtitleStyleState.DEFAULT.assScalePercent,
-            useForcedSubtitles = PlayerSettingsStorage.loadSubtitleUseForcedSubtitles()
-                ?: SubtitleStyleState.DEFAULT.useForcedSubtitles,
             showOnlyPreferredLanguages = PlayerSettingsStorage.loadSubtitleShowOnlyPreferredLanguages()
                 ?: SubtitleStyleState.DEFAULT.showOnlyPreferredLanguages,
         )
@@ -566,6 +618,7 @@ object PlayerSettingsRepository {
         skipDbApiKey = PlayerSettingsStorage.loadSkipDbApiKey() ?: ""
         introSubmitEnabled = PlayerSettingsStorage.loadIntroSubmitEnabled() ?: false
         streamAutoPlayNextEpisodeEnabled = PlayerSettingsStorage.loadStreamAutoPlayNextEpisodeEnabled() ?: false
+        streamAutoPlayManualNextEpisode = PlayerSettingsStorage.loadStreamAutoPlayManualNextEpisode() ?: false
         streamAutoPlayPreferBingeGroup = PlayerSettingsStorage.loadStreamAutoPlayPreferBingeGroup() ?: true
         streamAutoPlayReuseBingeGroup = PlayerSettingsStorage.loadStreamAutoPlayReuseBingeGroup() ?: true
         streamFailoverEnabled = PlayerSettingsStorage.loadStreamFailoverEnabled() ?: false
@@ -612,6 +665,10 @@ object PlayerSettingsRepository {
         desktopColorProfile = PlayerSettingsStorage.loadDesktopColorProfile()
             ?.let { runCatching { DesktopColorProfile.valueOf(it) }.getOrNull() }
             ?: DesktopColorProfile.Neutral
+        desktopColorContrast = PlayerSettingsStorage.loadDesktopColorContrast() ?: 0
+        desktopColorBrightness = PlayerSettingsStorage.loadDesktopColorBrightness() ?: 0
+        desktopColorSaturation = PlayerSettingsStorage.loadDesktopColorSaturation() ?: 0
+        desktopColorGamma = PlayerSettingsStorage.loadDesktopColorGamma() ?: 0
         desktopBufferPreset = PlayerSettingsStorage.loadDesktopBufferPreset()
             ?.let { runCatching { DesktopBufferPreset.valueOf(it) }.getOrNull() }
             ?: DesktopBufferPreset.Balanced
@@ -619,6 +676,7 @@ object PlayerSettingsRepository {
         desktopRendererApi = PlayerSettingsStorage.loadDesktopRendererApi()
             ?.let { runCatching { DesktopRendererApi.valueOf(it) }.getOrNull() }
             ?: DesktopRendererApi.OpenGL
+        desktopPerformanceLoggingEnabled = PlayerSettingsStorage.loadDesktopPerformanceLogging() ?: false
         desktopLowVramMode = PlayerSettingsStorage.loadDesktopLowVramMode()
             ?.let { runCatching { DesktopLowVramMode.valueOf(it) }.getOrNull() }
             ?: DesktopLowVramMode.Auto
@@ -655,6 +713,7 @@ object PlayerSettingsRepository {
             PlayerSettingsStorage.saveDesktopAnimeMode(DesktopAnimeMode.CustomShader.name)
         }
         desktopAudioPassthroughEnabled = PlayerSettingsStorage.loadDesktopAudioPassthroughEnabled() ?: false
+        desktopSeekThumbnailsEnabled = PlayerSettingsStorage.loadDesktopSeekThumbnailsEnabled() ?: true
         desktopCustomMpvOptions = PlayerSettingsStorage.loadDesktopCustomMpvOptions().orEmpty()
         desktopMpvConfigMode = PlayerSettingsStorage.loadDesktopMpvConfigMode()
             ?.let { runCatching { DesktopMpvConfigMode.valueOf(it) }.getOrNull() }
@@ -768,6 +827,15 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveDesktopUiScalePercent(clamped)
     }
 
+    fun setDesktopControlIconScalePercent(percent: Int) {
+        ensureLoaded()
+        val clamped = percent.coerceIn(-50, 50)
+        if (desktopControlIconScalePercent == clamped) return
+        desktopControlIconScalePercent = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopControlIconScalePercent(clamped)
+    }
+
     fun setSeekStepSeconds(seconds: Int) {
         ensureLoaded()
         val clamped = seconds.coerceIn(SEEK_STEP_SECONDS_RANGE.first, SEEK_STEP_SECONDS_RANGE.last)
@@ -783,6 +851,14 @@ object PlayerSettingsRepository {
         desktopSourceNotchPosition = position
         publish()
         PlayerSettingsStorage.saveDesktopSourceNotchPosition(position.name)
+    }
+
+    fun setDesktopSourceNotchHoverEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (desktopSourceNotchHoverEnabled == enabled) return
+        desktopSourceNotchHoverEnabled = enabled
+        publish()
+        PlayerSettingsStorage.saveDesktopSourceNotchHoverEnabled(enabled)
     }
 
     fun setDesktopPlayerNotificationPosition(position: DesktopPlayerNotificationPosition) {
@@ -870,12 +946,50 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveDualSubtitlesEnabled(enabled)
     }
 
-    fun setPreferHearingImpairedSubtitles(enabled: Boolean) {
+    fun setPreferredSubtitleTrackKind(kind: SubtitleTrackKind) {
         ensureLoaded()
-        if (preferHearingImpairedSubtitles == enabled) return
-        preferHearingImpairedSubtitles = enabled
+        if (preferredSubtitleTrackKind == kind) return
+        preferredSubtitleTrackKind = kind
         publish()
-        PlayerSettingsStorage.savePreferHearingImpairedSubtitles(enabled)
+        PlayerSettingsStorage.savePreferredSubtitleTrackKind(kind.storageValue)
+    }
+
+    /**
+     * The track kind, or its two predecessors folded into one. Until 1.14 "forced" was a language
+     * — a value of the preferred (or secondary) subtitle language dropdown, plus a "Use Forced
+     * Subtitles" switch that substituted it — and SDH was a separate switch, so a store written by
+     * an older build has no kind but may have any of those three.
+     *
+     * A forced *language* leaves the language slot with nothing in it. The secondary was what
+     * supplied the real language in that configuration, so it is promoted; failing that the
+     * device language is the least surprising stand-in, since nobody who picked Forced wanted
+     * subtitles off. The migrated values are written back so this runs once.
+     */
+    private fun loadOrMigrateSubtitleTrackKind(): SubtitleTrackKind {
+        SubtitleTrackKind.fromStorage(PlayerSettingsStorage.loadPreferredSubtitleTrackKind())
+            ?.let { return it }
+
+        val forcedLanguage = preferredSubtitleLanguage == SubtitleLanguageOption.FORCED
+        val forcedSecondary = secondaryPreferredSubtitleLanguage == SubtitleLanguageOption.FORCED
+        val kind = when {
+            forcedLanguage || forcedSecondary ||
+                PlayerSettingsStorage.loadLegacySubtitleUseForcedSubtitles() == true -> SubtitleTrackKind.FORCED
+            PlayerSettingsStorage.loadLegacyPreferHearingImpairedSubtitles() == true -> SubtitleTrackKind.SDH
+            else -> SubtitleTrackKind.DEFAULT
+        }
+        if (forcedLanguage) {
+            preferredSubtitleLanguage = secondaryPreferredSubtitleLanguage
+                ?.takeUnless { it == SubtitleLanguageOption.FORCED }
+                ?: SubtitleLanguageOption.DEVICE
+            secondaryPreferredSubtitleLanguage = null
+            PlayerSettingsStorage.savePreferredSubtitleLanguage(preferredSubtitleLanguage)
+            PlayerSettingsStorage.saveSecondaryPreferredSubtitleLanguage(null)
+        } else if (forcedSecondary) {
+            secondaryPreferredSubtitleLanguage = null
+            PlayerSettingsStorage.saveSecondaryPreferredSubtitleLanguage(null)
+        }
+        PlayerSettingsStorage.savePreferredSubtitleTrackKind(kind.storageValue)
+        return kind
     }
 
     fun setSubtitleStyle(style: SubtitleStyleState) {
@@ -899,7 +1013,6 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveSubtitleFontFamily(style.fontFamily)
         PlayerSettingsStorage.saveSubtitleAssStyleMode(style.assStyleMode.name)
         PlayerSettingsStorage.saveSubtitleAssScalePercent(style.assScalePercent)
-        PlayerSettingsStorage.saveSubtitleUseForcedSubtitles(style.useForcedSubtitles)
         PlayerSettingsStorage.saveSubtitleShowOnlyPreferredLanguages(style.showOnlyPreferredLanguages)
     }
 
@@ -1141,6 +1254,14 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveStreamFailoverTimeoutSeconds(snapped)
     }
 
+    fun setStreamAutoPlayManualNextEpisode(enabled: Boolean) {
+        ensureLoaded()
+        if (streamAutoPlayManualNextEpisode == enabled) return
+        streamAutoPlayManualNextEpisode = enabled
+        publish()
+        PlayerSettingsStorage.saveStreamAutoPlayManualNextEpisode(enabled)
+    }
+
     fun setStreamAutoPlayPreferBingeGroup(enabled: Boolean) {
         ensureLoaded()
         if (streamAutoPlayPreferBingeGroup == enabled) return
@@ -1376,8 +1497,10 @@ object PlayerSettingsRepository {
             playbackSpeedToggleHigh = playbackSpeedToggleHigh,
             desktopVerboseMpvLoggingEnabled = desktopVerboseMpvLoggingEnabled,
             desktopUiScalePercent = desktopUiScalePercent,
+            desktopControlIconScalePercent = desktopControlIconScalePercent,
             seekStepSeconds = seekStepSeconds,
             desktopSourceNotchPosition = desktopSourceNotchPosition,
+            desktopSourceNotchHoverEnabled = desktopSourceNotchHoverEnabled,
             desktopPlayerNotificationPosition = desktopPlayerNotificationPosition,
             externalPlayerEnabled = externalPlayerEnabled,
             externalPlayerForwardSubtitles = externalPlayerForwardSubtitles,
@@ -1387,7 +1510,7 @@ object PlayerSettingsRepository {
             preferredSubtitleLanguage = preferredSubtitleLanguage,
             secondaryPreferredSubtitleLanguage = secondaryPreferredSubtitleLanguage,
             dualSubtitlesEnabled = dualSubtitlesEnabled,
-            preferHearingImpairedSubtitles = preferHearingImpairedSubtitles,
+            preferredSubtitleTrackKind = preferredSubtitleTrackKind,
             subtitleStyle = subtitleStyle,
             addonSubtitleStartupMode = addonSubtitleStartupMode,
             rejectedSubtitleKeywords = rejectedSubtitleKeywords,
@@ -1416,6 +1539,7 @@ object PlayerSettingsRepository {
             skipDbApiKey = skipDbApiKey,
             introSubmitEnabled = introSubmitEnabled,
             streamAutoPlayNextEpisodeEnabled = streamAutoPlayNextEpisodeEnabled,
+            streamAutoPlayManualNextEpisode = streamAutoPlayManualNextEpisode,
             streamAutoPlayPreferBingeGroup = streamAutoPlayPreferBingeGroup,
             streamAutoPlayReuseBingeGroup = streamAutoPlayReuseBingeGroup,
             streamFailoverEnabled = streamFailoverEnabled,
@@ -1442,8 +1566,13 @@ object PlayerSettingsRepository {
             iosGamma = iosGamma,
             desktopHdrMode = desktopHdrMode,
             desktopColorProfile = desktopColorProfile,
+            desktopColorContrast = desktopColorContrast,
+            desktopColorBrightness = desktopColorBrightness,
+            desktopColorSaturation = desktopColorSaturation,
+            desktopColorGamma = desktopColorGamma,
             desktopBufferPreset = desktopBufferPreset,
             desktopRendererApi = desktopRendererApi,
+            desktopPerformanceLoggingEnabled = desktopPerformanceLoggingEnabled,
             desktopLowVramMode = desktopLowVramMode,
             desktopAnimeMode = desktopAnimeMode,
             desktopAnimeModeAutoEnabled = desktopAnimeModeAutoEnabled,
@@ -1457,6 +1586,7 @@ object PlayerSettingsRepository {
             desktopCustomShaderPaths = desktopCustomShaderPaths,
             desktopCustomShaderSelectedPath = desktopCustomShaderSelectedPath,
             desktopAudioPassthroughEnabled = desktopAudioPassthroughEnabled,
+            desktopSeekThumbnailsEnabled = desktopSeekThumbnailsEnabled,
             desktopMpvConfigMode = desktopMpvConfigMode,
             desktopCustomMpvOptions = desktopCustomMpvOptions,
             desktopMpvPropertyOverrides = desktopMpvPropertyOverrides,
@@ -1484,12 +1614,79 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveDesktopColorProfile(profile.name)
     }
 
+    /**
+     * The equalizer offsets behind [DesktopColorProfile.Custom]. Clamped to the same +/-50 the iOS
+     * tuning sliders use: mpv accepts +/-100, but past 50 the image is destroyed rather than graded.
+     */
+    fun setDesktopColorContrast(value: Int) {
+        ensureLoaded()
+        val clamped = value.coerceIn(DESKTOP_COLOR_OFFSET_RANGE.first, DESKTOP_COLOR_OFFSET_RANGE.last)
+        if (desktopColorContrast == clamped) return
+        desktopColorContrast = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopColorContrast(clamped)
+    }
+
+    fun setDesktopColorBrightness(value: Int) {
+        ensureLoaded()
+        val clamped = value.coerceIn(DESKTOP_COLOR_OFFSET_RANGE.first, DESKTOP_COLOR_OFFSET_RANGE.last)
+        if (desktopColorBrightness == clamped) return
+        desktopColorBrightness = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopColorBrightness(clamped)
+    }
+
+    fun setDesktopColorSaturation(value: Int) {
+        ensureLoaded()
+        val clamped = value.coerceIn(DESKTOP_COLOR_OFFSET_RANGE.first, DESKTOP_COLOR_OFFSET_RANGE.last)
+        if (desktopColorSaturation == clamped) return
+        desktopColorSaturation = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopColorSaturation(clamped)
+    }
+
+    fun setDesktopColorGamma(value: Int) {
+        ensureLoaded()
+        val clamped = value.coerceIn(DESKTOP_COLOR_OFFSET_RANGE.first, DESKTOP_COLOR_OFFSET_RANGE.last)
+        if (desktopColorGamma == clamped) return
+        desktopColorGamma = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopColorGamma(clamped)
+    }
+
+    /** Returns the Custom grade to neutral without leaving the Custom profile. */
+    fun resetDesktopColorTuning() {
+        ensureLoaded()
+        desktopColorContrast = 0
+        desktopColorBrightness = 0
+        desktopColorSaturation = 0
+        desktopColorGamma = 0
+        publish()
+        PlayerSettingsStorage.saveDesktopColorContrast(0)
+        PlayerSettingsStorage.saveDesktopColorBrightness(0)
+        PlayerSettingsStorage.saveDesktopColorSaturation(0)
+        PlayerSettingsStorage.saveDesktopColorGamma(0)
+    }
+
     fun setDesktopBufferPreset(preset: DesktopBufferPreset) {
         ensureLoaded()
         if (desktopBufferPreset == preset) return
         desktopBufferPreset = preset
         publish()
         PlayerSettingsStorage.saveDesktopBufferPreset(preset.name)
+    }
+
+    /**
+     * Frame-budget telemetry. Applies immediately — the probes and the frame-clock loops read the
+     * flag as snapshot state — so no restart is needed, unlike the renderer below.
+     */
+    fun setDesktopPerformanceLogging(enabled: Boolean) {
+        ensureLoaded()
+        if (desktopPerformanceLoggingEnabled == enabled) return
+        desktopPerformanceLoggingEnabled = enabled
+        frameBudgetSetProbesEnabled(enabled)
+        publish()
+        PlayerSettingsStorage.saveDesktopPerformanceLogging(enabled)
     }
 
     fun setDesktopRendererApi(api: DesktopRendererApi) {
@@ -1613,6 +1810,14 @@ object PlayerSettingsRepository {
         desktopAudioPassthroughEnabled = enabled
         publish()
         PlayerSettingsStorage.saveDesktopAudioPassthroughEnabled(enabled)
+    }
+
+    fun setDesktopSeekThumbnailsEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (desktopSeekThumbnailsEnabled == enabled) return
+        desktopSeekThumbnailsEnabled = enabled
+        publish()
+        PlayerSettingsStorage.saveDesktopSeekThumbnailsEnabled(enabled)
     }
 
     fun setDesktopCustomMpvOptions(options: String) {

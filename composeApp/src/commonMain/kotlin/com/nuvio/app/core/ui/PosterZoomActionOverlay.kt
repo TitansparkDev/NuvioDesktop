@@ -120,6 +120,8 @@ class PosterZoomOverlayAction(
     val label: String,
     val isDestructive: Boolean = false,
     val onSelected: () -> Unit,
+    /** Right-click (desktop) alternative to [onSelected]; the overlay closes the same way. */
+    val onSecondarySelected: (() -> Unit)? = null,
 )
 
 private enum class PosterZoomPhase {
@@ -229,6 +231,13 @@ fun NuvioPosterZoomActionOverlay(
             action.onSelected()
             close()
         }
+    }
+
+    fun selectSecondary(action: PosterZoomOverlayAction) {
+        val secondary = action.onSecondarySelected ?: return
+        if (phase != PosterZoomPhase.Open) return
+        secondary()
+        close()
     }
 
     PlatformBackHandler(enabled = true) {
@@ -358,6 +367,7 @@ fun NuvioPosterZoomActionOverlay(
                         action = action,
                         enabled = phase == PosterZoomPhase.Open,
                         onSelected = { select(action) },
+                        onSecondarySelected = action.onSecondarySelected?.let { { selectSecondary(action) } },
                         modifier = Modifier.graphicsLayer {
                             val stagger = index * 0.07f
                             val progress = ((menu.value.coerceIn(0f, 1f) - stagger) / (1f - stagger))
@@ -482,6 +492,7 @@ private fun PosterZoomMenuRow(
     action: PosterZoomOverlayAction,
     enabled: Boolean,
     onSelected: () -> Unit,
+    onSecondarySelected: (() -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
     val tokens = MaterialTheme.nuvio
@@ -490,6 +501,7 @@ private fun PosterZoomMenuRow(
         modifier = modifier
             .fillMaxWidth()
             .clickable(enabled = enabled, onClick = onSelected)
+            .secondaryClick(onSecondarySelected?.takeIf { enabled })
             .padding(horizontal = NuvioTokens.Space.s18, vertical = NuvioTokens.Space.s16),
         horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
         verticalAlignment = Alignment.CenterVertically,

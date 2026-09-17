@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="controls.css?v=20260903-episode-artwork">
+  <link rel="stylesheet" href="controls.css?v=20260913-control-icon-scale">
 </head>
 <body>
   <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
@@ -119,6 +119,12 @@
       <path d="M3 10v4h4l5 5V5L7 10H3Z"/>
       <path d="M16 9.5 21 14.5M21 9.5 16 14.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
     </symbol>
+    <!-- Overflow affordance for the action row: a rounded container holding the four glyph
+         slots that collapse into it, so the icon reads as "the rest of the icons live here". -->
+    <symbol id="icon-action-overflow" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="1.7" d="M4.85 3.75h14.3c.61 0 1.1.49 1.1 1.1v14.3c0 .61-.49 1.1-1.1 1.1H4.85c-.61 0-1.1-.49-1.1-1.1V4.85c0-.61.49-1.1 1.1-1.1Z"/>
+      <path d="M8.4 7.15a1.35 1.35 0 1 1 0 2.7 1.35 1.35 0 0 1 0-2.7Zm7.2 0a1.35 1.35 0 1 1 0 2.7 1.35 1.35 0 0 1 0-2.7Zm-7.2 7a1.35 1.35 0 1 1 0 2.7 1.35 1.35 0 0 1 0-2.7Zm7.2 0a1.35 1.35 0 1 1 0 2.7 1.35 1.35 0 0 1 0-2.7Z"/>
+    </symbol>
   </svg>
 
   <div class="player" id="playerRoot" tabindex="-1">
@@ -179,6 +185,54 @@
       <aside class="playback-info" id="playbackInfoPanel" aria-label="Playback information" aria-hidden="true">
         <div class="playback-info-rows" id="playbackInfoRows"></div>
       </aside>
+
+      <!-- Deliberately NOT a .modal-layer: that draws a 54% black scrim over the video, and a
+           colour grade can only be judged against the real picture. This panel floats over playback
+           instead, and holding a stepper repeats so a value can be swept without clicking 40 times. -->
+      <section class="grade-panel" id="colorGradePanel" aria-label="Custom color" aria-hidden="true">
+        <div class="grade-head">
+          <span class="grade-title">Custom color</span>
+          <button class="grade-close" id="colorGradeClose" type="button" aria-label="Close color panel"><svg><use href="#icon-close"></use></svg></button>
+        </div>
+        <div class="grade-rows">
+          <div class="style-row">
+            <span class="style-label">Contrast</span>
+            <div class="stepper">
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorContrast" data-grade-delta="-1" aria-label="Decrease contrast">-</button>
+              <span class="stepper-value" id="colorGradeContrastValue">+0</span>
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorContrast" data-grade-delta="1" aria-label="Increase contrast">+</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span class="style-label">Brightness</span>
+            <div class="stepper">
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorBrightness" data-grade-delta="-1" aria-label="Decrease brightness">-</button>
+              <span class="stepper-value" id="colorGradeBrightnessValue">+0</span>
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorBrightness" data-grade-delta="1" aria-label="Increase brightness">+</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span class="style-label">Saturation</span>
+            <div class="stepper">
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorSaturation" data-grade-delta="-1" aria-label="Decrease saturation">-</button>
+              <span class="stepper-value" id="colorGradeSaturationValue">+0</span>
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorSaturation" data-grade-delta="1" aria-label="Increase saturation">+</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span class="style-label">Gamma</span>
+            <div class="stepper">
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorGamma" data-grade-delta="-1" aria-label="Decrease gamma">-</button>
+              <span class="stepper-value" id="colorGradeGammaValue">+0</span>
+              <button class="round-step" type="button" data-grade-command="adjustDesktopColorGamma" data-grade-delta="1" aria-label="Increase gamma">+</button>
+            </div>
+          </div>
+        </div>
+        <div class="grade-foot">
+          <span class="grade-note" id="colorGradeNote">SDR only</span>
+          <button class="panel-button" id="colorGradeReset" type="button">Reset</button>
+        </div>
+      </section>
 
       <button class="episode-notch optional" id="episodeNotch" data-command="episodes" aria-label="Open episodes">
         <svg><use href="#icon-video"></use></svg>
@@ -283,18 +337,20 @@
             <button class="side-control episode-skip" data-command="nextEpisode" aria-label="Next episode"><svg><use href="#icon-next"></use></svg></button>
           </div>
           <div class="action-row">
-            <button class="action tertiary-action" data-command="resize" aria-label="Aspect ratio" title="Aspect ratio"><svg><use href="#icon-aspect"></use></svg><span id="resizeLabel">Fit</span></button>
-            <button class="action tertiary-action" id="speedButton" data-command="speed" aria-label="Playback speed" title="Playback speed"><svg><use href="#icon-speed"></use></svg><span id="speedLabel">1x</span></button>
-            <button class="action" data-command="subtitles" aria-label="Subtitles" title="Subtitles"><svg><use href="#icon-subs"></use></svg><span id="subtitlesLabel">Subs</span></button>
-            <button class="action" data-command="audio" aria-label="Audio tracks" title="Audio tracks"><svg><use href="#icon-audio"></use></svg><span id="audioLabel">Audio</span></button>
-            <button class="action desktop-preset-action" data-command="keyboardCycleHdrMode" aria-label="Cycle HDR mode" title="HDR mode"><svg><use href="#icon-hdr"></use></svg><span>HDR</span></button>
-            <button class="action desktop-preset-action" data-command="keyboardCycleColorProfile" aria-label="Cycle color profile" title="Color profile"><svg><use href="#icon-color-profile"></use></svg><span>Color</span></button>
-            <button class="action desktop-preset-action" id="animeShaderButton" data-command="keyboardCycleAnimeMode" aria-label="Cycle anime shader" title="Anime shaders"><svg><use href="#icon-anime-shader"></use></svg><span>Anime</span></button>
-            <button class="action desktop-preset-action" data-command="keyboardCycleAnimeSvp" aria-label="Toggle SVP" title="SVP interpolation"><svg><use href="#icon-svp"></use></svg><span>SVP</span></button>
-            <button class="action optional" id="sourcesButton" data-command="sources"><svg><use href="#icon-swap"></use></svg><span id="sourcesLabel">Sources</span></button>
-            <button class="action optional" id="episodesButton" data-command="episodes" hidden><svg><use href="#icon-video"></use></svg><span id="episodesLabel">Episodes</span></button>
-            <button class="action" id="submitIntroButton" data-command="submitIntro" aria-label="Submit intro" title="Submit intro"><svg><use href="#icon-flag"></use></svg><span>Submit</span></button>
-            <button class="action pip-action" id="pictureInPictureButton" data-command="pictureInPicture" aria-label="Picture in picture" title="Picture in picture"><svg><use href="#icon-pip"></use></svg><span>PiP</span></button>
+            <button class="action tertiary-action" data-action-priority="60" data-command="resize" aria-label="Aspect ratio" title="Aspect ratio"><svg><use href="#icon-aspect"></use></svg><span id="resizeLabel">Fit</span></button>
+            <button class="action tertiary-action" data-action-priority="55" id="speedButton" data-command="speed" aria-label="Playback speed" title="Playback speed"><svg><use href="#icon-speed"></use></svg><span id="speedLabel">1x</span></button>
+            <button class="action" data-action-priority="5" data-command="subtitles" aria-label="Subtitles" title="Subtitles"><svg><use href="#icon-subs"></use></svg><span id="subtitlesLabel">Subs</span></button>
+            <button class="action" data-action-priority="10" data-command="audio" aria-label="Audio tracks" title="Audio tracks"><svg><use href="#icon-audio"></use></svg><span id="audioLabel">Audio</span></button>
+            <button class="action desktop-preset-action" data-action-priority="70" data-command="keyboardCycleHdrMode" aria-label="Cycle HDR mode" title="HDR mode"><svg><use href="#icon-hdr"></use></svg><span>HDR</span></button>
+            <button class="action desktop-preset-action" data-action-priority="75" data-command="keyboardCycleColorProfile" aria-label="Cycle color profile" title="Color profile"><svg><use href="#icon-color-profile"></use></svg><span>Color</span></button>
+            <button class="action desktop-preset-action" data-action-priority="80" id="animeShaderButton" data-command="keyboardCycleAnimeMode" aria-label="Cycle anime shader" title="Anime shaders"><svg><use href="#icon-anime-shader"></use></svg><span>Anime</span></button>
+            <button class="action desktop-preset-action" data-action-priority="85" data-command="keyboardCycleAnimeSvp" aria-label="Toggle SVP" title="SVP interpolation"><svg><use href="#icon-svp"></use></svg><span>SVP</span></button>
+            <button class="action optional" data-action-priority="20" id="sourcesButton" data-command="sources"><svg><use href="#icon-swap"></use></svg><span id="sourcesLabel">Sources</span></button>
+            <button class="action optional" data-action-priority="25" id="episodesButton" data-command="episodes" hidden><svg><use href="#icon-video"></use></svg><span id="episodesLabel">Episodes</span></button>
+            <button class="action" data-action-priority="65" id="submitIntroButton" data-command="submitIntro" aria-label="Submit intro" title="Submit intro"><svg><use href="#icon-flag"></use></svg><span>Submit</span></button>
+            <button class="action pip-action" data-action-priority="30" id="pictureInPictureButton" data-command="pictureInPicture" aria-label="Picture in picture" title="Picture in picture"><svg><use href="#icon-pip"></use></svg><span>PiP</span></button>
+            <button class="action action-overflow-toggle" id="actionOverflowButton" type="button" aria-label="More controls" title="More controls" aria-haspopup="true" aria-expanded="false" hidden><svg><use href="#icon-action-overflow"></use></svg><span>More</span></button>
+            <div class="action-overflow-menu" id="actionOverflowMenu" role="menu" aria-label="More controls" hidden></div>
           </div>
         </div>
       </section>
@@ -597,6 +653,6 @@
     <div class="pip-resize-handle pip-resize-nw" data-pip-resize="8"></div>
   </div>
 
-  <script src="controls.js?v=20260903-episode-artwork"></script>
+  <script src="controls.js?v=20260913-control-icon-scale"></script>
 </body>
 </html>

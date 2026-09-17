@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.material3.MaterialTheme
@@ -16,6 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -25,6 +27,7 @@ import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.auth.ReauthenticationTrigger
 import com.nuvio.app.core.sync.ProfileSettingsSync
 import com.nuvio.app.core.sync.SynchronizationPreferencesRepository
+import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioPrimaryButton
 import com.nuvio.app.features.setup.FirstRunWizardController
 import com.nuvio.app.core.ui.NuvioStatusModal
@@ -146,90 +149,72 @@ private fun AccountSettingsBody(
             }
         }
 
-        NuvioSurfaceCard(
-            modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("account-status")),
+        // Sign out / sign in lives on the far right of the section heading, where the other pages
+        // keep their heading-level action, rather than as a full-width button under the card.
+        SettingsSection(
+            title = stringResource(Res.string.compose_settings_page_account),
+            isTablet = isTablet,
+            actions = {
+                if (authState is AuthState.Authenticated) {
+                    NuvioActionLabel(
+                        text = stringResource(Res.string.settings_account_sign_out),
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("account-sign-out")),
+                        onClick = { showSignOutConfirm = true },
+                    )
+                } else {
+                    NuvioActionLabel(
+                        text = stringResource(Res.string.compose_auth_sign_in),
+                        onClick = { ReauthenticationTrigger.trigger() },
+                    )
+                }
+            },
         ) {
-            Text(
-                text = stringResource(Res.string.compose_settings_page_account),
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(modifier = Modifier.height(14.dp))
-
-            when (val state = authState) {
-                is AuthState.Authenticated -> {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            text = stringResource(Res.string.settings_account_status),
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            text = if (state.isAnonymous) {
+            SettingsGroup(
+                isTablet = isTablet,
+                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("account-status")),
+            ) {
+                when (val state = authState) {
+                    is AuthState.Authenticated -> {
+                        AccountValueRow(
+                            label = stringResource(Res.string.settings_account_status),
+                            value = if (state.isAnonymous) {
                                 stringResource(Res.string.settings_account_status_anonymous)
                             } else {
                                 stringResource(Res.string.settings_account_status_signed_in)
                             },
-                            style = MaterialTheme.typography.bodyLarge.accentBrush(),
-                            color = MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.Medium,
+                            accent = true,
+                            isTablet = isTablet,
                         )
-                    }
-                    if (!state.isAnonymous && state.email != null) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = stringResource(Res.string.settings_account_email),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                text = state.email,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.Medium,
+                        if (!state.isAnonymous && state.email != null) {
+                            SettingsGroupDivider(isTablet = isTablet)
+                            AccountValueRow(
+                                label = stringResource(Res.string.settings_account_email),
+                                value = state.email,
+                                accent = false,
+                                isTablet = isTablet,
                             )
                         }
                     }
-                }
-                else -> {
-                    Text(
-                        text = stringResource(Res.string.settings_account_not_signed_in),
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    else -> {
+                        AccountValueRow(
+                            label = stringResource(Res.string.settings_account_status),
+                            value = stringResource(Res.string.settings_account_not_signed_in),
+                            accent = false,
+                            isTablet = isTablet,
+                        )
+                    }
                 }
             }
-        }
-
-        if (authState is AuthState.Authenticated) {
-            NuvioPrimaryButton(
-                text = stringResource(Res.string.settings_account_sign_out),
-                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("account-sign-out")),
-                onClick = { showSignOutConfirm = true },
-            )
-        } else {
-            NuvioPrimaryButton(
-                text = stringResource(Res.string.compose_auth_sign_in),
-                onClick = { ReauthenticationTrigger.trigger() },
-            )
         }
 
         SettingsSection(
             title = stringResource(Res.string.settings_sync_section),
             isTablet = isTablet,
         ) {
-            Text(
+            SettingsSectionNote(
                 text = stringResource(Res.string.settings_sync_description),
+                isTablet = isTablet,
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(modifier = Modifier.height(8.dp))
             SettingsGroup(isTablet = isTablet) {
@@ -334,10 +319,9 @@ private fun AccountSettingsBody(
                 )
             }
             Spacer(modifier = Modifier.height(8.dp))
-            Text(
+            SettingsSectionNote(
                 text = stringResource(Res.string.settings_sync_fork_local_note),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                isTablet = isTablet,
             )
         }
 
@@ -470,4 +454,34 @@ private fun AccountSettingsBody(
         },
         onDismiss = { showSignOutConfirm = false },
     )
+}
+
+/** One label/value line of the account card: label on the left, value right-aligned. */
+@Composable
+private fun AccountValueRow(
+    label: String,
+    value: String,
+    accent: Boolean,
+    isTablet: Boolean,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = if (isTablet) 10.dp else 14.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        val valueStyle = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
+        Text(
+            text = value,
+            style = if (accent) valueStyle.accentBrush() else valueStyle,
+            color = if (accent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.Medium,
+        )
+    }
 }

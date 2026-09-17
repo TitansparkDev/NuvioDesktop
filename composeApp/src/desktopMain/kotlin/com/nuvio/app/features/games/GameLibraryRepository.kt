@@ -55,6 +55,8 @@ class GameLibraryRepository(
 
     suspend fun saveGames(games: List<GameEntry>) = update { it.copy(games = games) }
 
+    suspend fun saveRows(rows: List<GameRow>) = update { it.copy(rows = rows) }
+
     suspend fun saveLastExecutableDirectory(directory: String) =
         update { it.copy(settings = it.settings.copy(lastExecutableDirectory = directory)) }
 
@@ -87,9 +89,12 @@ class GameLibraryRepository(
         fun defaultDataFile(): Path = DesktopStorage.rootDir.resolve("games").resolve("library.json")
 
         /**
-         * Where the library lived before game mode was merged in — first the standalone Umbra
-         * launcher, then its own pre-rebrand directory. The first one that exists is copied in
-         * once, so an existing library survives the move without the user doing anything.
+         * Where the library lived before game mode was merged into Nuvio. The first one that
+         * exists is copied in once, so an existing library survives the move without the user
+         * doing anything.
+         *
+         * These directory names are historical on-disk paths, not branding — they have to keep
+         * naming what is actually on the filesystem for the migration to find anything.
          */
         fun defaultLegacyDataFiles(): List<Path> {
             val localAppData = System.getenv("LOCALAPPDATA")?.takeIf(String::isNotBlank)

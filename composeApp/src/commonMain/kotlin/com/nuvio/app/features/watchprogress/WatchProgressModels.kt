@@ -71,6 +71,11 @@ data class WatchProgressEntry(
     val isCompleted: Boolean = false,
     val progressPercent: Float? = null,
     val source: String = WatchProgressSourceLocal,
+    // When the row is an Up Next seed and the provider says when the next unwatched episode airs.
+    // Read by the Continue Watching window (see isWithinContinueWatchingWindow) so a show returning
+    // after a long hiatus is not dropped before its premiere; null for in-progress rows and for
+    // providers that do not report it.
+    val nextEpisodeAirEpochMs: Long? = null,
 ) {
     val normalizedProgressPercent: Float?
         get() = progressPercent?.coerceIn(0f, 100f)
