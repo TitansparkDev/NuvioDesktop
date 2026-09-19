@@ -42,8 +42,10 @@ This fork is unaffiliated with the Nuvio team. Don't worry about the commit disp
 # Desktop Playback
 
 * MPV-based desktop player with extensive customization options built in, as well as the option to fully overwrite the MPV config.
+* Unique playback UI with right click menu for quickly swapping options and a clock with a "media ends at" timer.
 * Automatic stream failover, source affinity, binge mode, next-episode autoplay, and configurable buffering.
-* Anime shaders, SVP frame interpolation and NVIDIA RTX Video True HDR.
+* Three color profiles thanks to Stremio Kai (used with Permission), custom color profile and HDR modes.
+* Anime shaders (4K Anime, Stremio Kai, custom), SVP frame interpolation and NVIDIA RTX Video True HDR.
 * Seek-bar thumbnails, chapters, SkipDB support, intro/outro skipping, dual subtitles, subtitle styling, playback speed controls, and volume boost.
 * Desktop Picture-in-Picture, direct URL playback, local-file playback, and external-player integration.
 * Stream Scoring can rank or reject sources based on quality, resolution, HDR, audio, codec, language, release metadata, cache status, and file size.
@@ -57,9 +59,9 @@ This fork is unaffiliated with the Nuvio team. Don't worry about the commit disp
 
 # Customisation
 
-1. Custom hero discovery rules and metadata badges without modifying the application.
-2. Custom themes, accent gradients, system fonts, poster layouts, detail-page backgrounds, keyboard shortcuts, settings navigation, and player HUD scaling.
-3. Configurable provider preferences, source scoring, subtitle/audio filtering, playback behaviour, and discovery rows.
+* Custom hero discovery rules and metadata badges without modifying the application.
+* Custom themes, accent gradients, system fonts, poster layouts, detail-page backgrounds, keyboard shortcuts, settings navigation, and player HUD scaling.
+* Configurable provider preferences, source scoring, subtitle/audio filtering, playback behaviour, and discovery rows.
 
 # Other
 
