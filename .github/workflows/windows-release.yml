@@ -94,23 +94,21 @@ jobs:
       - name: Package Standalone Portable Zip
         shell: bash
         run: |
-          mkdir -p release-assets
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
           
           # Zip the standalone app folder containing Nuvio.exe and runtime
           if [ -d "composeApp/build/compose/binaries/main-release/app/Nuvio" ]; then
-            cd composeApp/build/compose/binaries/main-release/app/Nuvio
-            7z a -tzip -mx=7 "../../../../../../release-assets/Nuvio-Windows-x64-Portable.zip" *
-            cd ../../../../../..
+            (cd composeApp/build/compose/binaries/main-release/app/Nuvio && 7z a -tzip -mx=7 "$GITHUB_WORKSPACE/release-assets/Nuvio-Windows-x64-Portable.zip" *)
           fi
 
           # Collect MSI installer
-          find composeApp/build/compose/binaries/main-release -name "*.msi" -exec cp {} release-assets/ \;
+          find composeApp/build/compose/binaries/main-release -name "*.msi" -exec cp -v {} "$GITHUB_WORKSPACE/release-assets/" \;
           
           # Collect EXE installer if created
-          find composeApp/build/compose/binaries/main-release -name "*.exe" ! -name "Nuvio.exe" -exec cp {} release-assets/ \;
+          find composeApp/build/compose/binaries/main-release -name "*.exe" ! -name "Nuvio.exe" -exec cp -v {} "$GITHUB_WORKSPACE/release-assets/" \;
 
           echo "Release assets staged:"
-          ls -la release-assets/
+          ls -la "$GITHUB_WORKSPACE/release-assets/" 
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
