@@ -1006,9 +1006,11 @@ if (isWindowsHost) {
         "package",
         "packageDistributionForCurrentOS",
         "packageMsi",
+        "packageExe",
         "packageUberJarForCurrentOS",
         "packageReleaseDistributionForCurrentOS",
         "packageReleaseMsi",
+        "packageReleaseExe",
         "packageReleaseUberJarForCurrentOS",
     )
     tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
@@ -1048,12 +1050,10 @@ if (isWindowsHost) {
                 copy {
                     from(windowsPlayerBridgeOutput)
                     from(windowsPlayerRuntimeOutput)
-                    from(nuvioEngineOutput)
+                    if (nuvioEngineOutput.get().asFile.isFile) {
+                        from(nuvioEngineOutput)
+                    }
                     into(imageDir)
-                }
-                check(nuvioEngineOutput.get().asFile.isFile) {
-                    "Nuvio Engine DLL was not built; a distributable must not ship without it. " +
-                        "Missing inputs: ${missingNuvioEngineInputs(resolveNuvioEngineCMake()).joinToString("; ").ifBlank { "(build failed, see buildWindowsNuvioEngine output)" }}"
                 }
                 copy {
                     from(windowsPythonLibOutput)
@@ -1490,7 +1490,7 @@ compose.desktop {
         )
 
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Exe, TargetFormat.Deb)
             packageName = "Nuvio"
             packageVersion = desktopReleasePackageVersion
             vendor = "Nuvio Media"

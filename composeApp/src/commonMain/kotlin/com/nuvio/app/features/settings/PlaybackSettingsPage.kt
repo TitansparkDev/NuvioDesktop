@@ -1240,6 +1240,21 @@ private fun PlaybackSettingsSection(
                         isTablet = isTablet,
                         onCheckedChange = PlayerSettingsRepository::setDesktopAudioPassthroughEnabled,
                     )
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsChoiceRow(
+                        title = stringResource(Res.string.settings_playback_dialogue_leveler),
+                        description = stringResource(Res.string.settings_playback_dialogue_leveler_desc),
+                        options = listOf(
+                            SettingsChoiceOption(com.nuvio.app.features.player.DIALOGUE_LEVELER_OFF, stringResource(Res.string.dialogue_leveler_off)),
+                            SettingsChoiceOption(com.nuvio.app.features.player.DIALOGUE_LEVELER_LIGHT, stringResource(Res.string.dialogue_leveler_light)),
+                            SettingsChoiceOption(com.nuvio.app.features.player.DIALOGUE_LEVELER_MEDIUM, stringResource(Res.string.dialogue_leveler_medium)),
+                            SettingsChoiceOption(com.nuvio.app.features.player.DIALOGUE_LEVELER_STRONG, stringResource(Res.string.dialogue_leveler_strong)),
+                            SettingsChoiceOption(com.nuvio.app.features.player.DIALOGUE_LEVELER_MAX, stringResource(Res.string.dialogue_leveler_max)),
+                        ),
+                        selectedValue = autoPlayPlayerSettings.dialogueLeveler,
+                        isTablet = isTablet,
+                        onSelected = PlayerSettingsRepository::setDialogueLeveler,
+                    )
                 }
             }
         }

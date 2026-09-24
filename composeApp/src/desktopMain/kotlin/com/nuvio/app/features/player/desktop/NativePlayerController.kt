@@ -1770,6 +1770,12 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
             // the failure being able to stall playback start.
             add("audio-fallback-to-null=yes")
         }
+        if (useNuvioOptions && settings.dialogueLeveler > 0) {
+            val drcFilter = com.nuvio.app.features.player.buildMpvDialogueLevelerFilter(settings.dialogueLeveler)
+            if (drcFilter != null) {
+                add("af=$drcFilter")
+            }
+        }
         // Full verbose diagnostics: mpv's own --log-file writes a complete debug-level log
         // independently of the bridge's warnings-only capture (and without the per-line event-thread
         // write cost that gates the bridge log), so troubleshooting gets the unshortened stream.

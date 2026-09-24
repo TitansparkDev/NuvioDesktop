@@ -138,6 +138,7 @@ internal actual object PlayerSettingsStorage {
     private const val desktopCustomShaderPathsKey = "desktop_custom_shader_paths"
     private const val desktopCustomShaderSelectedPathKey = "desktop_custom_shader_selected_path"
     private const val desktopAudioPassthroughEnabledKey = "desktop_audio_passthrough_enabled"
+    private const val dialogueLevelerKey = "dialogue_leveler"
     private const val desktopSeekThumbnailsEnabledKey = "desktop_seek_thumbnails_enabled"
     private const val desktopCustomMpvOptionsKey = "desktop_custom_mpv_options"
     private const val desktopMpvConfigModeKey = "desktop_mpv_config_mode"
@@ -515,6 +516,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveDesktopCustomShaderPaths(paths: String) = saveString(desktopCustomShaderPathsKey, paths)
     actual fun loadDesktopCustomShaderSelectedPath(): String? = loadString(desktopCustomShaderSelectedPathKey)
     actual fun saveDesktopCustomShaderSelectedPath(path: String) = saveString(desktopCustomShaderSelectedPathKey, path)
+    actual fun loadDialogueLeveler(): Int? = loadInt(dialogueLevelerKey)
+    actual fun saveDialogueLeveler(level: Int) = saveInt(dialogueLevelerKey, level)
     actual fun loadDesktopAudioPassthroughEnabled(): Boolean? = loadBoolean(desktopAudioPassthroughEnabledKey)
     actual fun saveDesktopAudioPassthroughEnabled(enabled: Boolean) = saveBoolean(desktopAudioPassthroughEnabledKey, enabled)
     actual fun loadDesktopSeekThumbnailsEnabled(): Boolean? = loadBoolean(desktopSeekThumbnailsEnabledKey)

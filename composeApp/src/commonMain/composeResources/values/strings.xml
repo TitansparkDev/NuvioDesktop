@@ -3532,4 +3532,11 @@
     <string name="server_error_save">Could not save the server configuration.</string>
     <string name="server_error_session_clear">Could not safely clear the current session. The server was not changed.</string>
     <string name="server_error_restart">The server was saved, but the app could not restart automatically. Restart it manually.</string>
+    <string name="settings_playback_dialogue_leveler">Dialogue Leveler (DRC)</string>
+    <string name="settings_playback_dialogue_leveler_desc">Dynamic range compression boosts quiet speech and tames loud effects</string>
+    <string name="dialogue_leveler_off">Off</string>
+    <string name="dialogue_leveler_light">Light</string>
+    <string name="dialogue_leveler_medium">Medium</string>
+    <string name="dialogue_leveler_strong">Strong</string>
+    <string name="dialogue_leveler_max">Max</string>
 </resources>

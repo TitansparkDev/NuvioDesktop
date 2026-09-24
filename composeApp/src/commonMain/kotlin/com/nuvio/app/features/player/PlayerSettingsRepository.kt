@@ -206,6 +206,7 @@ data class PlayerSettingsUiState(
     val desktopCustomShaderPaths: String = "",
     val desktopCustomShaderSelectedPath: String = "",
     // Bitstream/passthrough of compressed audio (AC3/DTS/E-AC3/TrueHD/DTS-HD) to a receiver.
+    val dialogueLeveler: Int = DIALOGUE_LEVELER_OFF,
     val desktopAudioPassthroughEnabled: Boolean = false,
     // Seek-bar hover previews. They come from a second libmpv instance that opens the same stream
     // and issues a byte-range request per hovered position, so a remote source pays for them in
@@ -331,6 +332,7 @@ object PlayerSettingsRepository {
     private var desktopAnimeSvpSessionForced = false
     private var desktopCustomShaderPaths = ""
     private var desktopCustomShaderSelectedPath = ""
+    private var dialogueLeveler = DIALOGUE_LEVELER_OFF
     private var desktopAudioPassthroughEnabled = false
     private var desktopSeekThumbnailsEnabled = true
     private var desktopMpvConfigMode = DesktopMpvConfigMode.Off
@@ -457,6 +459,7 @@ object PlayerSettingsRepository {
         desktopAnimeSvpSessionForced = false
         desktopCustomShaderPaths = ""
         desktopCustomShaderSelectedPath = ""
+        dialogueLeveler = DIALOGUE_LEVELER_OFF
         desktopAudioPassthroughEnabled = false
         desktopSeekThumbnailsEnabled = true
         desktopMpvConfigMode = DesktopMpvConfigMode.Off
@@ -712,6 +715,7 @@ object PlayerSettingsRepository {
             desktopAnimeMode = DesktopAnimeMode.CustomShader
             PlayerSettingsStorage.saveDesktopAnimeMode(DesktopAnimeMode.CustomShader.name)
         }
+        dialogueLeveler = PlayerSettingsStorage.loadDialogueLeveler() ?: DIALOGUE_LEVELER_OFF
         desktopAudioPassthroughEnabled = PlayerSettingsStorage.loadDesktopAudioPassthroughEnabled() ?: false
         desktopSeekThumbnailsEnabled = PlayerSettingsStorage.loadDesktopSeekThumbnailsEnabled() ?: true
         desktopCustomMpvOptions = PlayerSettingsStorage.loadDesktopCustomMpvOptions().orEmpty()
@@ -1585,6 +1589,7 @@ object PlayerSettingsRepository {
             desktopAnimeSvpSessionForced = desktopAnimeSvpSessionForced,
             desktopCustomShaderPaths = desktopCustomShaderPaths,
             desktopCustomShaderSelectedPath = desktopCustomShaderSelectedPath,
+            dialogueLeveler = dialogueLeveler,
             desktopAudioPassthroughEnabled = desktopAudioPassthroughEnabled,
             desktopSeekThumbnailsEnabled = desktopSeekThumbnailsEnabled,
             desktopMpvConfigMode = desktopMpvConfigMode,
@@ -1802,6 +1807,15 @@ object PlayerSettingsRepository {
         desktopCustomShaderSelectedPath = normalized
         publish()
         PlayerSettingsStorage.saveDesktopCustomShaderSelectedPath(normalized)
+    }
+
+    fun setDialogueLeveler(level: Int) {
+        ensureLoaded()
+        val clamped = level.coerceIn(DIALOGUE_LEVELER_OFF, DIALOGUE_LEVELER_MAX)
+        if (dialogueLeveler == clamped) return
+        dialogueLeveler = clamped
+        publish()
+        PlayerSettingsStorage.saveDialogueLeveler(clamped)
     }
 
     fun setDesktopAudioPassthroughEnabled(enabled: Boolean) {

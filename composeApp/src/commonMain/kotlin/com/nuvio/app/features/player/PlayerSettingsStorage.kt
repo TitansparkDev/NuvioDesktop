@@ -257,6 +257,8 @@ internal expect object PlayerSettingsStorage {
     fun saveHeroTvTrailerFullscreen(enabled: Boolean)
     fun loadHeroTvTrailerSearchEnabled(): Boolean?
     fun saveHeroTvTrailerSearchEnabled(enabled: Boolean)
+    fun loadDialogueLeveler(): Int?
+    fun saveDialogueLeveler(level: Int)
     fun exportToSyncPayload(): JsonObject
     fun replaceFromSyncPayload(payload: JsonObject)
 }
