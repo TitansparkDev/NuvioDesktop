@@ -781,6 +781,7 @@ tasks.register<Exec>("nativePlaybackStartupTest") {
 val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRuntime") {
     notCompatibleWithConfigurationCache("Validates and bundles host-local Windows native player runtime DLLs.")
     enabled = isWindowsHost
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     into(windowsPlayerRuntimeOutput)
     doFirst {
         if (missingWindowsPlayerRuntimeInputs.isNotEmpty()) {

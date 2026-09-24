@@ -64,26 +64,30 @@ jobs:
           curl -L -o /c/Nuvio.zip https://github.com/UmbraProjects/NuvioDesktop/releases/download/v1.14/Nuvio.zip
           unzip -q -j /c/Nuvio.zip "Nuvio/*.dll" -d /c/nuvio-runtime/
           unzip -q -j /c/Nuvio.zip "Nuvio/lib/python3.14/*" -d /c/nuvio-python/ || true
+          rm -f /c/nuvio-runtime/WebView2Loader.dll
           rm /c/Nuvio.zip
 
       - name: Build Windows MSI, EXE, and Distributable
         shell: bash
         run: |
-          WEBVIEW2_DIR="$(pwd)/nuget_packages/Microsoft.Web.WebView2.1.0.4078.44"
-          echo "Using WebView2 dir: $WEBVIEW2_DIR"
+          touch local.properties
+          WEBVIEW2_WIN="$(cygpath -w "$(pwd)/nuget_packages/Microsoft.Web.WebView2.1.0.4078.44" | tr '\\' '/')"
+          echo "Using WebView2 dir: $WEBVIEW2_WIN"
           
           # Run Gradle packaging tasks
           ./gradlew.bat :composeApp:packageReleaseMsi :composeApp:createReleaseDistributable \
             -Pnuvio.windows.libmpv.runtimeDir="C:/nuvio-runtime" \
             -Pnuvio.windows.python.libDir="C:/nuvio-python" \
-            -Pnuvio.webview2.dir="$WEBVIEW2_DIR" \
+            -Pnuvio.webview2.dir="$WEBVIEW2_WIN" \
+            --no-configuration-cache \
             --stacktrace
 
           # Attempt packageReleaseExe if Inno Setup is available
           ./gradlew.bat :composeApp:packageReleaseExe \
             -Pnuvio.windows.libmpv.runtimeDir="C:/nuvio-runtime" \
             -Pnuvio.windows.python.libDir="C:/nuvio-python" \
-            -Pnuvio.webview2.dir="$WEBVIEW2_DIR" \
+            -Pnuvio.webview2.dir="$WEBVIEW2_WIN" \
+            --no-configuration-cache \
             --stacktrace || echo "packageReleaseExe skipped or not available"
 
       - name: Package Standalone Portable Zip
