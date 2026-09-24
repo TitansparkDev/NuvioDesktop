@@ -813,6 +813,7 @@ val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRunt
     if (windowsLibmpvRuntimeDir?.exists() == true) {
         from(windowsLibmpvRuntimeDir) {
             include("*.dll")
+            exclude("player_bridge.dll")
             exclude(windowsUnusedLibmpvRuntimeDlls)
         }
         // mpv's VapourSynth filter opens this fixed filename at runtime. Ship the alias in the
@@ -1049,6 +1050,7 @@ if (isWindowsHost) {
                     "Windows app image was not created at $imageDir"
                 }
                 copy {
+                    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
                     from(windowsPlayerBridgeOutput)
                     from(windowsPlayerRuntimeOutput)
                     if (nuvioEngineOutput.get().asFile.isFile) {
@@ -1057,6 +1059,7 @@ if (isWindowsHost) {
                     into(imageDir)
                 }
                 copy {
+                    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
                     from(windowsPythonLibOutput)
                     into(imageDir.resolve("lib/python3.14"))
                 }
