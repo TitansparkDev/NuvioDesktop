@@ -31,6 +31,13 @@ internal object NativePlayerBridge {
         loadNativeLibrary()
     }
 
+    /**
+     * Linux only: initializes GTK before any AWT/Compose/Skia code runs, so GDK's types are
+     * registered once and canonically (Skiko can otherwise half-load GDK and make the bridge's own
+     * gtk_init abort on a GType conflict). Must be the first thing main() does on Linux.
+     */
+    external fun initGtkEarly(): Boolean
+
     external fun create(
         hostViewPtr: Long,
         sourceUrl: String,
@@ -177,12 +184,30 @@ internal object NativePlayerBridge {
 
     private fun loadNativeLibrary() {
         val platform = DesktopHostOs.current
-        require(platform == DesktopHostOs.MACOS || platform == DesktopHostOs.WINDOWS) {
+        require(
+            platform == DesktopHostOs.MACOS ||
+                platform == DesktopHostOs.WINDOWS ||
+                platform == DesktopHostOs.LINUX
+        ) {
             "Native desktop playback is not implemented for $platform yet."
         }
 
         val libraryName = nativeLibraryName(platform)
         val platformDir = nativeDirectoryName(platform)
+        // A packaged Linux app carries the bridge in its app resources (see
+        // linuxAppResourcesRoot in build.gradle.kts). Its libmpv/GTK/WebKit dependencies come
+        // from the system or the Flatpak runtime, so there is nothing else to stage.
+        if (platform == DesktopHostOs.LINUX) {
+            System.getProperty("compose.application.resources.dir")
+                ?.takeIf(String::isNotBlank)
+                ?.let { File(it).resolve("native/$platformDir/$libraryName") }
+                ?.takeIf(File::isFile)
+                ?.let { packaged ->
+                    loadedRuntimeDir = packaged.parentFile
+                    System.load(packaged.absolutePath)
+                    return
+                }
+        }
         findLocalBuildLibrary(platformDir, libraryName)?.let { localLibrary ->
             copyLocalRuntimeResources(platformDir, localLibrary.parentFile)
             loadedRuntimeDir = localLibrary.parentFile

@@ -3,7 +3,8 @@ package com.nuvio.app.features.input
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import kotlinx.coroutines.flow.StateFlow
 
-actual fun gamepadSupported(): Boolean = DesktopHostOs.current == DesktopHostOs.WINDOWS
+actual fun gamepadSupported(): Boolean =
+    DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX
 
 actual fun ensureGamepadSettingsLoaded() = GamepadSettingsRepository.ensureLoaded()
 

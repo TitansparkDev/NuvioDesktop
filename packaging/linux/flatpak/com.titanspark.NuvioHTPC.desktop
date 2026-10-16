@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nuvio HTPC
+Comment=Nuvio media client with a controller-friendly TV mode
+Exec=nuvio-htpc %u
+Icon=com.titanspark.NuvioHTPC
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupNotify=true
+StartupWMClass=com-nuvio-app-MainKt
+MimeType=x-scheme-handler/nuvio;x-scheme-handler/stremio;

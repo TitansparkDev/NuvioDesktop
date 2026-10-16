@@ -36,9 +36,11 @@ internal object GamepadContext {
 internal enum class StickDirection { Up, Down, Left, Right }
 
 /**
- * Reads XInput on a background thread and replays what it finds as keystrokes.
+ * Reads controllers on a background thread (XInput on Windows, the kernel joystick API on Linux)
+ * and replays what it finds as keystrokes.
  *
- * Windows-only, and off unless the user turns it on. Start/stop is driven from the window
+ * Windows and Linux only, and off unless the user turns it on (on by default on Linux, where the
+ * typical install is a Steam Deck or couch PC). Start/stop is driven from the window
  * lifecycle in Main; the thread itself parks on a monitor while disabled, so a disabled pad — or a
  * machine with no pad at all — costs nothing beyond one idle thread.
  */
@@ -158,11 +160,11 @@ object GamepadInput {
     }
 
     /**
-     * Installs the poll thread. Safe to call when gamepad support is off or the host is not
-     * Windows — both cases no-op, and the native library is never touched.
+     * Installs the poll thread. Safe to call when gamepad support is off or the host has no
+     * gamepad source — both cases no-op, and the native library is never touched.
      */
     fun start() {
-        if (DesktopHostOs.current != DesktopHostOs.WINDOWS) return
+        if (!gamepadSupported()) return
         if (!started.compareAndSet(false, true)) return
         val myGeneration = generation.get()
         thread = Thread({ pollLoop(myGeneration) }, "nuvio-gamepad").apply {
@@ -178,7 +180,11 @@ object GamepadInput {
         generation.incrementAndGet()
         wakeLock.withLock { wakeCondition.signalAll() }
         thread = null
+        if (isLinux) LinuxJoysticks.closeAll()
     }
+
+    /** Linux reads `/dev/input/js*` in Kotlin; Windows goes through XInput in the native bridge. */
+    private val isLinux = DesktopHostOs.current == DesktopHostOs.LINUX
 
     private fun isCurrent(myGeneration: Int): Boolean = generation.get() == myGeneration
 
@@ -203,6 +209,7 @@ object GamepadInput {
                 connectedMask = 0
                 nextRescanAt = 0L
                 GamepadSettingsRepository.setConnected(false)
+                if (isLinux) LinuxJoysticks.closeAll()
                 wakeLock.withLock {
                     if (isCurrent(myGeneration) && (!GamepadSettingsRepository.enabled || unavailable)) {
                         runCatching { wakeCondition.await(1, TimeUnit.SECONDS) }
@@ -211,7 +218,7 @@ object GamepadInput {
                 continue
             }
 
-            if (!ensureNativeReady()) continue
+            if (!isLinux && !ensureNativeReady()) continue
 
             val now = System.currentTimeMillis()
             // A narrow tick asks only about slots already known to be connected; the periodic full
@@ -225,9 +232,11 @@ object GamepadInput {
             }
 
             if (slotMask != 0) {
-                connectedMask = runCatching { NativePlayerBridge.pollGamepads(slotMask, state) }
+                connectedMask = runCatching {
+                    if (isLinux) LinuxJoysticks.poll(slotMask, state) else NativePlayerBridge.pollGamepads(slotMask, state)
+                }
                     .onFailure {
-                        log.w(it) { "XInput poll failed; gamepad input disabled for this session" }
+                        log.w(it) { "gamepad poll failed; gamepad input disabled for this session" }
                         unavailable = true
                     }
                     .getOrDefault(0)

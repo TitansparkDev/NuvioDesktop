@@ -1,0 +1,127 @@
+app-id: com.titanspark.NuvioHTPC
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: nuvio-htpc
+add-extensions:
+  org.freedesktop.Platform.codecs-extra:
+    version: "25.08-extra"
+    directory: lib/codecs-extra
+    add-ld-path: "."
+  org.freedesktop.Platform.VAAPI.Intel:
+    version: "25.08"
+    directory: lib/intel-vaapi-driver
+    add-ld-path: "."
+    download-if: have-intel-gpu
+    enable-if: have-intel-gpu
+build-options:
+  append-pkg-config-path: /app/lib/pkgconfig:/app/lib64/pkgconfig
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  # AWT and the embedded mpv/WebKitGTK overlay are X11 (XWayland under gamescope/KDE).
+  - --socket=x11
+  - --socket=pulseaudio
+  # GPU for mpv, and /dev/input/js* for controllers.
+  - --device=all
+  - --filesystem=xdg-download
+  - --filesystem=xdg-videos:ro
+  - --filesystem=xdg-run/pipewire-0:ro
+  - --filesystem=xdg-run/discord-ipc-0
+  - --env=LD_LIBRARY_PATH=/app/lib:/app/lib64:/app/opt/Nuvio/lib
+  - --env=XDG_DATA_DIRS=/app/share:/usr/share
+
+modules:
+  # libmpv and its dependencies, as in upstream NuvioDesktop's Flatpak.
+  - name: libXpresent
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://xorg.freedesktop.org/archive/individual/lib/libXpresent-1.0.2.tar.xz
+        sha256: 4e5b21b4812206a4b223013606ae31170502c1043038777a1ef8f70c09d37602
+
+  - name: libass
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.gz
+        sha256: caab4b993dd7be6187c55623b789ed75dddefea6e65938af134637c732fe094a
+
+  - name: uchardet
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_STATIC=0
+      - -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://www.freedesktop.org/software/uchardet/releases/uchardet-0.0.8.tar.xz
+        sha256: e97a60cfc00a1c147a674b097bb1422abd9fa78a2d9ce3f3fdcc2e78a34ac5f0
+
+  - name: libplacebo
+    buildsystem: meson
+    config-opts:
+      - -Dvulkan=enabled
+      - -Ddemos=false
+    sources:
+      - type: git
+        url: https://github.com/haasn/libplacebo.git
+        tag: v7.360.1
+
+  - name: libmpv
+    buildsystem: meson
+    config-opts:
+      - -Dbuild-date=false
+      - -Dcplayer=false
+      - -Dlibmpv=true
+      - -Dmanpage-build=disabled
+      - -Dwayland=enabled
+      - -Dx11=enabled
+      - -Dvulkan=enabled
+      - -Dgl=enabled
+      - -Degl=enabled
+      - -Degl-x11=enabled
+      - -Dvaapi=enabled
+      - -Dvaapi-x11=enabled
+    sources:
+      - type: archive
+        url: https://github.com/mpv-player/mpv/archive/refs/tags/v0.41.0.tar.gz
+        sha256: ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209
+
+  - name: nuvio-htpc
+    buildsystem: simple
+    build-commands:
+      - install -d /app/opt/Nuvio /app/bin /app/lib/codecs-extra /app/lib/intel-vaapi-driver
+      - cp -a app/. /app/opt/Nuvio/
+      # Compile against the actual runtime to avoid host-library ABI assumptions.
+      - c++ -std=c++17 -shared -fPIC -O2 -Ijni -Ijni/linux $(pkg-config --cflags mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) bridge/player_bridge.cpp -o libplayer_bridge.so $(pkg-config --libs mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) -lpthread
+      - find /app/opt/Nuvio -name libplayer_bridge.so -exec cp libplayer_bridge.so {} \;
+      - install -Dm755 nuvio-htpc.sh /app/bin/nuvio-htpc
+      - install -Dm644 com.titanspark.NuvioHTPC.desktop /app/share/applications/com.titanspark.NuvioHTPC.desktop
+      - install -Dm644 com.titanspark.NuvioHTPC.metainfo.xml /app/share/metainfo/com.titanspark.NuvioHTPC.metainfo.xml
+      - install -Dm644 icon.png /app/share/icons/hicolor/512x512/apps/com.titanspark.NuvioHTPC.png
+      - desktop-file-validate /app/share/applications/com.titanspark.NuvioHTPC.desktop
+    sources:
+      - type: file
+        path: nuvio-htpc.sh
+      - type: file
+        path: com.titanspark.NuvioHTPC.desktop
+      - type: file
+        path: com.titanspark.NuvioHTPC.metainfo.xml
+      - type: file
+        path: ../../../composeApp/src/desktopMain/resources/icons/nuvio-app-icon.png
+        dest-filename: icon.png
+      # The jpackage app image from ./gradlew :composeApp:createReleaseDistributable.
+      - type: dir
+        path: ../../../composeApp/build/compose/binaries/main-release/app/Nuvio
+        dest: app
+      - type: dir
+        path: ../../../composeApp/src/desktopMain/native/linux
+        dest: bridge
+      - type: dir
+        path: ../../../composeApp/build/linux-jni
+        dest: jni

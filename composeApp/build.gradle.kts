@@ -298,6 +298,42 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
 
 val isMacHost = System.getProperty("os.name").contains("mac", ignoreCase = true)
 val isWindowsHost = System.getProperty("os.name").contains("win", ignoreCase = true)
+val isLinuxHost = System.getProperty("os.name").contains("linux", ignoreCase = true)
+
+// Linux player bridge: built against the host's libmpv, GTK 3 and WebKitGTK 4.1 (the same stack
+// the Flatpak's GNOME runtime provides). `./gradlew run` loads it from build/native/linux; a
+// packaged app carries it in its app resources (linuxAppResourcesRoot below).
+val linuxPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.cpp")
+val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer_bridge.so")
+val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
+val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
+    notCompatibleWithConfigurationCache("Builds a host-local player bridge against system libmpv.")
+    enabled = isLinuxHost
+    val sourceFile = linuxPlayerBridgeSource.asFile
+    val outputFile = linuxPlayerBridgeOutput.get().asFile
+    inputs.file(sourceFile)
+    outputs.file(outputFile)
+    val jni = "$linuxPlayerBridgeJavaHome/include"
+    val packages = "mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext"
+    doFirst { outputFile.parentFile.mkdirs() }
+    commandLine(
+        "bash", "-c",
+        "c++ -std=c++17 -shared -fPIC -O2 " +
+            "-I'$jni' -I'$jni/linux' " +
+            "$(pkg-config --cflags $packages) " +
+            "'${sourceFile.absolutePath}' -o '${outputFile.absolutePath}' " +
+            "$(pkg-config --libs $packages) -lpthread",
+    )
+}
+val linuxAppResourcesRoot = layout.buildDirectory.dir("linux-app-resources")
+val prepareLinuxAppResources = tasks.register<Sync>("prepareLinuxAppResources") {
+    enabled = isLinuxHost
+    dependsOn(buildLinuxPlayerBridge)
+    from(linuxPlayerBridgeOutput) {
+        into("linux-x64/native/linux")
+    }
+    into(linuxAppResourcesRoot)
+}
 val mpvKitDir = providers.gradleProperty("nuvio.mpvkit.dir")
     .orElse(rootProject.layout.projectDirectory.dir("MPVKit").asFile.absolutePath)
 val macosPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/macos/player_bridge.mm")
@@ -961,6 +997,9 @@ val leanDesktopJar = providers.gradleProperty("nuvio.desktop.leanJar")
     .getOrElse(true)
 
 tasks.withType<Jar>().configureEach {
+    if (isLinuxHost && name == "desktopJar") {
+        dependsOn(buildLinuxPlayerBridge)
+    }
     if (isMacHost && name == "desktopJar") {
         dependsOn(buildMacosPlayerBridge)
         from(macosPlayerBridgeOutput) {
@@ -1267,7 +1306,7 @@ mapOf(
         notCompatibleWithConfigurationCache("Rewrites the packaged material-icons-extended jar in the app image.")
         doLast {
             val binariesDir = layout.buildDirectory.dir("compose/binaries/$imageFlavor/app").get().asFile
-            val appDir = listOf("Nuvio/app", "Nuvio.app/Contents/app", "nuvio/lib/app")
+            val appDir = listOf("Nuvio/app", "Nuvio.app/Contents/app", "Nuvio/lib/app", "nuvio/lib/app")
                 .map(binariesDir::resolve)
                 .firstOrNull(File::isDirectory)
             check(appDir != null) { "No packaged app directory found under $binariesDir" }
@@ -1408,6 +1447,7 @@ compose.desktop {
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
+            if (isLinuxHost) "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED" else null,
             // Native-crash diagnostics (chasing the silent, log-less CTD on plugin users —
             // suspected QuickJS/JNI access violation). On an EXCEPTION_ACCESS_VIOLATION the
             // HotSpot handler writes an hs_err_pid<pid>.log naming the faulting native module,
@@ -1494,6 +1534,9 @@ compose.desktop {
         )
 
         nativeDistributions {
+            if (isLinuxHost) {
+                appResourcesRootDir.set(linuxAppResourcesRoot)
+            }
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Exe, TargetFormat.Deb)
             packageName = "Nuvio"
             packageVersion = desktopReleasePackageVersion
@@ -1546,3 +1589,10 @@ compose.desktop {
 }
 
 
+
+if (isLinuxHost) {
+    // Compose copies appResourcesRootDir into the app image in prepareAppResources.
+    tasks.matching { it.name == "prepareAppResources" }.configureEach {
+        dependsOn(prepareLinuxAppResources)
+    }
+}

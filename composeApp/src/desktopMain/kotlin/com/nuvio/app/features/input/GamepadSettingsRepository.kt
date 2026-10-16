@@ -2,6 +2,7 @@ package com.nuvio.app.features.input
 
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
+import com.nuvio.app.features.player.desktop.DesktopHostOs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,8 +16,12 @@ import kotlinx.coroutines.flow.asStateFlow
  * UI lands it belongs here, keyed by [GamepadButton.id] the way shortcuts are keyed by action id.
  */
 object GamepadSettingsRepository {
-    /** Off by default: a pad plugged in for a game should not start driving the UI unasked. */
-    const val DEFAULT_ENABLED = false
+    /**
+     * Off by default on Windows: a pad plugged in for a game should not start driving the UI
+     * unasked. On by default on Linux, where this build mostly runs on a Steam Deck or a couch PC
+     * and the pad is often the only input — the first-run wizard has to be reachable with it.
+     */
+    val DEFAULT_ENABLED = DesktopHostOs.current == DesktopHostOs.LINUX
 
     /**
      * Fraction of full stick deflection ignored as noise. Xbox pads rest well inside 0.20 even

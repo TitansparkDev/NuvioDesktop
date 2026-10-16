@@ -369,6 +369,14 @@ private inline fun desktopStartupStep(name: String, block: () -> Unit) {
 }
 
 fun main() {
+    // Linux: GTK must be initialized before AWT/Compose/Skia touch GDK (see initGtkEarly). A
+    // missing native runtime only costs the in-app player, never startup.
+    if (com.nuvio.app.features.player.desktop.DesktopHostOs.current ==
+        com.nuvio.app.features.player.desktop.DesktopHostOs.LINUX
+    ) {
+        runCatching { com.nuvio.app.features.player.desktop.NativePlayerBridge.initGtkEarly() }
+            .onFailure { System.err.println("Warning: (DesktopStartup) GTK early init failed: $it") }
+    }
     configureDesktopFileLogging()
     // Opt-in: dumps raw addon stream payloads so unparsed fields are visible. See
     // StreamPayloadDiagnostics — off by default, since it logs whole stream objects.
