@@ -113,7 +113,7 @@ modules:
       - type: file
         path: com.titanspark.NuvioHTPC.metainfo.xml
       - type: file
-        path: ../../../composeApp/src/desktopMain/resources/icons/nuvio-app-icon.png
+        path: icon.png
         dest-filename: icon.png
       # The jpackage app image from ./gradlew :composeApp:createReleaseDistributable.
       - type: dir
