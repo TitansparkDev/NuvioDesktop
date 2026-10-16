@@ -33,5 +33,5 @@ Install `org.gnome.Platform//50` and `org.gnome.Sdk//50` from Flathub, then run:
 ./packaging/linux/build-flatpak.sh
 ```
 
-The script runs desktop tests, packages the JRE, and rebuilds the player bridge inside the
+The script runs controller tests, packages the JRE, and rebuilds the player bridge inside the
 Flatpak SDK. Output and checksums are in `release-assets/`.

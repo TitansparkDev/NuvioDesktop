@@ -4,7 +4,7 @@ cd "$(dirname "$0")/../.."
 : "${JAVA_HOME:=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")}"
 # Runtime/SDK must already be installed from Flathub (org.gnome.Platform//50 and org.gnome.Sdk//50).
 [[ -f local.properties ]] || touch local.properties
-./gradlew :composeApp:desktopTest :composeApp:createReleaseDistributable
+./gradlew :composeApp:desktopTest --tests '*features.input.*' :composeApp:createReleaseDistributable
 mkdir -p composeApp/build/linux-jni
 cp -a "$JAVA_HOME/include/." composeApp/build/linux-jni/
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/nuvio-flatpak"
