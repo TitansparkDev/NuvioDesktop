@@ -1,9 +1,22 @@
 package com.nuvio.app.features.player.desktop
 
+import com.nuvio.app.features.iptv.isHlsPlaylistUrl
+
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.preroll.PostShowKey
+import com.nuvio.app.features.preroll.loudnessFilterExpression
+import com.nuvio.app.core.i18n.localizedString
 import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
+import com.nuvio.app.features.streams.badgeFillCssColorOrNull
+import com.nuvio.app.features.streams.toBadgeCssColorOrNull
+import java.nio.ByteOrder
+import java.nio.ByteBuffer
+import java.io.File
 import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.features.player.DesktopHudLayout
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
+import com.nuvio.app.features.player.PlayerControlCastItem
 import com.nuvio.app.features.player.PlayerControlAudioTrackItem
 import com.nuvio.app.features.player.PlayerControlBuiltInSubtitleItem
 import com.nuvio.app.features.player.PlayerControlEpisodeItem
@@ -14,6 +27,12 @@ import com.nuvio.app.features.player.PlayerControlSubtitleCueItem
 import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.AppShortcutAction
 import com.nuvio.app.features.player.AppShortcutsRepository
+import com.nuvio.app.features.player.DESKTOP_AUDIO_CHANNELS_OVERRIDE_KEY
+import com.nuvio.app.features.player.DESKTOP_AUDIO_SWRESAMPLE_OVERRIDE_KEY
+import com.nuvio.app.features.player.DESKTOP_HEADPHONE_SURROUND_ON
+import com.nuvio.app.features.player.DESKTOP_HEADPHONE_SURROUND_OVERRIDE_KEY
+import com.nuvio.app.features.player.desktopAudioChannelChoices
+import com.nuvio.app.features.player.desktopAudioDialogueChoices
 import com.nuvio.app.features.player.DesktopAnimeMode
 import com.nuvio.app.features.player.DesktopAnimeSessionOverride
 import com.nuvio.app.features.player.DesktopBufferPreset
@@ -32,11 +51,18 @@ import com.nuvio.app.features.player.PlayerControlsAction
 import com.nuvio.app.features.player.PlayerControlsState
 import com.nuvio.app.features.player.PlayerEngineController
 import com.nuvio.app.features.player.PlayerChapter
+import com.nuvio.app.features.player.PlayerControlPlaylistItem
+import com.nuvio.app.features.player.PlayerControlPartyMember
+import com.nuvio.app.features.player.PlayerControlPartyState
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.PlayerShortcutAction
 import com.nuvio.app.features.player.PlayerShortcutsRepository
+import com.nuvio.app.features.player.playerShortcutKeyCodeLabel
 import com.nuvio.app.features.player.PlayerSettingsRepository
+import com.nuvio.app.features.player.effectiveRtxTrueHdrAnimeEnabled
+import com.nuvio.app.features.player.effectiveRtxTrueHdrEnabled
+import com.nuvio.app.features.player.effectiveRtxVsrEnabled
 import com.nuvio.app.features.player.SUBTITLE_ASS_SCALE_MAX
 import com.nuvio.app.features.player.SUBTITLE_ASS_SCALE_MIN
 import com.nuvio.app.features.player.SUBTITLE_BLUR_MAX
@@ -58,6 +84,8 @@ import com.nuvio.app.features.player.primarySubtitleTargetsForSettings
 import com.nuvio.app.features.player.preferredMpvMediaTitle
 import com.nuvio.app.features.player.resolvePreferredAudioLanguageTargets
 import com.nuvio.app.features.player.toStorageHexString
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -65,17 +93,23 @@ import java.util.concurrent.atomic.AtomicLong
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 import kotlin.concurrent.thread
+import kotlin.math.floor
+import nuvio.composeapp.generated.resources.*
 
 /**
- * mpv audio-filter chain applied to trailer playback (hero previews, fullscreen trailers, and
- * manual trailer clicks — anything using [NativePlayerController] outside the main player).
+ * mpv audio-filter expression applied to trailer playback (hero previews, fullscreen trailers, the
+ * pre-show, theme songs: anything using [NativePlayerController] outside the main player).
  * Trailer loudness varies wildly between uploads with no consistent mastering, unlike a film's
- * own audio track; `dynaudnorm` continuously adjusts gain toward a target loudness in real
- * time (no pre-analysis pass needed, so it works on a streamed URL), smoothing out the
- * silent-then-jump-scare swings. `f=150` (a 150ms analysis frame, shorter than the 500ms
- * default) reacts fast enough to catch a sudden loud spike rather than only the next one.
+ * own audio track. `loudnorm` (EBU R128) steers each one to the same integrated loudness a film's
+ * dialogue sits at (see LoudnessTarget.kt) and holds the true peak under a ceiling, so a trailer
+ * is neither louder than the film that follows nor spiky. It works on a streamed URL (single
+ * pass, no pre-analysis). This is the bare expression; wrap it with [mpvAudioFilterValue].
+ *
+ * It replaced `dynaudnorm=f=150:g=15`, which evened trailers out against each other but pulled
+ * their peaks up to full scale, well above a film. The "Loudness normalise" choice in the player's
+ * audio menu still uses `dynaudnorm`, unchanged.
  */
-internal const val TRAILER_AUDIO_NORMALIZATION_FILTER = "dynaudnorm=f=150:g=15"
+internal val TRAILER_AUDIO_NORMALIZATION_FILTER: String = loudnessFilterExpression()
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
@@ -84,12 +118,12 @@ internal class NativePlayerController(
     private data class AnimeShaderChoice(
         val mode: DesktopAnimeMode,
         val customShaderPath: String = "",
-        val label: String = mode.label,
+        val label: String = localizedString(mode.labelRes),
     )
 
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
-        const val CONTROLS_PAGE_REVISION = "20260914-seek-thumbs-2"
+        const val CONTROLS_PAGE_REVISION = "20261109-source-replace-1"
         const val MPV_STARTUP_ERROR_EVENT_PREFIX = "mpvStartupError:"
         const val MPV_PLAYBACK_ERROR_EVENT_PREFIX = "mpvPlaybackError:"
 
@@ -111,10 +145,36 @@ internal class NativePlayerController(
 
     @Volatile
     private var handle: Long = 0L
+
+    // What the live [handle] was started (or last re-sourced) with, and the host it draws into:
+    // the reference canReuseLivePlayer compares the next attach against.
+    @Volatile
+    private var livePending: PendingSource? = null
+    @Volatile
+    private var liveHostViewPtr: Long = 0L
+
+    /**
+     * Whether a handle of this controller may have touched VapourSynth: SVP requested, the user's
+     * mpv options/config applied, or any `vf` written. Sticky, so it only ever errs towards the
+     * serialized teardown. A hero trailer never sets it, and its teardown then skips
+     * [nativeProcessLifecycleLock]: a trailer whose mpv_terminate_destroy took 1.9s held the main
+     * player's create for exactly that long (2026-10-20).
+     */
+    @Volatile
+    private var mayHostVapourSynth = false
     @Volatile
     private var lastResizeMode: PlayerResizeMode? = null
+    @Volatile
+    private var lastQuickAutoCrop = false
     private val handleLock = Any()
     private val attachGeneration = AtomicLong(0L)
+
+    // While >= 0: the attach generation that was current when a new source was handed to this
+    // controller. Until a later generation reports fileLoaded, the live handle still holds the
+    // previous file, and its track list must not be read as the new one's (see
+    // hideTracksUntilNextFileLoads).
+    @Volatile
+    private var tracksHiddenThroughGeneration = -1L
     @Volatile
     private var disposed = false
     @Volatile
@@ -130,6 +190,15 @@ internal class NativePlayerController(
     private var transientMessageForNextAttach: Pair<String, String>? = null
     @Volatile
     private var pendingSubtitleStyle: SubtitleStyleState? = null
+    // The player [pendingSubtitleStyle] was last applied to through applySubtitleStyle; a new
+    // player (stream swap) gets it again even when the style is unchanged.
+    @Volatile
+    private var subtitleStyleAppliedHandle = 0L
+    // Top of the HUD's visible chrome as a percentage of the window height from the top, reported
+    // by the overlay while the chrome is up and 0 while it is hidden. Subtitles whose bottom edge
+    // would fall below it are lifted onto it for as long as it is there; see
+    // effectiveSubtitlePosition.
+    private var hudSubtitleClearancePercent = 0.0
     @Volatile
     private var pendingSubtitleDelayMs: Int? = null
     @Volatile
@@ -139,8 +208,27 @@ internal class NativePlayerController(
     // in effect right now (auto-applied preset vs Off) before any session force exists.
     @Volatile
     var isAnimeContentDetected = false
+    // Whether SVP is in this video's filter chain, as the last video-profile pass decided it (the
+    // start-up pre-roll until that pass runs). This, not the saved setting, is what the SVP toggle
+    // flips and what its menu row shows: the saved setting is on for live action too, where SVP
+    // only runs with "all videos" or an in-player toggle.
+    @Volatile
+    private var svpInChain = false
+    // The saved SVP setting from before an in-player press forced SVP on, so pressing it off again
+    // on live action restores it instead of leaving SVP switched on for anime.
+    private var svpSettingBeforeForce: Boolean? = null
+    // Where the last definitively failed seek was headed (the bridge reports it just before the
+    // error). Read by the engine's rate-limit recovery; cleared by every attach.
+    @Volatile
+    var lastSeekFailureTargetMs: Long? = null
+        private set
+    // Installed by the desktop engine for each attach; see reconnectAfterRateLimit.
+    @Volatile
+    var rateLimitFailoverFallback: ((String) -> Boolean)? = null
     private var controlsState = PlayerControlsState()
     private var lastSentControlsStructureKey: PlayerControlsState? = null
+    // The HUD's own text (see HudLabels.kt) rides on the first controls push of each page.
+    private var hudLabelsSent = false
     private var lastSentMediaSessionKey: String? = null
     private var lastSentMpvMediaTitle: String? = null
     private var onAction: (PlayerControlsAction) -> Boolean = { false }
@@ -159,6 +247,9 @@ internal class NativePlayerController(
         isAnimeContent: Boolean = false,
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean,
+        // Whether Anime4K / a custom shader is expected on this session. With SVP, it tells the
+        // native file-load RTX install the same thing applyDesktopAnimeProfile decides later.
+        animeShaderRequested: Boolean = false,
         onError: (String?) -> Unit,
         controlsPageUrlSuffix: String = "",
         // Records this attach on PlaybackStartTrace. Only the main player surface passes true;
@@ -175,12 +266,36 @@ internal class NativePlayerController(
         // Re-applies the last user-set volume ([persistedVolumeFraction]) once the fresh mpv
         // instance exists, so volume carries over between episodes. Only the main player passes true.
         restoreVolume: Boolean = false,
+        // fork:preshow - extra "key=value" mpv init options applied before mpv_initialize/loadfile.
+        // For anything that must be in place before the first audio frame (volume, mute, af):
+        // as runtime properties they land after create() returns, after loading has started,
+        // which rebuilds the audio chain mid-start and is audible as a dip or blip.
+        initMpvOptions: List<String> = emptyList(),
     ) {
         if (disposed) return
+        if (enableUserMpvOptions || animeSvpEnabled) mayHostVapourSynth = true
+        // A network-share source (\\host\share, file://host/…) from an addon or scraper would make
+        // Windows authenticate to that host and hand it the user's NTLM hash.
+        // fork:youtube-languages - the audio string may carry more tracks, one per line (language, title and URL, tab-separated).
+        val audioSources = sourceAudioUrl?.takeIf { it.isNotBlank() }?.lines()?.map { it.substringAfterLast('\t') }.orEmpty()
+        (listOf(sourceUrl) + audioSources).forEach { source ->
+            val verdict = com.nuvio.app.features.player.PlaybackSourcePolicy.checkInProcess(source)
+            if (verdict is com.nuvio.app.features.player.PlaybackSourcePolicy.Verdict.Rejected) {
+                Logger.withTag("PlaybackSourcePolicy").w { "Refusing playback source: ${verdict.reason}" }
+                onError(localizedString(Res.string.player_hud_this_stream_points_at_a_network))
+                return
+            }
+        }
         // Re-attaching the same stream (surface recreation, RTX/settings toggles) must resume
         // from where playback currently is — restarting at the original initialPositionMs
         // looks like playback randomly jumping back. New sources keep the caller's position.
-        val carriedPositionMs = if (pendingSource?.sourceUrl == sourceUrl) {
+        // Never for live TV: a reconnect reopens the channel at the live edge, and a stream that
+        // cannot seek left its first frame waiting on the carried position (once a bogus 26 h one
+        // from the provider's timestamps) until the start-up watchdog gave up on it.
+        val carriedPositionMs = if (
+            pendingSource?.sourceUrl == sourceUrl &&
+            !com.nuvio.app.features.iptv.IptvPlaybackSession.isIptvUrl(sourceUrl)
+        ) {
             synchronized(handleLock) { handle }
                 .takeIf { it != 0L }
                 ?.let { current ->
@@ -203,6 +318,7 @@ internal class NativePlayerController(
         }
         val pending = PendingSource(
             sourceUrl = sourceUrl,
+            mediaTitle = mediaTitle,
             sourceAudioUrl = sourceAudioUrl?.takeIf { it.isNotBlank() },
             headerLines = sourceHeaders.withDefaultPlaybackUserAgent(sourceUrl).toHeaderLines(),
             playWhenReady = playWhenReady,
@@ -214,16 +330,53 @@ internal class NativePlayerController(
             animeSvpFilter = if (animeSvpEnabled && PlayerSettingsRepository.uiState.value.desktopAnimeSvpEnabled) {
                 DesktopAnimeSvp.vapoursynthArgument(
                     debugOverlay = PlayerSettingsRepository.uiState.value.desktopAnimeSvpDebugOverlayEnabled,
+                    // Only reached for non-anime when SVP is set to all videos (PlayerEngine.desktop.kt).
+                    cinema = !isAnimeContent,
                 )
             } else null,
             extraMpvOptions = buildList {
                 if (tracePlaybackStart && DesktopHostOs.current == DesktopHostOs.WINDOWS) {
-                    add("@nuvio-trace-id=${PlaybackStartTrace.currentId}")
+                    add("$MPV_TRACE_ID_OPTION_PREFIX${PlaybackStartTrace.currentId}")
                 }
-                if (isProviderPlaybackEndpoint(sourceUrl) || isExplicitProviderDiagnosticVideoUrl(sourceUrl)) {
+                if (isAnimeContent && DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+                    add("@nuvio-anime-layer=${if (animeShaderRequested || animeSvpEnabled) "yes" else "no"}")
+                    if (PlayerSettingsRepository.uiState.value.effectiveRtxTrueHdrAnimeEnabled) {
+                        add("@nuvio-anime-true-hdr=yes")
+                    }
+                }
+                // youtube-dl has nothing to add for a provider endpoint or a debrid CDN link, and
+                // when mpv cannot open one it hands the URL to ytdl_hook, whose "youtube-dl failed:
+                // not found" errors then bury the real failure in the playback log.
+                if (isProviderPlaybackEndpoint(sourceUrl) ||
+                    isExplicitProviderDiagnosticVideoUrl(sourceUrl) ||
+                    PlaybackRedirectResolver.isDirectMediaHost(sourceUrl)
+                ) {
                     add("ytdl=no")
                 }
+                // Live TV: reconnect options and, with an IPTV proxy set, the local relay. Before the
+                // user's options so an mpv.conf can still override them.
+                addAll(com.nuvio.app.features.iptv.iptvMpvOptions(sourceUrl))
+                // A Nuvio option like the rest: Replace lets a custom network-timeout override it,
+                // Add keeps this one, and Full (the user's own configuration only) never gets it.
+                if (PlayerSettingsRepository.uiState.value.desktopMpvConfigMode != DesktopMpvConfigMode.Full) {
+                    directMediaNetworkTimeoutOption(sourceUrl)?.let(::add)
+                    hlsDemuxerMpvOption(sourceUrl)?.let(::add)
+                    // YouTube tab videos: googlevideo serves one open-ended request at about the
+                    // playback rate, so a 1440p video at 2x ran dry every few seconds (Nov 2:
+                    // 2.9 s ahead at 1x, four cache pauses in 8 s at 2x). Bounded ranges are not
+                    // held to that rate, as the trailer and music players already found.
+                    addAll(com.nuvio.app.features.home.components.youtubeStreamMpvOptions(sourceUrl))
+                }
                 if (enableUserMpvOptions) addAll(buildDesktopUserMpvOptions(initialPlaybackSpeed))
+                // After the buffer preset in the user options, which also sets demuxer-max-back-bytes
+                // and cache-pause-wait.
+                addAll(com.nuvio.app.features.iptv.iptvLiveBufferMpvOptions(sourceUrl))
+                addAll(com.nuvio.app.features.iptv.iptvRewindMpvOptions(sourceUrl))
+                addAll(initMpvOptions) // fork:preshow
+                // An init option rather than a runtime property: mpv filters text subtitles as it
+                // parses them, so it has to be set before the first track loads. Only ever turned
+                // on here, never forced off, so an mpv.conf that enables it keeps working.
+                if (PlayerSettingsRepository.uiState.value.stripSdhSubtitles) add("sub-filter-sdh=yes")
                 mediaTitle.takeIf(String::isNotBlank)?.let { title ->
                     // Unlike mpv's inferred media-title this never exposes the resolved URL. Keep
                     // it after custom options so the app's presentation/security boundary wins.
@@ -246,12 +399,54 @@ internal class NativePlayerController(
             },
             tracePlaybackStart = tracePlaybackStart,
             restoreVolume = restoreVolume,
+            fastStreamEligible = enableUserMpvOptions,
         )
+        if (pending.fastStreamEligible) {
+            // fork:faststream-optin - FastStream stays on while the same streams re-attach (settings,
+            // surface rebuilds) and ends with the next video.
+            com.nuvio.app.features.youtube.YouTubeFastStream.retainOnly(pending.streamUrls)
+            val available = pending.streamUrls.all(com.nuvio.app.features.youtube.YouTubeFastStream::eligible)
+            // Automatic: a video opened at a fast speed, or as heavy as 4K, starts on FastStream's window.
+            if (available && !pending.streamUrls.all(com.nuvio.app.features.youtube.YouTubeFastStream::isEnabled) &&
+                com.nuvio.app.features.youtube.YouTubeFastStream.autoWanted(pending.sourceUrl, initialPlaybackSpeed)
+            ) {
+                com.nuvio.app.features.youtube.YouTubeFastStream.enable(pending.streamUrls, pending.headerLines.toHeaderMap(), window = true)
+            }
+            com.nuvio.app.features.youtube.YouTubeFastStreamState.update { it.copy(available = available, failed = it.failed && it.active) }
+        }
         pendingSource = pending
+        svpInChain = pending.animeSvpFilter != null
+        lastSeekFailureTargetMs = null
         host.onPeerReady = { attachPending() }
         if (host.isDisplayable) {
             attachPending()
         }
+    }
+
+    /**
+     * Whether [pending] can load into the live player instead of a new one (see
+     * [NativePlayerBridge.replaceSource]): the main player moving to a different stream with the
+     * same instance-level setup. Anything else (a trailer, the same stream again for a surface
+     * rebuild or reconnect, live TV, separate audio, a changed RTX/anime/mpv setup) recreates the
+     * player as before. UI thread.
+     */
+    private fun canReuseLivePlayer(pending: PendingSource, hostViewPtr: Long): Boolean {
+        if (!nativePlayerReuseEnabled || DesktopHostOs.current != DesktopHostOs.WINDOWS) return false
+        val live = livePending ?: return false
+        if (synchronized(handleLock) { handle } == 0L) return false
+        if (hostViewPtr == 0L || hostViewPtr != liveHostViewPtr) return false
+        if (!live.tracePlaybackStart || !pending.tracePlaybackStart) return false
+        if (pending.sourceUrl == live.sourceUrl) return false
+        if (live.sourceAudioUrl != null || pending.sourceAudioUrl != null) return false
+        val iptv = com.nuvio.app.features.iptv.IptvPlaybackSession
+        if (iptv.isIptvUrl(live.sourceUrl) || iptv.isIptvUrl(pending.sourceUrl)) return false
+        return live.controlsPageUrl == pending.controlsPageUrl &&
+            live.nvidiaRtxSuperResolutionEnabled == pending.nvidiaRtxSuperResolutionEnabled &&
+            live.nvidiaRtxHdrEnabled == pending.nvidiaRtxHdrEnabled &&
+            live.isAnimeContent == pending.isAnimeContent &&
+            live.animeSvpFilter == pending.animeSvpFilter &&
+            live.restoreVolume == pending.restoreVolume &&
+            mpvOptionsAllowSourceReplacement(live.extraMpvOptions, pending.extraMpvOptions)
     }
 
     private fun attachPending() {
@@ -263,20 +458,57 @@ internal class NativePlayerController(
                 return@invokeLater
             }
             val hostViewPtr = AwtNativeViewResolver.resolveNativeViewPointer(host)
-            val previousHandle = takePlayerHandle()
+            val reuseHandle = if (canReuseLivePlayer(pending, hostViewPtr)) synchronized(handleLock) { handle } else 0L
+            var previousHandle = if (reuseHandle != 0L) 0L else takePlayerHandle()
             keyboardPanelOpen = false
             lastSentControlsStructureKey = null
+            // A reused player keeps its controls page, which already has its labels.
+            if (reuseHandle == 0L) hudLabelsSent = false
             lastSentMediaSessionKey = null
             lastSentMpvMediaTitle = null
             thread(isDaemon = true, name = "Nuvio-Player-Attach") {
+                // Live TV over HLS with subtitles plays a local copy of its master playlist so the
+                // provider's repeated subtitle cues can be dropped (IptvHlsSubtitleServer). One
+                // playlist fetch, made here off the UI thread and outside the lifecycle lock.
+                val mpvSourceUrl = if (com.nuvio.app.features.iptv.IptvPlaybackSession.isIptvUrl(pending.sourceUrl)) {
+                    com.nuvio.app.features.iptv.IptvHlsSubtitleServer.playbackUrlFor(pending.sourceUrl, pending.headerLines)
+                } else {
+                    // fork:faststream-optin - the loopback copy while FastStream is on for this stream.
+                    com.nuvio.app.features.youtube.YouTubeFastStream.playbackUrl(pending.sourceUrl)
+                }
+                val mpvAudioUrl = com.nuvio.app.features.youtube.YouTubeFastStream.playbackAudio(pending.sourceAudioUrl)
                 synchronized(nativeProcessLifecycleLock) {
+                    if (reuseHandle != 0L) {
+                        if (pending.tracePlaybackStart) PlaybackStartTrace.mark("nativeAttachThread")
+                        if (disposed || generation != attachGeneration.get()) {
+                            return@synchronized
+                        }
+                        if (replaceLiveSource(reuseHandle, pending, generation, mpvSourceUrl)) {
+                            return@synchronized
+                        }
+                        // Refused (the player failed, or cannot take this source): recreate it.
+                        val stillLive = synchronized(handleLock) {
+                            (handle == reuseHandle).also { live ->
+                                if (live) {
+                                    handle = 0L
+                                    NativeAudioDuck.unregister(reuseHandle) // fork:voice-control
+                                }
+                            }
+                        }
+                        livePending = null
+                        if (!stillLive || disposed || generation != attachGeneration.get()) {
+                            return@synchronized
+                        }
+                        hudLabelsSent = false
+                        previousHandle = reuseHandle
+                    }
                     // Replacement is intentionally sequential. Both operations remain on this
                     // worker, so a slow native shutdown delays the next stream without freezing
                     // Compose or allowing shared mpv dependencies to tear down under a new player.
                     if (previousHandle != 0L) {
                         runCatching { NativePlayerBridge.dispose(previousHandle) }
                     }
-                    if (pending.tracePlaybackStart) PlaybackStartTrace.mark("nativeAttachThread")
+                    if (pending.tracePlaybackStart && reuseHandle == 0L) PlaybackStartTrace.mark("nativeAttachThread")
                     if (disposed || generation != attachGeneration.get()) {
                         return@synchronized
                     }
@@ -294,8 +526,8 @@ internal class NativePlayerController(
                     val result = runCatching {
                         newHandle = NativePlayerBridge.create(
                             hostViewPtr = hostViewPtr,
-                            sourceUrl = pending.sourceUrl,
-                            sourceAudioUrl = pending.sourceAudioUrl,
+                            sourceUrl = withMpvFilenameHint(mpvSourceUrl, pending.mediaTitle),
+                            sourceAudioUrl = mpvAudioUrl,
                             headerLines = pending.headerLines.toTypedArray(),
                             playWhenReady = pending.playWhenReady,
                             initialPositionMs = pending.initialPositionMs,
@@ -325,7 +557,10 @@ internal class NativePlayerController(
                             false
                         } else {
                             handle = newHandle
+                            livePending = pending
+                            liveHostViewPtr = hostViewPtr
                             diagnosticsOverlayEnabled = false
+                            NativeAudioDuck.register(newHandle) // fork:voice-control
                             true
                         }
                     }
@@ -334,35 +569,93 @@ internal class NativePlayerController(
                         return@synchronized
                     }
                     if (pending.tracePlaybackStart) PlaybackStartTrace.mark("nativeCreateReturned")
-                    // Carry the last-set volume onto the fresh mpv instance so a new episode doesn't
-                    // reset to 100%. The mpv `volume` property is settable before the file finishes
-                    // loading, so applying it here (rather than waiting for fileLoaded) avoids an
-                    // audible full-volume blip at the start of the next episode.
-                    if (pending.restoreVolume) {
-                        persistedVolumeFraction?.let { fraction ->
-                            NativePlayerBridge.setVolume(newHandle, fraction.coerceIn(0f, maxVolumeFraction) * 100f)
-                        }
-                    }
-                    synchronized(pendingMpvProperties) {
-                        pendingMpvProperties.forEach { (key, value) ->
-                            NativePlayerBridge.setMpvProperty(newHandle, key, value)
-                        }
-                    }
-                    lastResizeMode?.let { setResizeMode(it) }
-                    applyPendingSubtitleConfiguration(newHandle)
-                    if (pendingVideoRedraw) {
-                        pendingVideoRedraw = false
-                        NativePlayerBridge.forceVideoRedraw(newHandle)
-                    }
-                    updateControls(controlsState)
+                    pointSideDecodersAtPreview(newHandle, withMpvFilenameHint(mpvSourceUrl, pending.mediaTitle), mpvSourceUrl)
+                    finishAttach(newHandle, pending)
                 }
             }
         }
     }
 
+    /**
+     * Loads [pending] into the live player [liveHandle] (see [canReuseLivePlayer]). False when the
+     * bridge refused, and the caller recreates the player. Attach worker, under
+     * [nativeProcessLifecycleLock].
+     */
+    private fun replaceLiveSource(liveHandle: Long, pending: PendingSource, generation: Long, mpvSourceUrl: String): Boolean {
+        // A sink bound to this attach's generation, as for a new player: the outgoing file's
+        // late callbacks still reach the old sink, which this generation has made stale.
+        val generationEventSink = NativePlayerEventSink { type, value ->
+            SwingUtilities.invokeLater {
+                if (!disposed && generation == attachGeneration.get()) {
+                    handlePlayerEvent(type, value)
+                }
+            }
+        }
+        // Named before the swap: the bridge sets the side decoders' source while applying it.
+        pointSideDecodersAtPreview(liveHandle, withMpvFilenameHint(mpvSourceUrl, pending.mediaTitle), mpvSourceUrl)
+        val replaced = runCatching {
+            NativePlayerBridge.replaceSource(
+                handle = liveHandle,
+                sourceUrl = withMpvFilenameHint(mpvSourceUrl, pending.mediaTitle),
+                headerLines = pending.headerLines.toTypedArray(),
+                playWhenReady = pending.playWhenReady,
+                initialPositionMs = pending.initialPositionMs,
+                initialProgressFraction = pending.initialProgressFraction.toDouble(),
+                animeSvpFilter = pending.animeSvpFilter,
+                mediaTitle = pending.mediaTitle.takeIf(String::isNotBlank),
+                traceId = pending.extraMpvOptions
+                    .firstOrNull { it.startsWith(MPV_TRACE_ID_OPTION_PREFIX) }
+                    ?.removePrefix(MPV_TRACE_ID_OPTION_PREFIX),
+                eventSink = generationEventSink,
+            )
+        }.onFailure { error ->
+            playerReuseLog.w { "source replace failed, recreating the player: ${error.message}" }
+        }.getOrDefault(false)
+        if (!replaced) {
+            playerReuseLog.i { "source replace refused by the bridge; recreating the player" }
+            return false
+        }
+        livePending = pending
+        // The bridge put the prefetch limits back to the instance's starting (preset) values.
+        meteredPrefetchFrozen = false
+        if (pending.tracePlaybackStart) PlaybackStartTrace.mark("nativeSourceReplaced")
+        playerReuseLog.i { "next source loaded into the live player" }
+        // The controls page stays: clear what a freshly loaded page would not have.
+        NativePlayerBridge.runJavaScript(liveHandle, "window.nuvioSourceReplaced && window.nuvioSourceReplaced()")
+        finishAttach(liveHandle, pending)
+        return true
+    }
+
+    /** What every attach applies once its player exists, new or reused. Attach worker. */
+    private fun finishAttach(current: Long, pending: PendingSource) {
+        // Carry the last-set volume onto the fresh mpv instance so a new episode doesn't
+        // reset to 100%. The mpv `volume` property is settable before the file finishes
+        // loading, so applying it here (rather than waiting for fileLoaded) avoids an
+        // audible full-volume blip at the start of the next episode.
+        if (pending.restoreVolume) {
+            persistedVolumeFraction?.let { fraction ->
+                NativePlayerBridge.setVolume(current, fraction.coerceIn(0f, maxVolumeFraction) * 100f)
+            }
+        }
+        synchronized(pendingMpvProperties) {
+            pendingMpvProperties.forEach { (key, value) ->
+                NativePlayerBridge.setMpvProperty(current, key, value)
+            }
+        }
+        lastResizeMode?.let { setResizeMode(it, lastQuickAutoCrop) }
+        applyPendingSubtitleConfiguration(current)
+        if (pendingVideoRedraw) {
+            pendingVideoRedraw = false
+            NativePlayerBridge.forceVideoRedraw(current)
+        }
+        updateControls(controlsState)
+    }
+
     private fun takePlayerHandle(): Long = synchronized(handleLock) {
         val value = handle
         handle = 0L
+        livePending = null
+        NativeAudioDuck.unregister(value) // fork:voice-control
         value
     }
 
@@ -378,6 +671,63 @@ internal class NativePlayerController(
         this.onScrubFinished = onScrubFinished
     }
 
+    /**
+     * fork:youtube-watch-page - the watch page's corner player: the HUD shows PiP's controls, which move
+     * and resize the box rather than the window. Kept here rather than in [PlayerControlsState], whose constructor is at the JVM's
+     * limit of 255 parameter slots (one more field and the class no longer loads).
+     */
+    var miniPlayer = false
+    private var lastSentMiniPlayer = false
+
+    /** fork:youtube-mini-player - the corner player is over the tab, so its HUD shows an X that closes it. */
+    var miniPlayerClosable = false
+    private var lastSentMiniPlayerClosable = false
+
+    /** fork:pip-browse - classic PiP shows its Browse button: on to the corner box over the app. */
+    var pipBrowseAvailable = false
+    private var lastSentPipBrowseAvailable = false
+
+    /** fork:pip-browse - this is the corner box over the app (not YouTube's corner player): it shows Pop out. */
+    var pipBrowseBox = false
+    private var lastSentPipBrowseBox = false
+
+    /**
+     * The pointer on screen, in AWT's scaled units, which are Compose's dp. Read from the OS rather than
+     * the HUD's events: the HUD moves with the box under the pointer while it is dragged.
+     */
+    /** fork:pip-browse - this player is the one in the corner box over the app (not YouTube's corner player). */
+    private fun browsePipActive(): Boolean = com.nuvio.app.features.player.PlayerBrowsePip.active.value
+
+    private var lastCompactPressMs = 0L
+    private var lastCompactPressPoint: java.awt.Point? = null
+
+    /**
+     * A press that starts moving PiP's window or the corner box, and whether it is the second of a
+     * double-click: within the OS's double-click time of the last one and a few pixels from it. Judged
+     * here from the pointer's real position because the HUD's own timing missed it (the picture moves
+     * under the pointer while it is dragged).
+     */
+    private fun compactDoublePress(): Boolean {
+        val now = System.currentTimeMillis()
+        val point = runCatching { java.awt.MouseInfo.getPointerInfo()?.location }.getOrNull()
+        val interval = (java.awt.Toolkit.getDefaultToolkit().getDesktopProperty("awt.multiClickInterval") as? Int)
+            ?.coerceIn(200, 900) ?: 500
+        val last = lastCompactPressPoint
+        val double = point != null && last != null && now - lastCompactPressMs <= interval &&
+            kotlin.math.abs(point.x - last.x) <= 8 && kotlin.math.abs(point.y - last.y) <= 8
+        lastCompactPressMs = if (double) 0L else now
+        lastCompactPressPoint = if (double) null else point
+        if (double) compactPressLog.i { "double-click on the compact player (interval ${interval}ms)" }
+        return double
+    }
+
+    private fun miniPlayerPointer(): Pair<Float, Float>? =
+        runCatching { java.awt.MouseInfo.getPointerInfo()?.location }.getOrNull()?.let { it.x.toFloat() to it.y.toFloat() }
+
+    /** fork:youtube-watch-page - the page shows around the video: the wheel scrolls it rather than setting the volume. */
+    var watchPage = false
+    private var lastSentWatchPage = false
+
     fun updateControls(state: PlayerControlsState) {
         controlsState = state
         val currentHandle = handle
@@ -385,6 +735,7 @@ internal class NativePlayerController(
         val current = currentHandle.takeIf { it != 0L } ?: return
         val mpvMediaTitle = preferredMpvMediaTitle(
             streamTitle = state.streamTitle,
+            streamFilename = state.streamFilename,
             title = state.title,
             episodeText = state.episodeText,
         )
@@ -407,22 +758,50 @@ internal class NativePlayerController(
                 state.mediaSessionArtwork,
             )
         }
-        if (structureKey == lastSentControlsStructureKey) return
+        if (structureKey == lastSentControlsStructureKey && miniPlayer == lastSentMiniPlayer && watchPage == lastSentWatchPage &&
+            miniPlayerClosable == lastSentMiniPlayerClosable && pipBrowseAvailable == lastSentPipBrowseAvailable &&
+            pipBrowseBox == lastSentPipBrowseBox
+        ) return
         lastSentControlsStructureKey = structureKey
+        lastSentMiniPlayer = miniPlayer
+        lastSentMiniPlayerClosable = miniPlayerClosable
+        lastSentPipBrowseAvailable = pipBrowseAvailable
+        lastSentPipBrowseBox = pipBrowseBox
+        lastSentWatchPage = watchPage
         AppShortcutsRepository.ensureLoaded()
         PlayerShortcutsRepository.ensureLoaded()
         val controlsJson = state.toControlsJson(
             appFullscreenKeyCode = AppShortcutsRepository.keyCode(AppShortcutAction.ToggleFullscreen),
+            // fork:voice-control - the AWT dispatcher only sees the voice key while Compose has the
+            // keyboard; once the HUD is clicked it has it, so the page forwards the key itself. Not
+            // when a player action is bound to the same key: that action wins, as in the dispatcher.
+            voiceKeyCode = AppShortcutsRepository.keyCode(AppShortcutAction.VoiceCommand)
+                .takeIf { PlayerShortcutsRepository.actionForKeyCode(it) == null } ?: 0,
             playerShortcutKeyCodes = PlayerShortcutAction.entries.associate { action ->
                 action.id to PlayerShortcutsRepository.keyCode(action)
             },
+            skipIntervalKeyLabel = playerShortcutKeyCodeLabel(
+                PlayerShortcutsRepository.keyCode(PlayerShortcutAction.SkipInterval),
+            ),
+            miniPlayer = miniPlayer,
+            miniPlayerClosable = miniPlayerClosable,
+            pipBrowseAvailable = pipBrowseAvailable,
+            pipBrowseBox = pipBrowseBox,
+            watchPage = watchPage,
         )
-        if (!controlsJsonIsWellFormed(controlsJson)) return
-        NativePlayerBridge.updateControls(current, controlsJson)
+        val payload = if (hudLabelsSent) controlsJson else controlsJson.withHudLabels()
+        if (!controlsJsonIsWellFormed(payload)) return
+        NativePlayerBridge.updateControls(current, payload)
+        hudLabelsSent = true
     }
 
-    fun setResizeMode(mode: PlayerResizeMode) {
+    /**
+     * [quickAutoCrop] is for the hero trailers: Auto Crop that settles in about two seconds from
+     * the first frame instead of after five seconds of learning (native mode 4).
+     */
+    fun setResizeMode(mode: PlayerResizeMode, quickAutoCrop: Boolean = false) {
         lastResizeMode = mode
+        lastQuickAutoCrop = quickAutoCrop
         handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.setResizeMode(
                 handle = current,
@@ -430,46 +809,71 @@ internal class NativePlayerController(
                     PlayerResizeMode.Fit -> 0
                     PlayerResizeMode.Fill -> 1
                     PlayerResizeMode.Zoom -> 2
+                    PlayerResizeMode.AutoCrop -> if (quickAutoCrop) 4 else 3
                 },
             )
             forceVideoRedraw()
         }
     }
 
-    private var videoProfileProperties: LinkedHashMap<String, String>? = null
-    private var videoProfileRedraw = false
-
-    /** Collect one final value per property before touching the decoder or rendering surface. */
-    fun <T> withVideoProfile(block: () -> T): T {
-        check(videoProfileProperties == null)
+    private class VideoProfileBatch {
         val properties = linkedMapOf<String, String>()
-        videoProfileProperties = properties
-        videoProfileRedraw = false
+        var redraw = false
+    }
+
+    // Per thread: the profile is applied off the UI thread (endVideoProfile waits on mpv's VO, ~1 s
+    // with SVP + Anime4K), and a volume or subtitle change made on the UI thread meanwhile must go
+    // straight to mpv, not into another thread's batch.
+    private val videoProfileBatch = ThreadLocal<VideoProfileBatch?>()
+
+    /**
+     * Collect one final value per property before touching the decoder or rendering surface.
+     * Blocks until native code has taken the profile, so call it off the UI thread.
+     */
+    fun <T> withVideoProfile(block: () -> T): T {
+        check(videoProfileBatch.get() == null)
+        val batch = VideoProfileBatch()
+        videoProfileBatch.set(batch)
         try {
             val result = block()
-            videoProfileProperties = null
+            videoProfileBatch.set(null)
             val current = handle
             val windows = DesktopHostOs.current == DesktopHostOs.WINDOWS && current != 0L
             if (windows) NativePlayerBridge.beginVideoProfile(current)
             try {
-                properties.forEach { (key, value) -> setMpvProperty(key, value) }
+                batch.properties.forEach { (key, value) -> setMpvProperty(key, value) }
             } finally {
                 if (windows) NativePlayerBridge.endVideoProfile(current)
-                else if (videoProfileRedraw) forceVideoRedraw()
+                else if (batch.redraw) forceVideoRedraw()
             }
             return result
         } finally {
-            videoProfileProperties = null
-            videoProfileRedraw = false
+            videoProfileBatch.remove()
         }
     }
 
+    /** fork:music-stage - rounded corners for the video window (see NativePlayerBridge.setCornerRadius); a library without it stays square. */
+    fun setCornerRadius(radiusPx: Int) {
+        val current = handle.takeIf { it != 0L } ?: return
+        runCatching { NativePlayerBridge.setCornerRadius(current, radiusPx) }
+    }
+
     fun setMpvProperty(key: String, value: String) {
-        videoProfileProperties?.let { it[key] = value; return }
+        if (key == "vf") mayHostVapourSynth = true
+        videoProfileBatch.get()?.let { it.properties[key] = value; return }
         synchronized(pendingMpvProperties) {
             pendingMpvProperties[key] = value
         }
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setMpvProperty(it, key, value) }
+    }
+
+    /**
+     * The chain native code runs instead of the next `vf` while it bypasses SVP for speed (see
+     * applySpeedSensitiveVideoFiltersLocked); "" means that `vf` minus VapourSynth. Set it right
+     * before every `vf` write. Windows-only pseudo-property; nothing else understands it.
+     */
+    fun setSvpBypassVideoFilters(value: String) {
+        if (DesktopHostOs.current == DesktopHostOs.WINDOWS) setMpvProperty("@nuvio-svp-bypass-vf", value)
     }
 
     fun completeSvpStartupProfile() {
@@ -477,8 +881,18 @@ internal class NativePlayerController(
     }
 
     /** Forces mpv to repaint the embedded video surface (see native forceVideoRedraw). */
+    /** The host was resized: fit the video and the HUD to it now. An older bridge without the call keeps its timer. */
+    fun layoutToHost() {
+        val current = handle.takeIf { it != 0L } ?: return
+        try {
+            NativePlayerBridge.layoutToHost(current)
+        } catch (missing: UnsatisfiedLinkError) {
+            // A player_bridge.dll from before layoutToHost: its 500 ms timer still fits the video.
+        }
+    }
+
     fun forceVideoRedraw() {
-        if (videoProfileProperties != null) { videoProfileRedraw = true; return }
+        videoProfileBatch.get()?.let { it.redraw = true; return }
         val current = handle
         if (current == 0L) {
             pendingVideoRedraw = true
@@ -505,7 +919,12 @@ internal class NativePlayerController(
         svpActive: Boolean,
         videoLabel: String,
         shaderLabel: String?,
+        qualityLabel: String = "",
+        // The profile's decision; [svpActive] is the native runtime's report, which is also false
+        // while SVP sits out a >= 1.5x speed.
+        svpInChain: Boolean = svpActive,
     ) {
+        this.svpInChain = svpInChain
         // The same signal drives the pad's right stick: with a shader running its down direction
         // cycles the shader chain, and the HDR mode when none is. This pass is the only place that
         // knows which, and it re-runs on every settings change and file load.
@@ -514,8 +933,10 @@ internal class NativePlayerController(
         val payload = "{\"session\":${session.toJsonString()}," +
             "\"hdr\":${(hdrLabel ?: "").toJsonString()}," +
             "\"svp\":$svpActive," +
+            "\"svpInChain\":$svpInChain," +
             "\"video\":${videoLabel.toJsonString()}," +
-            "\"shader\":${(shaderLabel ?: "").toJsonString()}}"
+            "\"shader\":${(shaderLabel ?: "").toJsonString()}," +
+            "\"quality\":${qualityLabel.toJsonString()}}"
         NativePlayerBridge.runJavaScript(
             current,
             "window.nuvioSetPlaybackInfo && window.nuvioSetPlaybackInfo($payload)",
@@ -535,6 +956,9 @@ internal class NativePlayerController(
     override fun showTransientMessage(title: String, value: String) {
         showPresetPill(title, value)
     }
+
+    override fun reconnectAfterRateLimit(message: String): Boolean =
+        rateLimitFailoverFallback?.invoke(message) ?: false
 
     override fun showTransientMessageAfterNextAttach(title: String, value: String) {
         // A source switch tears the native surface (and its controls page) down, so a pill shown
@@ -559,7 +983,7 @@ internal class NativePlayerController(
         } else {
             "${"%.2f".format(speed).trimEnd('0').trimEnd('.')}x"
         }
-        showPresetPill("Playback speed", value)
+        showPresetPill(localizedString(Res.string.player_hud_playback_speed), value)
     }
 
     fun cycleDesktopHdrMode() {
@@ -567,13 +991,13 @@ internal class NativePlayerController(
         val current = PlayerSettingsRepository.uiState.value.desktopHdrMode
         val next = modes[(modes.indexOf(current) + 1) % modes.size]
         PlayerSettingsRepository.setDesktopHdrMode(next)
-        showPresetPill("HDR Mode", next.label)
+        showPresetPill(localizedString(Res.string.player_hud_hdr_mode), localizedString(next.labelRes))
     }
 
     private fun selectDesktopHdrMode(index: Int) {
         DesktopHdrMode.entries.getOrNull(index)?.let { mode ->
             PlayerSettingsRepository.setDesktopHdrMode(mode)
-            showPresetPill("HDR Mode", mode.label)
+            showPresetPill(localizedString(Res.string.player_hud_hdr_mode), localizedString(mode.labelRes))
         }
     }
 
@@ -582,7 +1006,7 @@ internal class NativePlayerController(
         val current = PlayerSettingsRepository.uiState.value.desktopColorProfile
         val next = profiles[(profiles.indexOf(current) + 1) % profiles.size]
         PlayerSettingsRepository.setDesktopColorProfile(next)
-        showPresetPill("Color Profile", next.label)
+        showPresetPill(localizedString(Res.string.player_hud_color_profile), localizedString(next.labelRes))
     }
 
     /**
@@ -622,7 +1046,7 @@ internal class NativePlayerController(
     private fun selectDesktopColorProfile(index: Int) {
         DesktopColorProfile.entries.getOrNull(index)?.let { profile ->
             PlayerSettingsRepository.setDesktopColorProfile(profile)
-            showPresetPill("Color Profile", profile.label)
+            showPresetPill(localizedString(Res.string.player_hud_color_profile), localizedString(profile.labelRes))
         }
     }
 
@@ -675,7 +1099,7 @@ internal class NativePlayerController(
                 label = choice.label,
             ),
         )
-        showPresetPill("Anime", choice.label)
+        showPresetPill(localizedString(Res.string.player_hud_anime), choice.label)
     }
 
     private fun openAnimeShaderContextMenu() {
@@ -707,42 +1131,98 @@ internal class NativePlayerController(
     private val mpvOptionCatalog = listOf(
         MpvOption(
             key = "deband",
-            label = "Debanding",
+            label = localizedString(Res.string.player_hud_debanding),
             // Nuvio's baseline enables deband (player_bridge startMpv), so On is the default here.
-            choices = listOf(MpvChoice("On", "yes", isDefault = true), MpvChoice("Off", "no")),
+            choices = listOf(MpvChoice(localizedString(Res.string.compose_action_on), "yes", isDefault = true), MpvChoice(localizedString(Res.string.compose_action_off), "no")),
         ),
         MpvOption(
             key = "deinterlace",
-            label = "Deinterlace",
-            choices = listOf(MpvChoice("Off", "no", isDefault = true), MpvChoice("On", "yes")),
+            label = localizedString(Res.string.player_hud_deinterlace),
+            choices = listOf(MpvChoice(localizedString(Res.string.compose_action_off), "no", isDefault = true), MpvChoice(localizedString(Res.string.compose_action_on), "yes")),
         ),
         MpvOption(
-            key = "sharpen",
-            label = "Sharpen",
+            // Not mpv's `sharpen` (vo=gpu only, a no-op on gpu-next): the saved value picks a CAS
+            // strength that the video profile appends to the active shader chain.
+            key = DESKTOP_SHARPEN_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_sharpen),
             choices = listOf(
-                MpvChoice("Off", "0", isDefault = true),
-                MpvChoice("Low", "1.0"),
-                MpvChoice("High", "2.0"),
+                MpvChoice(localizedString(Res.string.compose_action_off), "0", isDefault = true),
+                MpvChoice(localizedString(Res.string.player_hud_low), "1.0"),
+                MpvChoice(localizedString(Res.string.player_hud_high), "2.0"),
             ),
         ),
         MpvOption(
             // Luma upscaler. Only honoured for live-action; anime/custom-shader profiles force their
             // own sharp scaler (see applyDesktopVideoProfile). Default matches the live-action baseline.
             key = "scale",
-            label = "Upscaling",
+            label = localizedString(Res.string.player_hud_upscaling),
             choices = listOf(
-                MpvChoice("Default", "spline36", isDefault = true),
-                MpvChoice("Sharp", "ewa_lanczossharp"),
-                MpvChoice("Fast", "bilinear"),
+                MpvChoice(localizedString(Res.string.player_hud_default), "spline36", isDefault = true),
+                MpvChoice(localizedString(Res.string.player_hud_sharp), "ewa_lanczossharp"),
+                MpvChoice(localizedString(Res.string.player_hud_fast), "bilinear"),
             ),
         ),
         MpvOption(
-            // Loudness normalisation ("night mode"). Nothing else sets `af` on the main player.
-            key = "af",
-            label = "Loudness normalize",
+            // Added grain (deband-grain), not the grain an AV1 encode carries, which mpv always
+            // applies. Owned by the video profile; Light/Heavy need Deband, see selectMpvOption.
+            key = DESKTOP_FILM_GRAIN_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_film_grain),
             choices = listOf(
-                MpvChoice("Off", "", isDefault = true),
-                MpvChoice("On", "dynaudnorm=f=150:g=15"),
+                MpvChoice(localizedString(Res.string.player_hud_default), "default", isDefault = true),
+                MpvChoice(localizedString(Res.string.player_hud_none), DESKTOP_FILM_GRAIN_NONE),
+                MpvChoice(localizedString(Res.string.player_hud_light), DESKTOP_FILM_GRAIN_LIGHT),
+                MpvChoice(localizedString(Res.string.player_hud_heavy), DESKTOP_FILM_GRAIN_HEAVY),
+            ),
+        ),
+        MpvOption(
+            // target-contrast for SDR tone mapping. Owned by the video profile (HDR mode sets it).
+            key = DESKTOP_DISPLAY_PANEL_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_display_type),
+            choices = listOf(
+                MpvChoice("LCD", "lcd", isDefault = true),
+                MpvChoice("OLED", DESKTOP_DISPLAY_PANEL_OLED),
+            ),
+        ),
+        MpvOption(
+            // mpv's built-in frame-timing interpolation. Owned by the video profile so it can never
+            // run together with SVP.
+            key = DESKTOP_INTERPOLATION_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_motion_interpolation),
+            choices = listOf(MpvChoice(localizedString(Res.string.compose_action_off), "no", isDefault = true), MpvChoice(localizedString(Res.string.compose_action_on), "yes")),
+        ),
+        MpvOption(
+            // The filters are one chain, so each choice replaces the last; headphone surround is
+            // appended after it (desktopAudioFilterChain). Loudness keeps its old value so a saved
+            // choice carries over.
+            key = "af",
+            label = localizedString(Res.string.player_hud_audio_profile),
+            choices = listOf(
+                MpvChoice(localizedString(Res.string.compose_action_off), "", isDefault = true),
+                MpvChoice(localizedString(Res.string.player_hud_loudness_normalize), "dynaudnorm=f=150:g=15"),
+                MpvChoice(localizedString(Res.string.player_hud_night_mode), "lavfi=[acompressor=ratio=3:threshold=-20dB:attack=20:release=300:makeup=4dB]"),
+                MpvChoice(localizedString(Res.string.player_hud_vocal_clarity), "lavfi=[equalizer=f=300:t=q:w=1:g=-3,equalizer=f=2800:t=q:w=1:g=5]"),
+                MpvChoice(localizedString(Res.string.player_hud_bass_boost), "lavfi=[bass=g=7:f=110:w=0.6]"),
+                MpvChoice(localizedString(Res.string.player_hud_less_bass), "lavfi=[bass=g=-8:f=110:w=0.6]"),
+            ),
+        ),
+        // Shared with the Playback settings page; see DesktopAudioDownmix.kt.
+        MpvOption(
+            key = DESKTOP_AUDIO_CHANNELS_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_audio_channels),
+            choices = desktopAudioChannelChoices.map { MpvChoice(it.label, it.value, it.isDefault) },
+        ),
+        MpvOption(
+            key = DESKTOP_AUDIO_SWRESAMPLE_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_dialogue_boost_downmix),
+            choices = desktopAudioDialogueChoices.map { MpvChoice(it.label, it.value, it.isDefault) },
+        ),
+        MpvOption(
+            // Folded into `af` after the Audio profile; see DesktopHeadphoneSurround.kt.
+            key = DESKTOP_HEADPHONE_SURROUND_OVERRIDE_KEY,
+            label = localizedString(Res.string.player_hud_headphone_surround),
+            choices = listOf(
+                MpvChoice(localizedString(Res.string.compose_action_off), "", isDefault = true),
+                MpvChoice(localizedString(Res.string.compose_action_on), DESKTOP_HEADPHONE_SURROUND_ON),
             ),
         ),
     )
@@ -781,8 +1261,17 @@ internal class NativePlayerController(
                         key = option.key,
                         value = if (choice.isDefault) null else choice.value,
                     )
-                    setMpvProperty(option.key, choice.value)
-                    showPresetPill(option.label, choice.label)
+                    applyMpvOptionSideEffects(option.key, choice.value)
+                    // Profile-owned rows are applied by the profile rebuild the override change
+                    // triggers; writing them here would only be overwritten.
+                    if (option.key !in DESKTOP_PROFILE_OWNED_OVERRIDE_KEYS) setMpvProperty(option.key, choice.value)
+                    if (option.key in DESKTOP_AUDIO_FILTER_CHAIN_KEYS) {
+                        setMpvProperty(
+                            "af",
+                            desktopAudioFilterChain(PlayerSettingsRepository.uiState.value.desktopMpvPropertyOverrides),
+                        )
+                    }
+                    showPresetPill(option.label, mpvOptionPillLabel(option.key, choice))
                     // Re-push so a kept-open menu reflects the new selection.
                     openMpvOptionsContextMenu()
                     return
@@ -792,37 +1281,138 @@ internal class NativePlayerController(
         }
     }
 
-    fun cycleDesktopAnimeSvpMode() {
-        val current = PlayerSettingsRepository.uiState.value.desktopAnimeSvpEnabled
-        val next = !current
-        PlayerSettingsRepository.setDesktopAnimeSvpEnabled(next)
-        // An explicit in-player toggle also forces SVP for this session even when the title isn't
-        // detected as anime (the persisted toggle alone only fires on effectively-anime content).
-        PlayerSettingsRepository.setDesktopAnimeSvpSessionForced(next)
-        showPresetPill("Anime SVP", if (next) "On" else "Off")
-    }
-
-    /**
-     * Triggers the skip-intro/outro action if the skip prompt is currently on screen (Tab hotkey,
-     * matching the official client). Returns true if a skip was dispatched so the caller can consume
-     * the key; false when no skip is available (so Tab keeps its normal behavior).
-     */
-    fun triggerSkipIntervalIfAvailable(): Boolean {
-        return when {
-            controlsState.skipPromptVisible && !controlsState.skipPromptDismissed -> {
-                dispatchKeyboardShortcut("skipInterval", 0.0)
-                true
+    /** Keeps rows that depend on each other consistent; see the catalog notes. */
+    private fun applyMpvOptionSideEffects(key: String, value: String) {
+        val overrides = PlayerSettingsRepository.uiState.value.desktopMpvPropertyOverrides
+        val addsGrain = value == DESKTOP_FILM_GRAIN_LIGHT || value == DESKTOP_FILM_GRAIN_HEAVY
+        when {
+            // mpv adds grain inside the deband pass, so grain without deband does nothing.
+            key == DESKTOP_FILM_GRAIN_OVERRIDE_KEY && addsGrain && overrides["deband"] == "no" -> {
+                PlayerSettingsRepository.setDesktopMpvPropertyOverride(key = "deband", value = null)
+                setMpvProperty("deband", "yes")
             }
-            controlsState.nextEpisodeVisible && controlsState.nextEpisodePlayable -> {
-                dispatchKeyboardShortcut("playNextEpisode", 0.0)
-                true
-            }
-            else -> false
+            key == "deband" && value == "no" &&
+                overrides[DESKTOP_FILM_GRAIN_OVERRIDE_KEY].let {
+                    it == DESKTOP_FILM_GRAIN_LIGHT || it == DESKTOP_FILM_GRAIN_HEAVY
+                } -> PlayerSettingsRepository.setDesktopMpvPropertyOverride(
+                    key = DESKTOP_FILM_GRAIN_OVERRIDE_KEY,
+                    value = null,
+                )
+            // Left at Off the profile writes nothing (a custom options line may own these), so
+            // undo the interpolation it had switched on.
+            key == DESKTOP_INTERPOLATION_OVERRIDE_KEY && value != "yes" ->
+                DESKTOP_INTERPOLATION_OFF.forEach { (property, setting) -> setMpvProperty(property, setting) }
         }
     }
 
+    /** Says when a choice is saved but held back, so a row that seems to do nothing explains itself. */
+    private fun mpvOptionPillLabel(key: String, choice: MpvChoice): String {
+        if (key != DESKTOP_INTERPOLATION_OVERRIDE_KEY || choice.value != "yes") return choice.label
+        val settings = PlayerSettingsRepository.uiState.value
+        return when {
+            settings.desktopAudioPassthroughEnabled -> localizedString(Res.string.player_hud_on_off_during_audio_passthrough)
+            settings.desktopAnimeSvpEnabled -> localizedString(Res.string.player_hud_on_off_while_svp_runs)
+            else -> choice.label
+        }
+    }
+
+    fun cycleDesktopAnimeSvpMode() {
+        val settings = PlayerSettingsRepository.uiState.value
+        // Flip what is running, not the saved setting: on live action without "all videos" the
+        // setting is on while SVP is off, and flipping it made the first press a silent off -> off.
+        val next = !svpInChain
+        svpInChain = next // a second press before the profile pass lands must see this one
+        // Name the tuning this video gets, matching the profile choice in applyDesktopAnimeProfile:
+        // detected anime, or anime shaders forced on for this session.
+        val sessionPreset = settings.desktopAnimeSessionOverride?.mode
+        val animeTuning = isAnimeContentDetected || pendingSource?.isAnimeContent == true ||
+            (sessionPreset != null && sessionPreset != DesktopAnimeMode.Off)
+        if (next) {
+            if (!settings.desktopAnimeSvpSessionForced) svpSettingBeforeForce = settings.desktopAnimeSvpEnabled
+            PlayerSettingsRepository.setDesktopAnimeSvpEnabled(true)
+            // An explicit in-player toggle also forces SVP for this session even when the title
+            // isn't detected as anime (the saved setting alone only fires on anime content).
+            PlayerSettingsRepository.setDesktopAnimeSvpSessionForced(true)
+        } else if (settings.desktopAnimeSvpSessionForced && !animeTuning && !settings.desktopSvpAllContentEnabled) {
+            // Running only because of an earlier press this session: undo that press, which puts
+            // the saved setting (SVP on anime) back as the user had it.
+            PlayerSettingsRepository.setDesktopAnimeSvpSessionForced(false)
+            PlayerSettingsRepository.setDesktopAnimeSvpEnabled(svpSettingBeforeForce ?: settings.desktopAnimeSvpEnabled)
+        } else {
+            PlayerSettingsRepository.setDesktopAnimeSvpEnabled(false)
+            PlayerSettingsRepository.setDesktopAnimeSvpSessionForced(false)
+        }
+        val label = if (animeTuning) Res.string.player_hud_anime_svp else Res.string.player_hud_cinema_svp
+        showPresetPill(localizedString(label),if (next) localizedString(Res.string.compose_action_on) else localizedString(Res.string.compose_action_off))
+    }
+
+    // The player menu's RTX rows: session-only, so the video profile swaps the d3d11vpp filter
+    // live instead of the saved setting re-attaching the player. The pill names the one hold-back
+    // a viewer can act on from here; the others (HDR source, Windows HDR off) are in the settings.
+    // The NVIDIA App switch is named too: without it the row would seem to do nothing.
+    private fun toggleRtxVsrForSession() {
+        val settings = PlayerSettingsRepository.uiState.value
+        val next = !settings.effectiveRtxVsrEnabled
+        PlayerSettingsRepository.setDesktopRtxVsrSessionOverride(next)
+        val driverOff = NvidiaRtxDriverState.settings.value.superResolutionEnabled == false
+        showPresetPill(localizedString(Res.string.player_hud_rtx_super_resolution), rtxPillValue(next, settings.desktopAnimeSvpEnabled, driverOff))
+    }
+
+    private fun toggleRtxTrueHdrForSession() {
+        val settings = PlayerSettingsRepository.uiState.value
+        val next = !settings.effectiveRtxTrueHdrEnabled
+        PlayerSettingsRepository.setDesktopRtxTrueHdrSessionOverride(next)
+        val driverOff = NvidiaRtxDriverState.settings.value.trueHdrEnabled == false
+        showPresetPill(localizedString(Res.string.player_hud_rtx_true_hdr), rtxPillValue(next, settings.desktopAnimeSvpEnabled, driverOff))
+    }
+
+    private fun rtxPillValue(enabled: Boolean, svpEnabled: Boolean, driverOff: Boolean): String = when {
+        !enabled -> localizedString(Res.string.compose_action_off)
+        driverOff -> localizedString(Res.string.player_hud_on_off_in_the_nvidia_app)
+        svpEnabled -> localizedString(Res.string.player_hud_on_off_while_svp_runs)
+        else -> localizedString(Res.string.compose_action_on)
+    }
+
+    /**
+     * The skip key (Tab by default, Start on a pad): skips the prompt on screen, plays the next
+     * episode, or drives the SkipDB submission toast — whichever `skipKeyAction` resolved to when
+     * the controls state was last built (see PlayerScreenRuntime.resolveSkipKeyAction). Returns
+     * true if something was dispatched so the caller consumes the key; false when there was
+     * nothing to do, so the key keeps its normal behaviour.
+     */
+    fun triggerSkipIntervalIfAvailable(): Boolean {
+        val action = controlsState.skipKeyAction
+        if (action.isEmpty()) return false
+        dispatchKeyboardShortcut(action, 0.0)
+        return true
+    }
+
+    /** Escape while the submission toast is asking something dismisses it instead of leaving. */
+    /**
+     * The "Escape goes windowed first" shortcut option: in fullscreen (not PiP) Escape leaves
+     * fullscreen instead of the player. Already windowed, Escape closes the player as usual.
+     */
+    /** Whether the mouse pointer is over the video's own window. */
+    private fun pointerOverHost(): Boolean = runCatching {
+        if (!host.isShowing) return false
+        val pointer = java.awt.MouseInfo.getPointerInfo()?.location ?: return false
+        java.awt.Rectangle(host.locationOnScreen, host.size).contains(pointer)
+    }.getOrDefault(false)
+
+    fun escapeShouldGoWindowed(): Boolean =
+        PlayerShortcutsRepository.escWindowedFirst() &&
+            desktopAppFullscreenState.value &&
+            !desktopPictureInPictureState.value
+
+    fun dismissSkipSubmitToastIfShown(): Boolean {
+        if (!controlsState.skipSubmitToastDismissible) return false
+        dispatchKeyboardShortcut("skipSubmitDismiss", 0.0)
+        return true
+    }
+
     fun openKeyboardPanel(panel: String) {
-        if (panel != "sources" && panel != "episodes") return
+        // "controls": the HUD's own control navigation (Enter, then the arrows; see controls.js).
+        if (panel != "sources" && panel != "episodes" && panel != "iptvChannels" && panel != "controls") return
         val current = handle.takeIf { it != 0L } ?: return
         keyboardPanelOpen = true
         NativePlayerBridge.runJavaScript(
@@ -830,6 +1420,15 @@ internal class NativePlayerController(
             "window.nuvioOpenKeyboardPanel && window.nuvioOpenKeyboardPanel(${panel.toJsonString()})",
         )
     }
+
+    /** Live TV: one typed digit of a channel number; the HUD collects them and sends the number. */
+    fun dispatchIptvDigit(digit: Int) {
+        val current = handle.takeIf { it != 0L } ?: return
+        NativePlayerBridge.runJavaScript(current, "window.nuvioIptvDigit && window.nuvioIptvDigit(${digit.coerceIn(0, 9)})")
+    }
+
+    /** A keyboard panel or the player menu is being driven by the keys (the HUD says so). */
+    val isKeyboardPanelOpen: Boolean get() = keyboardPanelOpen
 
     fun dispatchKeyboardPanelKey(code: String): Boolean {
         if (!keyboardPanelOpen) return false
@@ -852,7 +1451,9 @@ internal class NativePlayerController(
         )
     }
 
-    private fun showVolumePillFromNative() {
+    /** Shows the volume pill and moves the HUD's volume slider to mpv's current level. Any change
+     * made outside the HUD (voice, keys) must call this, or the slider keeps its old position. */
+    fun showVolumePillFromNative() {
         val current = handle.takeIf { it != 0L } ?: return
         val percentage = NativePlayerBridge.volume(current).toInt().coerceIn(0, 200)
         val muted = NativePlayerBridge.isMuted(current)
@@ -872,6 +1473,10 @@ internal class NativePlayerController(
                 showPresetPill(pillTitle, pillValue, durationMs = 5000)
             }
         }
+        if (type == "seekFailureTargetMs") {
+            lastSeekFailureTargetMs = value.toLong().coerceAtLeast(0L)
+            return
+        }
         val errorPrefix = when {
             type.startsWith(MPV_STARTUP_ERROR_EVENT_PREFIX) -> MPV_STARTUP_ERROR_EVENT_PREFIX
             type.startsWith(MPV_PLAYBACK_ERROR_EVENT_PREFIX) -> MPV_PLAYBACK_ERROR_EVENT_PREFIX
@@ -879,7 +1484,7 @@ internal class NativePlayerController(
         }
         if (errorPrefix != null) {
             val message = type.removePrefix(errorPrefix).trim()
-                .ifBlank { "MPV failed to start playback." }
+                .ifBlank { localizedString(Res.string.player_hud_mpv_failed_to_start_playback) }
             pendingSource?.onError(message)
             return
         }
@@ -888,7 +1493,7 @@ internal class NativePlayerController(
             // reload (0). Either way video is still buffering, so hold the notice for the first
             // rendered frame like the failover pill — shown now it would expire unseen.
             audioPassthroughLog.i { "rejected by output device; bridge fell back to PCM (trackReloaded=${value >= 1.0})" }
-            transientMessageForNextAttach = "Audio passthrough" to "Not supported by output device — decoding to PCM"
+            transientMessageForNextAttach = localizedString(Res.string.player_hud_audio_passthrough) to localizedString(Res.string.player_hud_not_supported_by_output_device_decoding)
             return
         }
         if (type == "keyboardCycleHdrMode") {
@@ -939,13 +1544,16 @@ internal class NativePlayerController(
             PlayerSettingsRepository.setDesktopUiScalePercent(value.toInt())
             return
         }
+        if (type == "selectDesktopHudLayout") {
+            DesktopHudLayout.entries.getOrNull(value.toInt())?.let(PlayerSettingsRepository::setDesktopHudLayout)
+            return
+        }
         if (type == "seekThumbnail") {
             // Belt and braces with the HUD flag: the preview decoder is a second stream opened
             // against the same host, so a stale controls page must not be able to start it.
-            val settings = PlayerSettingsRepository.uiState.value
-            if (!settings.desktopSeekThumbnailsEnabled ||
-                settings.desktopBufferPreset == DesktopBufferPreset.Metered
-            ) {
+            // controlsState carries the runtime's verdict (mode, Metered preset, local vs
+            // streaming source), so this cannot disagree with what the HUD was told.
+            if (!controlsState.seekPreview.seekThumbnailsEnabled || SeekThumbnailRateLimitGate.isSuppressed()) {
                 return
             }
             handle.takeIf { it != 0L }?.let { current ->
@@ -963,10 +1571,18 @@ internal class NativePlayerController(
             cycleDesktopAnimeSvpMode()
             return
         }
+        if (type == "toggleRtxVsr") {
+            toggleRtxVsrForSession()
+            return
+        }
+        if (type == "toggleRtxTrueHdr") {
+            toggleRtxTrueHdrForSession()
+            return
+        }
         // Both the AWT key dispatcher and the HUD (its speed button and the step/toggle keys, which
         // this page owns whenever the WebView holds focus) route relative speed changes here, so the
         // Kotlin rules run against mpv's live speed either way and the pill is raised in one place.
-        if (type == "keyboardSpeedStep" || type == "keyboardSpeedToggle") {
+        if (type == "keyboardSpeedStep" || type == "keyboardSpeedToggle" || type == "holdSpeedStart" || type == "holdSpeedEnd") {
             onEvent(type, value)
             showPlaybackSpeedPillFromNative()
             return
@@ -977,12 +1593,12 @@ internal class NativePlayerController(
         // (missing still upstream) from "the URL was there and the WebView could not fetch it".
         if (type == "episodeArtworkFailed") {
             val index = value.toInt()
-            val item = controlsState.episodeItems.firstOrNull { it.index == index }
+            val item = controlsState.episodes.episodeItems.firstOrNull { it.index == index }
             episodeArtworkLog.w {
                 "Episode card artwork failed: " +
                     "index=$index code=${item?.code.orEmpty()} title=${item?.title.orEmpty()} " +
                     "thumbnail=${item?.thumbnail?.ifBlank { "<none>" } ?: "<unknown item>"} " +
-                    "fallback=${controlsState.episodeFallbackThumbnail.ifBlank { "<none>" }}"
+                    "fallback=${controlsState.episodes.episodeFallbackThumbnail.ifBlank { "<none>" }}"
             }
             return
         }
@@ -1000,21 +1616,139 @@ internal class NativePlayerController(
                     updateLocalProgress(value.toLong())
                 }
             }
+            "goLive" -> {
+                releaseMeteredPrefetchFreeze()
+                handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekToCachedLiveEdge(it, value.toLong()) }
+            }
             "scrubFinish" -> {
                 val scrubHandled = onScrubFinished(value.toLong())
                 if (!scrubHandled) {
                     seekTo(value.toLong())
                 }
             }
-            "toggleFullscreen" -> toggleDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+            "toggleFullscreen" -> {
+                val window = SwingUtilities.getWindowAncestor(host)
+                // A YouTube video's watch page takes the button: page to filling the screen and back.
+                if (!com.nuvio.app.features.youtube.handleYouTubeFullscreenButton(window)) toggleDesktopAppFullscreen(window)
+            }
+            // The HUD's Escape (with nothing of its own to close). The back button still sends "back".
+            // A D-pad key while the post-show cards are up (the controls page forwards them: it holds keyboard focus).
+            "postShowKey" -> PostShowController.press(value.toInt())
+            // fork:voice-control - the voice key pressed while the HUD has the keyboard.
+            "voiceCommand" -> com.nuvio.app.features.voice.VoiceControlRepository.toggleListening()
+            "escapeBack" -> {
+                val voice = com.nuvio.app.features.voice.VoiceControlRepository
+                if (voice.session.value !is com.nuvio.app.features.voice.VoiceSessionState.Idle) {
+                    // Escape while listening drops the command, as it does from the dispatcher.
+                    voice.cancelListening()
+                } else if (PostShowController.active.value) {
+                    // Escape closes the post-show cards instead of leaving the player.
+                    PostShowController.press(PostShowKey.Back)
+                } else if (browsePipActive()) {
+                    // fork:pip-browse - the corner box: Escape is the app's, not the video's.
+                } else if (com.nuvio.app.features.youtube.handleYouTubeEscape(SwingUtilities.getWindowAncestor(host))) {
+                    // Back to the YouTube watch page the video was filling the screen from.
+                } else if (escapeShouldGoWindowed()) {
+                    toggleDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+                } else {
+                    handlePlayerEvent("back", value)
+                }
+            }
+            // The YouTube watch page's corner player was clicked: back up to the video.
+            // fork:pip-browse - the same box over the app (PlayerBrowsePip) when that is what is up.
+            "miniPlayerClick" -> if (browsePipActive()) {
+                com.nuvio.app.features.player.PlayerBrowsePip.requestExpand()
+            } else {
+                com.nuvio.app.features.youtube.YouTubeWatchLayout.requestBackToVideo()
+            }
+            // fork:youtube-mini-player - the corner player's X, and PiP's move/resize gestures on its box.
+            "miniPlayerClose" -> if (browsePipActive()) {
+                com.nuvio.app.features.player.PlayerBrowsePip.requestClose()
+            } else {
+                com.nuvio.app.features.youtube.YouTubeWatchLayout.requestCloseFromCorner()
+            }
+            // A second press on the box straight after the first: as its exit button.
+            "beginMiniPlayerInteraction" -> if (value.toInt() == 1 && compactDoublePress()) {
+                handlePlayerEvent("miniPlayerClick", 0.0)
+            } else miniPlayerPointer()?.let { (x, y) ->
+                if (browsePipActive()) {
+                    com.nuvio.app.features.player.PlayerBrowsePip.beginInteraction(value.toInt(), x, y)
+                } else {
+                    com.nuvio.app.features.youtube.YouTubeWatchLayout.beginMiniInteraction(value.toInt(), x, y)
+                }
+            }
+            "updateMiniPlayerInteraction" -> miniPlayerPointer()?.let { (x, y) ->
+                if (browsePipActive()) {
+                    com.nuvio.app.features.player.PlayerBrowsePip.updateInteraction(x, y)
+                } else {
+                    com.nuvio.app.features.youtube.YouTubeWatchLayout.updateMiniInteraction(x, y)
+                }
+            }
+            "endMiniPlayerInteraction" -> {
+                com.nuvio.app.features.player.PlayerBrowsePip.endInteraction()
+                com.nuvio.app.features.youtube.YouTubeWatchLayout.endMiniInteraction()
+            }
+            // fork:pip-browse - classic PiP's X: out of PiP first, then the player closes as Back would.
+            // Closing straight from PiP tore mpv's surface down in the same moment the window went from
+            // the small PiP window back to borderless fullscreen; on Nov 8 that was followed by the TV
+            // flipping SDR/HDR and re-handshaking HDMI. Leaving PiP and then closing, a moment apart, is
+            // the order every earlier close went in (the exit button, then Back), which never did that.
+            "pictureInPictureClose" -> if (desktopPictureInPictureState.value) {
+                if (!onAction(PlayerControlsAction.PictureInPicture)) {
+                    setDesktopPictureInPicture(false, SwingUtilities.getWindowAncestor(host))
+                }
+                compactPressLog.i { "PiP close: leaving PiP, closing in ${PIP_CLOSE_SETTLE_MS}ms" }
+                javax.swing.Timer(PIP_CLOSE_SETTLE_MS) { if (!disposed) handlePlayerEvent("back", 0.0) }
+                    .apply { isRepeats = false }
+                    .start()
+            } else {
+                handlePlayerEvent("back", 0.0)
+            }
+            // fork:pip-browse - the corner box's Pop out: back to filling the window, then classic PiP over Windows.
+            "miniPlayerPopOut" -> if (browsePipActive()) com.nuvio.app.features.player.PlayerBrowsePip.requestPopOut()
+            // fork:pip-browse - classic PiP's Browse button: out of PiP (the window gets its size back,
+            // Main.kt) and on to the corner box, the app around it.
+            "pictureInPictureBrowse" -> if (
+                desktopPictureInPictureState.value &&
+                com.nuvio.app.features.player.PlayerBrowsePip.hostedPlayerAvailable.value
+            ) {
+                if (!onAction(PlayerControlsAction.PictureInPicture)) {
+                    setDesktopPictureInPicture(false, SwingUtilities.getWindowAncestor(host))
+                }
+                com.nuvio.app.features.player.PlayerBrowsePip.requestEnter()
+            }
+            // The wheel over the video on the watch page, in the page's pixels: the page scrolls by it.
+            "watchPageScroll" -> com.nuvio.app.features.youtube.YouTubeWatchLayout.requestScroll(value.toFloat())
+            // A double-click on the bare video, as on most video sites: the YouTube watch page's
+            // default view goes to theater; everywhere else (theater, filling the screen, any other
+            // video) goes to PiP, and in PiP it comes back out to whatever it left (Main.kt restores
+            // the window; the watch page and its theater setting were never touched).
+            "videoDoubleClick" -> {
+                val youTube = com.nuvio.app.features.youtube.YouTubeFeedRepository
+                val togglesFullscreen = com.nuvio.app.features.player.PlayerDoubleClick.action.value ==
+                    com.nuvio.app.features.player.PlayerDoubleClickAction.Fullscreen
+                // Settings > Playback > Double-click on the video. Inside PiP it always comes back out.
+                if (togglesFullscreen && !desktopPictureInPictureState.value) {
+                    handlePlayerEvent("toggleFullscreen", 0.0)
+                } else if (!desktopPictureInPictureState.value && watchPage && !miniPlayer && !youTube.theaterMode.value) {
+                    youTube.setTheaterMode(true)
+                } else {
+                    handlePlayerEvent("pictureInPicture", 0.0)
+                }
+            }
             "pictureInPicture" -> {
                 val actionHandled = onAction(PlayerControlsAction.PictureInPicture)
                 if (!actionHandled) setDesktopPictureInPicture(!desktopPictureInPictureState.value, SwingUtilities.getWindowAncestor(host))
             }
-            "beginPictureInPictureInteraction" -> beginNativeCompactPlayerWindowInteraction(
-                window = SwingUtilities.getWindowAncestor(host),
-                mode = value.toInt(),
-            )
+            // A second press on the PiP picture straight after the first: back to where PiP was entered from.
+            "beginPictureInPictureInteraction" -> if (value.toInt() == 1 && compactDoublePress()) {
+                handlePlayerEvent("videoDoubleClick", 0.0)
+            } else {
+                beginNativeCompactPlayerWindowInteraction(
+                    window = SwingUtilities.getWindowAncestor(host),
+                    mode = value.toInt(),
+                )
+            }
             "updatePictureInPictureInteraction" -> updateNativeCompactPlayerWindowInteraction(
                 SwingUtilities.getWindowAncestor(host),
             )
@@ -1023,10 +1757,46 @@ internal class NativePlayerController(
             )
             "cursorVisibility" -> {
                 val current = handle.takeIf { it != 0L } ?: return
-                NativePlayerBridge.setCursorHidden(current, value == 0.0)
+                val hide = value == 0.0
+                // fork:pip-browse - the box over the app never hides the pointer the app is being used with.
+                if (hide && browsePipActive()) {
+                    NativePlayerBridge.setCursorHidden(current, false)
+                    return
+                }
+                // fork:youtube-watch-page - on the watch page the video is only part of the window and the
+                // controls' idle timer only sees movement over it: the cursor is hidden only while it is
+                // over the video, and moving over the page shows it again.
+                if (com.nuvio.app.features.youtube.YouTubeWatchLayout.pageShown) {
+                    com.nuvio.app.features.youtube.YouTubeWatchLayout.revealCursor = {
+                        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setCursorHidden(it, false) }
+                    }
+                    if (hide && !pointerOverHost()) return
+                }
+                NativePlayerBridge.setCursorHidden(current, hide)
+            }
+            "hudSubtitleClearance" -> {
+                val percent = value.coerceIn(0.0, 100.0)
+                if (percent == hudSubtitleClearancePercent) return
+                hudSubtitleClearancePercent = percent
+                val current = handle.takeIf { it != 0L } ?: return
+                val style = pendingSubtitleStyle ?: return
+                // The bridge queues its light paused repaint for any sub-* write; the full
+                // forceVideoRedraw flashed the video black whenever the HUD showed or hid paused.
+                NativePlayerBridge.setMpvProperty(current, "sub-pos", effectiveSubtitlePosition(style).toString())
             }
             else -> {
                 if (type == "fileLoaded") {
+                    // Events reach here only for the current generation, so a later one than the
+                    // hide marker means the new source's file is the one now loaded.
+                    val hiddenThrough = tracksHiddenThroughGeneration
+                    if (hiddenThrough >= 0 && attachGeneration.get() > hiddenThrough) {
+                        tracksHiddenThroughGeneration = -1L
+                    }
+                    if (livePending?.tracePlaybackStart == true && DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+                        DisplayRefreshSwitcher.matchWhenKnown(liveHostViewPtr) {
+                            decodeTracks { NativePlayerBridge.videoTracksJson(it) }.firstOrNull { it.selected }?.fps
+                        }
+                    }
                     handle.takeIf { it != 0L }?.let { current ->
                         applyPendingSubtitleConfiguration(current)
                         // Align the overlay's tracked volume with mpv's real (possibly restored)
@@ -1063,15 +1833,14 @@ internal class NativePlayerController(
             PlayerControlsAction.KeyboardTogglePlayback -> {
                 val current = handle
                 if (current == 0L) return
-                val isEnded = NativePlayerBridge.isEnded(current)
-                val isPaused = NativePlayerBridge.isPaused(current)
-                if (isEnded) {
+                if (NativePlayerBridge.isEnded(current)) {
                     NativePlayerBridge.seekTo(current, 0L)
                     releaseMeteredPrefetchFreeze()
                     NativePlayerBridge.setPaused(current, false)
                 } else {
-                    if (isPaused) releaseMeteredPrefetchFreeze()
-                    NativePlayerBridge.setPaused(current, !isPaused)
+                    val play = NativePlayerBridge.isPaused(current)
+                    if (play) releaseMeteredPrefetchFreeze()
+                    NativePlayerBridge.setPaused(current, !play)
                 }
             }
             PlayerControlsAction.SeekBack,
@@ -1112,6 +1881,22 @@ internal class NativePlayerController(
         applyDesktopBufferPreset(PlayerSettingsRepository.uiState.value.desktopBufferPreset, next)
     }
 
+    /**
+     * [snapshot] off the UI thread. Every field is an mpv property read that waits on mpv's core,
+     * which stalled the UI thread 150-190 ms per poll while a hero trailer opened (`(UiStall)`,
+     * 2026-10-19). Holds the process-wide lifecycle lock, which the native dispose also takes, so
+     * the handle cannot be freed mid-read. A trailer's dispose skips that lock (see
+     * [mayHostVapourSynth]), so its polls do too rather than hold up the main player's create;
+     * the native handle registry already makes a read on a disposed id a no-op.
+     */
+    suspend fun snapshotOffUiThread(): PlayerPlaybackSnapshot = withContext(Dispatchers.IO) {
+        if (mayHostVapourSynth) {
+            synchronized(nativeProcessLifecycleLock) { snapshot() }
+        } else {
+            snapshot()
+        }
+    }
+
     fun snapshot(): PlayerPlaybackSnapshot {
         val current = handle
         if (current == 0L) return PlayerPlaybackSnapshot(isLoading = true)
@@ -1140,15 +1925,62 @@ internal class NativePlayerController(
         }.getOrDefault(PlayerPlaybackSnapshot(isLoading = true))
     }
 
+    /**
+     * fork:faststream-optin - turns FastStream on or off for the playing source and reopens it where
+     * it is (a fresh player, as a surface rebuild does), reading from the download or from YouTube.
+     */
+    fun setFastStream(on: Boolean, window: Boolean = false, speed: Float? = null) {
+        if (disposed) return
+        val pending = pendingSource?.takeIf { it.fastStreamEligible } ?: return
+        val fastStream = com.nuvio.app.features.youtube.YouTubeFastStream
+        if (!pending.streamUrls.all(fastStream::eligible)) return
+        // The button over automatic mode: the whole video as a download, without a reopen.
+        if (on && !window && pending.streamUrls.all(fastStream::isEnabled) && pending.streamUrls.any(fastStream::isWindowed)) {
+            fastStream.downloadWhole(pending.streamUrls)
+            return
+        }
+        if (on == pending.streamUrls.all(fastStream::isEnabled)) return
+        val current = synchronized(handleLock) { handle }.takeIf { it != 0L }
+        val positionMs = current?.let { runCatching { NativePlayerBridge.positionMs(it) }.getOrNull() }
+            ?.takeIf { it > 0L } ?: pending.initialPositionMs
+        val paused = current?.let { runCatching { NativePlayerBridge.isPaused(it) }.getOrNull() } ?: !pending.playWhenReady
+        // The reopened player starts at the speed it was playing at, not the one the video opened with.
+        val playingSpeed = speed ?: current?.let { runCatching { NativePlayerBridge.speed(it) }.getOrNull() }
+        if (on) {
+            val headers = pending.headerLines.toHeaderMap()
+            fastStream.enable(pending.streamUrls, headers, window = window)
+        } else {
+            fastStream.release(pending.streamUrls)
+        }
+        Logger.withTag("FastStream").i { "${if (on) "on" else "off"}${if (window) " (automatic)" else ""}: reopening at ${positionMs}ms" }
+        val options = playingSpeed?.let { value ->
+            pending.extraMpvOptions.map { if (it.startsWith("speed=")) "speed=${value.coerceIn(0.25f, 4f)}" else it }
+        } ?: pending.extraMpvOptions
+        pendingSource = pending.copy(
+            initialPositionMs = positionMs,
+            initialProgressFraction = 0f,
+            playWhenReady = !paused,
+            extraMpvOptions = options,
+        )
+        lastSeekFailureTargetMs = null
+        attachPending()
+    }
+
     fun dispose() {
         disposed = true
+        autoFastStreamTimer.stop()
         attachGeneration.incrementAndGet()
+        pendingSource?.takeIf { it.fastStreamEligible }?.let { closing ->
+            com.nuvio.app.features.youtube.YouTubeFastStream.release(closing.streamUrls)
+            com.nuvio.app.features.youtube.YouTubeFastStreamState.update { it.copy(available = false) }
+        }
         pendingSource = null
         host.onPeerReady = null
         onAction = { false }
         onEvent = { _, _ -> false }
         onScrubChange = { false }
         onScrubFinished = { false }
+        if (livePending?.tracePlaybackStart == true) DisplayRefreshSwitcher.releaseSoon()
         disposePlayerHandle()
     }
 
@@ -1161,6 +1993,14 @@ internal class NativePlayerController(
         val customOptionNames = desktopCustomMpvOptionNames(settings.desktopCustomMpvOptions)
         desktopBufferPresetMpvOptions(preset, DesktopHostOs.current, speed)
             .filterNot { (name, _) -> name == "stream-buffer-size" }
+            // Live TV's rewind buffer owns the back buffer; the preset would shrink it mid-stream.
+            .filterNot { (name, _) ->
+                name == "demuxer-max-back-bytes" && com.nuvio.app.features.iptv.iptvRewindActive(pendingSource?.sourceUrl)
+            }
+            // Likewise its resume threshold (see IPTV_CACHE_PAUSE_WAIT_SECONDS).
+            .filterNot { (name, _) ->
+                name == "cache-pause-wait" && com.nuvio.app.features.iptv.iptvLiveBufferActive(pendingSource?.sourceUrl)
+            }
             // While the Metered freeze is engaged the clamp outranks the preset. Without this an
             // unrelated re-apply (the video-profile flow re-runs this on every settings change, and
             // so does every speed change) would restore full readahead mid-pause and start
@@ -1224,22 +2064,37 @@ internal class NativePlayerController(
         val current = synchronized(handleLock) {
             val value = handle
             handle = 0L
+            livePending = null
+            NativeAudioDuck.unregister(value) // fork:voice-control
             value
         }
         keyboardPanelOpen = false
         lastSentControlsStructureKey = null
+        hudLabelsSent = false
         lastSentMediaSessionKey = null
         lastSentMpvMediaTitle = null
         // The clamp lived on the handle being torn down; the next handle starts from its pre-init
         // preset options, so only the flag needs clearing.
         meteredPrefetchFrozen = false
         if (current != 0L) {
+            val serialized = mayHostVapourSynth
             kotlin.concurrent.thread(isDaemon = true, name = "Nuvio-Player-Dispose") {
-                synchronized(nativeProcessLifecycleLock) {
+                if (serialized) {
+                    synchronized(nativeProcessLifecycleLock) {
+                        runCatching { NativePlayerBridge.dispose(current) }
+                    }
+                } else {
                     runCatching { NativePlayerBridge.dispose(current) }
                 }
             }
         }
+    }
+
+    /** Mirrors [handleFallbackAction]'s toggle: an ended or paused player plays, otherwise it pauses. */
+    override fun toggleWouldPlay(): Boolean? {
+        val current = handle
+        if (current == 0L) return null
+        return NativePlayerBridge.isEnded(current) || NativePlayerBridge.isPaused(current)
     }
 
     override fun play() {
@@ -1257,18 +2112,34 @@ internal class NativePlayerController(
         // A seek can invalidate the cache the freeze was protecting; let the demuxer refill at the
         // preset rate. The snapshot poll re-freezes once the new position has a resumable buffer.
         releaseMeteredPrefetchFreeze()
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekTo(it, positionMs) }
+        val current = handle.takeIf { it != 0L } ?: return
+        if (liveCacheOnlySeeks()) {
+            NativePlayerBridge.seekWithinCacheTo(current, positionMs)
+        } else {
+            NativePlayerBridge.seekTo(current, positionMs)
+        }
     }
 
     override fun seekBy(offsetMs: Long) {
         releaseMeteredPrefetchFreeze()
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekBy(it, offsetMs) }
+        val current = handle.takeIf { it != 0L } ?: return
+        if (liveCacheOnlySeeks()) {
+            NativePlayerBridge.seekWithinCacheBy(current, offsetMs)
+        } else {
+            NativePlayerBridge.seekBy(current, offsetMs)
+        }
     }
+
+    // A live channel can only seek inside what mpv has cached; anything further fell through to a
+    // connection that cannot seek and broke playback (see seekWithinCacheLocked in the bridge).
+    private fun liveCacheOnlySeeks(): Boolean =
+        com.nuvio.app.features.iptv.IptvPlaybackSession.isIptvUrl(pendingSource?.sourceUrl)
 
     override fun retry() {
         val pending = pendingSource ?: return
         attach(
             sourceUrl = pending.sourceUrl,
+            mediaTitle = pending.mediaTitle,
             sourceAudioUrl = pending.sourceAudioUrl,
             sourceHeaders = pending.headerLines.toHeaderMap(),
             playWhenReady = pending.playWhenReady,
@@ -1283,7 +2154,27 @@ internal class NativePlayerController(
     override fun setPlaybackSpeed(speed: Float) {
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setSpeed(it, speed) }
         applyDesktopBufferPreset(PlayerSettingsRepository.uiState.value.desktopBufferPreset, speed)
+        // fork:faststream-optin - automatic: past 1.25x googlevideo's pacing cannot keep up, so the YouTube
+        // stream moves to FastStream's window (one reopen at the same place and speed, then never again
+        // for this video).
+        // Waits until the speed has stopped changing: the HUD steps 1.1, 1.2, 1.3... and a reopen in the
+        // middle would start the new player at a speed the user has already gone past.
+        requestedSpeed = speed
+        autoFastStreamTimer.restart()
     }
+
+    @Volatile
+    private var requestedSpeed = 1f
+
+    private val autoFastStreamTimer = javax.swing.Timer(AUTO_FASTSTREAM_SETTLE_MS) {
+        val speed = requestedSpeed
+        if (disposed || speed < com.nuvio.app.features.youtube.YouTubeFastStream.AUTO_SPEED) return@Timer
+        val pending = pendingSource?.takeIf { it.fastStreamEligible } ?: return@Timer
+        val fastStream = com.nuvio.app.features.youtube.YouTubeFastStream
+        if (pending.streamUrls.all(fastStream::eligible) && !pending.streamUrls.all(fastStream::isEnabled)) {
+            setFastStream(on = true, window = true, speed = speed)
+        }
+    }.apply { isRepeats = false }
 
     override fun setMuted(muted: Boolean) {
         handle.takeIf { it != 0L }?.let { NativePlayerBridge.setMute(it, muted) }
@@ -1304,6 +2195,12 @@ internal class NativePlayerController(
      * the `mpv-diagnostics` chrome class, and the confirmation pill stay in sync — the HUD owns
      * that state and forwards the resulting `toggleMpvDiagnostics` event back to Kotlin.
      */
+    /** The player's menu, centred for the keyboard or pad, its rows walked with the arrows (controls.js). */
+    fun openPlayerMenu() {
+        val current = handle.takeIf { it != 0L } ?: return
+        NativePlayerBridge.runJavaScript(current, "window.nuvioOpenPlayerMenu && window.nuvioOpenPlayerMenu()")
+    }
+
     fun toggleMpvDiagnosticsOverlay() {
         val current = handle.takeIf { it != 0L } ?: return
         NativePlayerBridge.runJavaScript(
@@ -1365,7 +2262,7 @@ internal class NativePlayerController(
         val trackId = resolveTrackId(index, decodeTracks { NativePlayerBridge.audioTracksJson(it) }) ?: return false
         val selected = NativePlayerBridge.selectAudioTrack(current, trackId)
         if (!selected) {
-            showPresetPill("Audio track", "Stream is rate-limited - try again shortly")
+            showPresetPill(localizedString(Res.string.player_hud_audio_track), localizedString(Res.string.player_hud_stream_is_rate_limited_try_again))
         }
         return selected
     }
@@ -1428,9 +2325,149 @@ internal class NativePlayerController(
         handle.takeIf { it != 0L }?.let { current -> NativePlayerBridge.setSubtitleDelayMs(current, clamped) }
     }
 
+    override val supportsSpeechSpots: Boolean get() = handle != 0L
+
+    override fun decodeSpeechSpot(startSeconds: Double, durationSeconds: Double): FloatArray? {
+        val current = handle.takeIf { it != 0L } ?: return null
+        val directory = File(System.getProperty("java.io.tmpdir"), "nuvio-autosync").apply { mkdirs() }
+        val file = File.createTempFile("speech-", ".f32", directory)
+        return try {
+            val result = NativePlayerBridge.decodeSpeechSpot(current, startSeconds, durationSeconds, file.absolutePath)
+            // -1 is the native 90 s limit (or a start that failed): whatever was written by then is real audio, and the caller
+            // carries on from where it ends; any other failure gave nothing worth keeping.
+            if ((result != 0 && result != -1) || file.length() < 4) return null
+            // ao=pcm with audio-format=float writes raw little-endian float32 samples.
+            val samples = ByteBuffer.wrap(file.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+            FloatArray(samples.remaining()).also(samples::get)
+        } finally {
+            file.delete()
+        }
+    }
+
+    /**
+     * fork:live-tv-subtitles - what already played from [startSeconds] to [endSeconds], copied out of mpv's own cache
+     * (dump-cache: the live rewind buffer, so no second connection to the provider and no seek on the live stream), then
+     * decoded from that local copy to 16 kHz mono float PCM. Sample 0 is [startSeconds] (mpv starts a file at its first
+     * timestamp). Null when the range has left the cache, or on a bridge without the command (macOS).
+     */
+    override fun decodeCachedAudio(startSeconds: Double, endSeconds: Double): FloatArray? {
+        val current = handle.takeIf { it != 0L } ?: return null
+        if (endSeconds - startSeconds < 1.0) return null
+        val directory = File(System.getProperty("java.io.tmpdir"), "nuvio-autosync").apply { mkdirs() }
+        val dump = File.createTempFile("live-", ".ts", directory)
+        val pcm = File.createTempFile("live-", ".f32", directory)
+        return try {
+            val dumped = try {
+                NativePlayerBridge.mpvCommand(
+                    current,
+                    arrayOf("dump-cache", "%.3f".format(java.util.Locale.ROOT, startSeconds), "%.3f".format(java.util.Locale.ROOT, endSeconds), dump.absolutePath),
+                )
+            } catch (_: UnsatisfiedLinkError) {
+                -1
+            }
+            if (dumped < 0 || dump.length() < 4_096) return null
+            val decoded = try {
+                NativePlayerBridge.decodeAudioUrl(dump.absolutePath, emptyArray(), 0.0, endSeconds - startSeconds, 16_000, 1, pcm.absolutePath)
+            } catch (_: UnsatisfiedLinkError) {
+                -2
+            }
+            // -1 is the native time limit: what was written by then is real audio.
+            if ((decoded != 0 && decoded != -1) || pcm.length() < 4) return null
+            val samples = ByteBuffer.wrap(pcm.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+            FloatArray(samples.remaining()).also(samples::get)
+        } finally {
+            dump.delete()
+            pcm.delete()
+        }
+    }
+
+    /**
+     * A stretch of the playing audio as interleaved float32 PCM at [sampleRate] Hz with [channels] channels (1 or 2),
+     * decoded by a throwaway headless mpv like [decodeSpeechSpot]; null when it could not be read. Blocks. Used to
+     * measure a track's loudness (see MusicLoudness).
+     */
+    fun decodeAudioWindow(startSeconds: Double, durationSeconds: Double, sampleRate: Int, channels: Int): FloatArray? {
+        val current = handle.takeIf { it != 0L } ?: return null
+        val directory = File(System.getProperty("java.io.tmpdir"), "nuvio-autosync").apply { mkdirs() }
+        val file = File.createTempFile("loudness-", ".f32", directory)
+        return try {
+            val result = NativePlayerBridge.decodeAudioSpot(current, startSeconds, durationSeconds, sampleRate, channels, file.absolutePath)
+            if (result != 0 || file.length() < 4) return null
+            val samples = ByteBuffer.wrap(file.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+            FloatArray(samples.remaining()).also(samples::get)
+        } finally {
+            file.delete()
+        }
+    }
+
+    /** fork:visualiser - the audio decodes read this local copy instead of opening the stream again; null goes back to the stream. A build without the native call just keeps reading the stream. */
+    /**
+     * fork:gapless - queues [url] behind what is playing, in this same player, with [options] for it alone ("af=...").
+     * Null drops whatever was queued. Calls that need a native bridge without it (macOS) do nothing.
+     */
+    fun queueNext(url: String?, headers: Map<String, String>, options: List<String>) {
+        val current = handle.takeIf { it != 0L } ?: return
+        try {
+            NativePlayerBridge.queueNext(
+                current,
+                url.orEmpty(),
+                if (url == null) emptyArray() else headers.withDefaultPlaybackUserAgent(url).toHeaderLines().toTypedArray(),
+                options.toTypedArray(),
+            )
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    /** fork:gapless - points the audio decode (loudness, track map) at the queued stream that is now playing. */
+    fun setSpotSource(url: String?, headers: Map<String, String>) {
+        val current = handle.takeIf { it != 0L } ?: return
+        try {
+            NativePlayerBridge.setSpotSource(
+                current,
+                url,
+                if (url == null) emptyArray() else headers.withDefaultPlaybackUserAgent(url).toHeaderLines().toTypedArray(),
+            )
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    /** fork:gapless - the playlist entry playing, or -1 (no player, or a bridge without it). */
+    fun playlistPos(): Long {
+        val current = handle.takeIf { it != 0L } ?: return -1L
+        return try {
+            NativePlayerBridge.playlistPos(current)
+        } catch (_: UnsatisfiedLinkError) {
+            -1L
+        }
+    }
+
+    /** True when this player can queue a track behind the current one (the Windows bridge). */
+    val supportsQueueing: Boolean get() = DesktopHostOs.current == DesktopHostOs.WINDOWS
+
+    fun setAudioSpotFile(path: String?) {
+        val current = handle.takeIf { it != 0L } ?: return
+        try {
+            NativePlayerBridge.setAudioSpotFile(current, path)
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    override fun sourceBytesPerSecond(): Double? =
+        handle.takeIf { it != 0L }
+            ?.let { NativePlayerBridge.speechSourceBytesPerSecond(it) }
+            ?.takeIf { it > 0.0 }
+
     override fun applySubtitleStyle(style: SubtitleStyleState) {
+        val current = handle
+        // The Style tab applies a change from its click handler and the player screen applies the
+        // same style again once it recomposes; the repeat would cost a second round of property
+        // writes, a redraw and a paused refresh for nothing.
+        if (current != 0L && current == subtitleStyleAppliedHandle && style == pendingSubtitleStyle) return
         pendingSubtitleStyle = style
-        handle.takeIf { it != 0L }?.let { current -> applySubtitleStyle(current, style) }
+        if (current != 0L) {
+            applySubtitleStyle(current, style)
+            subtitleStyleAppliedHandle = current
+        }
     }
 
     private fun applyPendingSubtitleConfiguration(current: Long) {
@@ -1471,18 +2508,38 @@ internal class NativePlayerController(
             outlineSize = if (style.outlineEnabled) style.outlineWidth.toFloat() else 0f,
             bold = style.bold,
             fontSize = style.toMpvSubtitleFontSize(),
-            subPos = style.toMpvSubtitlePosition(),
+            subPos = effectiveSubtitlePosition(style),
             fontName = style.fontFamily,
         )
         // mpv's sub-shadow-color is an alias of sub-back-color. applySubtitleStyle writes the
         // user's (usually transparent) background to that property, so the shadow colour must be
         // applied afterwards or it is immediately overwritten and the offset appears to do
         // nothing. In outline-and-shadow mode sub-back-color is used for the shadow itself.
+        // No forceVideoRedraw here: the bridge's paused subtitle nudge, scheduled by the
+        // applySubtitleStyle call above, runs after this write on the same queue. The full redraw
+        // hides and re-shows the video window, which flashed black on paused subtitle changes.
         if (style.shadowEnabled && style.backgroundColor.alpha <= 0f) {
             NativePlayerBridge.setMpvProperty(current, "sub-back-color", style.shadowColor.toMpvColorString())
-            forceVideoRedraw()
         }
         reapplyCustomSubtitleOverrides(current)
+    }
+
+    /**
+     * The user's subtitle position, or — while the HUD is showing and the subtitles would reach
+     * into its chrome — the highest position whose bottom edge still sits on the clearance line
+     * the overlay reported. mpv puts a text subtitle's bottom edge at `sub-pos`% of the height
+     * less `sub-margin-y` (22 by default, in 720p-relative units, i.e. a fixed 22/720 of the
+     * height at any window size), and multi-line text grows upward from that edge — so it is the
+     * only thing that can collide with the controls, whatever the font size. Solving for the edge
+     * rather than the block means a subtitle that already clears the chrome, or one only just
+     * under it, moves not at all or by exactly the overlap.
+     */
+    private fun effectiveSubtitlePosition(style: SubtitleStyleState): Int {
+        val base = style.toMpvSubtitlePosition()
+        val clearance = hudSubtitleClearancePercent
+        if (clearance <= 0.0) return base
+        val ceiling = floor(clearance + 100.0 * MPV_DEFAULT_SUB_MARGIN_Y / 720.0).toInt().coerceIn(0, 150)
+        return minOf(base, ceiling)
     }
 
     private fun reapplyCustomSubtitleOverrides(current: Long) {
@@ -1508,7 +2565,73 @@ internal class NativePlayerController(
             }
     }
 
+    /**
+     * The selected video and audio tracks as mpv decoded them, for the player badges. Read from
+     * the bridge's cached track JSON, so it is cheap to poll. [width]/[height]/[isHdr] come from
+     * the caller, which already tracks the decoded frame.
+     */
+    fun playingMediaFacts(width: Int?, height: Int?, isHdr: Boolean): com.nuvio.app.features.player.PlayingMediaFacts? {
+        if (handle == 0L) return null
+        decodedWidth = width
+        decodedHeight = height
+        decodedIsHdr = isHdr
+        val video = decodeTracks { NativePlayerBridge.videoTracksJson(it) }.firstOrNull { it.selected }
+        val audio = decodeTracks { NativePlayerBridge.audioTracksJson(it) }.firstOrNull { it.selected }
+        if (video == null && audio == null) return null
+        return com.nuvio.app.features.player.PlayingMediaFacts(
+            width = width ?: video?.width?.takeIf { it > 0 },
+            height = height ?: video?.height?.takeIf { it > 0 },
+            isHdr = isHdr,
+            videoCodec = video?.codec?.takeIf(String::isNotBlank),
+            dolbyVisionProfile = video?.dvProfile ?: 0,
+            audioCodec = audio?.codec?.takeIf(String::isNotBlank),
+            audioProfile = audio?.profile?.takeIf(String::isNotBlank),
+            audioChannels = audio?.channelCount?.takeIf { it > 0 },
+            audioLanguage = audio?.language?.takeIf(String::isNotBlank),
+            videoProfile = video?.profile?.takeIf(String::isNotBlank),
+            fps = video?.fps?.takeIf { it > 0.0 },
+            videoBitrate = video?.bitrate?.takeIf { it > 0 },
+            audioTitle = audio?.label?.takeIf(String::isNotBlank),
+            audioSampleRate = audio?.sampleRate?.takeIf { it > 0 },
+            audioBitrate = audio?.bitrate?.takeIf { it > 0 },
+        )
+    }
+
+    // The decoded frame as PlayerEngine.desktop last reported it (it is the one that tracks it).
+    @Volatile private var decodedWidth: Int? = null
+    @Volatile private var decodedHeight: Int? = null
+    @Volatile private var decodedIsHdr: Boolean = false
+
+    override fun playingMediaFacts(): com.nuvio.app.features.player.PlayingMediaFacts? =
+        playingMediaFacts(decodedWidth, decodedHeight, decodedIsHdr)
+
+    /** Image badges for what is playing, shown in the title block; empty hides them. */
+    fun setPlayerBadges(badges: List<com.nuvio.app.features.streams.StreamBadge>) {
+        val current = handle.takeIf { it != 0L } ?: return
+        val payload = badges.joinToString(prefix = "[", postfix = "]") { badge ->
+            // The chip's fill and border as StreamBadgeChip draws them in the stream list.
+            val fill = badgeFillCssColorOrNull(badge.tagColor, badge.tagStyle).orEmpty()
+            val border = badge.borderColor.toBadgeCssColorOrNull().orEmpty()
+            "{\"name\":${badge.name.toJsonString()},\"imageURL\":${badge.imageURL.toJsonString()}," +
+                "\"backgroundColor\":${fill.toJsonString()},\"borderColor\":${border.toJsonString()}}"
+        }
+        NativePlayerBridge.runJavaScript(current, "window.nuvioSetPlayerBadges && window.nuvioSetPlayerBadges($payload)")
+    }
+
+    /**
+     * Reports no tracks until the next source's file has loaded. The surface hands this controller
+     * to the player screen as soon as the source changes, but the attach (and with it the live
+     * player's `loadfile`) only follows the redirect resolution. Reading tracks in that window
+     * returned the previous episode's list, whose already-selected subtitle the screen took as its
+     * preferred track being on; the reused player then cleared `sid` for the new file and nothing
+     * selected it again. UI thread.
+     */
+    fun hideTracksUntilNextFileLoads() {
+        tracksHiddenThroughGeneration = attachGeneration.get()
+    }
+
     private fun decodeTracks(readJson: (Long) -> String): List<NativeMpvTrack> {
+        if (tracksHiddenThroughGeneration >= 0) return emptyList()
         val current = handle.takeIf { it != 0L } ?: return emptyList()
         return runCatching {
             json.decodeFromString<List<NativeMpvTrack>>(readJson(current))
@@ -1524,6 +2647,15 @@ private data class NativeMpvTrack(
     val language: String = "",
     val selected: Boolean = false,
     val forced: Boolean = false,
+    val codec: String = "",
+    val profile: String = "",
+    val channelCount: Int = 0,
+    val dvProfile: Int = 0,
+    val width: Int = 0,
+    val height: Int = 0,
+    val fps: Double = 0.0,
+    val bitrate: Long = 0,
+    val sampleRate: Int = 0,
 )
 
 @Serializable
@@ -1560,6 +2692,9 @@ private const val METERED_PAUSED_PREFETCH_SECS = "1"
 
 /** Minimum buffer ahead of the playhead before pausing is allowed to freeze prefetch. */
 private const val METERED_FREEZE_MIN_BUFFER_MS = 3_000L
+
+/** fork:faststream-optin - how long the speed must stay put before automatic FastStream reopens the player. */
+private const val AUTO_FASTSTREAM_SETTLE_MS = 700
 
 private data class DesktopBufferLimits(
     val readaheadSeconds: Int,
@@ -1662,6 +2797,10 @@ private fun Color.toMpvColorString(): String {
 private fun SubtitleStyleState.toMpvSubtitleAssScale(): Double =
     assScalePercent.coerceIn(SUBTITLE_ASS_SCALE_MIN, SUBTITLE_ASS_SCALE_MAX) / 100.0
 
+// mpv's default `sub-margin-y`; nothing in the player sets it, and it has no property getter on
+// the bridge. Only effectiveSubtitlePosition depends on it, and only to a fraction of a percent.
+private const val MPV_DEFAULT_SUB_MARGIN_Y = 22.0
+
 private fun SubtitleStyleState.toMpvSubtitlePosition(): Int =
     (100 - (bottomOffset / 2)).coerceIn(0, 150)
 
@@ -1689,6 +2828,7 @@ private fun String.jsEscape(): String =
 
 private data class PendingSource(
     val sourceUrl: String,
+    val mediaTitle: String = "",
     val sourceAudioUrl: String?,
     val headerLines: List<String>,
     val playWhenReady: Boolean,
@@ -1703,7 +2843,13 @@ private data class PendingSource(
     val controlsPageUrl: String,
     val tracePlaybackStart: Boolean = false,
     val restoreVolume: Boolean = false,
-)
+    /** fork:faststream-optin - the main player (never a trailer): its YouTube streams may use FastStream. */
+    val fastStreamEligible: Boolean = false,
+) {
+    /** fork:faststream-optin - every stream URL mpv opens for this source: the video, then each audio track. */
+    val streamUrls: List<String>
+        get() = listOf(sourceUrl) + sourceAudioUrl?.lines()?.filter { it.isNotBlank() }?.map { it.substringAfterLast('\t') }.orEmpty()
+}
 
 // Standard bitstream formats to hand untouched to a receiver when passthrough is on. dts-hd
 // covers DTS-HD High Resolution; dts-hd-ma covers DTS-HD Master Audio.
@@ -1736,6 +2882,15 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
                 hostOs = DesktopHostOs.current,
                 playbackSpeed = initialPlaybackSpeed,
             ).forEach { (name, value) -> add("$name=$value") }
+            // Nuvio's stats overlay in place of the built-in one (same script name, so the
+            // diagnostics binding still finds it). `scripts`, not `scripts-append`: mpv's option
+            // API rejects the -append suffix. A `scripts=` line in the custom options box is
+            // applied later and replaces this, which leaves no overlay; so would a failed export,
+            // hence the built-in is only switched off when ours is there.
+            DesktopMpvScripts.statsScriptPath?.let {
+                add("load-stats-overlay=no")
+                add("scripts=$it")
+            }
         }
         // Let mpv select an embedded preferred-language subtitle as part of file loading. Waiting
         // for the Compose-side track poll is unnecessarily fragile for tracks already present in
@@ -1790,7 +2945,13 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
         // Curated overrides from the "Advanced (mpv)" menu, before the raw options box so a
         // hand-typed line can still win over a menu selection for the same property.
         if (useNuvioOptions) {
-            settings.desktopMpvPropertyOverrides.forEach { (key, value) -> add("$key=$value") }
+            settings.desktopMpvPropertyOverrides.forEach { (key, value) ->
+                if (key !in DESKTOP_PROFILE_OWNED_OVERRIDE_KEYS) add("$key=$value")
+            }
+            // Audio profile and headphone surround share one `af` chain.
+            desktopAudioFilterChain(settings.desktopMpvPropertyOverrides)
+                .takeIf { it.isNotEmpty() }
+                ?.let { add("af=$it") }
         }
         if (settings.desktopMpvConfigMode != DesktopMpvConfigMode.Off) {
             settings.desktopCustomMpvOptions.lineSequence()
@@ -1800,6 +2961,71 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
         }
     }
 }
+
+/**
+ * How long mpv waits on a silent connection to a debrid CDN before giving up, in place of mpv's
+ * 60 s default. These hosts answer a range request in well under a second (TorBox store nodes
+ * measured 0.1-0.6 s), so a minute of silence is a stalled node, not a slow one: on 2026-10-03
+ * `store-046.wnam.tb-cdn.io` held five opens for the full 60 s each. Failing in 15 s lets the
+ * TorBox node hop or failover start while the user is still waiting. Mid-playback it also brings
+ * FFmpeg's own `reconnect=1` retry forward, since a timed-out read of a partly read file
+ * reconnects at the same offset. Resolver and addon endpoints keep the default: a resolve can
+ * legitimately take 10 s or more (Debridio once took 14 s waiting on a throttled TorBox call).
+ */
+internal const val DIRECT_MEDIA_NETWORK_TIMEOUT_SECONDS = 15
+
+/**
+ * mpv's diagnostics overlay prints the `filename` property, which is the last path segment of the
+ * URL it opened and ignores `force-media-title`. A debrid CDN link ends in an opaque hash plus the
+ * account token (`/dld/<hash>?token=...`), so that is what the overlay showed.
+ *
+ * Appending `#/<title>` gives mpv a readable basename. FFmpeg's http protocol drops the fragment
+ * from the request line, so the server sees the original URL. Limited to direct-media hosts and to
+ * non-manifest paths: an HLS/DASH manifest resolves its relative segment URLs against the base URL,
+ * and a `/` inside the fragment would corrupt that base.
+ */
+/**
+ * fork:usenet - a built-in Usenet session's seek thumbnails read the engine's preview address,
+ * which it serves without read-ahead (see [NativePlayerBridge.setAuxiliarySource]). Nothing for
+ * any other source.
+ */
+private fun pointSideDecodersAtPreview(handle: Long, playedUrl: String, sourceUrl: String) {
+    val preview = com.nuvio.app.features.usenet.UsenetEngineUrls.preview(sourceUrl) ?: return
+    runCatching { NativePlayerBridge.setAuxiliarySource(handle, playedUrl, preview) }
+}
+
+internal fun withMpvFilenameHint(url: String, title: String): String {
+    val name = title.trim().replace(Regex("[\\\\/\\s]+"), " ").trim()
+    if (name.isEmpty() || '#' in url) return url
+    if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) return url
+    if (!PlaybackRedirectResolver.isDirectMediaHost(url)) return url
+    val path = url.substringBefore('?').lowercase()
+    if (path.endsWith(".m3u8") || path.endsWith(".mpd")) return url
+    return "$url#/${java.net.URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")}"
+}
+
+/**
+ * HLS from web providers. FFmpeg's HLS reader keeps one connection per host for the playlist's requests
+ * (`http_persistent`). A master that lists its subtitles as bare `.vtt` files rather than subtitle
+ * playlists (a plugin's provider, Nov 2026) makes each one a failed playlist parse that leaves the
+ * subtitle unread on that connection, and the next request over it, the video's own playlist, reads
+ * that text instead and fails too: sound, a black picture and no duration. A connection per request
+ * costs one handshake a segment. `extension_picky=0` also keeps audio segments that are MPEG-TS under
+ * an `.aac` name playing. Not live TV, which sets demuxer options of its own.
+ */
+internal fun hlsDemuxerMpvOption(sourceUrl: String): String? =
+    if (sourceUrl.isHlsPlaylistUrl() && !com.nuvio.app.features.iptv.IptvPlaybackSession.isIptvUrl(sourceUrl)) {
+        "demuxer-lavf-o=http_persistent=0,extension_picky=0"
+    } else {
+        null
+    }
+
+internal fun directMediaNetworkTimeoutOption(sourceUrl: String): String? =
+    if (PlaybackRedirectResolver.isDirectMediaHost(sourceUrl)) {
+        "network-timeout=$DIRECT_MEDIA_NETWORK_TIMEOUT_SECONDS"
+    } else {
+        null
+    }
 
 /**
  * Web (non-debrid) addon streams are served by streaming-site CDNs that reject libmpv's default
@@ -1865,6 +3091,36 @@ private fun String.toPlayerControlsAction(): PlayerControlsAction? =
 private val controlsJsonLog = Logger.withTag("PlayerControlsJson")
 
 private val audioPassthroughLog = Logger.withTag("PlayerAudioPassthrough")
+private val compactPressLog = Logger.withTag("PlayerPip")
+private val playerReuseLog = Logger.withTag("PlayerReuse")
+
+internal const val MPV_TRACE_ID_OPTION_PREFIX = "@nuvio-trace-id="
+
+/**
+ * Loading the next source into the live player (see NativePlayerController.canReuseLivePlayer) is
+ * on unless a file named `no-player-reuse` sits in the data folder, so a user hit by a regression
+ * can go back to recreating the player per source without a new build.
+ */
+private val nativePlayerReuseEnabled: Boolean by lazy {
+    runCatching { !java.nio.file.Files.exists(DesktopStorage.rootDir.resolve("no-player-reuse")) }
+        .getOrDefault(true)
+}
+
+/**
+ * Whether a player started with [liveOptions] can load a source that would have been started with
+ * [nextOptions]. Everything in them is applied once, before mpv_initialize, so they must match;
+ * only what the bridge re-applies per file on a replacement may differ: the trace id and the media
+ * title. Order counts (a later entry overrides an earlier one with the same key).
+ */
+internal fun mpvOptionsAllowSourceReplacement(liveOptions: List<String>, nextOptions: List<String>): Boolean {
+    fun instanceLevel(options: List<String>) = options.filterNot { option ->
+        option.startsWith(MPV_TRACE_ID_OPTION_PREFIX) || option.startsWith("force-media-title=")
+    }
+    return instanceLevel(liveOptions) == instanceLevel(nextOptions)
+}
+
+/** How long PiP's X waits after giving the window back its size before closing the player. */
+private const val PIP_CLOSE_SETTLE_MS = 400
 
 private val episodeArtworkLog = Logger.withTag("PlayerEpisodeArtwork")
 
@@ -1910,9 +3166,17 @@ internal fun payloadExcerptAroundFailure(payload: String, message: String): Stri
     )
 }
 
-private fun PlayerControlsState.toControlsJson(
+// internal (not private) so ControlsJsonGuardTest can check whole payloads, not just samples.
+internal fun PlayerControlsState.toControlsJson(
     appFullscreenKeyCode: Int,
     playerShortcutKeyCodes: Map<String, Int>,
+    skipIntervalKeyLabel: String,
+    voiceKeyCode: Int = 0,
+    miniPlayer: Boolean = false,
+    watchPage: Boolean = false,
+    miniPlayerClosable: Boolean = false,
+    pipBrowseAvailable: Boolean = false,
+    pipBrowseBox: Boolean = false,
 ): String =
     buildString {
         append('{')
@@ -1924,187 +3188,230 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("providerName", providerName)
         append(',')
-        appendJsonField("pauseOverlayWatchingLabel", pauseOverlayWatchingLabel)
+        appendJsonField("isYouTubeVideo", isYouTubeVideo)
         append(',')
-        appendJsonField("pauseOverlayLogo", pauseOverlayLogo.orEmpty())
+        appendJsonField("pauseOverlayWatchingLabel", pauseOverlay.pauseOverlayWatchingLabel)
         append(',')
-        appendJsonField("pauseOverlayEpisodeInfo", pauseOverlayEpisodeInfo)
+        appendJsonField("pauseOverlayLogo", pauseOverlay.pauseOverlayLogo.orEmpty())
         append(',')
-        appendJsonField("pauseOverlayEpisodeTitle", pauseOverlayEpisodeTitle)
+        appendJsonField("pauseOverlayEpisodeInfo", pauseOverlay.pauseOverlayEpisodeInfo)
         append(',')
-        appendJsonField("pauseOverlayDescription", pauseOverlayDescription)
+        appendJsonField("pauseOverlayEpisodeTitle", pauseOverlay.pauseOverlayEpisodeTitle)
         append(',')
-        appendJsonField("pauseOverlaySourceEnabled", pauseOverlaySourceEnabled)
+        appendJsonField("pauseOverlayDescription", pauseOverlay.pauseOverlayDescription)
+        append(',')
+        appendJsonField("pauseOverlaySourceEnabled", pauseOverlay.pauseOverlaySourceEnabled)
+        append(',')
+        appendJsonField("pauseOverlayEnabled", pauseOverlay.pauseOverlayEnabled)
+        append(',')
+        appendJsonArrayField("pauseOverlayCast", pauseOverlay.pauseOverlayCast) { appendCastItemJson(it) }
         append(',')
         appendJsonField("resizeModeLabel", resizeModeLabel)
         append(',')
         appendJsonField("playbackSpeedLabel", playbackSpeedLabel)
         append(',')
-        appendJsonField("subtitlesLabel", subtitlesLabel)
+        appendJsonField("subtitlesLabel", labels.subtitlesLabel)
         append(',')
-        appendJsonField("audioLabel", audioLabel)
+        appendJsonField("audioLabel", labels.audioLabel)
         append(',')
-        appendJsonField("sourcesLabel", sourcesLabel)
+        appendJsonField("sourcesLabel", labels.sourcesLabel)
         append(',')
-        appendJsonField("episodesLabel", episodesLabel)
+        appendJsonField("episodesLabel", labels.episodesLabel)
         append(',')
-        appendJsonField("externalPlayerLabel", externalPlayerLabel)
+        appendJsonField("externalPlayerLabel", labels.externalPlayerLabel)
         append(',')
-        appendJsonField("playLabel", playLabel)
+        appendJsonField("playLabel", labels.playLabel)
         append(',')
-        appendJsonField("pauseLabel", pauseLabel)
+        appendJsonField("pauseLabel", labels.pauseLabel)
         append(',')
-        appendJsonField("closeLabel", closeLabel)
+        appendJsonField("closeLabel", labels.closeLabel)
         append(',')
-        appendJsonField("lockLabel", lockLabel)
+        appendJsonField("lockLabel", labels.lockLabel)
         append(',')
-        appendJsonField("unlockLabel", unlockLabel)
+        appendJsonField("unlockLabel", labels.unlockLabel)
         append(',')
-        appendJsonField("submitIntroLabel", submitIntroLabel)
+        appendJsonField("submitIntroLabel", labels.submitIntroLabel)
         append(',')
-        appendJsonField("videoSettingsLabel", videoSettingsLabel)
+        appendJsonField("videoSettingsLabel", labels.videoSettingsLabel)
         append(',')
-        appendJsonField("pictureInPictureLabel", pictureInPictureLabel)
+        appendJsonField("pictureInPictureLabel", labels.pictureInPictureLabel)
         append(',')
         appendJsonField("pictureInPictureActive", pictureInPictureActive)
         append(',')
-        appendJsonField("desktopHdrModeLabel", desktopHdrModeLabel)
+        appendJsonField("miniPlayer", miniPlayer)
         append(',')
-        appendJsonField("desktopColorProfileLabel", desktopColorProfileLabel)
+        appendJsonField("miniPlayerClosable", miniPlayerClosable)
         append(',')
-        appendJsonField("desktopColorContrast", desktopColorContrast)
+        appendJsonField("pipBrowseAvailable", pipBrowseAvailable)
         append(',')
-        appendJsonField("desktopColorBrightness", desktopColorBrightness)
+        appendJsonField("pipBrowseBox", pipBrowseBox)
         append(',')
-        appendJsonField("desktopColorSaturation", desktopColorSaturation)
+        appendJsonField("watchPage", watchPage)
         append(',')
-        appendJsonField("desktopColorGamma", desktopColorGamma)
+        appendJsonField("desktopHdrModeLabel", video.desktopHdrModeLabel)
         append(',')
-        appendJsonField("desktopAnimeModeLabel", desktopAnimeModeLabel)
+        appendJsonField("desktopColorProfileLabel", video.desktopColorProfileLabel)
         append(',')
-        appendJsonField("desktopAnimeSvpEnabled", desktopAnimeSvpEnabled)
+        appendJsonField("desktopColorContrast", video.desktopColorContrast)
         append(',')
-        appendJsonField("playbackInfoPanelEnabled", playbackInfoPanelEnabled)
+        appendJsonField("desktopColorBrightness", video.desktopColorBrightness)
         append(',')
-        appendJsonField("activeSubtitleLabel", activeSubtitleLabel)
+        appendJsonField("desktopColorSaturation", video.desktopColorSaturation)
         append(',')
-        appendJsonField("seekThumbnailsEnabled", seekThumbnailsEnabled)
+        appendJsonField("desktopColorGamma", video.desktopColorGamma)
         append(',')
-        appendJsonField("seekStepSeconds", seekStepSeconds)
+        appendJsonField("desktopAnimeModeLabel", video.desktopAnimeModeLabel)
         append(',')
-        appendJsonField("tapToUnlockLabel", tapToUnlockLabel)
+        appendJsonField("desktopAnimeSvpEnabled", video.desktopAnimeSvpEnabled)
         append(',')
-        appendJsonField("playbackErrorTitle", playbackErrorTitle)
+        appendJsonField("rtxVsrEnabled", video.rtxVsrEnabled)
+        append(',')
+        appendJsonField("rtxTrueHdrEnabled", video.rtxTrueHdrEnabled)
+        append(',')
+        appendJsonField("playbackInfoPanelEnabled", hud.playbackInfoPanelEnabled)
+        append(',')
+        appendJsonField("activeSubtitleLabel", subtitles.activeSubtitleLabel)
+        append(',')
+        appendJsonField("seekThumbnailsEnabled", seekPreview.seekThumbnailsEnabled)
+        append(',')
+        appendJsonField("seekrVttUrl", seekPreview.seekrVttUrl)
+        append(',')
+        appendJsonField("seekrScale", seekPreview.seekrScale)
+        append(',')
+        appendJsonField("storyboardUrl", seekPreview.storyboardUrl)
+        append(',')
+        appendJsonField("storyboardWidth", seekPreview.storyboardWidth)
+        append(',')
+        appendJsonField("storyboardHeight", seekPreview.storyboardHeight)
+        append(',')
+        appendJsonField("storyboardColumns", seekPreview.storyboardColumns)
+        append(',')
+        appendJsonField("storyboardRows", seekPreview.storyboardRows)
+        append(',')
+        appendJsonField("storyboardCount", seekPreview.storyboardCount)
+        append(',')
+        appendJsonField("storyboardIntervalMs", seekPreview.storyboardIntervalMs)
+        append(',')
+        appendJsonField("seekStepSeconds", hud.seekStepSeconds)
+        append(',')
+        append("\"iptv\":")
+        iptv?.let { appendIptvStateJson(it) } ?: append("null")
+        append(',')
+        appendJsonField("tapToUnlockLabel", labels.tapToUnlockLabel)
+        append(',')
+        appendJsonField("playbackErrorTitle", labels.playbackErrorTitle)
         append(',')
         appendJsonField("playbackErrorMessage", playbackErrorMessage)
         append(',')
-        appendJsonField("playbackErrorActionLabel", playbackErrorActionLabel)
+        appendJsonField("playbackErrorActionLabel", labels.playbackErrorActionLabel)
         append(',')
-        appendJsonField("sourcesPanelTitle", sourcesPanelTitle)
+        appendJsonField("sourcesPanelTitle", labels.sourcesPanelTitle)
         append(',')
-        appendJsonField("episodesPanelTitle", episodesPanelTitle)
+        appendJsonField("episodesPanelTitle", labels.episodesPanelTitle)
         append(',')
-        appendJsonField("streamsPanelTitle", streamsPanelTitle)
+        appendJsonField("streamsPanelTitle", labels.streamsPanelTitle)
         append(',')
-        appendJsonField("allFilterLabel", allFilterLabel)
+        appendJsonField("allFilterLabel", labels.allFilterLabel)
         append(',')
-        appendJsonField("reloadLabel", reloadLabel)
+        appendJsonField("reloadLabel", labels.reloadLabel)
         append(',')
-        appendJsonField("backLabel", backLabel)
+        appendJsonField("backLabel", labels.backLabel)
         append(',')
-        appendJsonField("panelCloseLabel", panelCloseLabel)
+        appendJsonField("panelCloseLabel", labels.panelCloseLabel)
         append(',')
-        appendJsonField("cancelLabel", cancelLabel)
+        appendJsonField("cancelLabel", labels.cancelLabel)
         append(',')
-        appendJsonField("playingLabel", playingLabel)
+        appendJsonField("playingLabel", labels.playingLabel)
         append(',')
-        appendJsonField("noStreamsLabel", noStreamsLabel)
+        appendJsonField("noStreamsLabel", labels.noStreamsLabel)
         append(',')
-        appendJsonField("noEpisodesLabel", noEpisodesLabel)
+        appendJsonField("noEpisodesLabel", labels.noEpisodesLabel)
         append(',')
-        appendJsonField("submitIntroPanelTitle", submitIntroPanelTitle)
+        appendJsonField("submitIntroPanelTitle", submitIntro.submitIntroPanelTitle)
         append(',')
-        appendJsonField("submitIntroSegmentTypeLabel", submitIntroSegmentTypeLabel)
+        appendJsonField("submitIntroSegmentTypeLabel", submitIntro.submitIntroSegmentTypeLabel)
         append(',')
-        appendJsonField("submitIntroSegmentIntroLabel", submitIntroSegmentIntroLabel)
+        appendJsonField("submitIntroSegmentIntroLabel", submitIntro.submitIntroSegmentIntroLabel)
         append(',')
-        appendJsonField("submitIntroSegmentRecapLabel", submitIntroSegmentRecapLabel)
+        appendJsonField("submitIntroSegmentRecapLabel", submitIntro.submitIntroSegmentRecapLabel)
         append(',')
-        appendJsonField("submitIntroSegmentOutroLabel", submitIntroSegmentOutroLabel)
+        appendJsonField("submitIntroSegmentOutroLabel", submitIntro.submitIntroSegmentOutroLabel)
         append(',')
-        appendJsonField("submitIntroSegmentPreviewLabel", submitIntroSegmentPreviewLabel)
+        appendJsonField("submitIntroSegmentPreviewLabel", submitIntro.submitIntroSegmentPreviewLabel)
         append(',')
-        appendJsonField("submitIntroStartTimeLabel", submitIntroStartTimeLabel)
+        appendJsonField("submitIntroStartTimeLabel", submitIntro.submitIntroStartTimeLabel)
         append(',')
-        appendJsonField("submitIntroEndTimeLabel", submitIntroEndTimeLabel)
+        appendJsonField("submitIntroEndTimeLabel", submitIntro.submitIntroEndTimeLabel)
         append(',')
-        appendJsonField("submitIntroCaptureLabel", submitIntroCaptureLabel)
+        appendJsonField("submitIntroCaptureLabel", submitIntro.submitIntroCaptureLabel)
         append(',')
-        appendJsonField("submitIntroSubmitLabel", submitIntroSubmitLabel)
+        appendJsonField("submitIntroSubmitLabel", submitIntro.submitIntroSubmitLabel)
         append(',')
-        appendJsonField("p2pConsentTitle", p2pConsentTitle)
+        appendJsonField("p2pConsentTitle", labels.p2pConsentTitle)
         append(',')
-        appendJsonField("p2pConsentBody", p2pConsentBody)
+        appendJsonField("p2pConsentBody", labels.p2pConsentBody)
         append(',')
-        appendJsonField("p2pConsentEnableLabel", p2pConsentEnableLabel)
+        appendJsonField("p2pConsentEnableLabel", labels.p2pConsentEnableLabel)
         append(',')
-        appendJsonField("p2pConsentCancelLabel", p2pConsentCancelLabel)
+        appendJsonField("p2pConsentCancelLabel", labels.p2pConsentCancelLabel)
         append(',')
-        appendJsonField("subtitlesPanelTitle", subtitlesPanelTitle)
+        appendJsonField("subtitlesPanelTitle", subtitleLabels.subtitlesPanelTitle)
         append(',')
-        appendJsonField("subtitleBuiltInTabLabel", subtitleBuiltInTabLabel)
+        appendJsonField("subtitleBuiltInTabLabel", subtitleLabels.subtitleBuiltInTabLabel)
         append(',')
-        appendJsonField("subtitleAddonsTabLabel", subtitleAddonsTabLabel)
+        appendJsonField("subtitleAddonsTabLabel", subtitleLabels.subtitleAddonsTabLabel)
         append(',')
-        appendJsonField("subtitleStyleTabLabel", subtitleStyleTabLabel)
+        appendJsonField("subtitleStyleTabLabel", subtitleLabels.subtitleStyleTabLabel)
         append(',')
-        appendJsonField("noneLabel", noneLabel)
+        appendJsonField("noneLabel", subtitleLabels.noneLabel)
         append(',')
-        appendJsonField("fetchSubtitlesLabel", fetchSubtitlesLabel)
+        appendJsonField("fetchSubtitlesLabel", subtitleLabels.fetchSubtitlesLabel)
         append(',')
-        appendJsonField("downloadSubtitleLabel", downloadSubtitleLabel)
+        appendJsonField("downloadSubtitleLabel", subtitleLabels.downloadSubtitleLabel)
         append(',')
-        appendJsonField("subtitleDelayLabel", subtitleDelayLabel)
+        appendJsonField("autoSyncedSubtitleLabel", subtitleLabels.autoSyncedSubtitleLabel)
         append(',')
-        appendJsonField("resetLabel", resetLabel)
+        appendJsonField("subtitleDelayLabel", subtitleLabels.subtitleDelayLabel)
         append(',')
-        appendJsonField("autoSyncLabel", autoSyncLabel)
+        appendJsonField("resetLabel", subtitleLabels.resetLabel)
         append(',')
-        appendJsonField("reloadSmallLabel", reloadSmallLabel)
+        appendJsonField("autoSyncLabel", subtitleLabels.autoSyncLabel)
         append(',')
-        appendJsonField("captureLineLabel", captureLineLabel)
+        appendJsonField("reloadSmallLabel", subtitleLabels.reloadSmallLabel)
         append(',')
-        appendJsonField("selectAddonSubtitleFirstLabel", selectAddonSubtitleFirstLabel)
+        appendJsonField("captureLineLabel", subtitleLabels.captureLineLabel)
         append(',')
-        appendJsonField("loadingSubtitleLinesLabel", loadingSubtitleLinesLabel)
+        appendJsonField("selectAddonSubtitleFirstLabel", subtitleLabels.selectAddonSubtitleFirstLabel)
         append(',')
-        appendJsonField("fontSizeLabel", fontSizeLabel)
+        appendJsonField("loadingSubtitleLinesLabel", subtitleLabels.loadingSubtitleLinesLabel)
         append(',')
-        appendJsonField("outlineLabel", outlineLabel)
+        appendJsonField("fontSizeLabel", subtitleLabels.fontSizeLabel)
         append(',')
-        appendJsonField("outlineWidthLabel", outlineWidthLabel)
+        appendJsonField("outlineLabel", subtitleLabels.outlineLabel)
         append(',')
-        appendJsonField("shadowLabel", shadowLabel)
+        appendJsonField("outlineWidthLabel", subtitleLabels.outlineWidthLabel)
         append(',')
-        appendJsonField("shadowOffsetLabel", shadowOffsetLabel)
+        appendJsonField("shadowLabel", subtitleLabels.shadowLabel)
         append(',')
-        appendJsonField("shadowColorLabel", shadowColorLabel)
+        appendJsonField("shadowOffsetLabel", subtitleLabels.shadowOffsetLabel)
         append(',')
-        appendJsonField("shadowIntensityLabel", shadowIntensityLabel)
+        appendJsonField("shadowColorLabel", subtitleLabels.shadowColorLabel)
         append(',')
-        appendJsonField("blurLabel", blurLabel)
+        appendJsonField("shadowIntensityLabel", subtitleLabels.shadowIntensityLabel)
         append(',')
-        appendJsonField("boldLabel", boldLabel)
+        appendJsonField("blurLabel", subtitleLabels.blurLabel)
         append(',')
-        appendJsonField("italicLabel", italicLabel)
+        appendJsonField("boldLabel", subtitleLabels.boldLabel)
         append(',')
-        appendJsonField("bottomOffsetLabel", bottomOffsetLabel)
+        appendJsonField("italicLabel", subtitleLabels.italicLabel)
         append(',')
-        appendJsonField("assStyleModeLabel", assStyleModeLabel)
+        appendJsonField("bottomOffsetLabel", subtitleLabels.bottomOffsetLabel)
         append(',')
-        appendJsonField("assScaleLabel", assScaleLabel)
+        appendJsonField("assStyleModeLabel", subtitleLabels.assStyleModeLabel)
         append(',')
-        appendJsonField("assStyleModeValueLabel", assStyleModeValueLabel)
+        appendJsonField("assScaleLabel", subtitleLabels.assScaleLabel)
+        append(',')
+        appendJsonField("assStyleModeValueLabel", subtitles.assStyleModeValueLabel)
         append(',')
         // The level list itself, so the panel's dropdown is built from the enum rather than from a
         // copy of it kept in the overlay that could drift out of order.
@@ -2116,47 +3423,47 @@ private fun PlayerControlsState.toControlsJson(
             append('}')
         }
         append(',')
-        appendJsonField("colorLabel", colorLabel)
+        appendJsonField("colorLabel", subtitleLabels.colorLabel)
         append(',')
-        appendJsonField("textOpacityLabel", textOpacityLabel)
+        appendJsonField("textOpacityLabel", subtitleLabels.textOpacityLabel)
         append(',')
-        appendJsonField("outlineColorLabel", outlineColorLabel)
+        appendJsonField("outlineColorLabel", subtitleLabels.outlineColorLabel)
         append(',')
-        appendJsonField("backgroundColorLabel", backgroundColorLabel)
+        appendJsonField("backgroundColorLabel", subtitleLabels.backgroundColorLabel)
         append(',')
-        appendJsonField("resetDefaultsLabel", resetDefaultsLabel)
+        appendJsonField("resetDefaultsLabel", subtitleLabels.resetDefaultsLabel)
         append(',')
-        appendJsonField("onLabel", onLabel)
+        appendJsonField("onLabel", labels.onLabel)
         append(',')
-        appendJsonField("offLabel", offLabel)
+        appendJsonField("offLabel", labels.offLabel)
         append(',')
-        appendJsonField("posterHighlightMode", posterHighlightMode)
+        appendJsonField("posterHighlightMode", hud.posterHighlightMode)
         append(',')
-        appendJsonField("themeAccentColor", themeAccentColor)
+        appendJsonField("themeAccentColor", theme.themeAccentColor)
         append(',')
-        appendJsonField("themeAccentStrongColor", themeAccentStrongColor)
+        appendJsonField("themeAccentStrongColor", theme.themeAccentStrongColor)
         append(',')
-        appendJsonField("themeAccentFill", themeAccentFill)
+        appendJsonField("themeAccentFill", theme.themeAccentFill)
         append(',')
-        appendJsonField("themeOnAccentColor", themeOnAccentColor)
+        appendJsonField("themeOnAccentColor", theme.themeOnAccentColor)
         append(',')
-        appendJsonField("themeFocusColor", themeFocusColor)
+        appendJsonField("themeFocusColor", theme.themeFocusColor)
         append(',')
-        appendJsonField("themeSelectedSurfaceColor", themeSelectedSurfaceColor)
+        appendJsonField("themeSelectedSurfaceColor", theme.themeSelectedSurfaceColor)
         append(',')
-        appendJsonField("themeSelectedSurfaceHoverColor", themeSelectedSurfaceHoverColor)
+        appendJsonField("themeSelectedSurfaceHoverColor", theme.themeSelectedSurfaceHoverColor)
         append(',')
-        appendJsonField("themeSelectedRingColor", themeSelectedRingColor)
+        appendJsonField("themeSelectedRingColor", theme.themeSelectedRingColor)
         append(',')
-        appendJsonField("themeTimelineFillColor", themeTimelineFillColor)
+        appendJsonField("themeTimelineFillColor", theme.themeTimelineFillColor)
         append(',')
-        appendJsonField("themeTimelineTrackColor", themeTimelineTrackColor)
+        appendJsonField("themeTimelineTrackColor", theme.themeTimelineTrackColor)
         append(',')
-        appendJsonField("themeBufferingColor", themeBufferingColor)
+        appendJsonField("themeBufferingColor", theme.themeBufferingColor)
         append(',')
-        appendJsonField("themeBufferingTrackColor", themeBufferingTrackColor)
+        appendJsonField("themeBufferingTrackColor", theme.themeBufferingTrackColor)
         append(',')
-        appendJsonField("themeControlForegroundColor", themeControlForegroundColor)
+        appendJsonField("themeControlForegroundColor", theme.themeControlForegroundColor)
         append(',')
         appendJsonField("isPlaying", isPlaying)
         append(',')
@@ -2168,73 +3475,129 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("controlsVisible", controlsVisible)
         append(',')
-        appendJsonField("mouseMoveRevealsControlsEnabled", mouseMoveRevealsControlsEnabled)
+        appendJsonField("mouseMoveRevealsControlsEnabled", hud.mouseMoveRevealsControlsEnabled)
         append(',')
-        appendJsonField("legacyHudEnabled", legacyHudEnabled)
+        appendJsonField("legacyHudEnabled", hud.legacyHudEnabled)
         append(',')
-        appendJsonField("alwaysShowClock", alwaysShowClock)
+        appendJsonField("minimalHudEnabled", hud.minimalHudEnabled)
         append(',')
-        appendJsonField("playbackSpeedFineIncrementsEnabled", playbackSpeedFineIncrementsEnabled)
+        appendJsonField("minimalHudPillsEnabled", hud.minimalHudPillsEnabled)
         append(',')
-        appendJsonField("playbackSpeedToggleLow", playbackSpeedToggleLow)
+        appendJsonField("dockPanelFromBarEnabled", hud.dockPanelFromBarEnabled)
         append(',')
-        appendJsonField("playbackSpeedToggleHigh", playbackSpeedToggleHigh)
+        appendJsonField("ultraHudEnabled", hud.ultraHudEnabled)
+        append(',')
+        appendJsonField("officialHudEnabled", hud.officialHudEnabled)
+        append(',')
+        appendJsonField("seekHandleEnabled", hud.seekHandleEnabled)
+        append(',')
+        appendJsonField("hudVignetteEnabled", hud.hudVignetteEnabled)
+        append(',')
+        appendJsonField("hiddenHudButtons", hud.hiddenHudButtons)
+        append(',')
+        appendJsonField("hudButtonOrder", hud.hudButtonOrder)
+        append(',')
+        appendJsonField("alwaysShowClock", hud.alwaysShowClock)
+        append(',')
+        appendJsonField("playbackSpeedFineIncrementsEnabled", hud.playbackSpeedFineIncrementsEnabled)
+        append(',')
+        appendJsonField("zoneInput", hud.zoneInput)
+        append(',')
+        appendJsonField("zoneActions", hud.zoneActions)
+        append(',')
+        appendJsonField("playbackSpeedToggleLow", hud.playbackSpeedToggleLow)
+        append(',')
+        appendJsonField("playbackSpeedToggleHigh", hud.playbackSpeedToggleHigh)
         append(',')
         appendJsonField("appFullscreenKeyCode", appFullscreenKeyCode)
         append(',')
+        appendJsonField("voiceKeyCode", voiceKeyCode)
+        append(',')
         appendJsonMapField("playerShortcutKeyCodes", playerShortcutKeyCodes)
         append(',')
-        appendJsonField("uiScalePercent", uiScalePercent)
+        appendJsonField("uiScalePercent", hud.uiScalePercent)
         append(',')
-        appendJsonField("controlIconScalePercent", controlIconScalePercent)
+        appendJsonField("controlIconScalePercent", hud.controlIconScalePercent)
         append(',')
-        appendJsonField("uiFontFamily", uiFontFamily)
+        appendJsonField("uiFontFamily", hud.uiFontFamily)
         append(',')
-        appendJsonField("sourceNotchPosition", sourceNotchPosition)
+        appendJsonField("sourceNotchPosition", hud.sourceNotchPosition)
         append(',')
-        appendJsonField("sourceNotchHoverEnabled", sourceNotchHoverEnabled)
+        appendJsonField("sourceNotchHoverEnabled", hud.sourceNotchHoverEnabled)
         append(',')
-        appendJsonField("notificationPosition", notificationPosition)
+        appendJsonField("notificationPosition", hud.notificationPosition)
         append(',')
         appendJsonArrayField("parentalWarnings", parentalWarnings) { appendParentalWarningJson(it) }
         append(',')
         appendJsonField("showParentalGuide", showParentalGuide)
         append(',')
-        appendJsonField("showOpeningOverlay", showOpeningOverlay)
+        appendJsonField("showOpeningOverlay", opening.showOpeningOverlay)
         append(',')
-        appendJsonField("openingArtwork", openingArtwork.orEmpty())
+        appendJsonField("openingArtwork", opening.openingArtwork.orEmpty())
         append(',')
-        appendJsonField("openingLogo", openingLogo.orEmpty())
+        appendJsonField("openingLogo", opening.openingLogo.orEmpty())
         append(',')
-        appendJsonField("openingTitle", openingTitle)
+        appendJsonField("openingTitle", opening.openingTitle)
         append(',')
-        appendJsonField("openingMessage", openingMessage.orEmpty())
+        appendJsonField("openingMessage", opening.openingMessage.orEmpty())
         append(',')
-        appendJsonField("openingProgress", openingProgress)
+        appendJsonField("openingProgress", opening.openingProgress)
         append(',')
-        appendJsonField("skipPromptVisible", skipPromptVisible)
+        appendJsonField("skipPromptVisible", skipPrompt.skipPromptVisible)
         append(',')
-        appendJsonField("skipPromptLabel", skipPromptLabel)
+        appendJsonField("skipPromptLabel", skipPrompt.skipPromptLabel)
         append(',')
-        appendJsonField("skipPromptStartMs", skipPromptStartMs)
+        appendJsonField("skipPromptStartMs", skipPrompt.skipPromptStartMs)
         append(',')
-        appendJsonField("skipPromptEndMs", skipPromptEndMs)
+        appendJsonField("skipPromptEndMs", skipPrompt.skipPromptEndMs)
         append(',')
-        appendJsonField("skipPromptDismissed", skipPromptDismissed)
+        appendJsonField("skipPromptDismissed", skipPrompt.skipPromptDismissed)
         append(',')
-        appendJsonField("nextEpisodeVisible", nextEpisodeVisible)
+        appendJsonField("skipKeyAction", skipKeyAction)
         append(',')
-        appendJsonField("nextEpisodeHeaderLabel", nextEpisodeHeaderLabel)
+        appendJsonField("skipIntervalKeyLabel", skipIntervalKeyLabel)
         append(',')
-        appendJsonField("nextEpisodeTitle", nextEpisodeTitle)
+        appendJsonField("skipSubmitToastVisible", skipSubmitToast.visible)
         append(',')
-        appendJsonField("nextEpisodeThumbnail", nextEpisodeThumbnail)
+        appendJsonField("skipSubmitToastPhase", skipSubmitToast.phase)
         append(',')
-        appendJsonField("nextEpisodeStatus", nextEpisodeStatus)
+        appendJsonField("skipSubmitToastTitle", skipSubmitToast.title)
         append(',')
-        appendJsonField("nextEpisodeActionLabel", nextEpisodeActionLabel)
+        appendJsonField("skipSubmitToastDetail", skipSubmitToast.detail)
         append(',')
-        appendJsonField("nextEpisodePlayable", nextEpisodePlayable)
+        appendJsonField("skipSubmitToastHint", skipSubmitToast.hint)
+        append(',')
+        appendJsonField("skipSubmitToastAccepted", skipSubmitToast.accepted)
+        append(',')
+        appendJsonField("skipSubmitToastKey", skipSubmitToast.key)
+        append(',')
+        appendJsonField("skipSubmitToastDismissible", skipSubmitToastDismissible)
+        append(',')
+        appendJsonField("nextEpisodeVisible", nextEpisode.nextEpisodeVisible)
+        append(',')
+        appendJsonField("nextEpisodeHeaderLabel", nextEpisode.nextEpisodeHeaderLabel)
+        append(',')
+        appendJsonField("nextEpisodeTitle", nextEpisode.nextEpisodeTitle)
+        append(',')
+        appendJsonField("nextEpisodeThumbnail", nextEpisode.nextEpisodeThumbnail)
+        append(',')
+        appendJsonField("nextEpisodeStatus", nextEpisode.nextEpisodeStatus)
+        append(',')
+        appendJsonField("nextEpisodeActionLabel", nextEpisode.nextEpisodeActionLabel)
+        append(',')
+        appendJsonField("nextEpisodePlayable", nextEpisode.nextEpisodePlayable)
+        append(',')
+        appendJsonField("nextEpisodeProgress", nextEpisode.nextEpisodeProgress.toDouble())
+        append(',')
+        appendJsonField("nextEpisodeSearching", nextEpisode.nextEpisodeSearching)
+        append(',')
+        appendJsonField("playlistPeekTitle", playlistPeekTitle)
+        append(',')
+        appendJsonArrayField("playlistPeekItems", playlistPeekItems) { appendPlaylistPeekItemJson(it) }
+        append(',')
+        appendJsonPartyField("party", party)
+        append(',')
+        appendStreamInfoField(streamInfo)
         append(',')
         appendJsonField("showSubmitIntro", showSubmitIntro)
         append(',')
@@ -2250,77 +3613,85 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("positionMs", positionMs)
         append(',')
-        appendJsonArrayField("chapters", chapters) { appendChapterJson(it) }
+        appendJsonArrayField("chapters", seekBar.chapters) { appendChapterJson(it) }
         append(',')
-        appendJsonField("sourceIsLoading", sourceIsLoading)
+        appendJsonArrayField("seekSegments", seekBar.segments) { appendSeekSegmentJson(it) }
         append(',')
-        appendJsonField("sourceBadgePlacement", sourceBadgePlacement)
+        appendJsonField("sourceIsLoading", sources.sourceIsLoading)
         append(',')
-        appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }
+        appendJsonField("sourceBadgePlacement", sources.sourceBadgePlacement)
         append(',')
-        appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it) }
+        appendJsonArrayField("sourceFilters", sources.sourceFilters) { appendFilterItemJson(it) }
         append(',')
-        appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it) }
+        appendJsonArrayField("sourceItems", sources.sourceItems) { appendSourceItemJson(it) }
         append(',')
-        appendJsonField("episodeFallbackThumbnail", episodeFallbackThumbnail)
+        appendJsonArrayField("sourceSortOptions", sources.sourceSortOptions) { appendFilterItemJson(it) }
         append(',')
-        appendJsonArrayField("episodeSeasons", episodeSeasons) { appendSeasonItemJson(it) }
+        appendJsonField("sourceSortLabel", sources.sourceSortLabel)
         append(',')
-        appendJsonField("episodeStreamsVisible", episodeStreamsVisible)
+        appendJsonField("sourceCachedFirst", sources.sourceCachedFirst)
         append(',')
-        appendJsonField("episodeStreamsIsLoading", episodeStreamsIsLoading)
+        appendJsonArrayField("episodeItems", episodes.episodeItems) { appendEpisodeItemJson(it) }
         append(',')
-        appendJsonField("selectedEpisodeLabel", selectedEpisodeLabel)
+        appendJsonField("episodeFallbackThumbnail", episodes.episodeFallbackThumbnail)
         append(',')
-        appendJsonArrayField("episodeStreamFilters", episodeStreamFilters) { appendFilterItemJson(it) }
+        appendJsonArrayField("episodeSeasons", episodes.episodeSeasons) { appendSeasonItemJson(it) }
         append(',')
-        appendJsonArrayField("episodeStreamItems", episodeStreamItems) { appendSourceItemJson(it) }
+        appendJsonField("episodeStreamsVisible", episodes.episodeStreamsVisible)
         append(',')
-        appendJsonField("submitIntroSegmentType", submitIntroSegmentType)
+        appendJsonField("episodeStreamsIsLoading", episodes.episodeStreamsIsLoading)
         append(',')
-        appendJsonField("submitIntroStartTime", submitIntroStartTime)
+        appendJsonField("selectedEpisodeLabel", episodes.selectedEpisodeLabel)
         append(',')
-        appendJsonField("submitIntroEndTime", submitIntroEndTime)
+        appendJsonArrayField("episodeStreamFilters", episodes.episodeStreamFilters) { appendFilterItemJson(it) }
         append(',')
-        appendJsonField("isSubmitIntroSubmitting", isSubmitIntroSubmitting)
+        appendJsonArrayField("episodeStreamItems", episodes.episodeStreamItems) { appendSourceItemJson(it) }
         append(',')
-        appendJsonField("submitIntroStatusMessage", submitIntroStatusMessage)
+        appendJsonField("submitIntroSegmentType", submitIntro.submitIntroSegmentType)
+        append(',')
+        appendJsonField("submitIntroStartTime", submitIntro.submitIntroStartTime)
+        append(',')
+        appendJsonField("submitIntroEndTime", submitIntro.submitIntroEndTime)
+        append(',')
+        appendJsonField("isSubmitIntroSubmitting", submitIntro.isSubmitIntroSubmitting)
+        append(',')
+        appendJsonField("submitIntroStatusMessage", submitIntro.submitIntroStatusMessage)
         append(',')
         appendJsonField("showP2pConsent", showP2pConsent)
         append(',')
-        appendJsonField("subtitleActiveTab", subtitleActiveTab)
+        appendJsonField("subtitleActiveTab", subtitles.subtitleActiveTab)
         append(',')
-        appendJsonArrayField("addonSubtitleItems", addonSubtitleItems) { appendAddonSubtitleItemJson(it) }
+        appendJsonArrayField("addonSubtitleItems", subtitles.addonSubtitleItems) { appendAddonSubtitleItemJson(it) }
         append(',')
-        appendJsonField("builtInSubtitleFilterActive", builtInSubtitleFilterActive)
+        appendJsonField("builtInSubtitleFilterActive", subtitles.builtInSubtitleFilterActive)
         append(',')
-        appendJsonArrayField("builtInSubtitleItems", builtInSubtitleItems) { appendBuiltInSubtitleItemJson(it) }
+        appendJsonArrayField("builtInSubtitleItems", subtitles.builtInSubtitleItems) { appendBuiltInSubtitleItemJson(it) }
         append(',')
-        appendJsonField("audioTrackFilterActive", audioTrackFilterActive)
+        appendJsonField("audioTrackFilterActive", audioTracks.audioTrackFilterActive)
         append(',')
-        appendJsonArrayField("audioTrackItems", audioTrackItems) { appendAudioTrackItemJson(it) }
+        appendJsonArrayField("audioTrackItems", audioTracks.audioTrackItems) { appendAudioTrackItemJson(it) }
         append(',')
-        appendJsonField("isLoadingAddonSubtitles", isLoadingAddonSubtitles)
+        appendJsonField("isLoadingAddonSubtitles", subtitles.isLoadingAddonSubtitles)
         append(',')
-        appendJsonField("selectedAddonSubtitleId", selectedAddonSubtitleId)
+        appendJsonField("selectedAddonSubtitleId", subtitles.selectedAddonSubtitleId)
         append(',')
-        appendJsonField("useCustomSubtitles", useCustomSubtitles)
+        appendJsonField("useCustomSubtitles", subtitles.useCustomSubtitles)
         append(',')
-        appendJsonField("subtitleDelayMs", subtitleDelayMs)
+        appendJsonField("subtitleDelayMs", subtitles.subtitleDelayMs)
         append(',')
-        appendJsonField("hasSelectedAddonSubtitle", hasSelectedAddonSubtitle)
+        appendJsonField("hasSelectedAddonSubtitle", subtitles.hasSelectedAddonSubtitle)
         append(',')
-        appendJsonField("subtitleAutoSyncCapturedPositionMs", subtitleAutoSyncCapturedPositionMs)
+        appendJsonField("subtitleAutoSyncCapturedPositionMs", subtitles.subtitleAutoSyncCapturedPositionMs)
         append(',')
-        appendJsonArrayField("subtitleAutoSyncCues", subtitleAutoSyncCues) { appendSubtitleCueItemJson(it) }
+        appendJsonArrayField("subtitleAutoSyncCues", subtitles.subtitleAutoSyncCues) { appendSubtitleCueItemJson(it) }
         append(',')
-        appendJsonField("subtitleAutoSyncIsLoading", subtitleAutoSyncIsLoading)
+        appendJsonField("subtitleAutoSyncIsLoading", subtitles.subtitleAutoSyncIsLoading)
         append(',')
-        appendJsonField("subtitleAutoSyncErrorMessage", subtitleAutoSyncErrorMessage)
+        appendJsonField("subtitleAutoSyncErrorMessage", subtitles.subtitleAutoSyncErrorMessage)
         append(',')
-        appendJsonField("subtitleStyle", subtitleStyle)
+        appendJsonField("subtitleStyle", subtitles.subtitleStyle)
         append(',')
-        appendJsonArrayField("subtitleFontFamilies", subtitleFontFamilies) { append(it.toJsonString()) }
+        appendJsonArrayField("subtitleFontFamilies", subtitles.subtitleFontFamilies) { append(it.toJsonString()) }
         append(',')
         appendJsonArrayField("subtitleColorSwatches", SubtitleColorSwatches.map { it.toStorageHexString() }) { append(it.toJsonString()) }
         append(',')
@@ -2334,27 +3705,33 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("sourcesPanelOpen", sourcesPanelOpen)
         append(',')
-        appendJsonField("heroTrailerMode", heroTrailerMode)
+        appendJsonField("heroTrailerMode", heroTrailer.enabled)
         append(',')
-        appendJsonField("heroTrailerBackgroundColor", heroTrailerBackgroundColor)
+        appendJsonField("heroTrailerBackgroundColor", heroTrailer.backgroundColor)
         append(',')
-        appendJsonField("heroTrailerLogoUrl", heroTrailerLogoUrl)
+        appendJsonField("heroTrailerLogoUrl", heroTrailer.logoUrl)
         append(',')
-        appendJsonField("heroTrailerTitle", heroTrailerTitle)
+        appendJsonField("heroTrailerTitle", heroTrailer.title)
         append(',')
-        appendJsonField("heroTrailerMeta", heroTrailerMeta)
+        appendJsonField("heroTrailerMeta", heroTrailer.meta)
         append(',')
-        appendJsonField("heroTrailerDescription", heroTrailerDescription)
+        appendJsonField("heroTrailerDescription", heroTrailer.description)
         append(',')
-        appendJsonField("heroTrailerMuted", heroTrailerMuted)
+        appendJsonField("heroTrailerMuted", heroTrailer.muted)
         append(',')
-        appendJsonField("heroTrailerVolume", heroTrailerVolume)
+        appendJsonField("heroTrailerVolume", heroTrailer.volume)
         append(',')
-        appendJsonField("heroTrailerNavDismissEdge", heroTrailerNavDismissEdge)
+        appendJsonField("heroTrailerLibraryLabel", heroTrailer.libraryLabel)
         append(',')
-        appendJsonField("heroTrailerNavDismissBandFraction", heroTrailerNavDismissBandFraction.toDouble())
+        appendJsonField("heroTrailerInLibrary", heroTrailer.inLibrary)
         append(',')
-        appendJsonField("streamFailoverEnabled", streamFailoverEnabled)
+        appendJsonField("heroTrailerNavDismissEdge", heroTrailer.navDismissEdge)
+        append(',')
+        appendJsonField("heroTrailerNavDismissBandFraction", heroTrailer.navDismissBandFraction.toDouble())
+        append(',')
+        appendJsonField("streamFailoverEnabled", hud.streamFailoverEnabled)
+        append(',')
+        appendJsonField("postShowInput", heroTrailer.postShowInput)
         append('}')
     }
 
@@ -2365,7 +3742,7 @@ private fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsStat
         durationMs = 0L,
         positionMs = 0L,
         // Volatile data (driven by the overlay volume slider); not a structural change.
-        heroTrailerVolume = 0,
+        heroTrailer = heroTrailer.copy(volume = 0),
     )
 
 private fun StringBuilder.appendJsonField(name: String, value: String) {
@@ -2383,6 +3760,215 @@ private fun StringBuilder.appendJsonField(name: String, value: Double) {
 
 private fun StringBuilder.appendJsonField(name: String, value: Long) {
     append('"').append(name).append("\":").append(value)
+}
+
+private fun StringBuilder.appendJsonPartyField(name: String, party: PlayerControlPartyState) {
+    append('"').append(name).append("\":{")
+    appendJsonField("available", party.available)
+    append(',')
+    appendJsonField("active", party.active)
+    append(',')
+    appendJsonField("openPanelToken", party.openPanelToken)
+    append(',')
+    appendJsonField("busy", party.busy)
+    append(',')
+    appendJsonField("connected", party.connected)
+    append(',')
+    appendJsonField("isHost", party.isHost)
+    append(',')
+    appendJsonField("canControl", party.canControl)
+    append(',')
+    appendJsonField("hostOnly", party.hostOnly)
+    append(',')
+    appendJsonField("sharing", party.sharing)
+    append(',')
+    appendJsonField("canShareStream", party.canShareStream)
+    append(',')
+    appendJsonField("sameMedia", party.sameMedia)
+    append(',')
+    appendJsonField("code", party.code)
+    append(',')
+    appendJsonField("pillMessage", party.pillMessage)
+    append(',')
+    appendJsonField("behindTitle", party.behindTitle)
+    append(',')
+    appendJsonField("elsewhereTitle", party.elsewhereTitle)
+    append(',')
+    appendJsonField("startNote", party.startNote)
+    append(',')
+    appendJsonArrayField("members", party.members) { appendPartyMemberJson(it) }
+    append(',')
+    appendJsonField("chatUnread", party.chatUnread)
+    append(',')
+    appendJsonArrayField("chatMessages", party.chatMessages) { appendPartyChatMessageJson(it) }
+    append(',')
+    append("\"labels\":{")
+    party.labels.entries.forEachIndexed { index, (key, value) ->
+        if (index > 0) append(',')
+        appendJsonField(key, value)
+    }
+    append("}}")
+}
+
+private fun StringBuilder.appendPartyChatMessageJson(message: com.nuvio.app.features.player.PlayerControlChatMessage) {
+    append('{')
+    appendJsonField("key", message.key)
+    append(',')
+    appendJsonField("name", message.name)
+    append(',')
+    appendJsonField("initials", message.initials)
+    append(',')
+    appendJsonField("color", message.color)
+    append(',')
+    appendJsonField("avatarUrl", message.avatarUrl)
+    append(',')
+    appendJsonField("body", message.body)
+    append(',')
+    appendJsonField("time", message.time)
+    append(',')
+    appendJsonField("mine", message.mine)
+    append(',')
+    appendJsonField("sending", message.sending)
+    append(',')
+    appendJsonField("failed", message.failed)
+    append(',')
+    appendJsonField("startsGroup", message.startsGroup)
+    append('}')
+}
+
+private fun StringBuilder.appendStreamInfoField(info: com.nuvio.app.features.player.PlayerControlStreamInfo?) {
+    append("\"streamInfo\":")
+    if (info == null) {
+        append("null")
+        return
+    }
+    append('{')
+    appendJsonField("title", info.title)
+    append(',')
+    appendJsonField("closeLabel", info.closeLabel)
+    append(',')
+    appendJsonArrayField("sections", info.sections) { section ->
+        append('{')
+        appendJsonField("title", section.title)
+        append(',')
+        appendJsonArrayField("rows", section.rows) { row ->
+            append('{')
+            appendJsonField("label", row.label)
+            append(',')
+            appendJsonField("value", row.value)
+            append('}')
+        }
+        append('}')
+    }
+    append('}')
+}
+
+private fun StringBuilder.appendPartyMemberJson(member: PlayerControlPartyMember) {
+    append('{')
+    appendJsonField("index", member.index)
+    append(',')
+    appendJsonField("name", member.name)
+    append(',')
+    appendJsonField("initials", member.initials)
+    append(',')
+    appendJsonField("color", member.color)
+    append(',')
+    appendJsonField("avatarUrl", member.avatarUrl)
+    append(',')
+    appendJsonField("status", member.status)
+    append(',')
+    appendJsonField("presence", member.presence)
+    append(',')
+    appendJsonField("isHost", member.isHost)
+    append(',')
+    appendJsonField("isSelf", member.isSelf)
+    append(',')
+    appendJsonField("canRemove", member.canRemove)
+    append('}')
+}
+
+private fun StringBuilder.appendPlaylistPeekItemJson(item: PlayerControlPlaylistItem) {
+    append('{')
+    appendJsonField("position", item.position)
+    append(',')
+    appendJsonField("title", item.title)
+    append(',')
+    appendJsonField("subtitle", item.subtitle)
+    append(',')
+    appendJsonField("state", item.state)
+    append('}')
+}
+
+private fun StringBuilder.appendIptvStateJson(iptv: com.nuvio.app.features.player.PlayerControlIptvState) {
+    append('{')
+    appendJsonField("channelLabel", iptv.channelLabel)
+    append(',')
+    appendJsonField("nowTitle", iptv.nowTitle)
+    append(',')
+    appendJsonField("nowTimeLabel", iptv.nowTimeLabel)
+    append(',')
+    appendJsonField("nowProgress", iptv.nowProgress.toDouble())
+    append(',')
+    appendJsonField("nextLabel", iptv.nextLabel)
+    append(',')
+    appendJsonField("liveLabel", iptv.liveLabel)
+    append(',')
+    appendJsonField("goLiveLabel", iptv.goLiveLabel)
+    append(',')
+    appendJsonField("previousChannelLabel", iptv.previousChannelLabel)
+    append(',')
+    appendJsonField("nextChannelLabel", iptv.nextChannelLabel)
+    append(',')
+    appendJsonField("exitLabel", iptv.exitLabel)
+    append(',')
+    appendJsonField("rewindWindowMs", iptv.rewindWindowMs)
+    append(',')
+    appendJsonField("channelsLabel", iptv.channelsLabel)
+    append(',')
+    appendJsonField("groupsLabel", iptv.groupsLabel)
+    append(',')
+    appendJsonField("searchLabel", iptv.searchLabel)
+    append(',')
+    appendJsonField("channelsNote", iptv.channelsNote)
+    append(',')
+    appendJsonArrayField("groups", iptv.groups) { group ->
+        append('{')
+        appendJsonField("index", group.index.toLong())
+        append(',')
+        appendJsonField("name", group.name)
+        append(',')
+        appendJsonField("count", group.count.toLong())
+        append(',')
+        appendJsonField("selected", group.selected)
+        append('}')
+    }
+    append(',')
+    appendJsonArrayField("channels", iptv.channels) { channel ->
+        append('{')
+        appendJsonField("uid", channel.uid.toLong())
+        append(',')
+        appendJsonField("num", channel.num.toLong())
+        append(',')
+        appendJsonField("name", channel.name)
+        append(',')
+        appendJsonField("logo", channel.logo)
+        append(',')
+        appendJsonField("nowTitle", channel.nowTitle)
+        append(',')
+        appendJsonField("playing", channel.playing)
+        append('}')
+    }
+    append('}')
+}
+
+private fun StringBuilder.appendSeekSegmentJson(segment: com.nuvio.app.features.player.PlayerSeekSegment) {
+    append('{')
+    appendJsonField("start", segment.start)
+    append(',')
+    appendJsonField("end", segment.end)
+    append(',')
+    appendJsonField("kind", segment.kind)
+    append('}')
 }
 
 private fun StringBuilder.appendChapterJson(chapter: PlayerChapter) {
@@ -2517,6 +4103,22 @@ private fun StringBuilder.appendEpisodeItemJson(item: PlayerControlEpisodeItem) 
     appendJsonField("isCurrent", item.isCurrent)
     append(',')
     appendJsonField("isWatched", item.isWatched)
+    if (item.fillerKind.isNotEmpty()) {
+        append(',')
+        appendJsonField("fillerKind", item.fillerKind)
+        append(',')
+        appendJsonField("fillerLabel", item.fillerLabel)
+    }
+    append('}')
+}
+
+private fun StringBuilder.appendCastItemJson(item: PlayerControlCastItem) {
+    append('{')
+    appendJsonField("name", item.name)
+    append(',')
+    appendJsonField("role", item.role)
+    append(',')
+    appendJsonField("photo", item.photo)
     append('}')
 }
 
@@ -2535,6 +4137,8 @@ private fun StringBuilder.appendAddonSubtitleItemJson(item: PlayerControlAddonSu
     appendJsonField("isSelected", item.isSelected)
     append(',')
     appendJsonField("isDownloading", item.isDownloading)
+    append(',')
+    appendJsonField("isAutoSynced", item.isAutoSynced)
     append('}')
 }
 

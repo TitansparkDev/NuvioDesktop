@@ -15,6 +15,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 const val CATALOG_PAGE_SIZE = 100
+/** A catalog that does not say it pages is tried for a second page when its first held at least this many. */
+const val CATALOG_PROBE_MIN_ITEMS = 10
 private const val DUPLICATE_CATALOG_PAGE_ADVANCE_LIMIT = 3
 
 data class CatalogPage(
@@ -43,7 +45,7 @@ private suspend fun deduplicatedHttpGetText(url: String): String {
             inflightRequests[url] = created
             inflightRequestScope.launch {
                 try {
-                    created.complete(httpGetText(url))
+                    created.complete(com.nuvio.app.core.network.RateLimitGate.shared.run(url) { httpGetText(url) })
                 } catch (error: Throwable) {
                     created.completeExceptionally(error)
                 } finally {
@@ -77,7 +79,21 @@ suspend fun fetchCatalogPage(
         search = search,
         skip = skip,
     )
-    val payload = deduplicatedHttpGetText(url)
+    return catalogPageFromPayload(payload = fetchCatalogPayload(url), skip = skip, maxItems = maxItems)
+}
+
+/** The raw response behind [fetchCatalogPage], for a caller that keeps it (Home's catalog cache). */
+internal suspend fun fetchCatalogPayload(url: String): String = deduplicatedHttpGetText(url)
+
+/**
+ * Turns a catalog response into a page exactly as [fetchCatalogPage] does, so a response replayed
+ * from disk yields the same row a live fetch would.
+ */
+internal suspend fun catalogPageFromPayload(
+    payload: String,
+    skip: Int? = null,
+    maxItems: Int? = null,
+): CatalogPage {
     val parsed = HomeCatalogParser.parseCatalogResponse(
         payload = payload,
         maxItems = maxItems,

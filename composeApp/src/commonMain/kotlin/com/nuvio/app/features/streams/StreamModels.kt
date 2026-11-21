@@ -1,10 +1,17 @@
 package com.nuvio.app.features.streams
 
 import com.nuvio.app.core.build.AppFeaturePolicy
-import kotlinx.coroutines.runBlocking
-import nuvio.composeapp.generated.resources.*
-import org.jetbrains.compose.resources.getString
 
+/** A subtitle that comes with a stream, e.g. a media server's external subtitle file (upstream). */
+@kotlinx.serialization.Serializable
+data class StreamSubtitle(
+    val url: String,
+    val language: String,
+    val name: String? = null,
+    val headers: Map<String, String>? = null,
+)
+
+@kotlinx.serialization.Serializable
 data class StreamItem(
     val name: String? = null,
     val title: String? = null,
@@ -13,6 +20,8 @@ data class StreamItem(
     val infoHash: String? = null,
     val fileIdx: Int? = null,
     val externalUrl: String? = null,
+    /** A YouTube video id, the addon protocol's `ytId`; see [youTubeIdToResolve]. */
+    val ytId: String? = null,
     val sources: List<String> = emptyList(),
     val sourceName: String? = null,
     /** Audio languages advertised by the source. Empty means the addon did not provide metadata. */
@@ -54,9 +63,43 @@ data class StreamItem(
      */
     val sourceTotalSizeBytes: Long? = null,
     val badges: List<StreamBadge> = emptyList(),
+    /**
+     * When this row came from the Continue Watching stream cache rather than a live provider answer:
+     * the time that answer was fetched. Null for every live row. Autoplay leaves such rows alone
+     * unless a debrid resolve will prove the link first (see `CwStreamCache`).
+     */
+    val cachedAtMs: Long? = null,
+    /** True when [url] was produced by Nuvio's own debrid resolver, not returned by the add-on. */
+    val debridResolved: Boolean = false,
+    /** Subtitle files that come with this stream (a media server's external subtitles). */
+    val externalSubtitles: List<StreamSubtitle> = emptyList(),
+    /** Set for a media-server file: which server item to play and report progress for. */
+    @kotlinx.serialization.Transient
+    val serverTarget: com.nuvio.app.features.servers.ServerPlaybackTarget? = null,
+    /** A Usenet release: its NZB, played through the built-in Usenet engine. */
+    val nzbUrl: String? = null,
+    /**
+     * The NNTP servers to read [nzbUrl] from, as `nntps://user:pass@host:port/connections`; null
+     * means the user's own providers (Settings > Usenet). Carries credentials: never logged.
+     */
+    @kotlinx.serialization.Transient
+    val usenetServers: List<String>? = null,
+    /** Text the played file's name must contain, for an NZB holding several videos. */
+    val fileMustInclude: String? = null,
+    /**
+     * Other uploads of the same release (NZB links), tried in order when this one turns out
+     * incomplete. Set by Built-in Usenet's "Show each release once"; carries indexer keys, not saved.
+     */
+    @kotlinx.serialization.Transient
+    val usenetAlternates: List<String> = emptyList(),
+    /** The archive password of a release named "Name{{password}}", for the Usenet engine. */
+    @kotlinx.serialization.Transient
+    val usenetPassword: String? = null,
 ) {
     val streamLabel: String
-        get() = name ?: runBlocking { getString(Res.string.stream_default_name) }
+        // Read from composition for every row of a stream list, so it must not block: the resource
+        // lookup this used to do ran `runBlocking` on the UI thread while scrapers held the pool.
+        get() = name?.takeIf { it.isNotBlank() } ?: "Stream"
 
     val streamSubtitle: String?
         get() = description
@@ -75,6 +118,21 @@ data class StreamItem(
         get() = url?.takeIf {
             it.isNotBlank() && !it.isMagnetLink() && !it.isTorrentSchemeUrl()
         }
+
+    /**
+     * The YouTube id to resolve on the device, only when `ytId` is the stream's only way to play.
+     * Streams that also carry a url, externalUrl, torrent or debrid resolve keep using those.
+     */
+    val youTubeIdToResolve: String?
+        get() = ytId
+            ?.trim()
+            ?.takeIf {
+                it.isNotEmpty() &&
+                    url.isNullOrBlank() &&
+                    externalUrl.isNullOrBlank() &&
+                    infoHash.isNullOrBlank() &&
+                    clientResolve == null
+            }
 
     val torrentMagnetUri: String?
         get() = listOfNotNull(url, externalUrl, clientResolve?.magnetUri)
@@ -161,9 +219,20 @@ data class StreamItem(
         get() = isInstalledAddonStream && (needsLocalDebridResolve || isDirectDebridStream)
 
     val hasPlayableSource: Boolean
-        get() = url != null || infoHash != null || externalUrl != null || clientResolve != null
+        get() = url != null || infoHash != null || externalUrl != null || clientResolve != null || ytId != null ||
+            serverTarget != null || nzbUrl != null
+
+    /** A Usenet release with no engine session yet: the engine opens one when it is picked. */
+    val needsUsenetPreparation: Boolean
+        get() = nzbUrl != null && playableDirectUrl == null
+
+    /** A media-server file whose playback URL is only asked for when it is picked. */
+    val needsServerPreparation: Boolean
+        get() = serverTarget != null && playableDirectUrl == null
 }
 
+// Serializable for watch parties, which send the host's stream (badges included) to members.
+@kotlinx.serialization.Serializable
 data class StreamBadge(
     val name: String,
     val imageURL: String = "",
@@ -298,15 +367,29 @@ private fun String?.extractBtihInfoHash(): String? {
 val StreamItem.isScorableStream: Boolean
     get() = url != null ||
         !infoHash.isNullOrBlank() ||
+        // fork:usenet - a Usenet release carries only its NZB until the engine prepares it.
+        !nzbUrl.isNullOrBlank() ||
         clientResolve != null ||
         externalUrl.isMagnetLink() ||
         externalUrl.isTorrentSchemeUrl()
 
+/** The media file name the addon states for this stream, if any; never the display label. */
+val StreamItem.mediaFilename: String?
+    get() = (
+        behaviorHints.filename
+            ?: clientResolve?.filename
+            ?: clientResolve?.stream?.raw?.filename
+        )?.trim()?.takeIf { it.isNotEmpty() }
+
 fun StreamItem.isSelectableForPlayback(debridEnabled: Boolean): Boolean =
     playableDirectUrl != null ||
+        serverTarget != null ||
+        nzbUrl != null ||
+        youTubeIdToResolve != null ||
         (AppFeaturePolicy.p2pEnabled && needsLocalDebridResolve && p2pInfoHash != null) ||
         (debridEnabled && isAddonDebridCandidate)
 
+@kotlinx.serialization.Serializable
 data class StreamBehaviorHints(
     val bingeGroup: String? = null,
     val notWebReady: Boolean = false,
@@ -316,11 +399,13 @@ data class StreamBehaviorHints(
     val proxyHeaders: StreamProxyHeaders? = null,
 )
 
+@kotlinx.serialization.Serializable
 data class StreamProxyHeaders(
     val request: Map<String, String>? = null,
     val response: Map<String, String>? = null,
 )
 
+@kotlinx.serialization.Serializable
 enum class StreamDebridCacheState {
     CHECKING,
     CACHED,
@@ -328,6 +413,7 @@ enum class StreamDebridCacheState {
     UNKNOWN,
 }
 
+@kotlinx.serialization.Serializable
 data class StreamDebridCacheStatus(
     val providerId: String,
     val providerName: String,
@@ -350,6 +436,7 @@ data class StreamDebridCacheStatus(
  * addon streams marked NOT_CACHED. Feeding an addon's own flag into it would silently drop every
  * uncached result from the picker.
  */
+@kotlinx.serialization.Serializable
 data class StreamAddonData(
     /** Addon's own classification, e.g. "debrid", "usenet", "p2p". */
     val type: String? = null,
@@ -368,11 +455,13 @@ data class StreamAddonData(
     val torrent: StreamAddonTorrentData? = null,
 )
 
+@kotlinx.serialization.Serializable
 data class StreamAddonTorrentData(
     val infoHash: String? = null,
     val fileIdx: Int? = null,
 )
 
+@kotlinx.serialization.Serializable
 data class StreamClientResolve(
     val type: String? = null,
     val infoHash: String? = null,
@@ -399,10 +488,12 @@ data class StreamClientResolve(
             isCached == true
 }
 
+@kotlinx.serialization.Serializable
 data class StreamClientResolveStream(
     val raw: StreamClientResolveRaw? = null,
 )
 
+@kotlinx.serialization.Serializable
 data class StreamClientResolveRaw(
     val torrentName: String? = null,
     val filename: String? = null,
@@ -414,6 +505,7 @@ data class StreamClientResolveRaw(
     val parsed: StreamClientResolveParsed? = null,
 )
 
+@kotlinx.serialization.Serializable
 data class StreamClientResolveParsed(
     val rawTitle: String? = null,
     val parsedTitle: String? = null,

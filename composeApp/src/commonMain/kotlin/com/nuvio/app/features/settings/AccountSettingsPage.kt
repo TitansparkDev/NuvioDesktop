@@ -1,5 +1,8 @@
 package com.nuvio.app.features.settings
 
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.width
+import com.nuvio.app.core.ui.ditheredBackground
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,8 +34,8 @@ import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioPrimaryButton
 import com.nuvio.app.features.setup.FirstRunWizardController
 import com.nuvio.app.core.ui.NuvioStatusModal
-import com.nuvio.app.core.ui.NuvioSurfaceCard
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.core.storage.PortableMode
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.home.HomeCatalogSettingsSyncService
 import com.nuvio.app.features.updater.AppUpdaterController
@@ -42,6 +45,16 @@ import com.nuvio.app.features.updater.updateChannelLabel
 import com.nuvio.app.isDesktop
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.compose_settings_root_switch_profile_description
+import nuvio.composeapp.generated.resources.compose_settings_root_switch_profile_title
+import nuvio.composeapp.generated.resources.settings_portable_mode
+import nuvio.composeapp.generated.resources.settings_portable_mode_description
+import nuvio.composeapp.generated.resources.settings_portable_mode_disable_message
+import nuvio.composeapp.generated.resources.settings_portable_mode_disable_title
+import nuvio.composeapp.generated.resources.settings_portable_mode_enable_message
+import nuvio.composeapp.generated.resources.settings_portable_mode_enable_title
+import nuvio.composeapp.generated.resources.settings_portable_mode_failed
+import nuvio.composeapp.generated.resources.settings_portable_mode_restart
 import nuvio.composeapp.generated.resources.settings_account_run_wizard
 import nuvio.composeapp.generated.resources.settings_account_run_wizard_description
 import nuvio.composeapp.generated.resources.settings_account_setup
@@ -56,9 +69,13 @@ import nuvio.composeapp.generated.resources.settings_account_not_signed_in
 import nuvio.composeapp.generated.resources.settings_account_sign_out
 import nuvio.composeapp.generated.resources.settings_account_sign_out_confirm_message
 import nuvio.composeapp.generated.resources.settings_account_sign_out_confirm_title
+import nuvio.composeapp.generated.resources.settings_account_sign_out_erase
 import nuvio.composeapp.generated.resources.settings_account_status
 import nuvio.composeapp.generated.resources.settings_account_status_anonymous
 import nuvio.composeapp.generated.resources.settings_account_status_signed_in
+import nuvio.composeapp.generated.resources.settings_backup_import
+import nuvio.composeapp.generated.resources.settings_backup_import_description
+import nuvio.composeapp.generated.resources.settings_backup_import_restart_manually
 import nuvio.composeapp.generated.resources.settings_backup_saved
 import nuvio.composeapp.generated.resources.settings_backup_section
 import nuvio.composeapp.generated.resources.settings_backup_with_credentials
@@ -95,11 +112,17 @@ import com.nuvio.app.core.ui.accentBrush
 internal fun LazyListScope.accountSettingsContent(
     isTablet: Boolean,
     rememberLastProfileEnabled: Boolean,
+    /**
+     * Opens the profile selector. Desktop only: the settings top bar's avatar opens this page, so
+     * the selector it used to open is reached from here.
+     */
+    onOpenProfileSelector: (() -> Unit)? = null,
 ) {
     item {
         AccountSettingsBody(
             isTablet = isTablet,
             rememberLastProfileEnabled = rememberLastProfileEnabled,
+            onOpenProfileSelector = onOpenProfileSelector,
         )
     }
 }
@@ -108,6 +131,7 @@ internal fun LazyListScope.accountSettingsContent(
 private fun AccountSettingsBody(
     isTablet: Boolean,
     rememberLastProfileEnabled: Boolean,
+    onOpenProfileSelector: (() -> Unit)?,
 ) {
     val authState by AuthRepository.state.collectAsStateWithLifecycle()
     SynchronizationPreferencesRepository.ensureLoaded()
@@ -115,6 +139,7 @@ private fun AccountSettingsBody(
         SynchronizationPreferencesRepository.uiState.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     var showSignOutConfirm by remember { mutableStateOf(false) }
+    var pendingPortableMode by remember { mutableStateOf<Boolean?>(null) }
     val pullPortableSettingsIfSignedIn: () -> Unit = {
         val state = authState
         if (state is AuthState.Authenticated && !state.isAnonymous) {
@@ -124,27 +149,40 @@ private fun AccountSettingsBody(
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (isDesktop) {
-            NuvioSurfaceCard(
-                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("setup-wizard")),
+            // The settings glass, like the section cards below it, with the button beside the
+            // text at the control column's width, as an action on any other settings row.
+            Row(
+                modifier = Modifier
+                    .settingsScrollAnchor(SettingsScrollAnchor.searchKey("setup-wizard"))
+                    .fillMaxWidth()
+                    .ditheredBackground(SettingsSectionGlassFill, SettingsSectionGlassShape)
+                    .border(1.dp, SettingsSectionGlassEdge, SettingsSectionGlassShape)
+                    .padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SettingsRowTextGap),
             ) {
-                Text(
-                    text = stringResource(Res.string.settings_account_setup),
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Spacer(modifier = Modifier.height(14.dp))
-                Text(
-                    text = stringResource(Res.string.settings_account_run_wizard_description),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(modifier = Modifier.height(14.dp))
-                NuvioPrimaryButton(
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = stringResource(Res.string.settings_account_setup),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = stringResource(Res.string.settings_account_run_wizard_description),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsGlassButton(
                     text = stringResource(Res.string.settings_account_run_wizard),
                     // The wizard is hosted globally, so it opens above Settings rather than being a
                     // navigation destination of its own.
                     onClick = FirstRunWizardController::openManually,
+                    accent = true,
                 )
             }
         }
@@ -173,6 +211,16 @@ private fun AccountSettingsBody(
                 isTablet = isTablet,
                 modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("account-status")),
             ) {
+                if (onOpenProfileSelector != null) {
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.compose_settings_root_switch_profile_title),
+                        description = stringResource(Res.string.compose_settings_root_switch_profile_description),
+                        isTablet = isTablet,
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("switch-profile")),
+                        onClick = onOpenProfileSelector,
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                }
                 when (val state = authState) {
                     is AuthState.Authenticated -> {
                         AccountValueRow(
@@ -207,16 +255,13 @@ private fun AccountSettingsBody(
             }
         }
 
+        // The explanation is the heading's subtitle: as a line inside the card it read as part
+        // of the first switch (Appearance) below it.
         SettingsSection(
             title = stringResource(Res.string.settings_sync_section),
             isTablet = isTablet,
+            subtitle = stringResource(Res.string.settings_sync_description),
         ) {
-            SettingsSectionNote(
-                text = stringResource(Res.string.settings_sync_description),
-                isTablet = isTablet,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
             SettingsGroup(isTablet = isTablet) {
                 SettingsSwitchRow(
                     title = stringResource(Res.string.settings_sync_appearance),
@@ -318,7 +363,8 @@ private fun AccountSettingsBody(
                     },
                 )
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            // A footnote under the switches, divided off like a row of its own.
+            SettingsGroupDivider(isTablet = isTablet)
             SettingsSectionNote(
                 text = stringResource(Res.string.settings_sync_fork_local_note),
                 isTablet = isTablet,
@@ -362,6 +408,23 @@ private fun AccountSettingsBody(
                                 is DesktopSettingsBackupResult.Failed ->
                                     NuvioToastController.show(result.message)
                                 DesktopSettingsBackupResult.Cancelled -> Unit
+                            }
+                        },
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                    val restartManuallyMessage = stringResource(Res.string.settings_backup_import_restart_manually)
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.settings_backup_import),
+                        description = stringResource(Res.string.settings_backup_import_description),
+                        isTablet = isTablet,
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("import-settings")),
+                        onClick = {
+                            when (val result = DesktopSettingsBackup.import()) {
+                                is DesktopSettingsImportResult.Staged ->
+                                    if (!result.restarting) NuvioToastController.show(restartManuallyMessage)
+                                is DesktopSettingsImportResult.Failed ->
+                                    NuvioToastController.show(result.message)
+                                DesktopSettingsImportResult.Cancelled -> Unit
                             }
                         },
                     )
@@ -438,8 +501,44 @@ private fun AccountSettingsBody(
                         },
                     )
                 }
+                if (PortableMode.isSupported) {
+                    SettingsGroup(isTablet = isTablet) {
+                        SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_portable_mode),
+                            description = stringResource(Res.string.settings_portable_mode_description),
+                            checked = PortableMode.isEnabled,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("portable-mode"),
+                            ),
+                            // The switch only reflects where this session's data lives; flipping
+                            // it asks first, because the change is a restart and a data move.
+                            onCheckedChange = { value -> pendingPortableMode = value },
+                        )
+                    }
+                }
             }
         }
+    }
+
+    pendingPortableMode?.let { enable ->
+        val failedMessage = stringResource(Res.string.settings_portable_mode_failed)
+        NuvioStatusModal(
+            title = stringResource(
+                if (enable) Res.string.settings_portable_mode_enable_title else Res.string.settings_portable_mode_disable_title,
+            ),
+            message = stringResource(
+                if (enable) Res.string.settings_portable_mode_enable_message else Res.string.settings_portable_mode_disable_message,
+            ),
+            isVisible = true,
+            confirmText = stringResource(Res.string.settings_portable_mode_restart),
+            dismissText = stringResource(Res.string.action_cancel),
+            onConfirm = {
+                pendingPortableMode = null
+                if (!PortableMode.setEnabledAndRestart(enable)) NuvioToastController.show(failedMessage)
+            },
+            onDismiss = { pendingPortableMode = null },
+        )
     }
 
     NuvioStatusModal(
@@ -453,6 +552,11 @@ private fun AccountSettingsBody(
             scope.launch { AuthRepository.signOut() }
         },
         onDismiss = { showSignOutConfirm = false },
+        secondaryText = stringResource(Res.string.settings_account_sign_out_erase),
+        onSecondary = {
+            showSignOutConfirm = false
+            scope.launch { AuthRepository.signOut(erase = true) }
+        },
     )
 }
 
@@ -485,3 +589,4 @@ private fun AccountValueRow(
         )
     }
 }
+

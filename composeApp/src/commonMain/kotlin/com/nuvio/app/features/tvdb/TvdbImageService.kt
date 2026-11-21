@@ -28,6 +28,14 @@ object TvdbImageService {
         val logo: String?,
     )
 
+    /**
+     * English, else language-neutral, else nothing. TVDB wins over every other logo source, so
+     * falling back to "any language" here put e.g. a Polish logo on a show TMDB has an English
+     * one for. Returning null lets metahub / addon / TMDB (language-aware) supply it instead.
+     */
+    private fun List<TvdbArtwork>.selectEnglishOrNeutralLogo(): String? =
+        (firstOrNull { it.language == "eng" } ?: firstOrNull { it.language.isNullOrBlank() })?.image
+
     private const val BASE_URL = "https://api4.thetvdb.com/v4"
     private const val ARTWORK_BACKGROUND_SERIES = 3   // series landscape backdrop
     private const val ARTWORK_BACKGROUND_MOVIE = 15  // movie landscape backdrop
@@ -53,6 +61,20 @@ object TvdbImageService {
     // TVDB-numeric-ID → IMDB-ID cache (avoids repeat /extended calls)
     private val imdbIdCache = mutableMapOf<String, String>()
     private val imdbIdCacheMutex = Mutex()
+
+    /**
+     * When a series airs, as TVDB records it: the broadcast slot (`"21:00"`, 24h, may be blank)
+     * and the origin country as an ISO 3166-1 alpha-3 code (`"gbr"`). Either can be missing.
+     */
+    data class TvdbAirSchedule(
+        val airsTime: String?,
+        val originalCountry: String?,
+    )
+
+    // TVDB-numeric-ID → air schedule cache; a failed lookup is cached too (as null) so a series
+    // with no schedule costs one /extended call per run, not one per meta fetch.
+    private val airScheduleCache = mutableMapOf<String, TvdbAirSchedule?>()
+    private val airScheduleCacheMutex = Mutex()
 
     /** Pre-warms the TVDB auth token so it is cached before any image fetch needs it. */
     suspend fun warmToken() {
@@ -90,6 +112,70 @@ object TvdbImageService {
         return imdbId
     }
 
+    /**
+     * The series' broadcast slot and origin country from `/series/{id}/extended`, or null when
+     * there is no TVDB key or the fetch fails. Used to rebuild a real air instant for episodes an
+     * addon could only date (see `repairPlaceholderAirTimes`).
+     */
+    suspend fun fetchAirSchedule(tvdbId: String): TvdbAirSchedule? {
+        val apiKey = TvdbSettingsRepository.snapshot().apiKey.trim().takeIf(String::isNotBlank) ?: return null
+        airScheduleCacheMutex.withLock {
+            if (airScheduleCache.containsKey(tvdbId)) return airScheduleCache[tvdbId]
+        }
+        val token = acquireToken(apiKey) ?: return null
+        val schedule = runCatching {
+            val body = httpGetTextWithHeaders("$BASE_URL/series/$tvdbId/extended", authHeaders(token))
+            val data = json.decodeFromString<TvdbExtendedResponse>(body).data
+            TvdbAirSchedule(
+                airsTime = data?.airsTime?.trim()?.takeIf(String::isNotBlank),
+                originalCountry = (data?.originalCountry ?: data?.originalNetwork?.country)
+                    ?.trim()?.takeIf(String::isNotBlank),
+            )
+        }.onFailure { log.w { "TVDB air schedule fetch failed for series/$tvdbId: ${it.message}" } }
+            .getOrNull()
+        airScheduleCacheMutex.withLock { airScheduleCache[tvdbId] = schedule }
+        return schedule
+    }
+
+    private val characterCache = mutableMapOf<String, List<TvdbCharacter>>()
+    private val characterCacheMutex = Mutex()
+
+    /**
+     * TVDB's character portraits for a title's cast — a community-uploaded image of the
+     * character in the role, separate from the actor's photo (ported from the Nuvio Tracker
+     * site's `tvdbCharacters`). Series resolve through the usual TVDB id lookup; movies through
+     * TVDB's remote-id search on the IMDb id. Empty without a TVDB key or on any failure.
+     */
+    suspend fun fetchCharacters(type: String, id: String, imdbId: String?): List<TvdbCharacter> {
+        val apiKey = TvdbSettingsRepository.snapshot().apiKey.trim().takeIf(String::isNotBlank) ?: return emptyList()
+        val cacheKey = "$type:$id"
+        characterCacheMutex.withLock { characterCache[cacheKey] }?.let { return it }
+        val token = acquireToken(apiKey) ?: return emptyList()
+        val characters = runCatching {
+            val endpoint = if (isTvType(type)) {
+                val tvdbId = resolveTvdbId(imdbId ?: id, token) ?: return emptyList()
+                "series/$tvdbId/extended"
+            } else {
+                val imdb = imdbId?.takeIf { it.startsWith("tt") } ?: return emptyList()
+                val found = json.decodeFromString<TvdbRemoteIdSearchResponse>(
+                    httpGetTextWithHeaders("$BASE_URL/search/remoteid/$imdb", authHeaders(token)),
+                ).data.firstOrNull()?.movie?.id ?: return emptyList()
+                "movies/$found/extended"
+            }
+            json.decodeFromString<TvdbCharactersResponse>(
+                httpGetTextWithHeaders("$BASE_URL/$endpoint", authHeaders(token)),
+            ).data?.characters.orEmpty()
+                .filter { (it.peopleType.equals("Actor", ignoreCase = true) || it.type == 3) && !it.image.isNullOrBlank() }
+                .map { TvdbCharacter(person = it.personName.orEmpty(), character = it.name.orEmpty(), image = it.image!!) }
+        }.onFailure { log.w { "TVDB characters failed for $type/$id: ${it.message}" } }
+            .getOrNull() ?: return emptyList() // not cached: try again next open
+        characterCacheMutex.withLock {
+            if (characterCache.size > 300) characterCache.clear()
+            characterCache[cacheKey] = characters
+        }
+        return characters
+    }
+
     fun clearCache() {
         imageCache.clear()
         remoteIdCache.clear()
@@ -110,8 +196,7 @@ object TvdbImageService {
         val backdrop = backdrops2.firstOrNull { it.language.isNullOrBlank() }?.image
             ?: backdrops2.firstOrNull()?.image
         val logoList = artworks.filter { !it.image.isNullOrBlank() && it.type == ARTWORK_CLEARLOGO }
-        val logo = logoList.firstOrNull { it.language == "eng" }?.image
-            ?: logoList.firstOrNull()?.image
+        val logo = logoList.selectEnglishOrNeutralLogo()
         val result = TvdbImages(backdrop = backdrop, logo = logo)
         imageCacheMutex.withLock { imageCache[cacheKey] = result }
         return result
@@ -138,8 +223,7 @@ object TvdbImageService {
         val backdrop = backdrops.firstOrNull { it.language.isNullOrBlank() }?.image
             ?: backdrops.firstOrNull()?.image
         val logoList = artworks.filter { it.type == ARTWORK_CLEARLOGO && !it.image.isNullOrBlank() }
-        val logo = logoList.firstOrNull { it.language == "eng" }?.image
-            ?: logoList.firstOrNull()?.image
+        val logo = logoList.selectEnglishOrNeutralLogo()
 
         val result = TvdbImages(backdrop = backdrop, logo = logo)
         imageCacheMutex.withLock { imageCache[cacheKey] = result }
@@ -266,6 +350,44 @@ object TvdbImageService {
 
 // ── Response models ────────────────────────────────────────────────────────────
 
+/** A TVDB character: the actor's name, the character's, and the portrait of them in the role. */
+data class TvdbCharacter(val person: String, val character: String, val image: String)
+
+@Serializable
+private data class TvdbCharactersResponse(
+    val data: TvdbCharactersData? = null,
+)
+
+@Serializable
+private data class TvdbCharactersData(
+    val characters: List<TvdbCharacterDto> = emptyList(),
+)
+
+@Serializable
+private data class TvdbCharacterDto(
+    val name: String? = null,
+    val image: String? = null,
+    val personName: String? = null,
+    val peopleType: String? = null,
+    val type: Int? = null,
+)
+
+@Serializable
+private data class TvdbRemoteIdSearchResponse(
+    val data: List<TvdbRemoteIdHit> = emptyList(),
+)
+
+@Serializable
+private data class TvdbRemoteIdHit(
+    val movie: TvdbIdOnly? = null,
+    val series: TvdbIdOnly? = null,
+)
+
+@Serializable
+private data class TvdbIdOnly(
+    val id: Int? = null,
+)
+
 @Serializable
 private data class TvdbLoginResponse(
     val data: TvdbTokenData? = null,
@@ -301,6 +423,14 @@ private data class TvdbExtendedResponse(
 @Serializable
 private data class TvdbExtendedData(
     val remoteIds: List<TvdbRemoteId> = emptyList(),
+    val airsTime: String? = null,
+    val originalCountry: String? = null,
+    val originalNetwork: TvdbNetwork? = null,
+)
+
+@Serializable
+private data class TvdbNetwork(
+    val country: String? = null,
 )
 
 @Serializable

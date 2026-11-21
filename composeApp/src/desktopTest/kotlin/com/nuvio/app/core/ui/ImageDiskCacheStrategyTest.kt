@@ -54,6 +54,26 @@ class ImageDiskCacheStrategyTest {
     }
 
     @Test
+    fun `a failure with a copy on disk stores that copy back unchanged`() = runBlocking<Unit> {
+        // DISABLED here would leak Coil's snapshot of the entry and lock it for the session.
+        val cached = response(code = 200, "cache-control" to "max-age=60", "etag" to "\"a\"")
+            .copy(requestMillis = 1_000L, responseMillis = 2_000L)
+
+        val stored = ImageDiskCacheStrategy.write(
+            cacheResponse = cached,
+            networkRequest = request,
+            networkResponse = response(code = 503),
+            options = options,
+        ).response
+
+        assertNotNull(stored)
+        assertEquals(200, stored.code)
+        assertNull(stored.body, "a null body leaves the existing data file in place")
+        assertEquals(cached.headers, stored.headers)
+        assertEquals(2_000L, stored.responseMillis, "a failure does not make the copy any fresher")
+    }
+
+    @Test
     fun `a success response is written to the cache`() = runBlocking<Unit> {
         val networkResponse = response(code = 200, "cache-control" to "max-age=31536000, immutable")
 
@@ -192,6 +212,17 @@ class ImageDiskCacheStrategyTest {
 
         assertEquals(young, ImageDiskCacheStrategy.read(young, request, options).response)
         assertEquals("\"x\"", ImageDiskCacheStrategy.read(old, request, options).request?.headers?.get("if-none-match"))
+    }
+
+    @Test
+    fun `the reported age does not count against the backstop`() = runBlocking<Unit> {
+        // artworks.thetvdb.com: no Cache-Control at all, but CloudFront has held it for five months.
+        // The backstop is our own policy about how long to trust a stable URL, so only the time we
+        // have held the entry counts — otherwise it is stale on arrival and revalidates on every read.
+        val cached = response(code = 200, "age" to "12704009", "etag" to "\"x\"")
+            .copy(responseMillis = System.currentTimeMillis() - 10 * 86_400_000L)
+
+        assertEquals(cached, ImageDiskCacheStrategy.read(cached, request, options).response)
     }
 
     @Test

@@ -1,7 +1,19 @@
 package com.nuvio.app.features.details.components
 
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.async
+import com.nuvio.app.features.tmdb.fullSizeTmdbBackdrop
+import com.nuvio.app.features.tvdb.TvdbCharacter
+import com.nuvio.app.features.tvdb.TvdbImageService
+import com.nuvio.app.features.details.CastEpisodeCountVisibility
+import com.nuvio.app.features.details.CastViewStorage
+import com.nuvio.app.features.mdblist.linkFor
+import com.nuvio.app.features.mdblist.MdbListSettingsRepository
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import com.nuvio.app.core.ui.UiMotion
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +36,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import com.nuvio.app.features.streams.StreamPickerController
+import com.nuvio.app.features.streams.StreamPickerDock
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -40,16 +59,24 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.input.pointer.pointerHoverIcon
+import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -60,8 +87,15 @@ import androidx.compose.ui.unit.sp
 import com.nuvio.app.core.ui.NuvioPosterHoverTooltip
 import com.nuvio.app.features.details.GenreSubgenres
 import com.nuvio.app.features.details.allKeywords
+import com.nuvio.app.features.details.DetailForm
+import com.nuvio.app.features.details.DetailStatus
+import com.nuvio.app.features.details.DetailStatusLine
+import com.nuvio.app.features.details.buildDetailStatusLine
 import androidx.compose.ui.graphics.graphicsLayer
 import com.nuvio.app.core.ui.NuvioDesktopImageScaling
+import com.nuvio.app.core.ui.NuvioScrimRamp
+import com.nuvio.app.core.ui.rememberHeroLogoModel
+import com.nuvio.app.core.ui.nuvioDitheredScrim
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.features.details.MetaCompany
 import com.nuvio.app.features.details.MetaDetails
@@ -77,6 +111,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import nuvio.composeapp.generated.resources.*
+import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 
 object DetailHeroPeoplePanelToggleTrigger {
@@ -100,6 +135,7 @@ fun DetailHero(
     onHeightChanged: (Int) -> Unit = {},
     heroTrailerSourceUrl: String? = null,
     heroTrailerSourceAudioUrl: String? = null,
+    heroTrailerSourceHeaders: Map<String, String> = emptyMap(), // fork:trailer-signed-in
     heroTrailerReady: Boolean = false,
     heroTrailerPlayWhenReady: Boolean = false,
     heroTrailerMuted: Boolean = true,
@@ -110,6 +146,8 @@ fun DetailHero(
     heroGradientColor: Color? = null,
     onBackdropLoaded: (Painter, ImageBitmap?) -> Unit = { _, _ -> },
     desktopOverlay: Boolean = false,
+    /** The source picker is docked here: frost the whole backdrop so the list sits on it. */
+    backdropFrosted: Boolean = false,
     discoveryFacts: List<HeroDiscoveryFact> = emptyList(),
     maxDiscoveryBadges: Int = 0,
     playButtonLabel: String = stringResource(Res.string.action_play),
@@ -119,6 +157,7 @@ fun DetailHero(
     showActions: Boolean = false,
     showOverview: Boolean = false,
     showCast: Boolean = false,
+    castEpisodeCountVisibility: CastEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW,
     showProduction: Boolean = false,
     showDetails: Boolean = false,
     showManualPlayOption: Boolean = false,
@@ -153,6 +192,11 @@ fun DetailHero(
         modifier = modifier.fillMaxWidth(),
     ) {
         val heroHeight = detailHeroHeight(maxWidth, viewportHeight, isTablet, desktopOverlay)
+        val backdropFrost by animateFloatAsState(
+            targetValue = if (backdropFrosted) 1f else 0f,
+            animationSpec = tween(durationMillis = 260),
+            label = "detail_hero_backdrop_frost",
+        )
         val trailerAlpha by animateFloatAsState(
             targetValue = if (heroTrailerReady) 1f else 0f,
             animationSpec = tween(durationMillis = 300),
@@ -185,6 +229,13 @@ fun DetailHero(
             maxWidth * 0.44f,
         )
         val heroTrailerArtworkBottomPadding = 358.dp
+        // The source picker docks in the trailer area. In narrower windows that runs over the
+        // overlay's content lane, which then fades out under it (laneFadeStart, applied by
+        // DetailDesktopHeroOverlay while frosted) — a roomy panel over a faded lane reads better
+        // than a sliver squeezed beside it.
+        val laneEnd = DetailHeroLaneStart + contentMaxWidth.coerceAtMost(DetailHeroLaneMaxWidth)
+        val streamDockStart = heroTrailerArtworkStart
+        val dockOverlapsLane = streamDockStart < laneEnd
         // The desktop hero draws its content over scrim gradients that normally fade to the theme
         // background. While a bounded trailer plays, the trailer-background setting recolours those
         // scrims (and the flat fill) so the whole surround honours the choice — the flat background
@@ -211,7 +262,8 @@ fun DetailHero(
                     .fillMaxSize(),
                 contentAlignment = Alignment.BottomCenter,
             ) {
-                val imageUrl = meta.background ?: meta.poster
+                // Full size: addon metadata often carries a w1280 TMDB backdrop (fullSizeTmdbBackdrop).
+                val imageUrl = fullSizeTmdbBackdrop(meta.background) ?: meta.poster
                 val backdropScale = when {
                     desktopOverlay -> 1.04f
                     isTablet -> 1f
@@ -226,6 +278,19 @@ fun DetailHero(
                     heroTrailerBackgroundMode == MetaHeroTrailerBackgroundMode.Backdrop &&
                     imageUrl != null
                 val showBackdropImage = imageUrl != null && (!boundedHeroTrailerActive || backdropWashActive)
+                // Desktop composites its two scrims onto the artwork in one dithered pass rather
+                // than painting them as gradients over it: over a dark backdrop the gradient
+                // version steps through the few output levels available as visible bands.
+                val backdropScrimModifier = if (desktopOverlay) {
+                    Modifier.nuvioDitheredScrim(
+                        scrim = heroTrailerScrimColor,
+                        horizontal = DesktopHeroSideScrimRamp,
+                        vertical = DesktopHeroBottomScrimRamp,
+                    )
+                } else {
+                    Modifier
+                }
+                Box(modifier = Modifier.fillMaxSize().then(backdropScrimModifier)) {
                 if (showBackdropImage) {
                     AsyncImage(
                         model = imageUrl,
@@ -236,7 +301,14 @@ fun DetailHero(
                                 translationY = scrollOffset * 0.5f
                                 scaleX = backdropScale
                                 scaleY = backdropScale
-                            },
+                            }
+                            .then(
+                                if (backdropFrost > 0f) {
+                                    Modifier.blur((BackdropFrostBlurDp * backdropFrost).dp)
+                                } else {
+                                    Modifier
+                                },
+                            ),
                         alignment = when {
                             desktopOverlay -> Alignment.CenterEnd
                             isTablet -> Alignment.TopCenter
@@ -246,6 +318,14 @@ fun DetailHero(
                         desktopImageScaling = NuvioDesktopImageScaling.Disabled,
                         onSuccess = { state -> onBackdropLoaded(state.painter, null) },
                     )
+                    if (backdropFrost > 0f) {
+                        // A little darker as well as blurred, so the source list reads on it.
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = BackdropFrostDim * backdropFrost)),
+                        )
+                    }
                     if (backdropWashActive) {
                         // Dim the backdrop so the small trailer stays the focal point. The scrim
                         // gradients below add further darkening on the content side.
@@ -268,10 +348,12 @@ fun DetailHero(
                             ),
                     )
                 }
+                }
                 if (fullHeroTrailer) {
                     HeroTrailerPlayerSurface(
                         sourceUrl = heroTrailerSourceUrl,
                         sourceAudioUrl = heroTrailerSourceAudioUrl,
+                        sourceHeaders = heroTrailerSourceHeaders,
                         playWhenReady = heroTrailerPlayWhenReady,
                         muted = heroTrailerMuted,
                         volume = heroTrailerVolume,
@@ -293,49 +375,25 @@ fun DetailHero(
                     )
                 }
 
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(if (desktopOverlay) heroHeight else 260.dp)
-                        .align(Alignment.BottomCenter)
-                        .background(
-                            if (desktopOverlay) {
-                                Brush.horizontalGradient(
-                                    colorStops = arrayOf(
-                                        0f to heroTrailerScrimColor,
-                                        0.34f to heroTrailerScrimColor.copy(alpha = 0.9f),
-                                        0.6f to heroTrailerScrimColor.copy(alpha = 0.42f),
-                                        0.82f to heroTrailerScrimColor.copy(alpha = 0.12f),
-                                        1f to Color.Transparent,
-                                    ),
-                                )
-                            } else {
+                if (!desktopOverlay) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
                                 Brush.verticalGradient(
                                     colors = listOf(
                                         Color.Transparent,
                                         MaterialTheme.colorScheme.background.copy(alpha = 0.7f),
                                         MaterialTheme.colorScheme.background,
                                     ),
-                                )
-                            },
-                        ),
-                )
-
-                if (desktopOverlay) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    colorStops = arrayOf(
-                                        0f to Color.Transparent,
-                                        0.38f to Color.Transparent,
-                                        0.68f to heroTrailerScrimColor.copy(alpha = 0.72f),
-                                        1f to heroTrailerScrimColor,
-                                    ),
                                 ),
                             ),
                     )
+                }
+
+                if (desktopOverlay) {
                     DetailDesktopHeroOverlay(
                         meta = meta,
                         logoUrl = logoUrl,
@@ -349,6 +407,7 @@ fun DetailHero(
                         showActions = showActions,
                         showOverview = showOverview,
                         showCast = showCast,
+                        castEpisodeCountVisibility = castEpisodeCountVisibility,
                         showProduction = showProduction,
                         showDetails = showDetails,
                         showManualPlayOption = showManualPlayOption,
@@ -366,6 +425,9 @@ fun DetailHero(
                         ratingProviderName = ratingProviderName,
                         onCastClick = onCastClick,
                         onCompanyClick = onCompanyClick,
+                        badgesAlpha = 1f - backdropFrost,
+                        laneFadeStart = if (dockOverlapsLane) streamDockStart else null,
+                        laneFade = backdropFrost,
                     )
                 } else {
                     Column(
@@ -405,6 +467,7 @@ fun DetailHero(
                     HeroTrailerPlayerSurface(
                         sourceUrl = heroTrailerSourceUrl,
                         sourceAudioUrl = heroTrailerSourceAudioUrl,
+                        sourceHeaders = heroTrailerSourceHeaders,
                         playWhenReady = heroTrailerPlayWhenReady,
                         muted = heroTrailerMuted,
                         volume = heroTrailerVolume,
@@ -427,10 +490,42 @@ fun DetailHero(
                     )
                 }
 
-                if (discoveryFacts.isNotEmpty() && maxDiscoveryBadges > 0) {
+                if (desktopOverlay) {
+                    // Offer the trailer area to the source picker, which docks there instead of
+                    // opening over the page (StreamPickerController): the bounded trailer's region
+                    // out to the window's top and right edges, run a little lower so its bottom
+                    // lines up with the cast row's episode counts. Withdrawn when scrolling leaves
+                    // too little of it.
+                    val density = LocalDensity.current
+                    val dockKey = StreamPickerDock.forMeta(meta.id)
+                    DisposableEffect(dockKey) {
+                        onDispose { StreamPickerController.clearDock(dockKey) }
+                    }
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
+                            .padding(
+                                start = streamDockStart,
+                                bottom = heroTrailerArtworkBottomPadding - 22.dp,
+                            )
+                            .onGloballyPositioned { coordinates ->
+                                val bounds = coordinates.boundsInWindow()
+                                if (bounds.height >= with(density) { 240.dp.toPx() }) {
+                                    StreamPickerController.reportDock(dockKey, bounds)
+                                } else {
+                                    StreamPickerController.clearDock(dockKey)
+                                }
+                            },
+                    )
+                }
+
+                // The badges sit where the docked source list's header goes; they fade out with the
+                // frost and leave the composition (and their click targets) once it is complete.
+                if (discoveryFacts.isNotEmpty() && maxDiscoveryBadges > 0 && backdropFrost < 1f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer { alpha = 1f - backdropFrost }
                             .padding(
                                 top = WindowInsets.statusBars
                                     .asPaddingValues()
@@ -452,6 +547,14 @@ fun DetailHero(
     }
 }
 
+private const val BackdropFrostBlurDp = 28f
+private const val BackdropFrostDim = 0.25f
+private val DetailHeroLaneStart = 64.dp
+private val DetailHeroLaneMaxWidth = 760.dp
+/** Width over which the content lane fades out ahead of an overlapping docked picker. */
+private val LaneFadeRamp = 96.dp
+private val DetailHeroRatingsLaneHeight = 26.dp
+
 @Composable
 private fun DetailDesktopHeroOverlay(
     meta: MetaDetails,
@@ -466,6 +569,7 @@ private fun DetailDesktopHeroOverlay(
     showActions: Boolean,
     showOverview: Boolean,
     showCast: Boolean,
+    castEpisodeCountVisibility: CastEpisodeCountVisibility,
     showProduction: Boolean,
     showDetails: Boolean,
     showManualPlayOption: Boolean,
@@ -483,11 +587,16 @@ private fun DetailDesktopHeroOverlay(
     ratingProviderName: String?,
     onCastClick: ((MetaPerson, String?) -> Unit)?,
     onCompanyClick: ((MetaCompany, String) -> Unit)?,
+    badgesAlpha: Float = 1f,
+    /** Window-x where a docked picker overlapping the lane begins; null when it docks clear. */
+    laneFadeStart: Dp? = null,
+    /** 0..1: how far the lane has faded out under laneFadeStart (follows the backdrop frost). */
+    laneFade: Float = 0f,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         val safeTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-        val laneStart = 64.dp
-        val laneWidth = contentMaxWidth.coerceAtMost(760.dp)
+        val laneStart = DetailHeroLaneStart
+        val laneWidth = contentMaxWidth.coerceAtMost(DetailHeroLaneMaxWidth)
         val headingWidth = laneWidth.coerceAtMost(620.dp)
         val productionPeople = remember(meta) { meta.detailHeroProductionPeople() }
         val starringPeople = remember(meta.cast) {
@@ -495,6 +604,30 @@ private fun DetailDesktopHeroOverlay(
         }
         val canShowCast = showCast && starringPeople.isNotEmpty()
         val canShowProduction = showProduction && productionPeople.isNotEmpty()
+        // TVDB's portraits of the characters (ported from the Nuvio Tracker site), matched to the
+        // cast by actor name, else character name. Loaded after the page; a TVDB key is needed.
+        // null while the lookup runs. With the characters view on, the row waits for it on blank
+        // circles instead of loading every actor photo only to swap each one for the character's a
+        // moment later (two downloads per face and a visible swap). A slow lookup gives up waiting
+        // after CharacterPortraitWaitMs and shows the actors; the characters still replace them
+        // if they arrive.
+        var showCharacters by remember { mutableStateOf(CastViewStorage.loadShowCharacters()) }
+        val tvdbCharacters by produceState<List<TvdbCharacter>?>(null, meta.id, canShowCast) {
+            value = null
+            if (!canShowCast) {
+                value = emptyList()
+                return@produceState
+            }
+            val imdb = meta.imdbId?.takeIf { it.startsWith("tt") } ?: meta.id.takeIf { it.startsWith("tt") }?.substringBefore(':')
+            val lookup = async { TvdbImageService.fetchCharacters(meta.type, meta.id, imdb) }
+            value = withTimeoutOrNull(CharacterPortraitWaitMs) { lookup.await() } ?: emptyList()
+            if (!lookup.isCompleted) value = lookup.await()
+        }
+        val starringWithCharacters = remember(starringPeople, tvdbCharacters) {
+            starringPeople.withCharacterImages(tvdbCharacters.orEmpty())
+        }
+        val hasCharacters = starringWithCharacters.any { !it.characterImage.isNullOrBlank() }
+        val characterPortraitsPending = showCharacters && tvdbCharacters == null
         var peopleTab by remember(meta.id, canShowCast, canShowProduction) {
             mutableStateOf(
                 if (canShowCast) DetailHeroPeopleTab.Starring else DetailHeroPeopleTab.Production,
@@ -517,9 +650,74 @@ private fun DetailDesktopHeroOverlay(
             }
         }
 
+        // The status line takes room above the actions, so the logo and metadata sit higher with
+        // one and keep their original lanes without one.
+        val statusLine = remember(meta.type, meta.status, meta.seriesType, meta.country, meta.language, meta.videos, meta.genres, meta.director, meta.tmdbKeywords, meta.mdblistKeywords) {
+            buildDetailStatusLine(meta)
+        }
+        // A couple of the genre hover's tags close the status line, in its faded colour, like theme tags (deduplicated
+        // against the genres in the metadata row above, which keep the full card on hover).
+        val heroGenres = remember(meta.genres) { meta.genres.take(3).filter { it.isNotBlank() } }
+        val genreCard = remember(heroGenres, meta.imdbInterests, meta.tmdbKeywords, meta.mdblistKeywords) {
+            GenreSubgenres.card(heroGenres, meta.imdbInterests, meta.allKeywords())
+        }
+        val statusTags = remember(genreCard, heroGenres) { GenreSubgenres.lineTags(genreCard, heroGenres) }
+        val hasStatusLine = showOverview && (statusLine != null || statusTags.isNotEmpty())
+        // Every lane below sits this far under its original spot, so the block reads as centred in
+        // the hero rather than hung from the back button; the cast still clears the season tabs.
+        val laneShift = 12.dp
+        // With MDBList ratings on, a title is about to have a ratings row even while they are
+        // still loading, so its lane is held open from the start: the status line below it then
+        // stays put instead of being pushed down when the ratings arrive.
+        val mdbListSettings by MdbListSettingsRepository.uiState.collectAsState()
+        val reserveRatingsLane = mdbListSettings.enabled &&
+            mdbListSettings.apiKey.isNotBlank() &&
+            mdbListSettings.enabledProvidersInPriorityOrder().isNotEmpty()
+        val metadataTop = (if (hasStatusLine) 222.dp else 238.dp) + laneShift
+        // Non-blocking first-appearance stage arrival: logo, metadata, and actions gently rise
+        // and fade in over 180 ms via graphicsLayer while remaining immediately clickable.
+        val stageArrival = remember(meta.id) { Animatable(0f) }
+        LaunchedEffect(meta.id) {
+            UiMotion.markBusy(180L)
+            stageArrival.animateTo(1f, tween(durationMillis = 180, easing = FastOutSlowInEasing))
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer {
+                    val p = stageArrival.value
+                    if (p < 1f) {
+                        alpha = p
+                        translationY = (1f - p) * 10.dp.toPx()
+                    }
+                }
+                .then(
+                    if (laneFadeStart != null && laneFade > 0f) {
+                        // Fades whatever runs under the docked picker (overview, cast, actions)
+                        // so the frosted panel isn't read over the page's own text. Applied
+                        // outside the lane padding: an offscreen layer clips to its bounds, and
+                        // inside the padding it cut off the focused action's ring, which is drawn
+                        // just past the button's left edge.
+                        Modifier
+                            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                            .drawWithContent {
+                                drawContent()
+                                val fadeEnd = laneFadeStart.toPx()
+                                val fadeBegin = fadeEnd - LaneFadeRamp.toPx()
+                                drawRect(
+                                    brush = Brush.horizontalGradient(
+                                        0f to Color.Black,
+                                        1f to Color.Black.copy(alpha = 1f - laneFade),
+                                        startX = fadeBegin,
+                                        endX = fadeEnd,
+                                    ),
+                                    blendMode = BlendMode.DstIn,
+                                )
+                            }
+                    } else {
+                        Modifier
+                    },
+                )
                 .padding(start = laneStart, top = safeTop),
         ) {
             DetailHeroLogoOrTitle(
@@ -528,18 +726,21 @@ private fun DetailDesktopHeroOverlay(
                 logoLoadError = logoLoadError,
                 onLogoLoadError = onLogoLoadError,
                 modifier = Modifier
-                    .padding(top = 70.dp)
+                    // The logo rests on the box's bottom edge, 24dp above the metadata. Its
+                    // transparent margins are trimmed (rememberHeroLogoModel), so that gap is the
+                    // same for every title rather than whatever empty rows the artwork carries.
+                    .padding(top = metadataTop - 174.dp)
                     .width(headingWidth)
                     .height(150.dp),
                 titleTextAlign = TextAlign.Center,
-                logoAlignment = Alignment.Center,
+                logoAlignment = Alignment.BottomCenter,
                 isTablet = true,
             )
 
             if (showOverview) {
                 Column(
                     modifier = Modifier
-                        .padding(top = 238.dp)
+                        .padding(top = metadataTop)
                         .width(headingWidth),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -548,16 +749,27 @@ private fun DetailDesktopHeroOverlay(
                         meta = meta,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    if (meta.externalRatings.isNotEmpty()) {
+                    if (meta.externalRatings.isNotEmpty() || reserveRatingsLane) {
                         Box(
-                            modifier = Modifier.fillMaxWidth(),
+                            // Fixed height: the tallest badge (a certified Rotten Tomatoes one) is
+                            // 24dp, so a row with or without it, or not loaded yet, takes the same room.
+                            modifier = Modifier.fillMaxWidth().height(DetailHeroRatingsLaneHeight),
                             contentAlignment = Alignment.Center,
                         ) {
                             RatingsRow(
                                 ratings = meta.externalRatings,
                                 horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
+                                linkFor = { it.linkFor(meta) },
                             )
                         }
+                    }
+                    if (statusLine != null || statusTags.isNotEmpty()) {
+                        DetailHeroStatusLine(
+                            line = statusLine,
+                            tags = statusTags,
+                            card = genreCard,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                     }
                 }
             }
@@ -566,7 +778,7 @@ private fun DetailDesktopHeroOverlay(
                 val isSeriesMeta = meta.type.trim().lowercase() in setOf("series", "show", "tv", "tvshow")
                 DetailActionButtons(
                     modifier = Modifier
-                        .padding(top = 328.dp)
+                        .padding(top = 328.dp + laneShift)
                         .width(headingWidth),
                     playLabel = playButtonLabel,
                     secondaryActions = listOfNotNull(
@@ -651,24 +863,75 @@ private fun DetailDesktopHeroOverlay(
             }
 
             if (showOverview && !meta.description.isNullOrBlank()) {
-                // Same footprint as a 4-line clamp (4 * 25.sp line height), but scrollable
-                // instead of ellipsized so a long synopsis can still be read in full.
+                // Same footprint as a 4-line clamp (4 * 25.sp line height), snapped to the exact
+                // 4th-line bottom once laid out so the 5th line never peeks in half-clipped, while
+                // remaining scrollable for long synopses with soft scroll-activated edge fades.
+                val overviewDensity = LocalDensity.current
+                val overviewScroll = remember(meta.id) { androidx.compose.foundation.ScrollState(0) }
+                var overviewMaxHeight by remember(meta.id) { mutableStateOf(100.dp) }
+                val overviewOverflow = overviewScroll.maxValue.takeIf { it != Int.MAX_VALUE } ?: 0
+                val overviewFadePx = with(overviewDensity) { 16.dp.toPx() }
                 Text(
                     text = meta.description,
                     modifier = Modifier
-                        .padding(top = 418.dp)
+                        .padding(top = 418.dp + laneShift)
                         .width(headingWidth)
-                        .heightIn(max = 100.dp)
-                        .verticalScroll(rememberScrollState()),
+                        .heightIn(max = overviewMaxHeight)
+                        .then(
+                            if (overviewOverflow > 0) {
+                                Modifier
+                                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                                    .drawWithContent {
+                                        drawContent()
+                                        val fade = overviewFadePx.coerceAtMost(size.height / 3f)
+                                        val scrolled = overviewScroll.value.toFloat()
+                                        val topFade = (scrolled / fade).coerceIn(0f, 1f)
+                                        val remainingBelow = ((overviewOverflow - scrolled) / fade).coerceIn(0f, 1f)
+                                        val bottomFade = topFade * remainingBelow
+                                        if (topFade > 0f) {
+                                            drawRect(
+                                                brush = Brush.verticalGradient(
+                                                    colorStops = arrayOf(
+                                                        0f to Color.Black.copy(alpha = 1f - topFade),
+                                                        fade / size.height to Color.Black,
+                                                    ),
+                                                ),
+                                                blendMode = BlendMode.DstIn,
+                                            )
+                                        }
+                                        if (bottomFade > 0f) {
+                                            drawRect(
+                                                brush = Brush.verticalGradient(
+                                                    colorStops = arrayOf(
+                                                        1f - fade / size.height to Color.Black,
+                                                        1f to Color.Black.copy(alpha = 1f - bottomFade),
+                                                    ),
+                                                ),
+                                                blendMode = BlendMode.DstIn,
+                                            )
+                                        }
+                                    }
+                            } else {
+                                Modifier
+                            },
+                        )
+                        .verticalScroll(overviewScroll),
                     style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 25.sp),
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.92f),
+                    onTextLayout = { layout ->
+                        overviewMaxHeight = if (layout.lineCount > 4) {
+                            with(overviewDensity) { layout.getLineBottom(3).toDp() }
+                        } else {
+                            androidx.compose.ui.unit.Dp.Unspecified
+                        }
+                    },
                 )
             }
 
             if (canShowCast || canShowProduction) {
                 Column(
                     modifier = Modifier
-                        .padding(top = 552.dp)
+                        .padding(top = 552.dp + laneShift)
                         .width(headingWidth),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
@@ -677,32 +940,51 @@ private fun DetailDesktopHeroOverlay(
                         showCast = canShowCast,
                         showProduction = canShowProduction,
                         onTabSelected = { peopleTab = it },
+                        showCharacters = showCharacters.takeIf {
+                            hasCharacters && activePeopleTab == DetailHeroPeopleTab.Starring
+                        },
+                        onShowCharacters = { value ->
+                            showCharacters = value
+                            CastViewStorage.saveShowCharacters(value)
+                        },
                     )
                     DetailCastSection(
                         cast = if (activePeopleTab == DetailHeroPeopleTab.Production) {
                             productionPeople
                         } else {
-                            starringPeople
+                            starringWithCharacters
                         },
+                        showCharacters = showCharacters && hasCharacters &&
+                            activePeopleTab == DetailHeroPeopleTab.Starring,
+                        portraitsPending = characterPortraitsPending &&
+                            activePeopleTab == DetailHeroPeopleTab.Starring,
+                        // Series counts can land with TMDB enrichment after the cast is already
+                        // shown; keeping the line from the start stops the row growing then.
+                        reserveEpisodeLine = activePeopleTab == DetailHeroPeopleTab.Starring &&
+                            meta.type.trim().lowercase() in setOf("series", "show", "tv", "tvshow"),
+                        showEpisodeCounts = castEpisodeCountVisibility.showCounts(meta.genres),
                         showHeader = false,
                         visibleItemCount = 6,
-                        onCastClick = if (activePeopleTab == DetailHeroPeopleTab.Starring) onCastClick else null,
+                        onCastClick = onCastClick,
                         compactDesktopLayout = true,
                     )
                 }
             }
         }
 
-        DetailHeroProductionBadges(
-            meta = meta,
-            onCompanyClick = onCompanyClick,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(
-                    top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 16.dp,
-                    end = 24.dp,
-                ),
-        )
+        if (badgesAlpha > 0f) {
+            DetailHeroProductionBadges(
+                meta = meta,
+                onCompanyClick = onCompanyClick,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .graphicsLayer { alpha = badgesAlpha }
+                    .padding(
+                        top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 16.dp,
+                        end = 24.dp,
+                    ),
+            )
+        }
     }
 }
 
@@ -785,6 +1067,9 @@ private fun DetailHeroPeopleHeader(
     showCast: Boolean,
     showProduction: Boolean,
     onTabSelected: (DetailHeroPeopleTab) -> Unit,
+    /** Null hides the Actors / Characters switch (no portraits, or not on Starring). */
+    showCharacters: Boolean? = null,
+    onShowCharacters: (Boolean) -> Unit = {},
 ) {
     Row(
         modifier = Modifier.widthIn(max = 620.dp),
@@ -812,6 +1097,63 @@ private fun DetailHeroPeopleHeader(
                 onClick = { onTabSelected(DetailHeroPeopleTab.Production) },
             )
         }
+        if (showCharacters != null) {
+            Spacer(modifier = Modifier.weight(1f))
+            // The switch only appears once TVDB's portraits arrive, after the page is up. It is
+            // laid out as zero height (drawn centred on the header line) and faded in, so its
+            // arrival can't grow the header and push the cast row down.
+            val switchAlpha = remember { Animatable(0f) }
+            LaunchedEffect(Unit) { switchAlpha.animateTo(1f, tween(220)) }
+            Row(
+                modifier = Modifier
+                    .layout { measurable, constraints ->
+                        val placeable = measurable.measure(constraints.copy(minHeight = 0))
+                        layout(placeable.width, 0) {
+                            placeable.place(0, -placeable.height / 2)
+                        }
+                    }
+                    .graphicsLayer { alpha = switchAlpha.value }
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color.White.copy(alpha = 0.08f))
+                    .padding(3.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                listOf(false to "Actors", true to "Characters").forEach { (value, label) ->
+                    val on = showCharacters == value
+                    Text(
+                        text = label,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (on) Color.White.copy(alpha = 0.16f) else Color.Transparent)
+                            .pointerHoverIcon(PointerIcon.Hand)
+                            .clickable { onShowCharacters(value) }
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                        color = if (on) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private val characterNameNoise = Regex("[^\\p{L}\\p{N}]+")
+
+private fun String?.normalizedForCharacterMatch(): String =
+    orEmpty().lowercase().replace(characterNameNoise, "")
+
+/** Each cast member's TVDB character portrait: by actor name, else by character name. */
+private const val CharacterPortraitWaitMs = 1_500L
+
+private fun List<MetaPerson>.withCharacterImages(characters: List<TvdbCharacter>): List<MetaPerson> {
+    if (characters.isEmpty()) return this
+    // Blank names never match: an unnamed TVDB character must not land on a cast member with no role.
+    val byPerson = characters.associate { it.person.normalizedForCharacterMatch() to it.image } - ""
+    val byCharacter = characters.associate { it.character.normalizedForCharacterMatch() to it.image } - ""
+    return map { person ->
+        val image = byPerson[person.name.normalizedForCharacterMatch()]
+            ?: byCharacter[person.role?.substringBefore(" / ").normalizedForCharacterMatch()]
+        if (image == null) person else person.copy(characterImage = image)
     }
 }
 
@@ -845,6 +1187,9 @@ private fun MetaDetails.detailHeroProductionPeople(): List<MetaPerson> {
                     name = name,
                     role = role,
                     photo = detailHeroCrewImage(name, role),
+                    // Carried over from the TMDB people list so the crew opens a person page;
+                    // a name with no match there is looked up by name when clicked.
+                    tmdbId = cast.firstOrNull { it.name.equals(name, ignoreCase = true) && (it.tmdbId ?: 0) > 0 }?.tmdbId,
                 )
             }
     }
@@ -901,7 +1246,7 @@ private fun DetailHeroLogoOrTitle(
 ) {
     if (logoUrl != null && !logoLoadError) {
         AsyncImage(
-            model = logoUrl,
+            model = rememberHeroLogoModel(logoUrl),
             contentDescription = stringResource(Res.string.detail_logo_content_description, meta.name),
             modifier = modifier,
             alignment = logoAlignment,
@@ -940,9 +1285,6 @@ private fun DetailHeroMetadataRow(
         ?.trim()
         ?.takeIf { it.isNotBlank() }
         ?.uppercase()
-    val countryBadge = meta.country
-        ?.trim()
-        ?.takeIf { it.isNotBlank() }
     // Each genre is its own hoverable entry (every one opens the title's single sub-genre card);
     // they are still drawn as one "Drama • Thriller" group, spaced like the joined string used to
     // be rather than like the wider bullets between fields.
@@ -963,7 +1305,6 @@ private fun DetailHeroMetadataRow(
         runtimeText?.let { add(listOf(DetailMetadataEntry(it))) }
         ageBadge?.let { add(listOf(DetailMetadataEntry(it))) }
         languageBadge?.let { add(listOf(DetailMetadataEntry(it))) }
-        countryBadge?.let { add(listOf(DetailMetadataEntry(it))) }
     }
         // Drop any blank entry so the bullet separators (drawn between items) never end up
         // orphaned next to an empty value.
@@ -998,6 +1339,74 @@ private fun DetailHeroMetadataRow(
             }
         }
     }
+}
+
+/**
+ * "Airing · Japanese Series", "British Limited Series", "Cancelled after 2 seasons": a
+ * quieter caption under the ratings. The country lives here rather than in the metadata row.
+ * A couple of the genre hover's [tags] close it ("… · Folk Horror · Found footage"), each with the
+ * same hover [card] as the genres; with no status they make the line on their own.
+ */
+@Composable
+private fun DetailHeroStatusLine(
+    line: DetailStatusLine?,
+    tags: List<String>,
+    card: GenreSubgenres.Card,
+    modifier: Modifier = Modifier,
+) {
+    val text = line?.let { detailStatusLineText(it) }
+    if (text == null && tags.isEmpty()) return
+    val style = MaterialTheme.typography.bodyLarge
+    val color = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (text != null) {
+            // The status gives way first on a narrow hero; the tags are short.
+            Text(
+                text = text,
+                modifier = Modifier.weight(1f, fill = false),
+                style = style,
+                color = color,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        tags.forEachIndexed { index, tag ->
+            if (text != null || index > 0) {
+                Text(text = " · ", style = style, color = color, fontWeight = FontWeight.Medium, maxLines = 1)
+            }
+            NuvioPosterHoverTooltip(title = card.headline, subtitle = card.themeLine) {
+                Text(text = tag, style = style, color = color, fontWeight = FontWeight.Medium, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun detailStatusLineText(line: DetailStatusLine): String? {
+    val status = when (line.status) {
+        DetailStatus.Airing -> stringResource(Res.string.details_status_airing)
+        DetailStatus.Ended -> stringResource(Res.string.details_status_ended)
+        DetailStatus.Upcoming -> stringResource(Res.string.details_status_upcoming)
+        DetailStatus.Cancelled -> line.cancelledAfterSeasons?.let { seasons ->
+            pluralStringResource(Res.plurals.details_status_cancelled_after_seasons, seasons, seasons)
+        } ?: stringResource(Res.string.details_status_cancelled)
+        null -> null
+    }
+    val country = line.country
+    val form = when (line.form) {
+        DetailForm.Series -> country?.let { stringResource(Res.string.details_form_series_from, it) }
+        DetailForm.LimitedSeries -> country?.let { stringResource(Res.string.details_form_limited_series_from, it) }
+            ?: stringResource(Res.string.details_form_limited_series)
+        DetailForm.Film -> country?.let { stringResource(Res.string.details_form_film_from, it) }
+        null -> null
+    }
+    val directors = line.directors?.let { stringResource(Res.string.hero_badge_label_directed_by, it) }
+    return listOfNotNull(status, form, directors).joinToString(" · ").ifBlank { null }
 }
 
 private data class DetailMetadataEntry(
@@ -1042,3 +1451,16 @@ private fun detailHeroHeight(
             ?: 1080.dp
         minOf(maxWidth * 9f / 16f, viewportLimit).coerceIn(420.dp, 1080.dp)
     }
+
+/**
+ * The desktop hero's left-hand scrim: opaque under the metadata column, clear by the right edge.
+ * Same stops the gradient box used to paint; see [nuvioDitheredScrim] for why it is no longer one.
+ */
+private val DesktopHeroSideScrimRamp = NuvioScrimRamp(
+    listOf(0f to 1f, 0.34f to 0.9f, 0.6f to 0.42f, 0.82f to 0.12f, 1f to 0f),
+)
+
+/** The desktop hero's bottom fade into the page, applied over the side scrim. */
+private val DesktopHeroBottomScrimRamp = NuvioScrimRamp(
+    listOf(0f to 0f, 0.38f to 0f, 0.68f to 0.72f, 1f to 1f),
+)

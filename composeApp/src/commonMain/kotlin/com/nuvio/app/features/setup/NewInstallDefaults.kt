@@ -15,6 +15,7 @@ import com.nuvio.app.features.player.DesktopColorProfile
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.updater.AppUpdaterPlatform
 import com.nuvio.app.features.updater.UpdateChannel
+import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
 import com.nuvio.app.isDesktop
 
 private const val HERO_TRAILER_DELAY_SECONDS = 5
@@ -32,8 +33,9 @@ private const val HERO_BADGE_COUNT = 6
  * persisted fresh-install answer behind [FirstRunWizardStorage.isEligible], plus a marker so the
  * pass runs exactly once even if the first session is killed before the wizard is finished.
  *
- * Note this is an *install*-level decision, not a profile-level one: creating a new profile resets
- * profile-scoped state but leaves the installation alone, so it does not re-run this.
+ * Note this is an *account*-level decision (each account on the PC has its own settings folder),
+ * not a profile-level one: creating a new profile resets profile-scoped state but leaves the
+ * account's settings alone, so it does not re-run this.
  */
 internal object NewInstallDefaults {
 
@@ -54,6 +56,9 @@ internal object NewInstallDefaults {
         HomeCatalogSettingsRepository.setDiscoverBecauseYouWatchedRows(DISCOVER_BECAUSE_ROWS_RANGE.last)
         HomeCatalogSettingsRepository.setDiscoverTrendingGenreRows(DISCOVER_TRENDING_GENRE_ROWS_RANGE.last)
 
+        // Continue Watching: Up Next gets its own row rather than being mixed into resume items.
+        ContinueWatchingPreferencesRepository.setSeparateNextUpRow(true)
+
         // Home hero trailer. In the hero rather than full screen, because the default display mode
         // is TV Mode; Adaptive Ambient is the mode whose trailers want the whole window.
         PlayerSettingsRepository.setHeroTvTrailerFullscreen(false)
@@ -70,7 +75,7 @@ internal object NewInstallDefaults {
 
         // Posters
         PosterCardStyleRepository.setWidthDp(LargePosterCardWidthDp)
-        PosterCardStyleRepository.setPosterHighlightMode(PosterHighlightMode.Sweep)
+        PosterCardStyleRepository.setPosterHighlightMode(PosterHighlightMode.Shine)
 
         // Playback
         PlayerSettingsRepository.setDesktopPlaybackInfoPanelEnabled(true)

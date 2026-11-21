@@ -1,5 +1,12 @@
 package com.nuvio.app.core.ui
 
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.border
+import androidx.compose.foundation.hoverable
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -46,8 +53,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -113,6 +122,25 @@ object PosterZoomOverlayCoordinator {
     internal fun hide() {
         isVisible = false
     }
+
+    /**
+     * The open sheet's own close (its animation, then its onDismissed). Desktop has no platform back
+     * handler (PlatformBackHandler is a no-op there), so the app's Back (Escape, a pad's B, the mouse's
+     * back button) asks here first; without it Back went to the page behind the sheet (Nov 20 2026).
+     */
+    private var closeHandler: (() -> Unit)? = null
+
+    internal fun setCloseHandler(handler: (() -> Unit)?) {
+        closeHandler = handler
+    }
+
+    /** Closes the open sheet, if there is one. True when Back was used up by it. */
+    fun requestClose(): Boolean {
+        val close = closeHandler ?: return false
+        if (!isVisible) return false
+        close()
+        return true
+    }
 }
 
 class PosterZoomOverlayAction(
@@ -122,6 +150,16 @@ class PosterZoomOverlayAction(
     val onSelected: () -> Unit,
     /** Right-click (desktop) alternative to [onSelected]; the overlay closes the same way. */
     val onSecondarySelected: (() -> Unit)? = null,
+    /**
+     * [NuvioContextMenu] draws a separator wherever this changes from one row to the next; the other
+     * presentations ignore it.
+     */
+    val group: Int = 0,
+    /**
+     * [NuvioContextMenu] dims a disabled row and skips it for clicks and focus (the text fields'
+     * Cut/Copy with nothing selected); the other presentations ignore it.
+     */
+    val enabled: Boolean = true,
 )
 
 private enum class PosterZoomPhase {
@@ -243,6 +281,11 @@ fun NuvioPosterZoomActionOverlay(
     PlatformBackHandler(enabled = true) {
         close()
     }
+    DisposableEffect(Unit) {
+        val handler: () -> Unit = { close() }
+        PosterZoomOverlayCoordinator.setCloseHandler(handler)
+        onDispose { PosterZoomOverlayCoordinator.setCloseHandler(null) }
+    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -258,10 +301,23 @@ fun NuvioPosterZoomActionOverlay(
             ?.let { it.width / it.height }
             ?: 0.675f
         val aspect = anchorAspect.coerceIn(0.35f, 2.4f)
+        // The actions as a grid of tiles under the poster (2026-11-15): a list of ten rows ran off the bottom of
+        // the screen. Up to four across, as many rows as that takes; the poster gets whatever height is left, so
+        // the whole sheet always fits.
+        val fitColumns = ((maxWidth - NuvioTokens.Space.s48 + PosterZoomTileGap) / (PosterZoomTileMinWidth + PosterZoomTileGap))
+            .toInt().coerceAtLeast(1)
+        val gridColumns = frozenActions.size.coerceIn(1, 4).coerceAtMost(fitColumns)
+        val gridRows = (frozenActions.size + gridColumns - 1) / gridColumns
+        val tileWidth = min(
+            PosterZoomTileMaxWidth,
+            (maxWidth - NuvioTokens.Space.s48 - PosterZoomTileGap * (gridColumns - 1)) / gridColumns,
+        )
+        val menuWidth = tileWidth * gridColumns + PosterZoomTileGap * (gridColumns - 1)
+        val gridHeight = PosterZoomTileHeight * gridRows + PosterZoomTileGap * (gridRows - 1).coerceAtLeast(0)
         val maxPosterWidth = if (aspect >= 1f) maxWidth * 0.8f else maxWidth * 0.6f
-        val posterHeight = min(maxPosterWidth / aspect, maxHeight * 0.44f)
+        val roomForPoster = maxHeight - gridHeight - PosterZoomSheetChrome
+        val posterHeight = min(maxPosterWidth / aspect, min(maxHeight * 0.5f, roomForPoster)).coerceAtLeast(96.dp)
         val posterWidth = posterHeight * aspect
-        val menuWidth = min(280.dp, maxWidth - NuvioTokens.Space.s48)
         val columnWidth = max(posterWidth, menuWidth)
 
         Box(
@@ -336,6 +392,12 @@ fun NuvioPosterZoomActionOverlay(
 
             Spacer(modifier = Modifier.height(NuvioTokens.Space.s14))
 
+            val firstTile = remember { FocusRequester() }
+            LaunchedEffect(Unit) {
+                // The keyboard (and a pad) starts on the first action; the arrows walk the grid.
+                delay(120)
+                firstTile.requestFocusLogged()
+            }
             Column(
                 modifier = Modifier
                     .width(menuWidth)
@@ -343,39 +405,36 @@ fun NuvioPosterZoomActionOverlay(
                         val progress = menu.value
                         val clamped = progress.coerceIn(0f, 1f)
                         alpha = clamped
-                        val scale = 0.62f + 0.38f * progress
+                        val scale = 0.82f + 0.18f * progress
                         scaleX = scale
                         scaleY = scale
                         transformOrigin = TransformOrigin(0.5f, 0f)
                     }
-                    .graphicsLayer {
-                        shape = RoundedCornerShape(NuvioTokens.Space.s20.toPx())
-                        clip = true
-                    }
-                    .background(tokens.colors.surfaceElevated),
+                    .arrowKeyFocusNavigation(),
+                verticalArrangement = Arrangement.spacedBy(PosterZoomTileGap),
             ) {
-                frozenActions.forEachIndexed { index, action ->
-                    if (index > 0) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(NuvioTokens.Space.hairline)
-                                .background(tokens.colors.textPrimary.copy(alpha = 0.08f)),
-                        )
+                frozenActions.chunked(gridColumns).forEachIndexed { rowIndex, rowActions ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(PosterZoomTileGap)) {
+                        rowActions.forEachIndexed { columnIndex, action ->
+                            val index = rowIndex * gridColumns + columnIndex
+                            PosterZoomMenuTile(
+                                action = action,
+                                enabled = phase == PosterZoomPhase.Open,
+                                onSelected = { select(action) },
+                                onSecondarySelected = action.onSecondarySelected?.let { { selectSecondary(action) } },
+                                modifier = Modifier
+                                    .size(width = tileWidth, height = PosterZoomTileHeight)
+                                    .then(if (index == 0) Modifier.focusRequester(firstTile) else Modifier)
+                                    .graphicsLayer {
+                                        val stagger = index * 0.04f
+                                        val progress = ((menu.value.coerceIn(0f, 1f) - stagger) / (1f - stagger))
+                                            .coerceIn(0f, 1f)
+                                        alpha = progress
+                                        translationY = (1f - progress) * NuvioTokens.Space.s8.toPx()
+                                    },
+                            )
+                        }
                     }
-                    PosterZoomMenuRow(
-                        action = action,
-                        enabled = phase == PosterZoomPhase.Open,
-                        onSelected = { select(action) },
-                        onSecondarySelected = action.onSecondarySelected?.let { { selectSecondary(action) } },
-                        modifier = Modifier.graphicsLayer {
-                            val stagger = index * 0.07f
-                            val progress = ((menu.value.coerceIn(0f, 1f) - stagger) / (1f - stagger))
-                                .coerceIn(0f, 1f)
-                            alpha = progress
-                            translationY = (1f - progress) * NuvioTokens.Space.s8.toPx()
-                        },
-                    )
                 }
             }
         }
@@ -488,7 +547,7 @@ fun NuvioPosterZoomActionOverlay(
 }
 
 @Composable
-private fun PosterZoomMenuRow(
+private fun PosterZoomMenuTile(
     action: PosterZoomOverlayAction,
     enabled: Boolean,
     onSelected: () -> Unit,
@@ -497,32 +556,57 @@ private fun PosterZoomMenuRow(
 ) {
     val tokens = MaterialTheme.nuvio
     val contentColor = if (action.isDestructive) tokens.colors.danger else tokens.colors.textPrimary
-    Row(
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val focused by interaction.collectIsKeyboardFocusedAsState()
+    val shape = RoundedCornerShape(NuvioTokens.Space.s16)
+    // The app's glass (night base, frosted fill, hairline edge), lit in the accent when pointed at or focused,
+    // rather than the old flat grey card.
+    val night = NuvioGlass.night(tokens.colors.background, tokens.colors.accent)
+    val lit = hovered || focused
+    Column(
         modifier = modifier
-            .fillMaxWidth()
-            .clickable(enabled = enabled, onClick = onSelected)
+            .clip(shape)
+            .background(if (lit) androidx.compose.ui.graphics.lerp(night, tokens.colors.accent, 0.26f) else night.copy(alpha = 0.92f))
+            .ditheredBackground(NuvioGlass.Fill, shape)
+            .border(
+                if (focused) 2.dp else 1.dp,
+                if (lit) tokens.colors.accent.copy(alpha = 0.85f) else NuvioGlass.EdgeColor,
+                shape,
+            )
+            .hoverable(interaction)
+            .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onSelected)
             .secondaryClick(onSecondarySelected?.takeIf { enabled })
-            .padding(horizontal = NuvioTokens.Space.s18, vertical = NuvioTokens.Space.s16),
-        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = NuvioTokens.Space.s10, vertical = NuvioTokens.Space.s10),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
     ) {
-        Text(
-            text = action.label,
-            style = MaterialTheme.typography.bodyLarge,
-            color = contentColor,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
         Icon(
             imageVector = action.icon,
             contentDescription = null,
-            tint = contentColor,
+            tint = if (lit && !action.isDestructive) Color.White else contentColor.copy(alpha = 0.86f),
             modifier = Modifier.size(NuvioTokens.Icon.md),
+        )
+        Spacer(modifier = Modifier.height(NuvioTokens.Space.s8))
+        Text(
+            text = action.label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = contentColor,
+            fontWeight = FontWeight.Medium,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
+
+private val PosterZoomTileGap = 8.dp
+private val PosterZoomTileHeight = 88.dp
+private val PosterZoomTileMinWidth = 132.dp
+private val PosterZoomTileMaxWidth = 176.dp
+
+/** Everything in the sheet's column besides the poster and the grid: title, subtitle, spacers and a margin. */
+private val PosterZoomSheetChrome = 150.dp
 
 private fun lerp(start: Float, stop: Float, fraction: Float): Float =
     start + (stop - start) * fraction

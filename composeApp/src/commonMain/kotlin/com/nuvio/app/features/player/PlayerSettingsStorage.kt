@@ -13,12 +13,38 @@ internal expect object PlayerSettingsStorage {
     fun saveMouseMoveRevealsControlsEnabled(enabled: Boolean)
     fun loadDesktopLegacyHudEnabled(): Boolean?
     fun saveDesktopLegacyHudEnabled(enabled: Boolean)
+    fun loadDesktopMinimalHudEnabled(): Boolean?
+    fun saveDesktopMinimalHudEnabled(enabled: Boolean)
+    fun loadDesktopUltraHudEnabled(): Boolean?
+    fun saveDesktopUltraHudEnabled(enabled: Boolean)
+    fun loadDesktopOfficialHudEnabled(): Boolean?
+    fun saveDesktopOfficialHudEnabled(enabled: Boolean)
+    fun loadDesktopMinimalHudPillsEnabled(): Boolean?
+    fun saveDesktopMinimalHudPillsEnabled(enabled: Boolean)
+    fun loadDesktopDockPanelFromBarEnabled(): Boolean?
+    fun saveDesktopDockPanelFromBarEnabled(enabled: Boolean)
+    fun loadDesktopSeekHandleEnabled(): Boolean?
+    fun saveDesktopSeekHandleEnabled(enabled: Boolean)
+    fun loadDesktopHudVignetteEnabled(): Boolean?
+    fun saveDesktopHudVignetteEnabled(enabled: Boolean)
+    fun loadDesktopHiddenHudButtons(): String?
+    fun saveDesktopHiddenHudButtons(commands: String)
+    fun loadDesktopHudButtonOrder(): String?
+    fun saveDesktopHudButtonOrder(commands: String)
     fun loadDesktopAlwaysShowClockEnabled(): Boolean?
     fun saveDesktopAlwaysShowClockEnabled(enabled: Boolean)
     fun loadDesktopPauseOverlaySourceEnabled(): Boolean?
     fun saveDesktopPauseOverlaySourceEnabled(enabled: Boolean)
+    fun loadDesktopPauseOverlayEnabled(): Boolean?
+    fun saveDesktopPauseOverlayEnabled(enabled: Boolean)
     fun loadDesktopPlaybackSpeedFineIncrementsEnabled(): Boolean?
     fun saveDesktopPlaybackSpeedFineIncrementsEnabled(enabled: Boolean)
+    /** The wheel-only switch zones began as; read to migrate it to [loadDesktopPlayerZoneInput]. */
+    fun loadDesktopPlayerScrollZonesEnabled(): Boolean?
+    fun loadDesktopPlayerZoneInput(): String?
+    fun saveDesktopPlayerZoneInput(input: String)
+    fun loadDesktopPlayerZoneActions(): String?
+    fun saveDesktopPlayerZoneActions(actions: String)
     fun loadPlaybackSpeedToggleLow(): Float?
     fun savePlaybackSpeedToggleLow(speed: Float)
     fun loadPlaybackSpeedToggleHigh(): Float?
@@ -94,6 +120,8 @@ internal expect object PlayerSettingsStorage {
     fun saveSubtitleShowOnlyPreferredLanguages(enabled: Boolean)
     fun loadAddonSubtitleStartupMode(): String?
     fun saveAddonSubtitleStartupMode(mode: String)
+    fun loadPreferAddonSubtitles(): Boolean?
+    fun savePreferAddonSubtitles(enabled: Boolean)
     fun loadRejectedSubtitleKeywords(): Set<String>?
     fun saveRejectedSubtitleKeywords(keywords: Set<String>)
     fun loadRejectedAudioKeywords(): Set<String>?
@@ -108,12 +136,20 @@ internal expect object PlayerSettingsStorage {
     fun saveStreamPrefetchCacheMinutes(minutes: Int)
     fun loadStreamPrefetchResolveLinks(): Boolean?
     fun saveStreamPrefetchResolveLinks(enabled: Boolean)
+    fun loadStreamCwCacheEnabled(): Boolean?
+    fun saveStreamCwCacheEnabled(enabled: Boolean)
+    fun loadPreloadNextEpisodeSources(): Boolean?
+    fun savePreloadNextEpisodeSources(enabled: Boolean)
     fun loadDecoderPriority(): Int?
     fun saveDecoderPriority(priority: Int)
     fun loadNvidiaRtxSuperResolutionEnabled(): Boolean?
     fun saveNvidiaRtxSuperResolutionEnabled(enabled: Boolean)
     fun loadNvidiaRtxHdrEnabled(): Boolean?
     fun saveNvidiaRtxHdrEnabled(enabled: Boolean)
+    fun loadNvidiaRtxHdrAnimeEnabled(): Boolean?
+    fun saveNvidiaRtxHdrAnimeEnabled(enabled: Boolean)
+    fun loadNvidiaRtxHdrAnimeShadersEnabled(): Boolean?
+    fun saveNvidiaRtxHdrAnimeShadersEnabled(enabled: Boolean)
     fun loadDesktopAnimeModeAutoEnabled(): Boolean?
     fun saveDesktopAnimeModeAutoEnabled(enabled: Boolean)
     fun loadDesktopAnimeTreatAnimationAsAnime(): Boolean?
@@ -122,6 +158,8 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopAnimeSkipUltraHdEnabled(enabled: Boolean)
     fun loadDesktopAnimeSvpEnabled(): Boolean?
     fun saveDesktopAnimeSvpEnabled(enabled: Boolean)
+    fun loadDesktopSvpAllContentEnabled(): Boolean?
+    fun saveDesktopSvpAllContentEnabled(enabled: Boolean)
     fun loadDesktopAnimeSvpDebugOverlayEnabled(): Boolean?
     fun saveDesktopAnimeSvpDebugOverlayEnabled(enabled: Boolean)
     fun loadDesktopPlaybackInfoPanelEnabled(): Boolean?
@@ -134,8 +172,16 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopCustomShaderSelectedPath(path: String)
     fun loadDesktopAudioPassthroughEnabled(): Boolean?
     fun saveDesktopAudioPassthroughEnabled(enabled: Boolean)
+    /** Legacy On/Off switch, read once to migrate into [loadDesktopSeekThumbnailMode]. */
     fun loadDesktopSeekThumbnailsEnabled(): Boolean?
-    fun saveDesktopSeekThumbnailsEnabled(enabled: Boolean)
+    fun loadDesktopSeekThumbnailMode(): String?
+    fun saveDesktopSeekThumbnailMode(mode: String)
+    fun loadDesktopRateLimitRecoveryMode(): String?
+    fun saveDesktopRateLimitRecoveryMode(mode: String)
+    fun loadDesktopRateLimitReconnectFirstDelaySeconds(): Int?
+    fun saveDesktopRateLimitReconnectFirstDelaySeconds(seconds: Int)
+    fun loadDesktopRateLimitReconnectSecondDelaySeconds(): Int?
+    fun saveDesktopRateLimitReconnectSecondDelaySeconds(seconds: Int)
     fun loadDesktopCustomMpvOptions(): String?
     fun saveDesktopCustomMpvOptions(options: String)
     fun loadDesktopMpvConfigMode(): String?
@@ -165,12 +211,22 @@ internal expect object PlayerSettingsStorage {
     fun loadAnimeSkipClientId(): String?
     fun saveAnimeSkipClientId(clientId: String)
 
+    fun loadSeekrApiKey(): String?
+    fun saveSeekrApiKey(apiKey: String)
     fun loadIntroDbApiKey(): String?
     fun saveIntroDbApiKey(apiKey: String)
     fun loadSkipDbApiKey(): String?
     fun saveSkipDbApiKey(apiKey: String)
     fun loadSkipAutoAcceptMode(): String?
     fun saveSkipAutoAcceptMode(mode: String)
+    fun loadSkipMovieCreditsToPostCredits(): Boolean?
+    fun saveSkipMovieCreditsToPostCredits(enabled: Boolean)
+    fun loadSkipAutoAcceptOutros(): Boolean?
+    fun saveSkipAutoAcceptOutros(enabled: Boolean)
+    fun loadStripSdhSubtitles(): Boolean?
+    fun saveStripSdhSubtitles(enabled: Boolean)
+    fun loadAutomaticSubtitleSyncEnabled(): Boolean?
+    fun saveAutomaticSubtitleSyncEnabled(enabled: Boolean)
     fun loadIntroSubmitEnabled(): Boolean?
     fun saveIntroSubmitEnabled(enabled: Boolean)
     fun loadStreamAutoPlayNextEpisodeEnabled(): Boolean?
@@ -227,6 +283,12 @@ internal expect object PlayerSettingsStorage {
     fun saveIosGamma(value: Int)
     fun loadDesktopHdrMode(): String?
     fun saveDesktopHdrMode(mode: String)
+    fun loadDesktopInverseToneMappingEnabled(): Boolean?
+    fun saveDesktopInverseToneMappingEnabled(enabled: Boolean)
+    fun loadDesktopInverseToneMappingPeakNits(): Int?
+    fun saveDesktopInverseToneMappingPeakNits(nits: Int)
+    fun loadDesktopMatchDisplayRefreshRate(): Boolean?
+    fun saveDesktopMatchDisplayRefreshRate(enabled: Boolean)
     fun loadDesktopColorProfile(): String?
     fun saveDesktopColorProfile(profile: String)
     fun loadDesktopColorContrast(): Int?
@@ -243,6 +305,10 @@ internal expect object PlayerSettingsStorage {
     fun saveDesktopRendererApi(api: String)
     fun loadDesktopPerformanceLogging(): Boolean?
     fun saveDesktopPerformanceLogging(enabled: Boolean)
+    fun loadDesktopSteadyFramePacing(): Boolean?
+    fun saveDesktopSteadyFramePacing(enabled: Boolean)
+    fun loadDesktopHdrUiCompensation(): Boolean?
+    fun saveDesktopHdrUiCompensation(enabled: Boolean)
     fun loadDesktopLowVramMode(): String?
     fun saveDesktopLowVramMode(mode: String)
     fun loadDesktopAnimeMode(): String?

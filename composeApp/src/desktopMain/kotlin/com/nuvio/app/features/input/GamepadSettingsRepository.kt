@@ -2,6 +2,7 @@ package com.nuvio.app.features.input
 
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
+import com.nuvio.app.features.panelring.PanelRingSize
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -11,8 +12,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * defaults map that an untouched install matches exactly, and a `@Volatile` mirror because the
  * poll thread reads these on every tick while the UI writes them.
  *
- * Bindings themselves are not stored yet — [GamepadDefaults] is the whole layout. When a rebinding
- * UI lands it belongs here, keyed by [GamepadButton.id] the way shortcuts are keyed by action id.
+ * Rebound buttons are stored here too, one key per button ([GamepadButton.id]) holding both of its
+ * meanings (see [GamepadTargetCodec]); a button never rebound has no key and follows
+ * [GamepadDefaults]. So are the panel ring's settings: which button opens it, its size, and
+ * whether the middle mouse button opens it.
  */
 object GamepadSettingsRepository {
     /** Off by default: a pad plugged in for a game should not start driving the UI unasked. */
@@ -32,9 +35,53 @@ object GamepadSettingsRepository {
     const val MIN_REPEAT_INTERVAL_MS = 60
     const val MAX_REPEAT_INTERVAL_MS = 250
 
+    /**
+     * Off by default: with it on, every click into a text field raises the panel, which a desk user
+     * with a real keyboard would find in the way. It is for the couch, with only a mouse to hand.
+     */
+    const val DEFAULT_MOUSE_KEYBOARD = false
+
     private const val KEY_ENABLED = "gamepad_enabled"
     private const val KEY_DEAD_ZONE = "gamepad_dead_zone_pct"
     private const val KEY_REPEAT_INTERVAL = "gamepad_repeat_interval_ms"
+    private const val KEY_MOUSE_KEYBOARD = "osk_mouse_enabled"
+    private const val KEY_BINDING_PREFIX = "gamepad_bind_"
+    private const val KEY_RING_BUTTON = "panel_ring_pad_button"
+    private const val KEY_RING_SIZE = "panel_ring_size"
+    private const val KEY_RING_MOUSE = "panel_ring_middle_mouse"
+    private const val KEY_CURSOR_BUTTON = "gamepad_cursor_button"
+    private const val KEY_CURSOR_SPEED = "gamepad_cursor_speed"
+    private const val KEY_CURSOR_DEFAULT = "gamepad_cursor_default"
+    private const val KEY_CURSOR_HINT = "gamepad_cursor_hint"
+    private const val KEY_LIGHT_BAR = "gamepad_light_bar"
+    private const val KEY_PLAYER_LIGHT = "gamepad_player_light"
+
+    /** Hold this to turn the left stick into the mouse pointer; a tap still does the button's own action. */
+    val DEFAULT_CURSOR_BUTTON: GamepadButton? = GamepadButton.RightThumb
+
+    /** The stick clicks: the face buttons and D-pad are in use while pointing. */
+    val CURSOR_BUTTON_CHOICES: List<GamepadButton> = listOf(GamepadButton.RightThumb, GamepadButton.LeftThumb)
+
+    /** Hold this to open the panel ring; a tap still does the button's own action. */
+    val DEFAULT_RING_BUTTON: GamepadButton? = GamepadButton.LeftShoulder
+    const val RING_BUTTON_OFF = "off"
+
+    /**
+     * Buttons that can open the ring. Not View: holding it is push-to-talk. Not the D-pad, sticks'
+     * directions or A/B: they move and select inside the ring.
+     */
+    val RING_BUTTON_CHOICES: List<GamepadButton> = listOf(
+        GamepadButton.LeftShoulder,
+        GamepadButton.RightShoulder,
+        GamepadButton.LeftTrigger,
+        GamepadButton.RightTrigger,
+        GamepadButton.LeftThumb,
+        GamepadButton.RightThumb,
+        GamepadButton.X,
+        GamepadButton.Y,
+        GamepadButton.Start,
+    )
+    const val DEFAULT_RING_MOUSE = true
 
     private val store = DesktopStorage.store("nuvio_gamepad")
 
@@ -53,6 +100,13 @@ object GamepadSettingsRepository {
     var repeatIntervalMs: Int = DEFAULT_REPEAT_INTERVAL_MS
         private set
 
+    /**
+     * Not read by the poll thread, but kept with the pad settings because it is the same panel —
+     * and deliberately independent of [enabled], since the point is that no controller is needed.
+     */
+    private val _mouseKeyboardState = MutableStateFlow(DEFAULT_MOUSE_KEYBOARD)
+    val mouseKeyboardState: StateFlow<Boolean> = _mouseKeyboardState.asStateFlow()
+
     private val _enabledState = MutableStateFlow(DEFAULT_ENABLED)
     val enabledState: StateFlow<Boolean> = _enabledState.asStateFlow()
 
@@ -61,6 +115,56 @@ object GamepadSettingsRepository {
 
     private val _repeatIntervalState = MutableStateFlow(DEFAULT_REPEAT_INTERVAL_MS)
     val repeatIntervalState: StateFlow<Int> = _repeatIntervalState.asStateFlow()
+
+    /** Buttons the user has rebound; read by the poll thread on every press. */
+    @Volatile
+    private var overrides: Map<GamepadButton, GamepadBinding> = emptyMap()
+
+    @Volatile
+    var ringButton: GamepadButton? = DEFAULT_RING_BUTTON
+        private set
+
+    private val _ringButtonState = MutableStateFlow(DEFAULT_RING_BUTTON)
+    val ringButtonState: StateFlow<GamepadButton?> = _ringButtonState.asStateFlow()
+
+    private val _ringSizeState = MutableStateFlow(PanelRingSize.Medium)
+    val ringSizeState: StateFlow<PanelRingSize> = _ringSizeState.asStateFlow()
+
+    @Volatile
+    var cursorButton: GamepadButton? = DEFAULT_CURSOR_BUTTON
+        private set
+    private val _cursorButtonState = MutableStateFlow(DEFAULT_CURSOR_BUTTON)
+    val cursorButtonState: StateFlow<GamepadButton?> = _cursorButtonState.asStateFlow()
+
+    @Volatile
+    var cursorSpeed: ControllerCursorSpeed = ControllerCursorSpeed.Medium
+        private set
+    private val _cursorSpeedState = MutableStateFlow(ControllerCursorSpeed.Medium)
+    val cursorSpeedState: StateFlow<ControllerCursorSpeed> = _cursorSpeedState.asStateFlow()
+
+    /** The stick is the pointer whenever Nuvio is in front; the D-pad still moves focus. */
+    @Volatile
+    var cursorByDefault: Boolean = false
+        private set
+    private val _cursorByDefaultState = MutableStateFlow(false)
+    val cursorByDefaultState: StateFlow<Boolean> = _cursorByDefaultState.asStateFlow()
+
+    /** The pill naming the pointer's buttons while it is unlocked. */
+    private val _cursorHintState = MutableStateFlow(true)
+    val cursorHintState: StateFlow<Boolean> = _cursorHintState.asStateFlow()
+
+    private val _ringMouseState = MutableStateFlow(DEFAULT_RING_MOUSE)
+    val ringMouseState: StateFlow<Boolean> = _ringMouseState.asStateFlow()
+
+    /** A DualSense's light bar and player light; written to the pad by GamepadInput. */
+    private val _lightBarState = MutableStateFlow(ControllerLightBar.LeaveAlone)
+    val lightBarState: StateFlow<ControllerLightBar> = _lightBarState.asStateFlow()
+    private val _playerLightState = MutableStateFlow(true)
+    val playerLightState: StateFlow<Boolean> = _playerLightState.asStateFlow()
+
+    /** Bumped on every rebind, so the settings list redraws. */
+    private val _bindingsVersion = MutableStateFlow(0)
+    val bindingsVersion: StateFlow<Int> = _bindingsVersion.asStateFlow()
 
     /** True while a pad is actually answering XInput, for the settings page's status line. */
     private val _connected = MutableStateFlow(false)
@@ -81,8 +185,149 @@ object GamepadSettingsRepository {
             .coerceIn(MIN_DEAD_ZONE, MAX_DEAD_ZONE)
         repeatIntervalMs = (store.getInt(scoped(KEY_REPEAT_INTERVAL)) ?: DEFAULT_REPEAT_INTERVAL_MS)
             .coerceIn(MIN_REPEAT_INTERVAL_MS, MAX_REPEAT_INTERVAL_MS)
+        _mouseKeyboardState.value = store.getBoolean(scoped(KEY_MOUSE_KEYBOARD)) ?: DEFAULT_MOUSE_KEYBOARD
+        overrides = GamepadButton.entries.mapNotNull { button ->
+            val fallback = GamepadDefaults.binding(button)
+            GamepadTargetCodec.decodeBinding(store.getString(scoped(bindingKey(button))), fallback)
+                ?.let { button to it }
+        }.toMap()
+        ringButton = decodeRingButton(store.getString(scoped(KEY_RING_BUTTON)))
+        _ringSizeState.value = PanelRingSize.fromKey(store.getString(scoped(KEY_RING_SIZE)))
+        _ringMouseState.value = store.getBoolean(scoped(KEY_RING_MOUSE)) ?: DEFAULT_RING_MOUSE
+        _lightBarState.value = ControllerLightBar.entries.firstOrNull { it.name == store.getString(scoped(KEY_LIGHT_BAR)) }
+            ?: ControllerLightBar.LeaveAlone
+        _playerLightState.value = store.getBoolean(scoped(KEY_PLAYER_LIGHT)) ?: true
+        cursorButton = when (val stored = store.getString(scoped(KEY_CURSOR_BUTTON))) {
+            null -> DEFAULT_CURSOR_BUTTON
+            RING_BUTTON_OFF -> null
+            else -> GamepadButton.fromId(stored)?.takeIf { it in CURSOR_BUTTON_CHOICES } ?: DEFAULT_CURSOR_BUTTON
+        }
+        _cursorButtonState.value = cursorButton
+        cursorSpeed = ControllerCursorSpeed.entries.firstOrNull { it.name == store.getString(scoped(KEY_CURSOR_SPEED)) }
+            ?: ControllerCursorSpeed.Medium
+        _cursorSpeedState.value = cursorSpeed
+        cursorByDefault = store.getBoolean(scoped(KEY_CURSOR_DEFAULT)) ?: false
+        _cursorByDefaultState.value = cursorByDefault
+        _cursorHintState.value = store.getBoolean(scoped(KEY_CURSOR_HINT)) ?: true
         publish()
     }
+
+    /** What [button] does now: the user's rebind if there is one, else the default layout. */
+    fun binding(button: GamepadButton): GamepadBinding {
+        ensureLoaded()
+        return overrides[button] ?: GamepadDefaults.binding(button)
+    }
+
+    fun isRebound(button: GamepadButton): Boolean {
+        ensureLoaded()
+        return button in overrides
+    }
+
+    /** Sets one of [button]'s two meanings; the other keeps whatever it has now. */
+    fun setTarget(button: GamepadButton, inPlayer: Boolean, target: GamepadTarget) {
+        val current = binding(button)
+        val next = if (inPlayer) current.copy(player = target) else current.copy(browsing = target)
+        setBinding(button, next)
+    }
+
+    fun setBinding(button: GamepadButton, binding: GamepadBinding) {
+        ensureLoaded()
+        val encoded = GamepadTargetCodec.encodeBinding(binding)
+        if (binding == GamepadDefaults.binding(button) || encoded == null) {
+            overrides = overrides - button
+            store.remove(scoped(bindingKey(button)))
+        } else {
+            overrides = overrides + (button to binding)
+            store.putString(scoped(bindingKey(button)), encoded)
+        }
+        _bindingsVersion.value++
+    }
+
+    fun resetButton(button: GamepadButton) = setBinding(button, GamepadDefaults.binding(button))
+
+    fun resetAllButtons() {
+        ensureLoaded()
+        GamepadButton.entries.forEach { store.remove(scoped(bindingKey(it))) }
+        overrides = emptyMap()
+        _bindingsVersion.value++
+    }
+
+    fun setRingButton(button: GamepadButton?) {
+        ensureLoaded()
+        val value = button?.takeIf { it in RING_BUTTON_CHOICES }
+        ringButton = value
+        if (value == DEFAULT_RING_BUTTON) {
+            store.remove(scoped(KEY_RING_BUTTON))
+        } else {
+            store.putString(scoped(KEY_RING_BUTTON), value?.id ?: RING_BUTTON_OFF)
+        }
+        _ringButtonState.value = value
+    }
+
+    fun setCursorButton(button: GamepadButton?) {
+        ensureLoaded()
+        val value = button?.takeIf { it in CURSOR_BUTTON_CHOICES }
+        cursorButton = value
+        if (value == DEFAULT_CURSOR_BUTTON) {
+            store.remove(scoped(KEY_CURSOR_BUTTON))
+        } else {
+            store.putString(scoped(KEY_CURSOR_BUTTON), value?.id ?: RING_BUTTON_OFF)
+        }
+        _cursorButtonState.value = value
+    }
+
+    fun setCursorSpeed(speed: ControllerCursorSpeed) {
+        ensureLoaded()
+        cursorSpeed = speed
+        if (speed == ControllerCursorSpeed.Medium) store.remove(scoped(KEY_CURSOR_SPEED)) else store.putString(scoped(KEY_CURSOR_SPEED), speed.name)
+        _cursorSpeedState.value = speed
+    }
+
+    fun setCursorByDefault(enabled: Boolean) {
+        ensureLoaded()
+        cursorByDefault = enabled
+        if (enabled) store.putBoolean(scoped(KEY_CURSOR_DEFAULT), true) else store.remove(scoped(KEY_CURSOR_DEFAULT))
+        _cursorByDefaultState.value = enabled
+    }
+
+    fun setCursorHint(visible: Boolean) {
+        ensureLoaded()
+        if (visible) store.remove(scoped(KEY_CURSOR_HINT)) else store.putBoolean(scoped(KEY_CURSOR_HINT), false)
+        _cursorHintState.value = visible
+    }
+
+    fun setRingSize(size: PanelRingSize) {
+        ensureLoaded()
+        if (size == PanelRingSize.Medium) store.remove(scoped(KEY_RING_SIZE)) else store.putString(scoped(KEY_RING_SIZE), size.key)
+        _ringSizeState.value = size
+    }
+
+    fun setRingMouse(enabled: Boolean) {
+        ensureLoaded()
+        if (enabled == DEFAULT_RING_MOUSE) store.remove(scoped(KEY_RING_MOUSE)) else store.putBoolean(scoped(KEY_RING_MOUSE), enabled)
+        _ringMouseState.value = enabled
+    }
+
+    fun setLightBar(mode: ControllerLightBar) {
+        ensureLoaded()
+        if (mode == ControllerLightBar.LeaveAlone) store.remove(scoped(KEY_LIGHT_BAR)) else store.putString(scoped(KEY_LIGHT_BAR), mode.name)
+        _lightBarState.value = mode
+    }
+
+    fun setPlayerLight(enabled: Boolean) {
+        ensureLoaded()
+        if (enabled) store.remove(scoped(KEY_PLAYER_LIGHT)) else store.putBoolean(scoped(KEY_PLAYER_LIGHT), false)
+        _playerLightState.value = enabled
+    }
+
+    /** Never set: the default. "off": no button. Anything else: that button, if it may open the ring. */
+    internal fun decodeRingButton(stored: String?): GamepadButton? = when (stored) {
+        null -> DEFAULT_RING_BUTTON
+        RING_BUTTON_OFF -> null
+        else -> GamepadButton.fromId(stored)?.takeIf { it in RING_BUTTON_CHOICES } ?: DEFAULT_RING_BUTTON
+    }
+
+    private fun bindingKey(button: GamepadButton) = KEY_BINDING_PREFIX + button.id
 
     fun setEnabled(value: Boolean) {
         ensureLoaded()
@@ -111,6 +356,18 @@ object GamepadSettingsRepository {
         publish()
     }
 
+    fun setMouseKeyboard(value: Boolean) {
+        ensureLoaded()
+        if (_mouseKeyboardState.value == value) return
+        _mouseKeyboardState.value = value
+        if (value == DEFAULT_MOUSE_KEYBOARD) {
+            store.remove(scoped(KEY_MOUSE_KEYBOARD))
+        } else {
+            store.putBoolean(scoped(KEY_MOUSE_KEYBOARD), value)
+        }
+    }
+
+    /** Controller tunables only — the mouse keyboard has its own section and is not a pad setting. */
     fun resetAll() {
         ensureLoaded()
         listOf(KEY_ENABLED, KEY_DEAD_ZONE, KEY_REPEAT_INTERVAL).forEach { store.remove(scoped(it)) }
@@ -123,6 +380,8 @@ object GamepadSettingsRepository {
     }
 
     private fun publish() {
+        _ringButtonState.value = ringButton
+        _bindingsVersion.value++
         _enabledState.value = enabled
         _deadZoneState.value = deadZone
         _repeatIntervalState.value = repeatIntervalMs

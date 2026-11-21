@@ -1,5 +1,7 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +22,7 @@ import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_player_airs_prefix
 import nuvio.composeapp.generated.resources.compose_player_downloaded
+import nuvio.composeapp.generated.resources.compose_player_resize_auto_crop
 import nuvio.composeapp.generated.resources.compose_player_resize_fill
 import nuvio.composeapp.generated.resources.compose_player_resize_fit
 import nuvio.composeapp.generated.resources.compose_player_resize_zoom
@@ -69,7 +72,13 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
 
     val runtime = remember {
         PlayerScreenRuntime(args).apply {
-            sessionPlaybackSpeed = playerSettingsUiState.defaultPlaybackSpeed
+            // A playlist opens a fresh player per entry; keep the speed the last entry played at.
+            // Live TV always starts at 1x: it arrives in real time, so a faster default only runs
+            // into the live edge and buffers. Changing the speed by hand there still works.
+            sessionPlaybackSpeed = PlaylistPlaybackSession.playbackSpeed
+                ?.takeIf { args.autoPlayMode == PlayerAutoPlayMode.Playlist }
+                ?: playerSettingsUiState.defaultPlaybackSpeed.takeUnless { isIptvPlayback }
+                ?: 1f
         }
     }
     runtime.args = args
@@ -93,7 +102,7 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
         runtime.episodeStreamsRepoState = episodeStreamsRepoState
         runtime.metaUiState = metaUiState
         runtime.addonsUiState = addonsUiState
-        runtime.addonSubtitles = addonSubtitles
+        runtime.addonSubtitles = mergeStreamAndAddonSubtitles(addonSubtitles, runtime.externalSubtitles)
         runtime.isLoadingAddonSubtitles = isLoadingAddonSubtitles
         runtime.horizontalSafePadding = horizontalSafePadding
         runtime.metrics = metrics
@@ -102,6 +111,7 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
         runtime.resizeModeFitLabel = stringResource(Res.string.compose_player_resize_fit)
         runtime.resizeModeFillLabel = stringResource(Res.string.compose_player_resize_fill)
         runtime.resizeModeZoomLabel = stringResource(Res.string.compose_player_resize_zoom)
+        runtime.resizeModeAutoCropLabel = stringResource(Res.string.compose_player_resize_auto_crop)
         runtime.downloadedLabel = stringResource(Res.string.compose_player_downloaded)
         runtime.airsPrefix = stringResource(Res.string.compose_player_airs_prefix)
         runtime.tbaLabel = stringResource(Res.string.compose_player_tba)
@@ -139,6 +149,7 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
             playerSize = runtime.layoutSize,
         )
         runtime.BindPlayerRuntimeEffects()
+        runtime.BindPlayerBrowsePip() // fork:pip-browse
         runtime.RenderPlayerRuntimeUi()
     }
 }

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.games
 
+import com.nuvio.app.core.ui.requestFocusLogged
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
@@ -70,6 +71,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
+import com.nuvio.app.DesktopApplicationExit
 import com.nuvio.app.core.ui.NuvioPosterCard
 import com.nuvio.app.core.ui.NuvioShelfSection
 import com.nuvio.app.core.ui.navigationKey
@@ -94,11 +96,11 @@ import com.nuvio.app.features.home.components.immersiveHeroContentOffsetY
 import com.nuvio.app.features.home.components.immersiveHeroSideScrimStops
 import com.nuvio.app.features.home.components.immersiveRowBodyEnter
 import com.nuvio.app.features.home.components.immersiveRowBodyExit
+import com.nuvio.app.features.home.components.immersiveRowFadeBounds
 import com.nuvio.app.features.home.components.immersiveRowTransition
 import com.nuvio.app.features.home.components.immersiveShelfScrimStops
 import com.nuvio.app.features.home.immersiveCatalogPosterBaseWidthDp
 import com.nuvio.app.features.home.immersiveShelfHeightDp
-import com.nuvio.app.features.home.IMMERSIVE_SHELF_BOTTOM_PADDING_DP
 import com.nuvio.app.features.home.IMMERSIVE_SHELF_TOP_PADDING_DP
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -107,6 +109,9 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
+import nuvio.composeapp.generated.resources.*
+import org.jetbrains.compose.resources.stringResource
+import com.nuvio.app.core.i18n.localizedString
 
 /**
  * Where the user was in the library the last time game mode was open.
@@ -192,7 +197,7 @@ actual fun GameModeScreen(
     }
     LaunchedEffect(dialogOpen) {
         if (!dialogOpen) {
-            runCatching { focusRequester.requestFocus() }
+            focusRequester.requestFocusLogged()
         }
     }
     LaunchedEffect(message) {
@@ -240,9 +245,19 @@ actual fun GameModeScreen(
 
     fun launchGame(game: GameEntry) {
         controller.launch(game).onSuccess { pid ->
-            message = if (pid != null) "Started ${game.title}  •  PID $pid" else "Started ${game.title}"
+            message = if (pid != null) localizedString(Res.string.games_mode_started_pid, game.title, pid) else localizedString(Res.string.games_mode_started, game.title)
+            if (settings.closeAfterLaunch) {
+                // The process (or the shell hand-off for a protocol/shortcut launch) is already
+                // under way; the pause is only so the status line is readable before the window
+                // goes, and so a launcher that re-execs itself is not racing our exit.
+                message = localizedString(Res.string.games_mode_started_closing, game.title)
+                scope.launch {
+                    delay(CloseAfterLaunchDelayMs)
+                    withContext(Dispatchers.Main) { DesktopApplicationExit.request() }
+                }
+            }
         }.onFailure { error ->
-            message = error.message ?: "Could not start ${game.title}"
+            message = error.message ?: localizedString(Res.string.games_mode_start_failed, game.title)
         }
     }
 
@@ -412,7 +427,7 @@ actual fun GameModeScreen(
 
     if (showAddDialog) {
         GameEditorDialog(
-            title = "Add game",
+            title = stringResource(Res.string.games_mode_add_game),
             initial = null,
             rows = rows,
             lastExecutableDirectory = lastExecutableDirectory,
@@ -449,9 +464,9 @@ actual fun GameModeScreen(
                     // Land on the first new game, in the row it went to.
                     pendingFocusGameId = added.first().id
                     message = if (added.size == 1) {
-                        "Imported ${added.first().title}"
+                        localizedString(Res.string.games_mode_imported_one, added.first().title)
                     } else {
-                        "Imported ${added.size} games"
+                        localizedString(Res.string.games_mode_imported_many, added.size)
                     }
                 }
             },
@@ -461,7 +476,7 @@ actual fun GameModeScreen(
 
     editingGame?.let { game ->
         GameEditorDialog(
-            title = "Edit game",
+            title = stringResource(Res.string.games_mode_edit_game),
             initial = game,
             rows = rows,
             lastExecutableDirectory = lastExecutableDirectory,
@@ -496,6 +511,9 @@ actual fun GameModeScreen(
 
 /** How long the wheel is ignored after a row step; the same lock TV Mode uses. */
 private const val ImmersiveWheelLockMs = 220L
+
+/** Pause between a successful game start and Nuvio exiting when "close after launch" is on. */
+private const val CloseAfterLaunchDelayMs = 1_500L
 
 @Composable
 private fun GameLibraryContent(
@@ -596,7 +614,8 @@ private fun GameLibraryContent(
                 )
                 .padding(
                     top = IMMERSIVE_SHELF_TOP_PADDING_DP.dp,
-                    bottom = IMMERSIVE_SHELF_BOTTOM_PADDING_DP.dp,
+                    // Applied inside each row instead; see immersiveRowFadeBounds.
+                    bottom = 0.dp,
                 ),
             contentAlignment = Alignment.TopStart,
         ) {
@@ -623,6 +642,7 @@ private fun GameLibraryContent(
                 NuvioShelfSection(
                     title = shelfRow.row.name,
                     entries = shelfRow.games,
+                    modifier = Modifier.immersiveRowFadeBounds(),
                     headerHorizontalPadding = sectionPadding,
                     rowContentPadding = PaddingValues(horizontal = sectionPadding),
                     showHeaderAccent = showHeaderAccent,
@@ -908,11 +928,11 @@ private fun GameTopBar(onAdd: () -> Unit, onImportFolder: () -> Unit, onSettings
         horizontalArrangement = Arrangement.End,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(onClick = onAdd) { Icon(Icons.Rounded.Add, "Add game", tint = silver) }
+        IconButton(onClick = onAdd) { Icon(Icons.Rounded.Add, stringResource(Res.string.games_mode_add_game), tint = silver) }
         IconButton(onClick = onImportFolder) {
-            Icon(Icons.Rounded.CreateNewFolder, "Import games from folder", tint = silver)
+            Icon(Icons.Rounded.CreateNewFolder, stringResource(Res.string.games_mode_import_games_from_folder), tint = silver)
         }
-        IconButton(onClick = onSettings) { Icon(Icons.Rounded.Settings, "Game settings", tint = silver) }
+        IconButton(onClick = onSettings) { Icon(Icons.Rounded.Settings, stringResource(Res.string.games_mode_game_settings), tint = silver) }
     }
 }
 
@@ -929,14 +949,14 @@ private fun EmptyGameLibrary(onAdd: () -> Unit, onImportFolder: () -> Unit, onSe
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                "Your games, centre stage.",
+                stringResource(Res.string.games_mode_empty_title),
                 color = Color.White,
                 fontSize = 38.sp,
                 fontWeight = FontWeight.Black,
             )
             Spacer(Modifier.height(12.dp))
             Text(
-                "Link a local executable, match it with IGDB, and launch it from a clean TV interface.",
+                stringResource(Res.string.games_mode_empty_message),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 17.sp,
                 lineHeight = 25.sp,
@@ -946,17 +966,17 @@ private fun EmptyGameLibrary(onAdd: () -> Unit, onImportFolder: () -> Unit, onSe
                 Button(onClick = onAdd) {
                     Icon(Icons.Rounded.Add, null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Add your first game")
+                    Text(stringResource(Res.string.games_mode_add_your_first_game))
                 }
                 OutlinedButton(onClick = onImportFolder) {
                     Icon(Icons.Rounded.CreateNewFolder, null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Import a folder")
+                    Text(stringResource(Res.string.games_mode_import_a_folder))
                 }
             }
             Spacer(Modifier.height(16.dp))
             Text(
-                "A add   •   I import folder   •   S settings   •   G back to Nuvio",
+                stringResource(Res.string.games_mode_key_hints),
                 color = Color.White.copy(alpha = 0.48f),
                 fontSize = 12.sp,
             )

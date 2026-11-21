@@ -14,7 +14,14 @@ internal actual object StreamBadgeSettingsStorage {
     private const val streamBadgeRulesKey = "stream_badge_rules"
     private const val showFileSizeBadgesKey = "show_file_size_badges"
     private const val showAddonLogoKey = "show_addon_logo"
+    private const val useUsenetFormatterForAllKey = "use_usenet_formatter_for_all"
+    private const val showInPlayerKey = "show_badges_in_player"
+    private const val playerBadgeSourceKey = "player_badge_source"
     private const val streamBadgePlacementKey = "stream_badge_placement"
+    private const val streamListSortOrderKey = "stream_list_sort_order"
+    private const val streamListCachedFirstKey = "stream_list_cached_first"
+    private const val streamListTwoColumnsKey = "stream_list_two_columns"
+    private const val streamPickerModalSizeKey = "stream_picker_modal_size"
     private const val legacyDebridStreamBadgeRulesKey = "debrid_stream_badge_rules"
     private val syncKeys = listOf(streamBadgeRulesKey, showFileSizeBadgesKey, streamBadgePlacementKey)
     private val store = DesktopStorage.store("nuvio_stream_badge_settings")
@@ -26,8 +33,25 @@ internal actual object StreamBadgeSettingsStorage {
     actual fun saveShowFileSizeBadges(enabled: Boolean) = saveBoolean(showFileSizeBadgesKey, enabled)
     actual fun loadShowAddonLogo(): Boolean? = loadBoolean(showAddonLogoKey)
     actual fun saveShowAddonLogo(enabled: Boolean) = saveBoolean(showAddonLogoKey, enabled)
+    actual fun loadUseUsenetFormatterForAll(): Boolean? = loadBoolean(useUsenetFormatterForAllKey)
+    actual fun saveUseUsenetFormatterForAll(enabled: Boolean) = saveBoolean(useUsenetFormatterForAllKey, enabled)
+    actual fun loadShowInPlayer(): Boolean? = loadBoolean(showInPlayerKey)
+    actual fun saveShowInPlayer(enabled: Boolean) = saveBoolean(showInPlayerKey, enabled)
+    actual fun loadPlayerBadgeSource(): String? = loadString(playerBadgeSourceKey)
+    actual fun savePlayerBadgeSource(source: String) = saveString(playerBadgeSourceKey, source)
     actual fun loadStreamBadgePlacement(): String? = loadString(streamBadgePlacementKey)
     actual fun saveStreamBadgePlacement(placement: String) = saveString(streamBadgePlacementKey, placement)
+    actual fun loadStreamListSortOrder(): String? = loadString(streamListSortOrderKey)
+    actual fun saveStreamListSortOrder(order: String) = saveString(streamListSortOrderKey, order)
+    actual fun loadStreamListCachedFirst(): Boolean? = loadBoolean(streamListCachedFirstKey)
+    actual fun saveStreamListCachedFirst(enabled: Boolean) = saveBoolean(streamListCachedFirstKey, enabled)
+    actual fun loadStreamListTwoColumns(): Boolean? = loadBoolean(streamListTwoColumnsKey)
+    actual fun saveStreamListTwoColumns(enabled: Boolean) = saveBoolean(streamListTwoColumnsKey, enabled)
+    actual fun loadStreamPickerModalSize(): String? = loadString(streamPickerModalSizeKey)
+    actual fun saveStreamPickerModalSize(size: String?) {
+        if (size == null) store.remove(ProfileScopedKey.of(streamPickerModalSizeKey))
+        else saveString(streamPickerModalSizeKey, size)
+    }
 
     actual fun loadLegacyDebridStreamBadgeRules(): String? =
         legacyDebridStore.getString(ProfileScopedKey.of(legacyDebridStreamBadgeRulesKey))

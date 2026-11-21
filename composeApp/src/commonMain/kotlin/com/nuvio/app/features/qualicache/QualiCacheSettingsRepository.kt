@@ -13,7 +13,7 @@ object QualiCacheSettingsRepository {
     private var enabled = false
     private var baseUrl = ""
     private var accessKey = ""
-    private var minimumTrust = QualiCacheMinimumTrust.HIGH
+    private var minimumTrust = QualiCacheMinimumTrust.MEDIUM
     private var showResolution = true
     private var showDynamicRange = true
     private var showAudio = true
@@ -47,11 +47,13 @@ object QualiCacheSettingsRepository {
         ensureLoaded()
         val normalized = normalizeBaseUrl(value)
         if (baseUrl == normalized) return
+        val wasConfigured = isConfigured()
         baseUrl = normalized
         if (baseUrl.isBlank()) {
             enabled = false
             QualiCacheSettingsStorage.saveEnabled(false)
         }
+        enableOnFirstConfiguration(wasConfigured)
         publish()
         QualiCacheSettingsStorage.saveBaseUrl(normalized)
         // Anything cached came from the previous server (or from a URL typo that failed); it must
@@ -63,11 +65,26 @@ object QualiCacheSettingsRepository {
         ensureLoaded()
         val normalized = value.trim()
         if (accessKey == normalized) return
+        val wasConfigured = isConfigured()
         accessKey = normalized
+        enableOnFirstConfiguration(wasConfigured)
         publish()
         QualiCacheSettingsStorage.saveAccessKey(normalized)
         // A wrong key produced cached 401 failures; a corrected one must be able to retry at once.
         QualiCacheQualityService.invalidate()
+    }
+
+    private fun isConfigured(): Boolean = baseUrl.isNotBlank() && accessKey.isNotBlank()
+
+    /**
+     * Switches the integration on the moment both the address and the key are filled in: entering
+     * them is the request, and leaving a fully configured integration off reads as broken. Only on
+     * that transition, so editing either field afterwards never undoes a deliberate "off".
+     */
+    private fun enableOnFirstConfiguration(wasConfigured: Boolean) {
+        if (wasConfigured || !isConfigured() || enabled) return
+        enabled = true
+        QualiCacheSettingsStorage.saveEnabled(true)
     }
 
     fun setMinimumTrust(value: QualiCacheMinimumTrust) {
@@ -112,7 +129,7 @@ object QualiCacheSettingsRepository {
         val storedMinimumTrust = QualiCacheSettingsStorage.loadMinimumTrust()
         minimumTrust = QualiCacheMinimumTrust.fromStorage(storedMinimumTrust)
             ?: legacyMinimumTrust
-            ?: QualiCacheMinimumTrust.HIGH
+            ?: QualiCacheMinimumTrust.MEDIUM
         if (storedMinimumTrust.isNullOrBlank() && legacyMinimumTrust != null) {
             QualiCacheSettingsStorage.saveMinimumTrust(minimumTrust.apiValue)
         }

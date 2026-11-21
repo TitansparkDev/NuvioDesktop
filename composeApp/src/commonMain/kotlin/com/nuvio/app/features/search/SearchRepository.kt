@@ -1,5 +1,9 @@
 package com.nuvio.app.features.search
 
+import com.nuvio.app.core.perf.PerfTelemetry
+import com.nuvio.app.features.posterservice.withCachedCustomPosters
+import com.nuvio.app.features.posterservice.withCustomPosterOverlay
+import com.nuvio.app.features.posterservice.CustomPosterScreen
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.i18n.localizedMediaTypeLabel
 import com.nuvio.app.features.addons.AddonCatalog
@@ -18,13 +22,24 @@ import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.home.HomeCatalogSection
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.ensureUniqueKeys
+import com.nuvio.app.features.home.WatchedContentFilter
 import com.nuvio.app.features.home.filterReleasedItems
+import com.nuvio.app.features.home.filterUnwatchedItems
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
+import com.nuvio.app.features.discover.DiscoverBrowseStorage
+import com.nuvio.app.features.discover.TmdbBrowse
+import com.nuvio.app.features.discover.TmdbBrowseQuery
+import com.nuvio.app.features.discover.TmdbBrowseStatus
+import com.nuvio.app.features.discover.tmdbBrowseRegion
+import com.nuvio.app.features.home.WATCHED_FILTER_RESOLVE_BUDGET_MS
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,14 +54,23 @@ object SearchRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val _uiState = MutableStateFlow(SearchUiState())
     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
+        .withCustomPosterOverlay(CustomPosterScreen.Search) { settings, keys ->
+            copy(sections = sections.map { section ->
+                val items = section.items.withCachedCustomPosters(settings, keys)
+                if (items === section.items) section else section.copy(items = items)
+            })
+        }
     private val _discoverUiState = MutableStateFlow(DiscoverUiState())
     val discoverUiState: StateFlow<DiscoverUiState> = _discoverUiState.asStateFlow()
+        .withCustomPosterOverlay(CustomPosterScreen.Search) { settings, keys ->
+            copy(items = items.withCachedCustomPosters(settings, keys))
+        }
 
     private var activeJob: Job? = null
     private var activeDiscoverJob: Job? = null
     private var lastRequestKey: String? = null
     private var discoverSources: List<DiscoverCatalogOption> = emptyList()
-    private var lastDiscoverHideUnreleasedContent: Boolean? = null
+    private var lastDiscoverFilterKey: String? = null
 
     fun search(query: String, addons: List<ManagedAddon>) {
         val normalizedQuery = query.trim()
@@ -56,7 +80,9 @@ object SearchRepository {
         }
 
         val activeAddons = addons.enabledAddons().filter { it.manifest != null }
-        if (activeAddons.isEmpty()) {
+        // Media servers that can search answer with a row each, after the addons' rows.
+        val serverSearches = com.nuvio.app.features.servers.ServerCatalog.searchTargets()
+        if (activeAddons.isEmpty() && serverSearches.isEmpty()) {
             activeJob?.cancel()
             lastRequestKey = null
             _uiState.value = SearchUiState(
@@ -70,7 +96,7 @@ object SearchRepository {
             addons = activeAddons,
             query = normalizedQuery,
         )
-        if (requests.isEmpty()) {
+        if (requests.isEmpty() && serverSearches.isEmpty()) {
             activeJob?.cancel()
             lastRequestKey = null
             _uiState.value = SearchUiState(
@@ -90,7 +116,20 @@ object SearchRepository {
                     "${request.addon.manifestUrl}:${request.type}:${request.catalogId}"
                 },
             )
+            serverSearches.forEach { ref ->
+                append("|server:${ref.connection.id}:${ref.kind.contentType}:")
+                append(ref.connection.selectedLibraries(ref.kind).joinToString(",") { it.id })
+            }
         }
+        val loaders: List<suspend () -> HomeCatalogSection> =
+            requests.map { request -> suspend { request.toSection() } } +
+                serverSearches.map { ref ->
+                    suspend {
+                        com.nuvio.app.features.servers.ServerCatalog.searchSection(ref, normalizedQuery).also { section ->
+                            require(section.items.isNotEmpty()) { "No results in ${section.title}" }
+                        }
+                    }
+                }
         if (lastRequestKey == requestKey) return
         lastRequestKey = requestKey
 
@@ -102,9 +141,9 @@ object SearchRepository {
 
         activeJob = scope.launch {
             val resultChannel = Channel<IndexedSearchResult>(Channel.UNLIMITED)
-            val jobs = requests.mapIndexed { index, request ->
+            val jobs = loaders.mapIndexed { index, load ->
                 launch {
-                    runCatching { request.toSection() }
+                    runCatching { load() }
                         .fold(
                             onSuccess = { section ->
                                 resultChannel.send(
@@ -130,11 +169,26 @@ object SearchRepository {
                 jobs.joinAll()
                 resultChannel.close()
             }
-            val results = arrayOfNulls<IndexedSearchResult>(requests.size)
+            val results = arrayOfNulls<IndexedSearchResult>(loaders.size)
+            // Rows are published as they arrive, but not before the top one is known: a later
+            // catalog answering first (Series before Movies) was drawn as row one and then pushed
+            // down when the real first row landed, moving whatever was focused. Past the wait,
+            // whatever has arrived is shown rather than holding the screen on a slow addon.
+            var firstRowWaitOver = false
+            val firstRowWaitJob = launch {
+                delay(SEARCH_FIRST_ROW_WAIT_MS)
+                resultChannel.send(IndexedSearchResult(index = FIRST_ROW_WAIT_OVER))
+            }
 
             try {
                 for (result in resultChannel) {
-                    results[result.index] = result
+                    if (result.index == FIRST_ROW_WAIT_OVER) {
+                        firstRowWaitOver = true
+                    } else {
+                        results[result.index] = result
+                    }
+                    if (!firstRowWaitOver && !results.topRowSettled()) continue
+                    firstRowWaitJob.cancel()
                     val sections = results.orderedSections()
                     if (sections.isNotEmpty()) {
                         _uiState.value = SearchUiState(
@@ -145,6 +199,7 @@ object SearchRepository {
                     }
                 }
             } finally {
+                firstRowWaitJob.cancel()
                 closeChannelJob.cancel()
                 resultChannel.close()
             }
@@ -179,17 +234,53 @@ object SearchRepository {
         activeDiscoverJob?.cancel()
         lastRequestKey = null
         discoverSources = emptyList()
-        lastDiscoverHideUnreleasedContent = null
+        lastDiscoverFilterKey = null
+        // The TMDB browser's choices are per profile: read them again for whoever is next.
+        browseLoaded = false
+        browseTmdbSelected = false
+        browseTmdbQuery = TmdbBrowseQuery()
         _uiState.value = SearchUiState()
         _discoverUiState.value = DiscoverUiState()
     }
 
     fun refreshDiscover(addons: List<ManagedAddon>) {
+        PerfTelemetry.count("SearchRepository.refreshDiscover")
+        ensureBrowseLoaded()
         val activeAddons = addons.enabledAddons().filter { it.manifest != null }
+        val tmdbAvailable = TmdbBrowse.isAvailable
+        // The built-in TMDB browser needs no addon at all, so it is answered before the addon
+        // checks below — which would otherwise report "no catalogs" over a working browser.
+        if (tmdbAvailable && (browseTmdbSelected || activeAddons.isEmpty())) {
+            val sources = buildDiscoverSources(activeAddons)
+            discoverSources = sources
+            val current = _discoverUiState.value
+            val filterKey = discoverFilterKey()
+            val reuse = current.tmdbSelected && lastDiscoverFilterKey == filterKey &&
+                current.tmdbQuery == browseTmdbQuery &&
+                (current.isLoading || current.items.isNotEmpty() || current.emptyStateReason != null)
+            lastDiscoverFilterKey = filterKey
+            val typeOptions = sources.map { it.typeGroup }.distinct()
+            val selectedType = current.selectedType?.takeIf(typeOptions::contains) ?: typeOptions.firstOrNull()
+            val catalogOptions = sources.filter { it.typeGroup == selectedType }
+            _discoverUiState.value = current.copy(
+                availableCatalogs = sources,
+                typeOptions = typeOptions,
+                selectedType = selectedType,
+                catalogOptions = catalogOptions,
+                selectedCatalogKey = catalogOptions.firstOrNull { it.key == current.selectedCatalogKey }?.key
+                    ?: catalogOptions.firstOrNull()?.key,
+                tmdbSelected = true,
+                tmdbAvailable = true,
+                tmdbQuery = browseTmdbQuery,
+            )
+            loadTmdbOptions()
+            if (!reuse) loadTmdbFeed(reset = true)
+            return
+        }
         if (activeAddons.isEmpty()) {
             activeDiscoverJob?.cancel()
             discoverSources = emptyList()
-            lastDiscoverHideUnreleasedContent = null
+            lastDiscoverFilterKey = null
             log.d { "Discover refresh aborted: no active addons" }
             _discoverUiState.value = DiscoverUiState(
                 emptyStateReason = DiscoverEmptyStateReason.NoActiveAddons,
@@ -199,10 +290,10 @@ object SearchRepository {
 
         val sources = buildDiscoverSources(activeAddons)
         val current = _discoverUiState.value
-        val hideUnreleasedContent = HomeCatalogSettingsRepository.snapshot().hideUnreleasedContent
+        val filterKey = discoverFilterKey()
         if (
             sources == discoverSources &&
-            lastDiscoverHideUnreleasedContent == hideUnreleasedContent &&
+            lastDiscoverFilterKey == filterKey &&
             current.canReuseDiscoverState(sources)
         ) {
             log.d {
@@ -213,21 +304,25 @@ object SearchRepository {
         }
 
         discoverSources = sources
-        lastDiscoverHideUnreleasedContent = hideUnreleasedContent
+        lastDiscoverFilterKey = filterKey
         if (sources.isEmpty()) {
             activeDiscoverJob?.cancel()
             log.d { "Discover refresh found no compatible discover catalogs" }
+            if (tmdbAvailable) {
+                selectTmdbBrowse()
+                return
+            }
             _discoverUiState.value = DiscoverUiState(
                 emptyStateReason = DiscoverEmptyStateReason.NoDiscoverCatalogs,
             )
             return
         }
 
-        val typeOptions = sources.map { it.type }.distinct()
+        val typeOptions = sources.map { it.typeGroup }.distinct()
         val selectedType = current.selectedType
             ?.takeIf { type -> typeOptions.contains(type) }
             ?: typeOptions.first()
-        val catalogOptions = sources.filter { it.type == selectedType }
+        val catalogOptions = sources.filter { it.typeGroup == selectedType }
         val selectedCatalog = catalogOptions.firstOrNull { it.key == current.selectedCatalogKey } ?: catalogOptions.first()
         val selectedGenre = selectedCatalog.resolveGenreSelection(current.selectedGenre)
 
@@ -243,6 +338,9 @@ object SearchRepository {
             nextSkip = null,
             emptyStateReason = null,
             errorMessage = null,
+            tmdbAvailable = tmdbAvailable,
+            tmdbQuery = browseTmdbQuery,
+            tmdbOptions = current.tmdbOptions,
         )
 
         log.d {
@@ -255,11 +353,13 @@ object SearchRepository {
 
     fun selectDiscoverType(type: String) {
         val current = _discoverUiState.value
-        if (current.selectedType == type) return
+        if (!current.tmdbSelected && current.selectedType == type) return
+        setBrowseTmdbSelected(false)
 
-        val catalogOptions = discoverSources.filter { it.type == type }
+        val catalogOptions = discoverSources.filter { it.typeGroup == type }
         val selectedCatalog = catalogOptions.firstOrNull() ?: run {
             _discoverUiState.value = current.copy(
+                tmdbSelected = false,
                 selectedType = type,
                 catalogOptions = emptyList(),
                 selectedCatalogKey = null,
@@ -274,6 +374,7 @@ object SearchRepository {
         }
 
         _discoverUiState.value = current.copy(
+            tmdbSelected = false,
             selectedType = type,
             catalogOptions = catalogOptions,
             selectedCatalogKey = selectedCatalog.key,
@@ -289,12 +390,14 @@ object SearchRepository {
 
     fun selectDiscoverCatalog(catalogKey: String) {
         val current = _discoverUiState.value
-        if (current.selectedCatalogKey == catalogKey) return
+        if (!current.tmdbSelected && current.selectedCatalogKey == catalogKey) return
 
         val selectedCatalog = discoverSources.firstOrNull { it.key == catalogKey } ?: return
-        val catalogOptions = discoverSources.filter { it.type == selectedCatalog.type }
+        setBrowseTmdbSelected(false)
+        val catalogOptions = discoverSources.filter { it.typeGroup == selectedCatalog.typeGroup }
         _discoverUiState.value = current.copy(
-            selectedType = selectedCatalog.type,
+            tmdbSelected = false,
+            selectedType = selectedCatalog.typeGroup,
             catalogOptions = catalogOptions,
             selectedCatalogKey = selectedCatalog.key,
             selectedGenre = selectedCatalog.resolveGenreSelection(null),
@@ -327,7 +430,146 @@ object SearchRepository {
     fun loadMoreDiscover() {
         val current = _discoverUiState.value
         if (current.isLoading || current.nextSkip == null) return
-        loadDiscoverFeed(reset = false)
+        if (current.tmdbSelected) loadTmdbFeed(reset = false) else loadDiscoverFeed(reset = false)
+    }
+
+    // ---- The built-in TMDB browser ----
+
+    private val browseJson = Json { ignoreUnknownKeys = true }
+    private var browseLoaded = false
+    private var browseTmdbSelected = false
+    private var browseTmdbQuery = TmdbBrowseQuery()
+    private var activeOptionsJob: Job? = null
+    private val browseRegion: String by lazy { tmdbBrowseRegion() }
+
+    private fun ensureBrowseLoaded() {
+        if (browseLoaded) return
+        browseLoaded = true
+        val stored = DiscoverBrowseStorage.loadPayload()?.takeIf(String::isNotBlank)?.let {
+            runCatching { browseJson.decodeFromString<StoredDiscoverBrowse>(it) }.getOrNull()
+        } ?: return
+        browseTmdbSelected = stored.tmdbSelected
+        browseTmdbQuery = stored.query
+    }
+
+    private fun persistBrowse() {
+        DiscoverBrowseStorage.savePayload(
+            browseJson.encodeToString(StoredDiscoverBrowse(browseTmdbSelected, browseTmdbQuery)),
+        )
+    }
+
+    private fun setBrowseTmdbSelected(selected: Boolean) {
+        ensureBrowseLoaded()
+        if (browseTmdbSelected == selected) return
+        browseTmdbSelected = selected
+        persistBrowse()
+    }
+
+    /** Switches row 1 from an addon catalog to the built-in TMDB browser. */
+    fun selectTmdbBrowse() {
+        ensureBrowseLoaded()
+        if (!TmdbBrowse.isAvailable) return
+        val current = _discoverUiState.value
+        if (current.tmdbSelected) return
+        setBrowseTmdbSelected(true)
+        _discoverUiState.value = current.copy(
+            tmdbSelected = true,
+            tmdbAvailable = true,
+            tmdbQuery = browseTmdbQuery,
+            emptyStateReason = null,
+            errorMessage = null,
+        )
+        loadTmdbOptions()
+        loadTmdbFeed(reset = true)
+    }
+
+    /** Applies a filter change to the TMDB browser and reloads it from the first page. */
+    fun updateTmdbQuery(transform: (TmdbBrowseQuery) -> TmdbBrowseQuery) {
+        ensureBrowseLoaded()
+        val current = _discoverUiState.value
+        val next = transform(current.tmdbQuery)
+        if (next == current.tmdbQuery) return
+        browseTmdbQuery = next
+        persistBrowse()
+        _discoverUiState.value = current.copy(tmdbQuery = next)
+        if (next.media != current.tmdbQuery.media) loadTmdbOptions()
+        if (current.tmdbSelected) loadTmdbFeed(reset = true)
+    }
+
+    /** Genres, services and networks for the TMDB browser's menus, for its current media type. */
+    private fun loadTmdbOptions() {
+        val media = _discoverUiState.value.tmdbQuery.media
+        activeOptionsJob?.cancel()
+        activeOptionsJob = scope.launch {
+            val options = runCatching { TmdbBrowse.options(media, browseRegion) }.getOrNull() ?: return@launch
+            val latest = _discoverUiState.value
+            if (latest.tmdbQuery.media == media) _discoverUiState.value = latest.copy(tmdbOptions = options)
+        }
+    }
+
+    private fun loadTmdbFeed(reset: Boolean) {
+        activeDiscoverJob?.cancel()
+        val current = _discoverUiState.value
+        val query = current.tmdbQuery
+        val page = if (reset) 1 else current.nextSkip ?: return
+        _discoverUiState.value = current.copy(
+            isLoading = true,
+            items = if (reset) emptyList() else current.items,
+            nextSkip = if (reset) null else current.nextSkip,
+            tmdbTotal = if (reset) 0 else current.tmdbTotal,
+            paginates = true,
+            emptyStateReason = null,
+            errorMessage = null,
+        )
+        activeDiscoverJob = scope.launch {
+            var nextPage: Int? = page
+            var merged = if (reset) emptyList() else current.items
+            var total = current.tmdbTotal
+            var emptyPages = 0
+            try {
+                // A page can come back empty once watched and unreleased titles are taken out; the
+                // row would then sit on its empty message with nothing on screen to ask for more,
+                // so keep going a few pages while that is the case.
+                while (nextPage != null) {
+                    val result = TmdbBrowse.browse(query, nextPage, browseRegion)
+                    var items = result.items
+                    if (HomeCatalogSettingsRepository.snapshot().hideUnreleasedContent &&
+                        query.status != TmdbBrowseStatus.Upcoming
+                    ) {
+                        items = items.filterReleasedItems(CurrentDateProvider.todayIsoDate())
+                    }
+                    WatchedContentFilter.prepareForLoad(items, resolveBudgetMs = WATCHED_FILTER_RESOLVE_BUDGET_MS)
+                    items = items.filterUnwatchedItems(WatchedContentFilter.current())
+                    val before = merged.size
+                    merged = if (merged.isEmpty()) items else mergeCatalogItems(merged, items)
+                    nextPage = result.nextPage
+                    total = result.total
+                    if (merged.size > before || ++emptyPages >= TMDB_EMPTY_PAGE_LIMIT) break
+                }
+                val latest = _discoverUiState.value
+                if (!latest.tmdbSelected || latest.tmdbQuery != query) return@launch
+                _discoverUiState.value = latest.copy(
+                    items = merged,
+                    isLoading = false,
+                    nextSkip = nextPage,
+                    tmdbTotal = total,
+                    emptyStateReason = if (merged.isEmpty()) DiscoverEmptyStateReason.NoResults else null,
+                    errorMessage = null,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                log.e(error) { "TMDB browse failed page=$page" }
+                val latest = _discoverUiState.value
+                if (!latest.tmdbSelected || latest.tmdbQuery != query) return@launch
+                _discoverUiState.value = latest.copy(
+                    isLoading = false,
+                    nextSkip = null,
+                    emptyStateReason = DiscoverEmptyStateReason.RequestFailed,
+                    errorMessage = error.message ?: getString(Res.string.discover_empty_load_failed_message),
+                )
+            }
+        }
     }
 
     private fun buildSearchRequests(
@@ -423,7 +665,7 @@ object SearchRepository {
         log.d {
             "Discover request reset=$reset addon=${selectedCatalog.addonName} type=${selectedCatalog.type} " +
                 "catalogId=${selectedCatalog.catalogId} catalogKey=${selectedCatalog.key} " +
-                "genre=${current.selectedGenre ?: "<all>"} skip=$requestedSkip url=$requestUrl"
+                "genre=${current.selectedGenre ?: "<all>"} skip=$requestedSkip url=${com.nuvio.app.core.network.redactAddonUrl(requestUrl)}"
         }
 
         _discoverUiState.value = current.copy(
@@ -431,6 +673,7 @@ object SearchRepository {
             items = if (reset) emptyList() else current.items,
             nextSkip = if (reset) null else current.nextSkip,
             consecutiveDuplicatePages = if (reset) 0 else current.consecutiveDuplicatePages,
+            paginates = if (reset) selectedCatalog.supportsPagination else current.paginates,
             emptyStateReason = null,
             errorMessage = null,
         )
@@ -443,7 +686,7 @@ object SearchRepository {
                     catalogId = selectedCatalog.catalogId,
                     genre = current.selectedGenre,
                     skip = requestedSkip.takeIf { it > 0 },
-                ).withUnreleasedFilter()
+                ).withUnreleasedFilter().withWatchedFilter()
             }.fold(
                 onSuccess = { page ->
                     val latest = _discoverUiState.value
@@ -474,6 +717,7 @@ object SearchRepository {
                         isLoading = false,
                         nextSkip = paginationState.nextSkip,
                         consecutiveDuplicatePages = paginationState.consecutiveDuplicatePages,
+                        paginates = latest.paginates || supportsPagination,
                         emptyStateReason = if (mergedItems.isEmpty()) DiscoverEmptyStateReason.NoResults else null,
                         errorMessage = null,
                     )
@@ -510,6 +754,14 @@ object SearchRepository {
     }
 }
 
+private const val TMDB_EMPTY_PAGE_LIMIT = 4
+
+@Serializable
+private data class StoredDiscoverBrowse(
+    val tmdbSelected: Boolean = false,
+    val query: TmdbBrowseQuery = TmdbBrowseQuery(),
+)
+
 private data class IndexedSearchResult(
     val index: Int,
     val section: HomeCatalogSection? = null,
@@ -519,10 +771,43 @@ private data class IndexedSearchResult(
 private fun Array<IndexedSearchResult?>.orderedSections(): List<HomeCatalogSection> =
     mapNotNull { result -> result?.section }.ensureUniqueKeys()
 
+/** How long search holds its rows back waiting for the top one before showing what it has. */
+internal const val SEARCH_FIRST_ROW_WAIT_MS = 2_500L
+
+/** Channel marker (not a catalog index) for [SEARCH_FIRST_ROW_WAIT_MS] running out. */
+private const val FIRST_ROW_WAIT_OVER = -1
+
+/**
+ * True once nothing can arrive above the first row shown: every catalog before the first one with
+ * results has answered (empty or failed), or every catalog has.
+ */
+private fun Array<IndexedSearchResult?>.topRowSettled(): Boolean {
+    for (result in this) {
+        if (result == null) return false
+        if (result.section != null) return true
+    }
+    return true
+}
+
 private fun CatalogPage.withUnreleasedFilter(): CatalogPage {
     if (!HomeCatalogSettingsRepository.snapshot().hideUnreleasedContent) return this
     val filteredItems = items.filterReleasedItems(CurrentDateProvider.todayIsoDate())
     return if (filteredItems.size == items.size) this else copy(items = filteredItems)
+}
+
+/**
+ * Browse feed only — never the query results. Searching is where a watched title is looked up on
+ * purpose, so [toSection] stays unfiltered by design.
+ */
+private fun CatalogPage.withWatchedFilter(): CatalogPage {
+    val filteredItems = items.filterUnwatchedItems(WatchedContentFilter.current())
+    return if (filteredItems.size == items.size) this else copy(items = filteredItems)
+}
+
+/** Both browsing filters, so a toggle in Settings refetches instead of reusing the cached feed. */
+private fun discoverFilterKey(): String {
+    val snapshot = HomeCatalogSettingsRepository.snapshot()
+    return "hideUnreleased=${snapshot.hideUnreleasedContent}|hideWatched=${snapshot.hideWatchedContent}"
 }
 
 private data class SearchCatalogRequest(
@@ -568,12 +853,12 @@ private fun DiscoverUiState.canReuseDiscoverState(
     sources: List<DiscoverCatalogOption>,
 ): Boolean {
     val currentType = selectedType ?: return false
-    if (!typeOptions.contains(currentType) || !sources.any { it.type == currentType }) {
+    if (!typeOptions.contains(currentType) || !sources.any { it.typeGroup == currentType }) {
         return false
     }
 
     val currentCatalog = sources.firstOrNull { it.key == selectedCatalogKey } ?: return false
-    if (currentCatalog.type != currentType) {
+    if (currentCatalog.typeGroup != currentType) {
         return false
     }
 

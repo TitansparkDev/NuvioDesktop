@@ -10,8 +10,9 @@ import com.nuvio.app.features.metadata.hasAnimeNamespacePrefix
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.tmdb.TmdbService
-import com.nuvio.app.features.tmdb.TmdbSettingsRepository
-import com.nuvio.app.features.tmdb.resolveCustomPosterIds
+import com.nuvio.app.features.posterservice.CustomPosterScreen
+import com.nuvio.app.features.posterservice.CustomPosterSettingsRepository
+import com.nuvio.app.features.posterservice.resolveCustomPosterIds
 import com.nuvio.app.features.trakt.TraktPlatformClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,10 +38,13 @@ private data class LocalConfigPayload(
     val playbackPreference: LocalLibraryPlaybackPreference =
         LocalLibraryPlaybackPreference.SOURCE_PICKER,
     val assignments: Map<String, String> = emptyMap(),
+    val titlePlayback: Map<String, LocalTitlePlayback> = emptyMap(),
     // Item keys the auto-filer has already considered. null = pre-feature payload: everything
     // already cached is treated as considered on load, so we never retroactively file old items
     // (only genuinely new scans get auto-filed). Absent on fresh installs (empty cache) too.
     val autoFiledKeys: Set<String>? = null,
+    /** Connection ids of the media servers shown in the Local Library (LocalServerLinks). */
+    val serverLinks: Set<String> = emptySet(),
 )
 
 @Serializable
@@ -71,11 +75,13 @@ object LocalLibraryRepository {
     private var playbackPreference: LocalLibraryPlaybackPreference =
         LocalLibraryPlaybackPreference.SOURCE_PICKER
     private var assignmentsByKey: Map<String, String> = emptyMap()
+    private var titlePlaybackByKey: Map<String, LocalTitlePlayback> = emptyMap()
     private var overridesByKey: Map<String, LocalMatchOverride> = emptyMap()
     private var itemsByKey: Map<String, LocalMediaItem> = emptyMap()
     // Keys the auto-filer has already considered — so an item the user deliberately moves to
     // Unsorted isn't re-filed on the next rescan, and pre-existing items aren't filed retroactively.
     private var autoConsideredKeys: Set<String> = emptySet()
+    private var serverLinks: Set<String> = emptySet()
     private var scanJob: Job? = null
 
     // Startup loads this from the deferred warm on a background thread; screens still call
@@ -83,11 +89,15 @@ object LocalLibraryRepository {
     // starting a second scan) under a load that is already in flight.
     private val loadLock = Any()
 
+    /**
+     * Loads the cached library only — no folder scan. Library folders usually sit on a big HDD,
+     * and scanning at launch spun it up on every start even when nothing would look at local
+     * files. The first screen that shows the library calls [scanIfNotScannedThisSession].
+     */
     fun ensureLoaded() {
         synchronized(loadLock) {
             if (hasLoaded) return
             loadFromDisk(ProfileRepository.activeProfileId)
-            if (folders.isNotEmpty()) rescan()
         }
     }
 
@@ -95,9 +105,19 @@ object LocalLibraryRepository {
         synchronized(loadLock) {
             if (newProfileId == profileId && hasLoaded) return
             scanJob?.cancel()
+            scannedThisSession = false
             loadFromDisk(newProfileId)
-            if (folders.isNotEmpty()) rescan()
         }
+    }
+
+    @Volatile
+    private var scannedThisSession = false
+
+    /** One background scan per session, started by the screens that show local items. */
+    fun scanIfNotScannedThisSession() {
+        ensureLoaded()
+        if (scannedThisSession || (folders.isEmpty() && serverLinks.isEmpty())) return
+        rescan()
     }
 
     private fun loadFromDisk(profileId: Int) {
@@ -112,6 +132,8 @@ object LocalLibraryRepository {
         playbackPreference = config?.playbackPreference
             ?: LocalLibraryPlaybackPreference.SOURCE_PICKER
         assignmentsByKey = config?.assignments.orEmpty()
+        titlePlaybackByKey = config?.titlePlayback.orEmpty()
+        serverLinks = config?.serverLinks.orEmpty()
         overridesByKey = LocalLibraryStorage.loadOverrides(profileId)
             ?.let { runCatching { json.decodeFromString<LocalOverridesPayload>(it).overrides }.getOrNull() }
             .orEmpty()
@@ -119,7 +141,10 @@ object LocalLibraryRepository {
         itemsByKey = LocalLibraryStorage.loadCache(profileId)
             ?.let { runCatching { json.decodeFromString<LocalCachePayload>(it).items }.getOrNull() }
             .orEmpty()
-            .filter { it.folderId in folders.map(LocalFolder::id) }
+            .filter { item ->
+                item.folderId in folders.map(LocalFolder::id) ||
+                    item.folderId.localServerConnectionId()?.let { it in serverLinks } == true
+            }
             .associateBy { it.key }
         // A null set means a pre-feature (or fresh) payload: treat everything already cached as
         // considered, so upgrading never sweeps existing Unsorted items into their type catalogs.
@@ -179,6 +204,44 @@ object LocalLibraryRepository {
     }
 
     /**
+     * The local item whose own plain-click override applies to [contentId]/[videoId]: one that
+     * actually serves the requested video, so a show's override reaches each of its episodes and a
+     * franchise sibling without a file never inherits one.
+     */
+    fun titleFor(contentId: String?, videoId: String?): LocalMediaItem? {
+        ensureLoaded()
+        val candidates = when {
+            videoId != null -> itemsByKey.values
+            contentId != null -> itemsForContentId(contentId)
+            else -> return null
+        }
+        return candidates.firstOrNull { streamsFor(it, videoId).isNotEmpty() }
+    }
+
+    /** The configured preference with [contentId]/[videoId]'s own override folded in. */
+    fun routingFor(contentId: String?, videoId: String?): LocalTitleRouting {
+        ensureLoaded()
+        val override = titlePlaybackByKey.takeIf { it.isNotEmpty() }
+            ?.let { overrides -> titleFor(contentId, videoId)?.let { overrides[it.key] } }
+        return playbackPreference.forTitle(override)
+    }
+
+    fun titlePlaybackFor(itemKey: String): LocalTitlePlayback? = titlePlaybackByKey[itemKey]
+
+    /** Sets a title's plain-click override, or clears it (follow the preference) with null. */
+    fun setTitlePlayback(itemKey: String, playback: LocalTitlePlayback?) {
+        ensureLoaded()
+        if (titlePlaybackByKey[itemKey] == playback) return
+        titlePlaybackByKey = if (playback == null) {
+            titlePlaybackByKey - itemKey
+        } else {
+            titlePlaybackByKey + (itemKey to playback)
+        }
+        persistConfig()
+        publish(isScanning = _uiState.value.isScanning)
+    }
+
+    /**
      * Whether [path] is a file this library owns, i.e. it sits under one of the configured roots.
      *
      * Deliberately a path test rather than a scan lookup: a download the PVR/manual grab just
@@ -193,15 +256,34 @@ object LocalLibraryRepository {
         return folders.any { path.isInsideDirectory(it.path) }
     }
 
+    /** Shows a media server's titles in the Local Library, or takes them out again. */
+    fun setServerLinked(connectionId: String, linked: Boolean) {
+        ensureLoaded()
+        val updated = if (linked) serverLinks + connectionId else serverLinks - connectionId
+        if (updated == serverLinks) return
+        serverLinks = updated
+        persistConfig()
+        if (!linked) {
+            val folderId = localServerFolderId(connectionId)
+            itemsByKey = itemsByKey.filterValues { it.folderId != folderId }
+            persistCache()
+            publish(isScanning = _uiState.value.isScanning)
+        } else {
+            publish(isScanning = _uiState.value.isScanning)
+            rescan()
+        }
+    }
+
     fun rescan() {
         ensureLoaded()
-        if (folders.isEmpty()) {
+        if (folders.isEmpty() && serverLinks.isEmpty()) {
             itemsByKey = emptyMap()
             persistCache()
             publish(isScanning = false)
             return
         }
         scanJob?.cancel()
+        scannedThisSession = true
         publish(isScanning = true)
         scanJob = scope.launch {
             val scanned = mutableListOf<LocalMediaItem>()
@@ -210,6 +292,13 @@ object LocalLibraryRepository {
                 val result = FolderScanner.scan(folder)
                 if (result.errorMessage != null && firstError == null) firstError = result.errorMessage
                 scanned += result.items.map { applyOverride(it) }
+            }
+            // Linked media servers: their titles join the scan; one that cannot be reached keeps
+            // the titles it had, so a server being off for a while does not empty its catalogs.
+            for (server in LocalServerLinks.scan(serverLinks)) {
+                val folderId = localServerFolderId(server.connectionId)
+                scanned += server.items?.map { applyOverride(it) }
+                    ?: itemsByKey.values.filter { it.folderId == folderId }
             }
 
             // Preserve ids that were already resolved (from cache) before re-matching, so we don't
@@ -298,8 +387,8 @@ object LocalLibraryRepository {
      * on screen, and persists — so a library whose ids are complete costs nothing on later scans.
      */
     private suspend fun backfillPosterServiceIds() {
-        val settings = TmdbSettingsRepository.snapshot()
-        if (!settings.libraryPosterEnabled) return
+        val settings = CustomPosterSettingsRepository.snapshot(CustomPosterScreen.Library)
+        if (!settings.isActive) return
         val incomplete = itemsByKey.values.filter { item ->
             // One id present and the other missing: nothing to derive from otherwise, and a
             // native-anime identity deliberately keeps its own per-season art.
@@ -647,47 +736,48 @@ object LocalLibraryRepository {
             contentId != null -> itemsForContentId(contentId)
             else -> emptyList()
         }
-        if (items.isEmpty()) return emptyList()
-        return items.flatMap { item ->
-            when {
-                // A movie's file is only served for the movie's OWN id. It must never answer an
-                // `<id>:season:episode` request: movies used to answer any video id, which let a
-                // stale meta — or the movie surfacing on its franchise's series page — play the
-                // movie file in place of an episode (or of a different show entirely).
-                item.type == LocalFolderType.MOVIES ->
-                    if (videoId == null || item.ownsVideoId(videoId)) {
-                        item.files.map { it.toStreamItem() }
-                    } else {
-                        emptyList()
-                    }
-                // Anime video ids mix coordinate spaces (`kitsu:id:ep` is entry-relative,
-                // `tt…:s:e` is franchise season/episode) and so do local file names; the matcher
-                // converts between them through the anime-list mapping and rejects ids that
-                // belong to neither this item nor its franchise.
-                item.isAnime -> {
-                    val matched = videoId?.let { LocalAnimeEpisodeMatcher.matchFiles(item, it) }
-                    when {
-                        matched != null -> matched.map { it.toStreamItem() }
-                        (videoId == null || item.ownsVideoId(videoId)) &&
-                            item.files.singleOrNull()?.isEpisodePlayable == true ->
-                            item.files.map { it.toStreamItem() }
-                        else -> emptyList()
-                    }
+        return items.flatMap { item -> streamsFor(item, videoId) }
+    }
+
+    /** This item's files that answer [videoId] (any of them, when null). */
+    private fun streamsFor(item: LocalMediaItem, videoId: String?): List<StreamItem> =
+        when {
+            // A movie's file is only served for the movie's OWN id. It must never answer an
+            // `<id>:season:episode` request: movies used to answer any video id, which let a
+            // stale meta — or the movie surfacing on its franchise's series page — play the
+            // movie file in place of an episode (or of a different show entirely).
+            item.type == LocalFolderType.MOVIES ->
+                if (videoId == null || item.ownsVideoId(videoId)) {
+                    item.files.map { it.toStreamItem() }
+                } else {
+                    emptyList()
                 }
-                else -> {
-                    val coords = videoId?.takeIf { item.ownsVideoId(it) }?.let(::parseSeasonEpisode)
-                    when {
-                        coords != null -> item.files
-                            .filter { it.season == coords.first && it.episode == coords.second }
-                            .map { it.toStreamItem() }
-                        (videoId == null || item.ownsVideoId(videoId)) && item.files.size == 1 ->
-                            item.files.map { it.toStreamItem() }
-                        else -> emptyList()
-                    }
+            // Anime video ids mix coordinate spaces (`kitsu:id:ep` is entry-relative,
+            // `tt…:s:e` is franchise season/episode) and so do local file names; the matcher
+            // converts between them through the anime-list mapping and rejects ids that
+            // belong to neither this item nor its franchise.
+            item.isAnime -> {
+                val matched = videoId?.let { LocalAnimeEpisodeMatcher.matchFiles(item, it) }
+                when {
+                    matched != null -> matched.map { it.toStreamItem() }
+                    (videoId == null || item.ownsVideoId(videoId)) &&
+                        item.files.singleOrNull()?.isEpisodePlayable == true ->
+                        item.files.map { it.toStreamItem() }
+                    else -> emptyList()
+                }
+            }
+            else -> {
+                val coords = videoId?.takeIf { item.ownsVideoId(it) }?.let(::parseSeasonEpisode)
+                when {
+                    coords != null -> item.files
+                        .filter { it.season == coords.first && it.episode == coords.second }
+                        .map { it.toStreamItem() }
+                    (videoId == null || item.ownsVideoId(videoId)) && item.files.size == 1 ->
+                        item.files.map { it.toStreamItem() }
+                    else -> emptyList()
                 }
             }
         }
-    }
 
     /**
      * The video id for one episode [file]. Absolute-numbered anime files keep the native
@@ -798,6 +888,8 @@ object LocalLibraryRepository {
             catalogs = catalogs,
             hideEmptyCatalogs = hideEmptyCatalogs,
             playbackPreference = playbackPreference,
+            titlePlayback = titlePlaybackByKey,
+            linkedServers = serverLinks,
             isLoaded = true,
             isScanning = isScanning,
             errorMessage = errorMessage,
@@ -814,7 +906,9 @@ object LocalLibraryRepository {
                     hideEmptyCatalogs = hideEmptyCatalogs,
                     playbackPreference = playbackPreference,
                     assignments = assignmentsByKey,
+                    titlePlayback = titlePlaybackByKey,
                     autoFiledKeys = autoConsideredKeys,
+                    serverLinks = serverLinks,
                 ),
             ),
         )

@@ -1,0 +1,918 @@
+package com.nuvio.app.features.settings
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.ui.NuvioModalDialog
+import com.nuvio.app.core.ui.nuvio
+import com.nuvio.app.features.iptv.IptvBrakeRules
+import com.nuvio.app.features.iptv.IptvWeedRules
+import com.nuvio.app.features.iptv.IptvDecide
+import com.nuvio.app.features.iptv.IptvPlaylist
+import com.nuvio.app.features.iptv.IptvPlaylistType
+import com.nuvio.app.features.iptv.IptvRefreshPolicy
+import com.nuvio.app.features.iptv.IptvRepository
+import com.nuvio.app.features.iptv.IptvSettings
+import com.nuvio.app.features.iptv.IptvSourceException
+import com.nuvio.app.features.iptv.IptvStreamFormat
+import com.nuvio.app.features.iptv.IptvTestResult
+import com.nuvio.app.features.iptv.StalkerIdentity
+import com.nuvio.app.features.iptv.asIptvError
+import com.nuvio.app.features.iptv.iptvErrorText
+import java.net.URI
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
+import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_cancel
+import nuvio.composeapp.generated.resources.action_delete
+import nuvio.composeapp.generated.resources.action_save
+import nuvio.composeapp.generated.resources.iptv_playlist_delete_confirm
+import nuvio.composeapp.generated.resources.iptv_playlist_dialog_add_title
+import nuvio.composeapp.generated.resources.iptv_playlist_dialog_edit_title
+import nuvio.composeapp.generated.resources.iptv_playlist_device_id
+import nuvio.composeapp.generated.resources.iptv_playlist_device_id2
+import nuvio.composeapp.generated.resources.iptv_playlist_epg_url
+import nuvio.composeapp.generated.resources.iptv_playlist_epg_url_description
+import nuvio.composeapp.generated.resources.iptv_playlist_identity_description
+import nuvio.composeapp.generated.resources.iptv_playlist_mac
+import nuvio.composeapp.generated.resources.iptv_playlist_mac_description
+import nuvio.composeapp.generated.resources.iptv_playlist_missing_fields
+import nuvio.composeapp.generated.resources.iptv_playlist_missing_stalker
+import nuvio.composeapp.generated.resources.iptv_playlist_missing_url
+import nuvio.composeapp.generated.resources.iptv_playlist_name
+import nuvio.composeapp.generated.resources.iptv_playlist_name_placeholder
+import nuvio.composeapp.generated.resources.iptv_playlist_password
+import nuvio.composeapp.generated.resources.iptv_playlist_portal
+import nuvio.composeapp.generated.resources.iptv_playlist_portal_description
+import nuvio.composeapp.generated.resources.iptv_playlist_serial
+import nuvio.composeapp.generated.resources.iptv_playlist_server
+import nuvio.composeapp.generated.resources.iptv_playlist_server_description
+import nuvio.composeapp.generated.resources.iptv_playlist_signature
+import nuvio.composeapp.generated.resources.iptv_playlist_summary_channels
+import nuvio.composeapp.generated.resources.iptv_playlist_summary_loading
+import nuvio.composeapp.generated.resources.iptv_playlist_summary_not_loaded
+import nuvio.composeapp.generated.resources.iptv_playlist_test
+import nuvio.composeapp.generated.resources.iptv_playlist_testing
+import nuvio.composeapp.generated.resources.iptv_playlist_type
+import nuvio.composeapp.generated.resources.iptv_playlist_type_m3u
+import nuvio.composeapp.generated.resources.iptv_playlist_type_stalker
+import nuvio.composeapp.generated.resources.iptv_playlist_type_xtream
+import nuvio.composeapp.generated.resources.iptv_playlist_url
+import nuvio.composeapp.generated.resources.iptv_playlist_url_description
+import nuvio.composeapp.generated.resources.iptv_playlist_username
+import nuvio.composeapp.generated.resources.iptv_settings_add_playlist
+import nuvio.composeapp.generated.resources.iptv_settings_add_playlist_description
+import nuvio.composeapp.generated.resources.iptv_settings_format_auto
+import nuvio.composeapp.generated.resources.iptv_settings_format_hls
+import nuvio.composeapp.generated.resources.iptv_settings_format_ts
+import nuvio.composeapp.generated.resources.iptv_settings_intro
+import nuvio.composeapp.generated.resources.iptv_settings_preferred_format
+import nuvio.composeapp.generated.resources.iptv_settings_rewind
+import nuvio.composeapp.generated.resources.iptv_settings_rewind_description
+import nuvio.composeapp.generated.resources.iptv_settings_rewind_minutes
+import nuvio.composeapp.generated.resources.iptv_settings_rewind_standard
+import nuvio.composeapp.generated.resources.iptv_settings_preferred_format_description
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_every_launch
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_hours
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_interval
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_interval_description
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_now
+import nuvio.composeapp.generated.resources.iptv_settings_refresh_now_description
+import nuvio.composeapp.generated.resources.iptv_settings_section_playback
+import nuvio.composeapp.generated.resources.iptv_settings_section_playlists
+import nuvio.composeapp.generated.resources.iptv_settings_section_updates
+import nuvio.composeapp.generated.resources.iptv_test_ok
+import nuvio.composeapp.generated.resources.iptv_test_ok_account
+import nuvio.composeapp.generated.resources.iptv_test_ok_account_expires
+import nuvio.composeapp.generated.resources.iptv_test_ok_channels
+import androidx.compose.ui.text.input.KeyboardType
+import com.nuvio.app.features.iptv.IptvProxy
+import com.nuvio.app.features.iptv.IptvProxyType
+import nuvio.composeapp.generated.resources.iptv_settings_section_connection
+import nuvio.composeapp.generated.resources.iptv_proxy
+import nuvio.composeapp.generated.resources.iptv_proxy_description
+import nuvio.composeapp.generated.resources.iptv_proxy_off
+import nuvio.composeapp.generated.resources.iptv_proxy_http
+import nuvio.composeapp.generated.resources.iptv_proxy_socks
+import nuvio.composeapp.generated.resources.iptv_proxy_host
+import nuvio.composeapp.generated.resources.iptv_proxy_host_description
+import nuvio.composeapp.generated.resources.iptv_proxy_port
+import nuvio.composeapp.generated.resources.iptv_proxy_username
+import nuvio.composeapp.generated.resources.iptv_proxy_username_description
+import nuvio.composeapp.generated.resources.iptv_proxy_password
+import org.jetbrains.compose.resources.stringResource
+
+/**
+ * Live TV (IPTV) settings: the user's playlists, how often they refresh, and the stream format.
+ * Playlists stay on this PC (per profile) because they hold the provider's password.
+ */
+internal fun LazyListScope.iptvSettingsContent(
+    isTablet: Boolean,
+) {
+    item {
+        val settings = rememberIptvSettings()
+        SettingsSection(title = "General", isTablet = isTablet) {
+            SettingsGroup(isTablet = isTablet) {
+                SettingsSwitchRow(
+                    title = "Show in navigation",
+                    description = "A Live TV button in the sidebar and top bar. Its place can be changed under " +
+                        "Appearance > Navigation order.",
+                    checked = settings.tabShown,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-in-navigation")),
+                    onCheckedChange = IptvRepository::setTabEnabled,
+                )
+                // fork:live-tv-on-now
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "On Now",
+                    description = "Live TV opens on what is on: live sport with the score (from Live scores below), " +
+                        "films with how far in they are, and the channels you usually watch at this hour. Copies of " +
+                        "one channel (FHD, HD, SD, backup) become one row that moves to the next copy when one fails, " +
+                        "and a programme can be started from its beginning where the provider keeps catch-up.",
+                    checked = settings.onNow,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-on-now")),
+                    onCheckedChange = IptvRepository::setOnNow,
+                )
+                // fork:live-tv-decide
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Decide for me",
+                    description = "Needs On Now. Four short views that offer little and end: Three things (a safe one, one " +
+                        "starting soon, a wildcard, and one reshuffle a night), I have N minutes (only what fits, 15 to 90), " +
+                        "Earlier today (what your provider kept, ready to play from the start) and Following (programmes and " +
+                        "teams you follow, found on whichever channel has them).",
+                    checked = settings.decide,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-decide")),
+                    onCheckedChange = IptvRepository::setDecide,
+                )
+                // fork:live-tv-stage
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Stage",
+                    description = "Live TV opens on the front door: one pick (OK plays it), your favourite channels and the " +
+                        "scores of the teams you follow. Behind it, full-screen stages, one decision each: Three things, Starting soon, " +
+                        "I have N minutes, Tonight's running order, Earlier today, Following, Just ask and Your 40. " +
+                        "Left and right on the strip at the top change stage; All channels opens the classic list. " +
+                        "The picks learn from what you watch to the end, put new episodes above repeats and prefer " +
+                        "programmes with a picture and a description.",
+                    checked = settings.stage,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-stage")),
+                    onCheckedChange = IptvRepository::setStage,
+                )
+                // fork:live-tv-polish - the home country for the picks.
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsChoiceRow(
+                    title = "Home country",
+                    description = "The picks (the front door, Three things, For you now and the other views) put this country's " +
+                        "channels first and push other countries' news down, so the news you see is yours. " +
+                        "From the triage: uses the triage's country when it kept only one.",
+                    options = listOf(SettingsChoiceOption<String?>(null, "From the triage")) +
+                        com.nuvio.app.features.iptv.IptvRegions.HOME_CHOICES.map { SettingsChoiceOption<String?>(it, com.nuvio.app.features.iptv.IptvRegions.countryName(it)) },
+                    selectedValue = settings.homeRegion,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-home-region")),
+                    onSelected = IptvRepository::setHomeRegion,
+                )
+                // fork:live-tv-front-door
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Front door picture",
+                    description = "The front door's pick plays its channel, muted, instead of the programme's art, " +
+                        "only while nothing else is playing. It uses a connection to your provider while it shows. Off: the art only.",
+                    checked = settings.doorPreview,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-door-preview")),
+                    onCheckedChange = IptvRepository::setDoorPreview,
+                )
+                // fork:live-tv-on-demand
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "From the start, on demand",
+                    description = "On the stages, On Now and the channel list (Your 40 and the guide too): picking a film or episode " +
+                        "that started a few minutes ago asks first: join live, or " +
+                        "play it from the beginning through your add-ons (your TorBox cache and the like), found by its title " +
+                        "on TMDB. Episodes need the guide's series and episode numbers; without them the series' page opens to " +
+                        "pick one. News, sport and anything marked Live are always joined live.",
+                    checked = settings.onDemand,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-on-demand")),
+                    onCheckedChange = IptvRepository::setOnDemand,
+                )
+                // fork:live-tv-weed
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Overnight weeding",
+                    description = "Between 02:00 and 05:00, while nothing is playing, opens the channels of Your 40 and the ones " +
+                        "you watched lately, one at a time and for a few seconds (at most 60 a night; not on portals). A channel " +
+                        "that fails three nights in a row leaves Your 40 and the wall; one good night keeps it. " +
+                        "\"Bring back channels thrown out\" returns them. " +
+                        "Now marked dead: ${settings.weeds.values.sumOf { IptvWeedRules.dead(it).size }}.",
+                    checked = settings.weed,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-weed")),
+                    onCheckedChange = IptvRepository::setWeed,
+                )
+                // fork:live-tv-evening
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Running order and Just ask",
+                    description = "Needs On Now. Tonight's running order: one proposed evening from your lineup (or usual channels), " +
+                        "ending before the bedtime set under What to watch; approve it once and Nuvio changes channel at each " +
+                        "start, any key takes over, nothing starts after the last. Just ask: type a line in the search box " +
+                        "(\"something funny, half an hour\") and get one answer, with Not that for the next.",
+                    checked = settings.evening,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-evening")),
+                    onCheckedChange = IptvRepository::setEvening,
+                )
+                // fork:live-tv-ask-ai
+                var askConsentFor by remember { mutableStateOf<AiConsentTarget?>(null) }
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Let the AI answer Just ask",
+                    description = "Just ask sends your question, the time, and the titles, channels and descriptions of what is on " +
+                        "now or within the hour (60 at most) to the AI under Settings > Discover, with your key; it picks up " +
+                        "to three and says why. Without a key, or when it fails, the rules answer as before. At most 40 " +
+                        "questions a day.",
+                    checked = settings.askAi,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-ask-ai")),
+                    onCheckedChange = { on ->
+                        val ai = com.nuvio.app.features.discover.DiscoverAiSettingsRepository.snapshot()
+                        when {
+                            !on -> IptvRepository.setAskAi(false)
+                            ai.apiKey.isNotBlank() && !ai.consentGiven -> askConsentFor = AiConsentTarget.LiveTvAsk
+                            else -> IptvRepository.setAskAi(true)
+                        }
+                    },
+                )
+                AiConsentDialog(target = askConsentFor, onDismiss = { askConsentFor = null })
+                // fork:live-tv-brakes
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Brakes",
+                    description = "Three gentle stops. Five channel changes in two minutes offers to stop (once a night). " +
+                        "After a programme you stayed with, \"Stop here\" comes first. And an honest week: " +
+                        (IptvBrakeRules.weekLine(IptvBrakeRules.week(settings.tally, IptvDecide.nightOf(System.currentTimeMillis()))) + "."),
+                    checked = settings.brakes,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-brakes")),
+                    onCheckedChange = IptvRepository::setBrakes,
+                )
+                // fork:live-tv-subtitles
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Subtitles for films on live channels",
+                    description = "When a film or an episode is on, Nuvio finds it on TMDB and asks your subtitle add-ons " +
+                        "(Subsense and the like) for it, as for TorBox; pick one in the player's subtitles. It is placed from " +
+                        "the guide's start time at once, then matched to the speech in what has already played (from the " +
+                        "rewind buffer, no second connection), at the film's speed or sped up to 25 frames, and checked again " +
+                        "every few minutes for ad breaks. A new programme takes the subtitle off. Not for news, sport or recordings.",
+                    checked = settings.liveSubtitles,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-live-subtitles")),
+                    onCheckedChange = IptvRepository::setLiveSubtitles,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Match live subtitles by their words",
+                    description = "Needs the setting above and a speech model downloaded in Settings > Voice control (voice " +
+                        "control itself can stay off). Nuvio listens to what has already played, writes down the words and " +
+                        "finds them in the subtitle, so it is in time within a minute, songs do not confuse it, and an ad " +
+                        "break is caught by the words that follow. English subtitles only; uses some CPU while it listens.",
+                    checked = settings.liveSubtitleWords,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-live-subtitle-words")),
+                    onCheckedChange = IptvRepository::setLiveSubtitleWords,
+                )
+                // fork:live-tv-views - the six extra views are always there: the Views chip on Live TV's strip picks one.
+                // fork:live-tv-departure
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Starting soon",
+                    description = "Needs On Now. Adds a departure board to Live TV: only programmes that have not started, " +
+                        "leaving within 15, 30 and 60 minutes, with a countdown (on the channels of Your 40 when that is on). " +
+                        "Open one to be reminded when it starts, or to have Nuvio switch to the channel by itself.",
+                    checked = settings.departure,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-departure")),
+                    onCheckedChange = IptvRepository::setDeparture,
+                )
+                // fork:live-tv-lineup
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = "Your 40",
+                    description = "Live TV opens on a numbered lineup of about forty channels, like a television: what you " +
+                        "watch most, then what the triage kept. The numbers stay where they are until you move a channel " +
+                        "(the ... beside its star); typed numbers in the player and channel up and down follow the lineup. " +
+                        "\"Never again\" in the same menu hides a channel from the lineup and the lists for good.",
+                    checked = settings.lineupOn,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-lineup")),
+                    onCheckedChange = IptvRepository::setLineupOn,
+                )
+                // fork:live-tv-taste
+                if (settings.titles.isNotEmpty()) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsNavigationRow(
+                        title = "Forget what I watched",
+                        description = "Clears the ${settings.titles.size} programmes the Stage's picks learned from. Channels you usually watch are kept.",
+                        isTablet = isTablet,
+                        onClick = IptvRepository::forgetWatched,
+                    )
+                }
+                if (settings.never.values.any { it.isNotEmpty() }) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsNavigationRow(
+                        title = "Bring back channels thrown out",
+                        description = "Shows every channel you chose Never again for. They are not added to Your 40 again.",
+                        isTablet = isTablet,
+                        onClick = IptvRepository::bringBackAll,
+                    )
+                }
+            }
+        }
+    }
+
+    item {
+        IptvPlaylistsSection(isTablet = isTablet, settings = rememberIptvSettings())
+    }
+
+    item {
+        val settings = rememberIptvSettings()
+        SettingsSection(
+            title = stringResource(Res.string.iptv_settings_section_updates),
+            isTablet = isTablet,
+        ) {
+            SettingsGroup(
+                isTablet = isTablet,
+                modifier = Modifier.settingsSearchAnchors("iptv-refresh-interval", "iptv-refresh-now"),
+            ) {
+                val everyLaunch = stringResource(Res.string.iptv_settings_refresh_every_launch)
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.iptv_settings_refresh_interval),
+                    description = stringResource(Res.string.iptv_settings_refresh_interval_description),
+                    options = IptvRefreshPolicy.OPTIONS.map { hours ->
+                        SettingsChoiceOption(
+                            value = hours,
+                            label = if (hours == 0) everyLaunch else stringResource(Res.string.iptv_settings_refresh_hours, hours),
+                        )
+                    },
+                    selectedValue = settings.refreshHours,
+                    isTablet = isTablet,
+                    onSelected = IptvRepository::setRefreshHours,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsNavigationRow(
+                    title = stringResource(Res.string.iptv_settings_refresh_now),
+                    description = stringResource(Res.string.iptv_settings_refresh_now_description),
+                    enabled = settings.playlists.isNotEmpty(),
+                    isTablet = isTablet,
+                    onClick = { IptvRepository.refreshAllInBackground(force = true) },
+                )
+            }
+        }
+    }
+
+    item {
+        val settings = rememberIptvSettings()
+        SettingsSection(
+            title = stringResource(Res.string.iptv_settings_section_playback),
+            isTablet = isTablet,
+        ) {
+            SettingsGroup(
+                isTablet = isTablet,
+                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-preferred-format")),
+            ) {
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.iptv_settings_preferred_format),
+                    description = stringResource(Res.string.iptv_settings_preferred_format_description),
+                    options = listOf(
+                        SettingsChoiceOption<String?>(null, stringResource(Res.string.iptv_settings_format_auto)),
+                        SettingsChoiceOption<String?>(IptvStreamFormat.TS, stringResource(Res.string.iptv_settings_format_ts)),
+                        SettingsChoiceOption<String?>(IptvStreamFormat.HLS, stringResource(Res.string.iptv_settings_format_hls)),
+                    ),
+                    selectedValue = settings.preferredFormat,
+                    isTablet = isTablet,
+                    onSelected = IptvRepository::setPreferredFormat,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                val standard = stringResource(Res.string.iptv_settings_rewind_standard)
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.iptv_settings_rewind),
+                    description = stringResource(Res.string.iptv_settings_rewind_description),
+                    options = com.nuvio.app.features.iptv.IPTV_REWIND_OPTIONS.map { minutes ->
+                        SettingsChoiceOption(
+                            value = minutes,
+                            label = if (minutes == 0) standard else stringResource(Res.string.iptv_settings_rewind_minutes, minutes),
+                        )
+                    },
+                    selectedValue = settings.rewindMinutes,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("iptv-rewind")),
+                    onSelected = IptvRepository::setRewindMinutes,
+                )
+            }
+        }
+    }
+
+    item {
+        IptvProxySection(isTablet = isTablet, proxy = rememberIptvSettings().proxy)
+    }
+
+    liveScoresSettingsContent(isTablet) // fork:live-scores
+}
+
+/**
+ * Proxy for IPTV only, for providers the user's ISP blocks. Each field saves on its own, so the
+ * rows below the type only appear once a type is chosen.
+ */
+@Composable
+private fun IptvProxySection(isTablet: Boolean, proxy: IptvProxy) {
+    SettingsSection(
+        title = stringResource(Res.string.iptv_settings_section_connection),
+        isTablet = isTablet,
+    ) {
+        SettingsGroup(
+            isTablet = isTablet,
+            modifier = Modifier.settingsSearchAnchors("iptv-proxy"),
+        ) {
+            SettingsChoiceRow(
+                title = stringResource(Res.string.iptv_proxy),
+                description = stringResource(Res.string.iptv_proxy_description),
+                options = listOf(
+                    SettingsChoiceOption(IptvProxyType.Off, stringResource(Res.string.iptv_proxy_off)),
+                    SettingsChoiceOption(IptvProxyType.Http, stringResource(Res.string.iptv_proxy_http)),
+                    SettingsChoiceOption(IptvProxyType.Socks, stringResource(Res.string.iptv_proxy_socks)),
+                ),
+                selectedValue = proxy.type,
+                isTablet = isTablet,
+                onSelected = { IptvRepository.setProxy(proxy.copy(type = it)) },
+            )
+            if (proxy.type == IptvProxyType.Off) return@SettingsGroup
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsTextInputRow(
+                title = stringResource(Res.string.iptv_proxy_host),
+                description = stringResource(Res.string.iptv_proxy_host_description),
+                value = proxy.host,
+                placeholder = "proxy.example.com",
+                isTablet = isTablet,
+                onSave = { raw ->
+                    // A pasted host:port fills both fields.
+                    val (host, port) = IptvProxy.parseHostAndPort(raw)
+                    IptvRepository.setProxy(proxy.copy(host = host, port = if (port > 0) port else proxy.port))
+                },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsTextInputRow(
+                title = stringResource(Res.string.iptv_proxy_port),
+                description = "",
+                value = proxy.port.takeIf { it > 0 }?.toString().orEmpty(),
+                placeholder = if (proxy.type == IptvProxyType.Socks) "1080" else "8080",
+                isTablet = isTablet,
+                keyboardType = KeyboardType.Number,
+                normalize = { it.filter(Char::isDigit) },
+                onSave = { raw -> IptvRepository.setProxy(proxy.copy(port = raw.toIntOrNull()?.coerceIn(0, 65535) ?: 0)) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsTextInputRow(
+                title = stringResource(Res.string.iptv_proxy_username),
+                description = stringResource(Res.string.iptv_proxy_username_description),
+                value = proxy.username,
+                placeholder = stringResource(Res.string.iptv_proxy_username),
+                isTablet = isTablet,
+                onSave = { IptvRepository.setProxy(proxy.copy(username = it)) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsTextInputRow(
+                title = stringResource(Res.string.iptv_proxy_password),
+                description = "",
+                value = proxy.password,
+                placeholder = stringResource(Res.string.iptv_proxy_password),
+                isTablet = isTablet,
+                secret = true,
+                normalize = { it },
+                onSave = { IptvRepository.setProxy(proxy.copy(password = it)) },
+            )
+        }
+    }
+}
+
+/** The page reads its own state instead of having SettingsScreen thread it through both layouts. */
+@Composable
+private fun rememberIptvSettings(): IptvSettings {
+    remember { IptvRepository.ensureLoaded() }
+    val settings by IptvRepository.settings.collectAsStateWithLifecycle()
+    return settings
+}
+
+/** The playlist list plus the add/edit dialog, which needs composable state of its own. */
+@Composable
+private fun IptvPlaylistsSection(isTablet: Boolean, settings: IptvSettings) {
+    // null = closed; a playlist with a blank id = adding.
+    var editing by remember { mutableStateOf<IptvPlaylist?>(null) }
+
+    SettingsSection(
+        title = stringResource(Res.string.iptv_settings_section_playlists),
+        isTablet = isTablet,
+    ) {
+        SettingsGroup(
+            isTablet = isTablet,
+            modifier = Modifier.settingsSearchAnchors("iptv-playlists", "iptv-add-playlist"),
+        ) {
+            if (settings.playlists.isEmpty()) {
+                SettingsSubtext(
+                    text = stringResource(Res.string.iptv_settings_intro),
+                    isTablet = isTablet,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+            }
+            settings.playlists.forEach { playlist ->
+                IptvPlaylistRow(playlist = playlist, isTablet = isTablet, onClick = { editing = playlist })
+                SettingsGroupDivider(isTablet = isTablet)
+            }
+            SettingsNavigationRow(
+                title = stringResource(Res.string.iptv_settings_add_playlist),
+                description = stringResource(Res.string.iptv_settings_add_playlist_description),
+                isTablet = isTablet,
+                onClick = { editing = IptvPlaylist(id = "", type = IptvPlaylistType.Xtream, name = "") },
+            )
+        }
+    }
+
+    editing?.let { playlist ->
+        IptvPlaylistDialog(
+            initial = playlist,
+            isTablet = isTablet,
+            onDismiss = { editing = null },
+        )
+    }
+}
+
+@Composable
+private fun IptvPlaylistRow(playlist: IptvPlaylist, isTablet: Boolean, onClick: () -> Unit) {
+    val state by IptvRepository.contentState(playlist.id).collectAsStateWithLifecycle()
+    val typeLabel = playlistTypeLabel(playlist.type)
+    val where = playlistHost(playlist)?.let { "$typeLabel · $it" } ?: typeLabel
+    val content = state.content
+    val error = state.error
+    val description = when {
+        state.loading -> stringResource(Res.string.iptv_playlist_summary_loading, where)
+        error != null -> iptvErrorText(error)
+        content != null -> stringResource(Res.string.iptv_playlist_summary_channels, where, content.channels.size)
+        else -> stringResource(Res.string.iptv_playlist_summary_not_loaded, where)
+    }
+    SettingsNavigationRow(
+        title = playlist.name.ifBlank { where },
+        description = description,
+        isTablet = isTablet,
+        onClick = onClick,
+    )
+}
+
+@Composable
+private fun playlistTypeLabel(type: IptvPlaylistType): String = when (type) {
+    IptvPlaylistType.Xtream -> stringResource(Res.string.iptv_playlist_type_xtream)
+    IptvPlaylistType.M3u -> stringResource(Res.string.iptv_playlist_type_m3u)
+    IptvPlaylistType.Stalker -> stringResource(Res.string.iptv_playlist_type_stalker)
+}
+
+private fun playlistHost(playlist: IptvPlaylist): String? {
+    val raw = (if (playlist.type == IptvPlaylistType.M3u) playlist.url else playlist.server)?.trim() ?: return null
+    val withScheme = if ("://" in raw) raw else "http://$raw"
+    return runCatching { URI(withScheme).host }.getOrNull()?.takeIf { it.isNotBlank() }
+}
+
+private sealed interface IptvDialogStatus {
+    data object Testing : IptvDialogStatus
+    data class Tested(val result: IptvTestResult) : IptvDialogStatus
+    data class Failed(val error: IptvSourceException) : IptvDialogStatus
+    data object MissingFields : IptvDialogStatus
+}
+
+@Composable
+private fun IptvPlaylistDialog(
+    initial: IptvPlaylist,
+    isTablet: Boolean,
+    onDismiss: () -> Unit,
+) {
+    val tokens = MaterialTheme.nuvio
+    val scope = rememberCoroutineScope()
+    val adding = initial.id.isBlank()
+
+    var type by remember { mutableStateOf(initial.type) }
+    var name by remember { mutableStateOf(initial.name) }
+    var server by remember { mutableStateOf(initial.server.orEmpty()) }
+    var username by remember { mutableStateOf(initial.username.orEmpty()) }
+    var password by remember { mutableStateOf(initial.password.orEmpty()) }
+    var url by remember { mutableStateOf(initial.url.orEmpty()) }
+    var epgUrl by remember { mutableStateOf(initial.epgUrl.orEmpty()) }
+    var serial by remember { mutableStateOf(initial.serial.orEmpty()) }
+    var deviceId by remember { mutableStateOf(initial.deviceId.orEmpty()) }
+    var deviceId2 by remember { mutableStateOf(initial.deviceId2.orEmpty()) }
+    var signature by remember { mutableStateOf(initial.signature.orEmpty()) }
+    var status by remember { mutableStateOf<IptvDialogStatus?>(null) }
+    var confirmingDelete by remember { mutableStateOf(false) }
+
+    fun draft() = IptvPlaylist(
+        id = initial.id,
+        type = type,
+        name = name,
+        // Only the fields of the chosen type are kept, so switching type leaves nothing stale behind.
+        server = server.takeIf { type != IptvPlaylistType.M3u },
+        username = username.takeIf { type != IptvPlaylistType.M3u },
+        password = password.takeIf { type == IptvPlaylistType.Xtream },
+        url = url.takeIf { type == IptvPlaylistType.M3u },
+        epgUrl = epgUrl,
+        serial = serial.takeIf { type == IptvPlaylistType.Stalker },
+        deviceId = deviceId.takeIf { type == IptvPlaylistType.Stalker },
+        deviceId2 = deviceId2.takeIf { type == IptvPlaylistType.Stalker },
+        signature = signature.takeIf { type == IptvPlaylistType.Stalker },
+    )
+
+    fun complete(): Boolean = when (type) {
+        IptvPlaylistType.Xtream -> server.isNotBlank() && username.isNotBlank() && password.isNotEmpty()
+        IptvPlaylistType.M3u -> url.isNotBlank()
+        IptvPlaylistType.Stalker -> server.isNotBlank() && StalkerIdentity.normalizeMac(username) != null
+    }
+
+    val testing = status == IptvDialogStatus.Testing
+    val formScroll = rememberScrollState()
+    // The message sits under the last field; in the taller Xtream form that is below the fold.
+    LaunchedEffect(status) {
+        if (status == null) return@LaunchedEffect
+        withFrameNanos { } // let the message lay out first, or maxValue is the old bottom
+        formScroll.animateScrollTo(formScroll.maxValue)
+    }
+
+    NuvioModalDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(if (adding) Res.string.iptv_playlist_dialog_add_title else Res.string.iptv_playlist_dialog_edit_title),
+        maxWidth = 640.dp,
+        modifier = Modifier.width(640.dp),
+        actions = {
+            if (!adding) {
+                TextButton(
+                    onClick = {
+                        if (confirmingDelete) {
+                            IptvRepository.removePlaylist(initial.id)
+                            onDismiss()
+                        } else {
+                            confirmingDelete = true
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = tokens.colors.danger),
+                ) {
+                    Text(stringResource(if (confirmingDelete) Res.string.iptv_playlist_delete_confirm else Res.string.action_delete))
+                }
+            }
+            TextButton(
+                enabled = !testing,
+                onClick = {
+                    if (!complete()) {
+                        status = IptvDialogStatus.MissingFields
+                        return@TextButton
+                    }
+                    status = IptvDialogStatus.Testing
+                    val toTest = draft()
+                    scope.launch {
+                        status = try {
+                            IptvDialogStatus.Tested(IptvRepository.test(toTest))
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            IptvDialogStatus.Failed(e.asIptvError())
+                        }
+                    }
+                },
+            ) {
+                Text(stringResource(if (testing) Res.string.iptv_playlist_testing else Res.string.iptv_playlist_test))
+            }
+            TextButton(onClick = onDismiss) { Text(stringResource(Res.string.action_cancel)) }
+            TextButton(
+                onClick = {
+                    if (!complete()) {
+                        status = IptvDialogStatus.MissingFields
+                        return@TextButton
+                    }
+                    val id = if (adding) {
+                        IptvRepository.addPlaylist(draft()).id
+                    } else {
+                        IptvRepository.updatePlaylist(draft())
+                        initial.id
+                    }
+                    IptvRepository.refreshInBackground(id)
+                    onDismiss()
+                },
+            ) { Text(stringResource(Res.string.action_save)) }
+        },
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 520.dp)
+                .verticalScroll(formScroll)
+                .padding(bottom = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            // Three types do not fit a settings row's control, so it takes the dialog's width.
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = if (isTablet) 20.dp else 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = stringResource(Res.string.iptv_playlist_type),
+                    style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
+                    color = settingsRowTitleColor(stringResource(Res.string.iptv_playlist_type)),
+                    fontWeight = FontWeight.Medium,
+                )
+                SettingsSegmentedControl(
+                    options = listOf(
+                        SettingsChoiceOption(IptvPlaylistType.Xtream, stringResource(Res.string.iptv_playlist_type_xtream)),
+                        SettingsChoiceOption(IptvPlaylistType.M3u, stringResource(Res.string.iptv_playlist_type_m3u)),
+                        SettingsChoiceOption(IptvPlaylistType.Stalker, stringResource(Res.string.iptv_playlist_type_stalker)),
+                    ),
+                    selectedValue = type,
+                    enabled = true,
+                    isTablet = isTablet,
+                    modifier = Modifier.fillMaxWidth(),
+                    onSelected = {
+                        type = it
+                        status = null
+                    },
+                )
+            }
+            SettingsTextRow(
+                title = stringResource(Res.string.iptv_playlist_name),
+                description = null,
+                value = name,
+                isTablet = isTablet,
+                placeholder = stringResource(Res.string.iptv_playlist_name_placeholder),
+                onValueChange = { name = it },
+            )
+            when (type) {
+                IptvPlaylistType.Xtream -> {
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_server),
+                        description = stringResource(Res.string.iptv_playlist_server_description),
+                        value = server,
+                        isTablet = isTablet,
+                        placeholder = "http://",
+                        onValueChange = { server = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_username),
+                        description = null,
+                        value = username,
+                        isTablet = isTablet,
+                        onValueChange = { username = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_password),
+                        description = null,
+                        value = password,
+                        isTablet = isTablet,
+                        secret = true,
+                        onValueChange = { password = it; status = null },
+                    )
+                }
+                IptvPlaylistType.M3u -> {
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_url),
+                        description = stringResource(Res.string.iptv_playlist_url_description),
+                        value = url,
+                        isTablet = isTablet,
+                        placeholder = "https://",
+                        onValueChange = { url = it; status = null },
+                    )
+                }
+                IptvPlaylistType.Stalker -> {
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_portal),
+                        description = stringResource(Res.string.iptv_playlist_portal_description),
+                        value = server,
+                        isTablet = isTablet,
+                        placeholder = "http://",
+                        onValueChange = { server = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_mac),
+                        description = stringResource(Res.string.iptv_playlist_mac_description),
+                        value = username,
+                        isTablet = isTablet,
+                        placeholder = "00:1A:79:XX:XX:XX",
+                        onValueChange = { username = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_serial),
+                        description = stringResource(Res.string.iptv_playlist_identity_description),
+                        value = serial,
+                        isTablet = isTablet,
+                        onValueChange = { serial = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_device_id),
+                        description = null,
+                        value = deviceId,
+                        isTablet = isTablet,
+                        onValueChange = { deviceId = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_device_id2),
+                        description = null,
+                        value = deviceId2,
+                        isTablet = isTablet,
+                        onValueChange = { deviceId2 = it; status = null },
+                    )
+                    SettingsTextRow(
+                        title = stringResource(Res.string.iptv_playlist_signature),
+                        description = null,
+                        value = signature,
+                        isTablet = isTablet,
+                        onValueChange = { signature = it; status = null },
+                    )
+                }
+            }
+            SettingsTextRow(
+                title = stringResource(Res.string.iptv_playlist_epg_url),
+                description = stringResource(Res.string.iptv_playlist_epg_url_description),
+                value = epgUrl,
+                isTablet = isTablet,
+                placeholder = "https://",
+                onValueChange = { epgUrl = it },
+            )
+            status?.let { current ->
+                val (text, isError) = when (current) {
+                    IptvDialogStatus.Testing -> stringResource(Res.string.iptv_playlist_testing) to false
+                    IptvDialogStatus.MissingFields -> stringResource(
+                        when (type) {
+                            IptvPlaylistType.Xtream -> Res.string.iptv_playlist_missing_fields
+                            IptvPlaylistType.M3u -> Res.string.iptv_playlist_missing_url
+                            IptvPlaylistType.Stalker -> Res.string.iptv_playlist_missing_stalker
+                        },
+                    ) to true
+                    is IptvDialogStatus.Failed -> iptvErrorText(current.error) to true
+                    is IptvDialogStatus.Tested -> testResultText(current.result) to false
+                }
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (isError) tokens.colors.danger else tokens.colors.textMuted,
+                    modifier = Modifier.padding(horizontal = if (isTablet) 20.dp else 16.dp, vertical = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun testResultText(result: IptvTestResult): String {
+    result.channelCount?.let { return stringResource(Res.string.iptv_test_ok_channels, it) }
+    val account = result.account ?: return stringResource(Res.string.iptv_test_ok)
+    val status = account.status ?: "Active"
+    val connections = account.maxConnections ?: return stringResource(Res.string.iptv_test_ok)
+    val expires = account.expiresAtSeconds?.let {
+        // Localised formats need locale data a native-image build may not carry; ISO is a fine fallback.
+        val date = Instant.ofEpochSecond(it).atZone(ZoneId.systemDefault())
+        runCatching { DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).format(date) }
+            .getOrElse { DateTimeFormatter.ISO_LOCAL_DATE.format(date) }
+    }
+    return if (expires != null) {
+        stringResource(Res.string.iptv_test_ok_account_expires, status, connections, expires)
+    } else {
+        stringResource(Res.string.iptv_test_ok_account, status, connections)
+    }
+}

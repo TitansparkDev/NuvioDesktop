@@ -34,10 +34,16 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
-private const val UNKNOWN_TORRENT_ERROR = "Unknown torrent error"
+private val UNKNOWN_TORRENT_ERROR: String get() = localizedString(Res.string.p2p_unknown_torrent_error)
 private const val STREAMING_SAMPLE_INTERVAL_MS = 5_000L
 private const val STARTUP_SAMPLE_INTERVAL_MS = 1_000L
+
+// Under DesktopStorage.rootDir/nuvio-engine. The engine adds its own `payload/<info hash>` below.
+internal const val NUVIO_ENGINE_CACHE_DIRECTORY = "torrent-cache"
+private const val LEGACY_NUVIO_ENGINE_CACHE_DIRECTORY = "payload"
 
 // Metadata wait. The hard cap is the most a user should ever stare at "fetching metadata"; the
 // stall rule ends it sooner when the swarm has demonstrably nothing to offer: the announce round
@@ -47,8 +53,9 @@ private const val STARTUP_SAMPLE_INTERVAL_MS = 1_000L
 // cap. Measured on a live swarm the engine had 350 known peers and metadata in 1.3 s; on a dead
 // hash it plateaued at 2–7 known peers, all connect failures, for three minutes.
 /**
- * The engine's download window ahead of the player's read position (its rolling selection is
- * min(this, a 1 GiB ceiling in patch 0002), held as verified pieces in RAM). It follows the
+ * The engine's download window ahead of the player's read position, passed as its memory cache
+ * capacity (patch 0002 makes the window min(this, disk cache / 4), at least 64 MiB; upstream
+ * would size it from the disk cache alone, capped at 256 MiB). It follows the
  * playback buffer preset: the preset already says how much the user wants held ahead of the
  * playhead for mpv (Metered 32 MiB ... Resilient 1 GiB), and the swarm-side window is the same
  * decision one layer down. 16 MiB pieces need several in flight to keep a swarm busy, so even
@@ -79,6 +86,7 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
         val torrentProfile: P2pTorrentProfile,
         val diskCacheCapacityBytes: Long,
         val windowBytes: Long,
+        val ramOnlyMode: Boolean,
     )
 
     private data class DetachedStream(
@@ -130,7 +138,7 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
                 _state.value !is P2pStreamingState.Streaming &&
                     _state.value !is P2pStreamingState.Connecting,
             ) {
-                "Torrent cache cannot be cleared during active playback"
+                localizedString(Res.string.p2p_torrent_cache_cannot_be_cleared_during)
             }
             _cacheState.value = _cacheState.value.copy(isClearing = true)
             try {
@@ -430,6 +438,7 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
             torrentProfile = settings.torrentProfile,
             diskCacheCapacityBytes = settings.cacheSize.bytes,
             windowBytes = nuvioEngineWindowBytes(PlayerSettingsRepository.uiState.value.desktopBufferPreset),
+            ramOnlyMode = settings.ramOnlyMode,
         )
         engine?.takeIf { engineConfigurationKey == configurationKey }?.let { return it }
 
@@ -439,12 +448,17 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
         currentCoroutineContext().ensureActive()
         val root = DesktopStorage.rootDir.resolve("nuvio-engine").toFile()
         val stateDirectory = File(root, "state")
-        val cacheDirectory = File(root, "payload")
-        check(stateDirectory.mkdirs() || stateDirectory.isDirectory) {
-            "Could not create the Nuvio Engine state directory"
-        }
-        check(cacheDirectory.mkdirs() || cacheDirectory.isDirectory) {
-            "Could not create the Nuvio Engine cache directory"
+        val cacheDirectory = File(root, NUVIO_ENGINE_CACHE_DIRECTORY)
+        removeLegacyCacheDirectory(root)
+        if (configurationKey.ramOnlyMode) {
+            removeDiskCacheForRamOnlyMode(cacheDirectory)
+        } else {
+            check(stateDirectory.mkdirs() || stateDirectory.isDirectory) {
+                localizedString(Res.string.p2p_could_not_create_the_nuvio_engine)
+            }
+            check(cacheDirectory.mkdirs() || cacheDirectory.isDirectory) {
+                localizedString(Res.string.p2p_could_not_create_the_nuvio_engine_2)
+            }
         }
         return NuvioEngine.create(
             buildNuvioEngineConfig(
@@ -454,14 +468,80 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
                 torrentProfile = configurationKey.torrentProfile,
                 diskCacheCapacityBytes = configurationKey.diskCacheCapacityBytes,
                 windowBytes = configurationKey.windowBytes,
+                ramOnlyMode = configurationKey.ramOnlyMode,
             ),
         ).also { created ->
             engine = created
             engineConfigurationKey = configurationKey
             observeEngineEvents(created)
+            if (configurationKey.ramOnlyMode) {
+                updateCacheState(0L, 0L)
+            } else {
+                pruneDiskCacheAtStart(created, configurationKey.diskCacheCapacityBytes)
+            }
             log.i {
                 "Using Nuvio Engine ${NuvioEngine.version} (${NuvioEngine.protocolBackendVersion}) " +
                     "after ${elapsedMillis(startedAt)}ms"
+            }
+        }
+    }
+
+    /**
+     * The engine only enforces the cache size every 30 s while nothing is streaming, so torrents
+     * left over from earlier sessions could sit there for a whole viewing session. One reclaim to
+     * the cap right after start evicts the least recently used ones by their real on-disk size
+     * (the files are sparse; their listed size is the whole torrent). Not awaited: playback start
+     * must not wait on a directory scan, and the engine queues it ahead of the new torrent.
+     */
+    private fun pruneDiskCacheAtStart(activeEngine: NuvioEngine, capacityBytes: Long) {
+        scope.launch {
+            try {
+                activeEngine.reclaimDiskCache(capacityBytes)
+                val stats = activeEngine.stats.value
+                log.i {
+                    "Nuvio Engine startup cache prune: used=${stats.diskCacheUsedBytes} " +
+                        "capacity=$capacityBytes reclaimed=${stats.diskCacheReclaimedBytes}"
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                log.w(error) { "Nuvio Engine startup cache prune failed" }
+            }
+        }
+    }
+
+    /**
+     * Before the rename the cache lived in `nuvio-engine/payload` (BitTorrent's word for file
+     * content), whose sparse files list at the full torrent size and alarmed people. It is only
+     * part-streamed data, so it is deleted rather than moved; in the background, as it can hold
+     * thousands of files.
+     */
+    /**
+     * RAM-only mode never touches the disk cache, so whatever an earlier disk-mode session left
+     * there would stay until the mode was switched off again. The point of the mode is no torrent
+     * data on the drive, so it goes; in the background, like the legacy directory below. The
+     * disk-mode engine has already been closed, so nothing holds the files.
+     */
+    private fun removeDiskCacheForRamOnlyMode(cacheDirectory: File) {
+        if (!cacheDirectory.exists()) return
+        scope.launch(Dispatchers.IO) {
+            if (cacheDirectory.deleteRecursively()) {
+                log.i { "RAM-only mode: removed the Nuvio Engine disk cache ${cacheDirectory.path}" }
+            } else {
+                log.w { "RAM-only mode: could not fully remove the Nuvio Engine disk cache ${cacheDirectory.path}" }
+            }
+        }
+    }
+
+    private fun removeLegacyCacheDirectory(root: File) {
+        val legacy = File(root, LEGACY_NUVIO_ENGINE_CACHE_DIRECTORY)
+        if (!legacy.exists()) return
+        scope.launch(Dispatchers.IO) {
+            val removed = legacy.deleteRecursively()
+            if (removed) {
+                log.i { "Removed legacy Nuvio Engine cache directory ${legacy.path}" }
+            } else {
+                log.w { "Could not fully remove legacy Nuvio Engine cache directory ${legacy.path}" }
             }
         }
     }
@@ -584,7 +664,8 @@ internal object NuvioEngineP2pBackend : DesktopP2pBackend {
                                 "scheduled=${route?.scheduledPieces ?: -1} demands=${route?.activeDemands ?: -1} " +
                                 "trackerPeers=${aggregate.trackerPeersReturned} dhtPeers=${aggregate.dhtPeersReturned} " +
                                 "timedOutBlocks=${aggregate.timedOutBlockRequests} http=${aggregate.activeHttpRequests} " +
-                                "diskUsed=${aggregate.diskCacheUsedBytes} overBudget=${aggregate.diskCacheOverBudget}"
+                                "diskUsed=${aggregate.diskCacheUsedBytes} overBudget=${aggregate.diskCacheOverBudget} " +
+                                "memoryUsed=${aggregate.memoryCacheUsedBytes}"
                         }
                     }
                     updateStreamingIfCurrent(generation) { latest ->
@@ -743,12 +824,15 @@ internal fun buildNuvioEngineConfig(
     torrentProfile: P2pTorrentProfile,
     diskCacheCapacityBytes: Long,
     windowBytes: Long = nuvioEngineWindowBytes(DesktopBufferPreset.Balanced),
+    ramOnlyMode: Boolean = false,
 ): NuvioEngineConfig = NuvioEngineConfig(
     dataDirectory = stateDirectory,
     cacheDirectory = cacheDirectory,
     // See nuvioEngineWindowBytes: the memory cache IS the download window on desktop.
     memoryCacheCapacityBytes = windowBytes,
-    diskCacheCapacityBytes = diskCacheCapacityBytes,
+    // RAM-only mode: the engine keeps the window plus what it retains behind it in memory, and
+    // has no disk cache (patch 0005).
+    diskCacheCapacityBytes = if (ramOnlyMode) 0L else diskCacheCapacityBytes,
     torrentProfile = when (torrentProfile) {
         P2pTorrentProfile.SOFT -> NuvioTorrentProfile.Soft
         P2pTorrentProfile.BALANCED -> NuvioTorrentProfile.Balanced
@@ -758,6 +842,7 @@ internal fun buildNuvioEngineConfig(
     // mpv pauses its reads while its own cache is full; a route-inactivity timeout would tear the
     // stream down mid-film. Upstream disables it for the same reason.
     streamInactivityTimeoutMilliseconds = 0,
+    ramOnlyMode = ramOnlyMode,
 )
 
 internal fun unexpectedStreamStopError(
@@ -793,12 +878,12 @@ internal fun unexpectedTorrentError(
 /** Null while it is still worth waiting for metadata; otherwise the user-facing reason to stop. */
 internal fun metadataWaitVerdict(waitedMs: Long, stalledForMs: Long, knownPeers: Long): String? = when {
     waitedMs >= METADATA_DEADLINE_MS ->
-        "Torrent metadata did not arrive within ${METADATA_DEADLINE_MS / 1000}s"
+        localizedString(Res.string.p2p_metadata_timeout, METADATA_DEADLINE_MS / 1000)
     waitedMs >= METADATA_STALL_MIN_WAIT_MS && stalledForMs >= METADATA_STALL_MS ->
         if (knownPeers == 0L) {
-            "No peers found for this torrent"
+            localizedString(Res.string.p2p_no_peers_found_for_this_torrent)
         } else {
-            "No reachable peers for this torrent ($knownPeers found, none answered)"
+            localizedString(Res.string.p2p_no_reachable_peers, knownPeers)
         }
     else -> null
 }

@@ -1,5 +1,7 @@
 package com.nuvio.app.features.settings
 
+import nuvio.composeapp.generated.resources.compose_settings_page_continue_watching
+import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_description
 import nuvio.composeapp.generated.resources.settings_cw_seed_nuvio_description
 import nuvio.composeapp.generated.resources.settings_cw_seed_nuvio_title
 import androidx.compose.runtime.Composable
@@ -61,6 +63,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.draw.alpha
@@ -78,6 +81,7 @@ import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepositor
 import com.nuvio.app.features.watchprogress.ContinueWatchingClickAction
 import com.nuvio.app.features.watchprogress.ContinueWatchingSectionStyle
 import com.nuvio.app.features.watchprogress.ContinueWatchingSortMode
+import com.nuvio.app.features.watchprogress.ContinueWatchingSourceShortcut
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
@@ -88,16 +92,26 @@ import nuvio.composeapp.generated.resources.settings_advanced_section_cache
 import nuvio.composeapp.generated.resources.settings_continue_watching_resume_prompt_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_resume_prompt_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_details
+import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_details_upcoming
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_play
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_title
+import nuvio.composeapp.generated.resources.settings_continue_watching_source_shortcut_center
+import nuvio.composeapp.generated.resources.settings_continue_watching_source_shortcut_corner
+import nuvio.composeapp.generated.resources.settings_continue_watching_source_shortcut_description
+import nuvio.composeapp.generated.resources.settings_continue_watching_source_shortcut_off
+import nuvio.composeapp.generated.resources.settings_continue_watching_source_shortcut_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_section_default_action
 import nuvio.composeapp.generated.resources.settings_continue_watching_blur_next_up_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_blur_next_up_title
+import nuvio.composeapp.generated.resources.settings_continue_watching_relative_countdown_description
+import nuvio.composeapp.generated.resources.settings_continue_watching_relative_countdown_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_show_unaired_next_up_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_show_unaired_next_up_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_separate_next_up_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_separate_next_up_title
+import nuvio.composeapp.generated.resources.settings_continue_watching_separate_upcoming_description
+import nuvio.composeapp.generated.resources.settings_continue_watching_separate_upcoming_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_section_card_style
 import nuvio.composeapp.generated.resources.settings_continue_watching_section_on_launch
 import nuvio.composeapp.generated.resources.settings_continue_watching_section_sort_order
@@ -106,6 +120,8 @@ import nuvio.composeapp.generated.resources.settings_continue_watching_show_desc
 import nuvio.composeapp.generated.resources.settings_continue_watching_show_title
 import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_default
 import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_default_desc
+import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_rotation
+import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_rotation_desc
 import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_streaming
 import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_streaming_desc
 import nuvio.composeapp.generated.resources.settings_continue_watching_sort_mode_title
@@ -131,28 +147,89 @@ internal fun LazyListScope.continueWatchingSettingsContent(
     useEpisodeThumbnails: Boolean,
     showUnairedNextUp: Boolean,
     separateNextUpRow: Boolean,
+    separateUpcomingRow: Boolean,
     blurNextUp: Boolean,
     showResumePromptOnLaunch: Boolean,
     sortMode: ContinueWatchingSortMode,
+    relativeAirCountdown: Boolean,
 ) {
+    // One panel, the look of the row first and then ordered by how much each row changes it:
+    // whether it is there and where it reads from first, then how Up Next is split out, then what a click does, then the
+    // finer points. It used to be seven sections, with the on/off switch in the middle of
+    // "Up Next behavior", below rows that only matter once it is on.
     item {
         SettingsSection(
-            title = stringResource(Res.string.settings_continue_watching_section_card_style),
-            isTablet = isTablet,
-        ) {
-            ContinueWatchingStyleSelector(
-                isTablet = isTablet,
-                selectedStyle = style,
-                onStyleSelected = ContinueWatchingPreferencesRepository::setStyle,
-            )
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_continue_watching_section_default_action),
+            title = stringResource(Res.string.compose_settings_page_continue_watching),
             isTablet = isTablet,
         ) {
             SettingsGroup(isTablet = isTablet) {
+                // First: what the row looks like, picked from three previews. Rows follow it, so
+                // the tiles are square at the bottom as well as under the heading.
+                ContinueWatchingStyleSelector(
+                    isTablet = isTablet,
+                    selectedStyle = style,
+                    onStyleSelected = ContinueWatchingPreferencesRepository::setStyle,
+                    squareCorners = true,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_show_title),
+                    description = stringResource(Res.string.settings_continue_watching_show_description),
+                    checked = isVisible,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-show-continue-watching")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setVisible,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                Column(
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-source")),
+                ) {
+                    ContinueWatchingSourceRow(isTablet = isTablet)
+                    ContinueWatchingWindowRow(isTablet = isTablet)
+                    // Only SIMKL reports anime as per-entry seasons, so the identity choice only
+                    // changes what this row produces when SIMKL is the source. The same setting is
+                    // also reachable from Local Library, which it governs regardless of this source.
+                    val continueWatchingSource by ContinueWatchingSourceRepository.uiState
+                        .collectAsStateWithLifecycle()
+                    if (continueWatchingSource == ContinueWatchingSource.SIMKL) {
+                        SettingsGroupDivider(isTablet = isTablet)
+                        AnimeIdPreferenceRow(
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("anime-id-preference"),
+                            ),
+                        )
+                    }
+                }
+                SeedFromNuvioSyncRow(isTablet = isTablet)
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_separate_next_up_title),
+                    description = stringResource(Res.string.settings_continue_watching_separate_next_up_description),
+                    checked = separateNextUpRow,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-separate-next-up")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setSeparateNextUpRow,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_separate_upcoming_title),
+                    description = stringResource(Res.string.settings_continue_watching_separate_upcoming_description),
+                    checked = separateUpcomingRow,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-separate-upcoming")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setSeparateUpcomingRow,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_up_next_title),
+                    description = stringResource(Res.string.settings_continue_watching_up_next_description),
+                    checked = upNextFromFurthestEpisode,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-up-next")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setUpNextFromFurthestEpisode,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
                 SettingsChoiceRow(
                     title = stringResource(Res.string.settings_continue_watching_click_action_title),
                     description = stringResource(Res.string.settings_continue_watching_click_action_description),
@@ -165,6 +242,10 @@ internal fun LazyListScope.continueWatchingSettingsContent(
                             ContinueWatchingClickAction.DETAILS,
                             stringResource(Res.string.settings_continue_watching_click_action_details),
                         ),
+                        SettingsChoiceOption(
+                            ContinueWatchingClickAction.DETAILS_FOR_UPCOMING,
+                            stringResource(Res.string.settings_continue_watching_click_action_details_upcoming),
+                        ),
                     ),
                     selectedValue = clickAction,
                     isTablet = isTablet,
@@ -173,78 +254,40 @@ internal fun LazyListScope.continueWatchingSettingsContent(
                     ),
                     onSelected = ContinueWatchingPreferencesRepository::setClickAction,
                 )
-            }
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_cw_source_section),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(
-                isTablet = isTablet,
-                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-source")),
-            ) {
-                ContinueWatchingSourceRow(isTablet = isTablet)
-                ContinueWatchingWindowRow(isTablet = isTablet)
-                // Only SIMKL reports anime as per-entry seasons, so the identity choice only
-                // changes what this row produces when SIMKL is the source. The same setting is
-                // also reachable from Local Library, which it governs regardless of this source.
-                val continueWatchingSource by ContinueWatchingSourceRepository.uiState
-                    .collectAsStateWithLifecycle()
-                if (continueWatchingSource == ContinueWatchingSource.SIMKL) {
-                    AnimeIdPreferenceRow(
-                        isTablet = isTablet,
-                        modifier = Modifier.settingsScrollAnchor(
-                            SettingsScrollAnchor.searchKey("anime-id-preference"),
+                SettingsGroupDivider(isTablet = isTablet)
+                val preferences by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.settings_continue_watching_source_shortcut_title),
+                    description = stringResource(Res.string.settings_continue_watching_source_shortcut_description),
+                    options = listOf(
+                        SettingsChoiceOption(
+                            ContinueWatchingSourceShortcut.OFF,
+                            stringResource(Res.string.settings_continue_watching_source_shortcut_off),
                         ),
-                    )
-                }
-                SettingsGroupDivider(isTablet = isTablet)
-                SeedFromNuvioSyncRow(isTablet = isTablet)
-            }
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_continue_watching_section_up_next_behavior),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_continue_watching_show_title),
-                    description = stringResource(Res.string.settings_continue_watching_show_description),
-                    checked = isVisible,
+                        SettingsChoiceOption(
+                            ContinueWatchingSourceShortcut.CORNER,
+                            stringResource(Res.string.settings_continue_watching_source_shortcut_corner),
+                        ),
+                        SettingsChoiceOption(
+                            ContinueWatchingSourceShortcut.CENTER,
+                            stringResource(Res.string.settings_continue_watching_source_shortcut_center),
+                        ),
+                    ),
+                    selectedValue = preferences.sourceShortcut,
                     isTablet = isTablet,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-show-continue-watching")),
-                    onCheckedChange = ContinueWatchingPreferencesRepository::setVisible,
+                    modifier = Modifier.settingsScrollAnchor(
+                        SettingsScrollAnchor.searchKey("continue-watching-source-shortcut"),
+                    ),
+                    onSelected = ContinueWatchingPreferencesRepository::setSourceShortcut,
                 )
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_continue_watching_use_episode_thumbnails_title),
-                    description = stringResource(Res.string.settings_continue_watching_use_episode_thumbnails_description),
-                    checked = useEpisodeThumbnails,
+                    title = stringResource(Res.string.settings_continue_watching_resume_prompt_title),
+                    description = stringResource(Res.string.settings_continue_watching_resume_prompt_description),
+                    checked = showResumePromptOnLaunch,
                     isTablet = isTablet,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-episode-thumbnails")),
-                    onCheckedChange = ContinueWatchingPreferencesRepository::setUseEpisodeThumbnails,
-                )
-                SettingsGroupDivider(isTablet = isTablet)
-                SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_continue_watching_up_next_title),
-                    description = stringResource(Res.string.settings_continue_watching_up_next_description),
-                    checked = upNextFromFurthestEpisode,
-                    isTablet = isTablet,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-up-next")),
-                    onCheckedChange = ContinueWatchingPreferencesRepository::setUpNextFromFurthestEpisode,
-                )
-                SettingsGroupDivider(isTablet = isTablet)
-                SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_continue_watching_separate_next_up_title),
-                    description = stringResource(Res.string.settings_continue_watching_separate_next_up_description),
-                    checked = separateNextUpRow,
-                    isTablet = isTablet,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-separate-next-up")),
-                    onCheckedChange = ContinueWatchingPreferencesRepository::setSeparateNextUpRow,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-resume-prompt")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setShowResumePromptOnLaunch,
                 )
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsSwitchRow(
@@ -254,6 +297,24 @@ internal fun LazyListScope.continueWatchingSettingsContent(
                     isTablet = isTablet,
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-unaired-next-up")),
                     onCheckedChange = ContinueWatchingPreferencesRepository::setShowUnairedNextUp,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_relative_countdown_title),
+                    description = stringResource(Res.string.settings_continue_watching_relative_countdown_description),
+                    checked = relativeAirCountdown,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-relative-countdown")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setRelativeAirCountdown,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_continue_watching_use_episode_thumbnails_title),
+                    description = stringResource(Res.string.settings_continue_watching_use_episode_thumbnails_description),
+                    checked = useEpisodeThumbnails,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-episode-thumbnails")),
+                    onCheckedChange = ContinueWatchingPreferencesRepository::setUseEpisodeThumbnails,
                 )
                 if (useEpisodeThumbnails) {
                     SettingsGroupDivider(isTablet = isTablet)
@@ -266,32 +327,32 @@ internal fun LazyListScope.continueWatchingSettingsContent(
                         onCheckedChange = ContinueWatchingPreferencesRepository::setBlurNextUp,
                     )
                 }
-            }
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_continue_watching_section_on_launch),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_continue_watching_resume_prompt_title),
-                    description = stringResource(Res.string.settings_continue_watching_resume_prompt_description),
-                    checked = showResumePromptOnLaunch,
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.settings_continue_watching_sort_mode_title),
+                    description = stringResource(Res.string.settings_continue_watching_sort_mode_description),
+                    options = listOf(
+                        SettingsChoiceOption(
+                            ContinueWatchingSortMode.DEFAULT,
+                            stringResource(Res.string.settings_continue_watching_sort_mode_default),
+                        ),
+                        SettingsChoiceOption(
+                            ContinueWatchingSortMode.STREAMING_STYLE,
+                            stringResource(Res.string.settings_continue_watching_sort_mode_streaming),
+                        ),
+                        SettingsChoiceOption(
+                            ContinueWatchingSortMode.ROTATION,
+                            stringResource(Res.string.settings_continue_watching_sort_mode_rotation),
+                        ),
+                    ),
+                    selectedValue = sortMode,
                     isTablet = isTablet,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("continue-watching-resume-prompt")),
-                    onCheckedChange = ContinueWatchingPreferencesRepository::setShowResumePromptOnLaunch,
+                    modifier = Modifier.settingsScrollAnchor(
+                        SettingsScrollAnchor.searchKey("continue-watching-sort-order"),
+                    ),
+                    onSelected = ContinueWatchingPreferencesRepository::setSortMode,
                 )
-            }
-        }
-    }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_advanced_section_cache),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
+                SettingsGroupDivider(isTablet = isTablet)
                 val scope = rememberCoroutineScope()
                 var cleared by rememberSaveable { mutableStateOf(false) }
                 SettingsNavigationRow(
@@ -319,38 +380,6 @@ internal fun LazyListScope.continueWatchingSettingsContent(
             }
         }
     }
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_continue_watching_section_sort_order),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                val currentModeLabel = stringResource(
-                    when (sortMode) {
-                        ContinueWatchingSortMode.DEFAULT -> Res.string.settings_continue_watching_sort_mode_default
-                        ContinueWatchingSortMode.STREAMING_STYLE -> Res.string.settings_continue_watching_sort_mode_streaming
-                    }
-                )
-                SettingsChoiceRow(
-                    title = stringResource(Res.string.settings_continue_watching_sort_mode_title),
-                    description = currentModeLabel,
-                    options = listOf(
-                        SettingsChoiceOption(
-                            ContinueWatchingSortMode.DEFAULT,
-                            stringResource(Res.string.settings_continue_watching_sort_mode_default),
-                        ),
-                        SettingsChoiceOption(
-                            ContinueWatchingSortMode.STREAMING_STYLE,
-                            stringResource(Res.string.settings_continue_watching_sort_mode_streaming),
-                        ),
-                    ),
-                    selectedValue = sortMode,
-                    isTablet = isTablet,
-                    onSelected = ContinueWatchingPreferencesRepository::setSortMode,
-                )
-            }
-        }
-    }
 }
 
 @Composable
@@ -358,6 +387,8 @@ private fun ContinueWatchingStyleSelector(
     isTablet: Boolean,
     selectedStyle: ContinueWatchingSectionStyle,
     onStyleSelected: (ContinueWatchingSectionStyle) -> Unit,
+    /** Square on every side, for tiles with more of the card below them. */
+    squareCorners: Boolean = false,
 ) {
     // Inside a section card the three options are segments of the card itself: no gap between
     // them, square where they meet each other and the heading band, and rounded only where the
@@ -380,6 +411,7 @@ private fun ContinueWatchingStyleSelector(
                     isTablet = isTablet,
                     shape = when {
                         !segmented -> RoundedCornerShape(12.dp)
+                        squareCorners -> RectangleShape
                         index == 0 -> RoundedCornerShape(bottomStart = 12.dp)
                         index == styles.lastIndex -> RoundedCornerShape(bottomEnd = 12.dp)
                         else -> RectangleShape
@@ -403,61 +435,62 @@ private fun ContinueWatchingStyleOption(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
-        color = if (selected) {
-            MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-        } else {
-            MaterialTheme.colorScheme.surface
+        // On desktop the tiles sit inside the glass section card, so an unselected tile is clear and
+        // lets the card's glass show; an opaque surface here read as an older, solid panel.
+        color = when {
+            selected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+            isTablet -> Color.Transparent
+            else -> MaterialTheme.colorScheme.surface
         },
         shape = shape,
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = if (isTablet) 12.dp else 8.dp, vertical = if (isTablet) 14.dp else 10.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(if (isTablet) 8.dp else 6.dp),
-        ) {
-            Row(
+        // The tick sits over the tile's corner rather than on a row of its own, so the preview and
+        // its labels are centred in the tile; the even padding leaves the corner room for it.
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Icon(
+                imageVector = Icons.Rounded.CheckCircle,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(if (isTablet) 12.dp else 6.dp)
+                    .size(if (isTablet) 24.dp else 18.dp)
+                    .alpha(if (selected) 1f else 0f),
+            )
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = if (isTablet) 4.dp else 0.dp),
-                horizontalArrangement = Arrangement.End,
+                    .padding(horizontal = if (isTablet) 12.dp else 8.dp, vertical = if (isTablet) 28.dp else 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(if (isTablet) 8.dp else 6.dp),
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.CheckCircle,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                Box(
                     modifier = Modifier
-                        .size(if (isTablet) 24.dp else 18.dp)
-                        .alpha(if (selected) 1f else 0f),
+                        .fillMaxWidth()
+                        .height(if (isTablet) 96.dp else 66.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ContinueWatchingStylePreview(
+                        style = style,
+                        isSelected = selected,
+                    )
+                }
+                Text(
+                    text = stringResource(style.labelRes),
+                    style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.labelMedium,
+                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = stringResource(style.descriptionRes),
+                    style = if (isTablet) MaterialTheme.typography.bodySmall else MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(if (isTablet) 96.dp else 66.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                ContinueWatchingStylePreview(
-                    style = style,
-                    isSelected = selected,
-                )
-            }
-            Text(
-                text = stringResource(style.labelRes),
-                style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.labelMedium,
-                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = stringResource(style.descriptionRes),
-                style = if (isTablet) MaterialTheme.typography.bodySmall else MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
         }
     }
 }
@@ -493,6 +526,11 @@ private fun ContinueWatchingSortModeDialog(
             ContinueWatchingSortMode.STREAMING_STYLE,
             Res.string.settings_continue_watching_sort_mode_streaming,
             Res.string.settings_continue_watching_sort_mode_streaming_desc,
+        ),
+        Triple(
+            ContinueWatchingSortMode.ROTATION,
+            Res.string.settings_continue_watching_sort_mode_rotation,
+            Res.string.settings_continue_watching_sort_mode_rotation_desc,
         ),
     )
 
@@ -761,18 +799,20 @@ private fun WithdrawImportedHistoryRow(isTablet: Boolean) {
  * Whether Up Next may also draw on the Nuvio Sync watched history while another service is the
  * Continue Watching source.
  *
- * Only meaningful for a remote source, so it is disabled when Nuvio Sync is already the source.
+ * Only meaningful for a remote source, so it is hidden when Nuvio Sync is already the source.
+ * Draws its own leading divider, so nothing is left dangling when it is hidden.
  */
 @Composable
 private fun SeedFromNuvioSyncRow(isTablet: Boolean) {
     val preferences by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
     val source by ContinueWatchingSourceRepository.uiState.collectAsStateWithLifecycle()
 
+    if (source == ContinueWatchingSource.LOCAL) return
+    SettingsGroupDivider(isTablet = isTablet)
     SettingsSwitchRow(
         title = stringResource(Res.string.settings_cw_seed_nuvio_title),
         description = stringResource(Res.string.settings_cw_seed_nuvio_description),
         checked = preferences.seedNextUpFromNuvioSync,
-        enabled = source != ContinueWatchingSource.LOCAL,
         isTablet = isTablet,
         onCheckedChange = ContinueWatchingPreferencesRepository::setSeedNextUpFromNuvioSync,
     )

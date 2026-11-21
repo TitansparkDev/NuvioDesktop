@@ -3,6 +3,7 @@ package com.nuvio.app.features.settings
 import com.nuvio.app.core.ui.AccentGradientDirection
 import com.nuvio.app.core.ui.AppTheme
 import com.nuvio.app.core.ui.NativeTabBridge
+import com.nuvio.app.core.ui.HoldToSelect
 import com.nuvio.app.core.ui.WasdNavigation
 import com.nuvio.app.core.ui.ThemeColorPalette
 import com.nuvio.app.core.ui.ThemeColors
@@ -29,8 +30,11 @@ data class CustomThemeSettings(
         )
 }
 
+const val DEFAULT_APP_FONT_SCALE_PERCENT = 100
+val APP_FONT_SCALE_PERCENT_RANGE = 70..130
+
 object ThemeSettingsRepository {
-    private val _selectedTheme = MutableStateFlow(AppTheme.WHITE)
+    private val _selectedTheme = MutableStateFlow(AppTheme.OCEAN)
     val selectedTheme: StateFlow<AppTheme> = _selectedTheme.asStateFlow()
 
     private val _customTheme = MutableStateFlow(CustomThemeSettings())
@@ -45,7 +49,7 @@ object ThemeSettingsRepository {
     private val _liquidGlassNativeTabBarEnabled = MutableStateFlow(false)
     val liquidGlassNativeTabBarEnabled: StateFlow<Boolean> = _liquidGlassNativeTabBarEnabled.asStateFlow()
 
-    private val _desktopColumnGuidesVisible = MutableStateFlow(true)
+    private val _desktopColumnGuidesVisible = MutableStateFlow(false)
     val desktopColumnGuidesVisible: StateFlow<Boolean> = _desktopColumnGuidesVisible.asStateFlow()
 
     /** Settings shell spans the whole window instead of a centred fixed-width column set. */
@@ -54,6 +58,9 @@ object ThemeSettingsRepository {
 
     private val _wasdNavigationEnabled = MutableStateFlow(false)
     val wasdNavigationEnabled: StateFlow<Boolean> = _wasdNavigationEnabled.asStateFlow()
+
+    private val _holdToSelectEnabled = MutableStateFlow(true)
+    val holdToSelectEnabled: StateFlow<Boolean> = _holdToSelectEnabled.asStateFlow()
 
     private val _desktopNavigationLayout = MutableStateFlow(DesktopNavigationLayout.Default)
     val desktopNavigationLayout: StateFlow<DesktopNavigationLayout> = _desktopNavigationLayout.asStateFlow()
@@ -65,6 +72,10 @@ object ThemeSettingsRepository {
 
     // Hides the Discover entry from the desktop navigation. Navigation to the tab is blocked while
     // it is off, so the tab can never be selected without a way back to it in the bar.
+    /** Sidebar layout only: its items grouped at the top under the profile instead of centred down the side. */
+    private val _desktopSidebarItemsTop = MutableStateFlow(false)
+    val desktopSidebarItemsTop: StateFlow<Boolean> = _desktopSidebarItemsTop.asStateFlow()
+
     private val _desktopDiscoverTabVisible = MutableStateFlow(true)
     val desktopDiscoverTabVisible: StateFlow<Boolean> = _desktopDiscoverTabVisible.asStateFlow()
 
@@ -78,6 +89,11 @@ object ThemeSettingsRepository {
     // resolved (and validated) by the theme — nothing here checks the host has it.
     private val _appFontFamily = MutableStateFlow("")
     val appFontFamily: StateFlow<String> = _appFontFamily.asStateFlow()
+
+    // Text size for a swapped-in font, so one that runs wider or narrower than JetBrains Sans can
+    // be brought back to roughly the same footprint. Ignored while the bundled font is in use.
+    private val _appFontScalePercent = MutableStateFlow(DEFAULT_APP_FONT_SCALE_PERCENT)
+    val appFontScalePercent: StateFlow<Int> = _appFontScalePercent.asStateFlow()
 
     private val _selectedAppLanguage = MutableStateFlow(AppLanguage.ENGLISH)
     val selectedAppLanguage: StateFlow<AppLanguage> = _selectedAppLanguage.asStateFlow()
@@ -95,23 +111,27 @@ object ThemeSettingsRepository {
 
     fun clearLocalState() {
         hasLoaded = false
-        _selectedTheme.value = AppTheme.WHITE
+        _selectedTheme.value = AppTheme.OCEAN
         _customTheme.value = CustomThemeSettings()
         _accentGradientDirection.value = AccentGradientDirection.Default
         _amoledEnabled.value = false
         _liquidGlassNativeTabBarEnabled.value = false
-        _desktopColumnGuidesVisible.value = true
+        _desktopColumnGuidesVisible.value = false
         _desktopSettingsFullWidth.value = false
         _wasdNavigationEnabled.value = false
         WasdNavigation.enabled = false
+        _holdToSelectEnabled.value = true
+        HoldToSelect.enabled = true
         _desktopNavigationLayout.value = DesktopNavigationLayout.Default
         _desktopTopBarAlwaysVisible.value = false
         _desktopDiscoverTabVisible.value = true
+        _desktopSidebarItemsTop.value = false
         _desktopAppUiScalePercent.value = 0
         _desktopAppUiScaleAppliesToDetails.value = true
-        NativeTabBridge.publishAccentColor(ThemeColors.White.nativeAccentHex)
+        NativeTabBridge.publishAccentColor(ThemeColors.Ocean.nativeAccentHex)
         NativeTabBridge.publishLiquidGlassEnabled(false)
         _appFontFamily.value = ""
+        _appFontScalePercent.value = DEFAULT_APP_FONT_SCALE_PERCENT
         _selectedAppLanguage.value = AppLanguage.ENGLISH
     }
 
@@ -143,10 +163,10 @@ object ThemeSettingsRepository {
             try {
                 AppTheme.valueOf(stored)
             } catch (_: IllegalArgumentException) {
-                AppTheme.WHITE
+                AppTheme.OCEAN
             }
         } else {
-            AppTheme.WHITE
+            AppTheme.OCEAN
         }
         _selectedTheme.value = theme
         NativeTabBridge.publishAccentColor(theme.nativeTabAccentHex(_customTheme.value))
@@ -156,21 +176,27 @@ object ThemeSettingsRepository {
         val liquidGlassEnabled = ThemeSettingsStorage.loadLiquidGlassNativeTabBarEnabled() ?: false
         _liquidGlassNativeTabBarEnabled.value = liquidGlassEnabled
         NativeTabBridge.publishLiquidGlassEnabled(liquidGlassEnabled)
-        _desktopColumnGuidesVisible.value = ThemeSettingsStorage.loadDesktopColumnGuidesVisible() ?: true
+        _desktopColumnGuidesVisible.value = ThemeSettingsStorage.loadDesktopColumnGuidesVisible() ?: false
         _desktopSettingsFullWidth.value = ThemeSettingsStorage.loadDesktopSettingsFullWidth() ?: false
         val wasdEnabled = ThemeSettingsStorage.loadWasdNavigationEnabled() ?: false
         _wasdNavigationEnabled.value = wasdEnabled
         WasdNavigation.enabled = wasdEnabled
+        val holdToSelectEnabled = ThemeSettingsStorage.loadHoldToSelectEnabled() ?: true
+        _holdToSelectEnabled.value = holdToSelectEnabled
+        HoldToSelect.enabled = holdToSelectEnabled
         _desktopNavigationLayout.value = DesktopNavigationLayout.fromName(
             ThemeSettingsStorage.loadDesktopNavigationLayout(),
         )
         _desktopTopBarAlwaysVisible.value = ThemeSettingsStorage.loadDesktopTopBarAlwaysVisible() ?: false
         _desktopDiscoverTabVisible.value = ThemeSettingsStorage.loadDesktopDiscoverTabVisible() ?: true
+        _desktopSidebarItemsTop.value = ThemeSettingsStorage.loadDesktopSidebarItemsTop() ?: false
         _desktopAppUiScalePercent.value =
             ThemeSettingsStorage.loadDesktopAppUiScalePercent()?.coerceIn(-50, 50) ?: 0
         _desktopAppUiScaleAppliesToDetails.value =
             ThemeSettingsStorage.loadDesktopAppUiScaleAppliesToDetails() ?: true
         _appFontFamily.value = ThemeSettingsStorage.loadAppFontFamily()?.trim().orEmpty()
+        _appFontScalePercent.value = ThemeSettingsStorage.loadAppFontScalePercent()
+            ?.coerceIn(APP_FONT_SCALE_PERCENT_RANGE) ?: DEFAULT_APP_FONT_SCALE_PERCENT
         val appLanguage = AppLanguage.fromCode(ThemeSettingsStorage.loadSelectedAppLanguage())
         ThemeSettingsStorage.applySelectedAppLanguage(appLanguage.code)
         _selectedAppLanguage.value = appLanguage
@@ -291,6 +317,14 @@ object ThemeSettingsRepository {
         ThemeSettingsStorage.saveWasdNavigationEnabled(enabled)
     }
 
+    fun setHoldToSelectEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (_holdToSelectEnabled.value == enabled) return
+        _holdToSelectEnabled.value = enabled
+        HoldToSelect.enabled = enabled
+        ThemeSettingsStorage.saveHoldToSelectEnabled(enabled)
+    }
+
     fun setDesktopNavigationLayout(layout: DesktopNavigationLayout) {
         ensureLoaded()
         if (_desktopNavigationLayout.value == layout) return
@@ -303,6 +337,13 @@ object ThemeSettingsRepository {
         if (_desktopTopBarAlwaysVisible.value == enabled) return
         _desktopTopBarAlwaysVisible.value = enabled
         ThemeSettingsStorage.saveDesktopTopBarAlwaysVisible(enabled)
+    }
+
+    fun setDesktopSidebarItemsTop(top: Boolean) {
+        ensureLoaded()
+        if (_desktopSidebarItemsTop.value == top) return
+        _desktopSidebarItemsTop.value = top
+        ThemeSettingsStorage.saveDesktopSidebarItemsTop(top)
     }
 
     fun setDesktopDiscoverTabVisible(visible: Boolean) {
@@ -320,6 +361,16 @@ object ThemeSettingsRepository {
         ThemeSettingsStorage.saveDesktopAppUiScalePercent(clamped)
     }
 
+    /**
+     * Nudges the app UI scale by [deltaPercent] (Ctrl+plus / Ctrl+minus, and the size buttons on the
+     * music Library header). Returns the new value so a caller can show it.
+     */
+    fun stepDesktopAppUiScalePercent(deltaPercent: Int): Int {
+        ensureLoaded()
+        setDesktopAppUiScalePercent(_desktopAppUiScalePercent.value + deltaPercent)
+        return _desktopAppUiScalePercent.value
+    }
+
     fun setDesktopAppUiScaleAppliesToDetails(enabled: Boolean) {
         ensureLoaded()
         if (_desktopAppUiScaleAppliesToDetails.value == enabled) return
@@ -334,6 +385,14 @@ object ThemeSettingsRepository {
         if (_appFontFamily.value == next) return
         _appFontFamily.value = next
         ThemeSettingsStorage.saveAppFontFamily(next)
+    }
+
+    fun setAppFontScalePercent(percent: Int) {
+        ensureLoaded()
+        val next = percent.coerceIn(APP_FONT_SCALE_PERCENT_RANGE)
+        if (_appFontScalePercent.value == next) return
+        _appFontScalePercent.value = next
+        ThemeSettingsStorage.saveAppFontScalePercent(next)
     }
 
     fun setAppLanguage(language: AppLanguage) {

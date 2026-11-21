@@ -1,8 +1,36 @@
 package com.nuvio.app.features.home.components
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.foundation.layout.BoxScope
+import com.nuvio.app.features.player.PlayerSettingsRepository
+import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.ContinueWatchingSourceShortcut
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.graphicsLayer
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,7 +60,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -64,6 +96,10 @@ import com.nuvio.app.features.watchprogress.ContinueWatchingArtworkFailures
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
 import com.nuvio.app.features.watchprogress.ContinueWatchingSectionStyle
 import com.nuvio.app.features.watchprogress.computeAirDateBadgeText
+import com.nuvio.app.features.watchprogress.CurrentDateProvider
+import com.nuvio.app.features.watchprogress.WatchProgressClock
+import com.nuvio.app.features.watchprogress.releaseCountdown
+import com.nuvio.app.features.watchprogress.resolveReleaseInstant
 import kotlin.math.roundToInt
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
@@ -97,29 +133,72 @@ private fun localizedContinueWatchingMetaLine(item: ContinueWatchingItem): Strin
 private fun ContinueWatchingItem.isCloudLibraryItem(): Boolean =
     parentMetaType.equals(CloudLibraryContentType, ignoreCase = true)
 
+/**
+ * Every image a card of [style] could show for this item, preferred first: the card shows the head
+ * and moves down the list only when an image fails to load. The cards and the artwork prewarm both
+ * call this, so what gets warmed is exactly what the card will ask for.
+ *
+ * [preferBackdropForNextUp] defaults to what the Card style decides on screen — a Next Up episode
+ * whose air date is still ahead leads with the backdrop. The card passes the value it derived from
+ * its live countdown; the prewarm takes the default, which asks the same question of the clock.
+ */
+internal fun ContinueWatchingItem.continueWatchingDisplayArtworkChain(
+    style: ContinueWatchingSectionStyle,
+    useEpisodeThumbnails: Boolean,
+    preferBackdropForNextUp: Boolean = isNextUp && !isReleaseAlert && hasUpcomingAirDate(),
+): List<String> = when (style) {
+    ContinueWatchingSectionStyle.Card -> continueWatchingCardArtworkUrls(
+        useEpisodeThumbnails = useEpisodeThumbnails,
+        preferBackdropForNextUp = preferBackdropForNextUp,
+    ).withCustomArtFirst(this, landscape = true)
+    ContinueWatchingSectionStyle.Wide ->
+        continueWatchingArtworkUrls(useEpisodeThumbnails).withCustomArtFirst(this, landscape = false)
+    ContinueWatchingSectionStyle.Poster ->
+        continueWatchingPosterArtworkUrls(useEpisodeThumbnails).withCustomArtFirst(this, landscape = false)
+}
+
+/** Whether the Card style would print an air-date countdown for this item: unstarted, and still to air. */
+private fun ContinueWatchingItem.hasUpcomingAirDate(): Boolean {
+    if (progressFraction > 0f || seasonNumber == null || episodeNumber == null) return false
+    val release = resolveReleaseInstant(released) ?: return false
+    return releaseCountdown(
+        release = release,
+        nowMs = WatchProgressClock.nowEpochMs(),
+        todayIsoDate = CurrentDateProvider.todayIsoDate(),
+    ) != null
+}
+
 private fun ContinueWatchingItem.continueWatchingArtworkUrls(
     useEpisodeThumbnails: Boolean,
 ): List<String> = when {
     isNextUp && useEpisodeThumbnails -> artworkChain(
         episodeThumbnail,
+        customPoster,
         poster,
+        customLandscape,
         background,
         imageUrl,
     )
     isNextUp -> artworkChain(
+        customPoster,
         poster,
+        customLandscape,
         background,
         episodeThumbnail,
         imageUrl,
     )
     useEpisodeThumbnails -> artworkChain(
         episodeThumbnail,
+        customPoster,
         poster,
+        customLandscape,
         background,
         imageUrl,
     )
     else -> artworkChain(
+        customPoster,
         poster,
+        customLandscape,
         background,
         episodeThumbnail,
         imageUrl,
@@ -139,7 +218,9 @@ private fun ContinueWatchingItem.continueWatchingPosterArtworkUrls(
         ?.takeIf { it.isNotBlank() && it != normalizedEpisodeThumbnail }
 
     return artworkChain(
+        customPoster,
         poster,
+        customLandscape,
         background,
         nonEpisodeImageUrl,
         if (useEpisodeThumbnails) episodeThumbnail else null,
@@ -152,35 +233,63 @@ private fun ContinueWatchingItem.continueWatchingCardArtworkUrls(
     preferBackdropForNextUp: Boolean,
 ): List<String> = when {
     isNextUp && preferBackdropForNextUp -> artworkChain(
+        customLandscape,
         background,
+        customPoster,
         poster,
         episodeThumbnail,
         imageUrl,
     )
     isNextUp && useEpisodeThumbnails -> artworkChain(
         episodeThumbnail,
+        customLandscape,
         background,
+        customPoster,
         poster,
         imageUrl,
     )
     isNextUp -> artworkChain(
+        customLandscape,
         background,
+        customPoster,
         poster,
         episodeThumbnail,
         imageUrl,
     )
     useEpisodeThumbnails -> artworkChain(
         episodeThumbnail,
+        customLandscape,
         background,
+        customPoster,
         poster,
         imageUrl,
     )
     else -> artworkChain(
+        customLandscape,
         background,
+        customPoster,
         poster,
         episodeThumbnail,
         imageUrl,
     )
+}
+
+/**
+ * The poster service's Continue Watching "All": custom art ahead of everything, the episode still
+ * included, which stays in the chain as the fallback. Otherwise the chain is left as built.
+ */
+/** The card is showing poster-service art rather than an episode still (spoiler blur skips it). */
+private fun ContinueWatchingItem.isShowingCustomArt(url: String?): Boolean =
+    url != null && (url == customPoster?.trim() || url == customLandscape?.trim())
+
+private fun List<String>.withCustomArtFirst(item: ContinueWatchingItem, landscape: Boolean): List<String> {
+    if (!item.customArtFirst) return this
+    val lead = if (landscape) {
+        listOf(item.customLandscape, item.customPoster)
+    } else {
+        listOf(item.customPoster, item.customLandscape)
+    }
+    return (lead.mapNotNull { it?.trim()?.takeIf(String::isNotBlank) } + this).distinct()
 }
 
 /**
@@ -236,6 +345,7 @@ internal fun HomeContinueWatchingSection(
     bodyModifier: Modifier = Modifier,
     onItemClick: ((ContinueWatchingItem) -> Unit)? = null,
     onItemLongPress: ((ContinueWatchingItem) -> Unit)? = null,
+    onItemSourceShortcut: ((ContinueWatchingItem) -> Unit)? = null,
 ) {
     if (items.isEmpty()) return
     val effectiveRowState = rowState ?: androidx.compose.foundation.lazy.rememberLazyListState()
@@ -260,6 +370,7 @@ internal fun HomeContinueWatchingSection(
             bodyModifier = bodyModifier,
             onItemClick = onItemClick,
             onItemLongPress = onItemLongPress,
+            onItemSourceShortcut = onItemSourceShortcut,
         )
     } else {
         BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
@@ -282,6 +393,7 @@ internal fun HomeContinueWatchingSection(
                 bodyModifier = bodyModifier,
                 onItemClick = onItemClick,
                 onItemLongPress = onItemLongPress,
+                onItemSourceShortcut = onItemSourceShortcut,
             )
         }
     }
@@ -307,29 +419,25 @@ private fun HomeContinueWatchingSectionContent(
     bodyModifier: Modifier,
     onItemClick: ((ContinueWatchingItem) -> Unit)?,
     onItemLongPress: ((ContinueWatchingItem) -> Unit)?,
+    onItemSourceShortcut: ((ContinueWatchingItem) -> Unit)?,
 ) {
     val homeCatalogSettings by remember {
         HomeCatalogSettingsRepository.snapshot()
         HomeCatalogSettingsRepository.uiState
     }.collectAsStateWithLifecycle()
+    val continueWatchingPreferences by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
+    val playerSettings by PlayerSettingsRepository.uiState.collectAsStateWithLifecycle()
     val posterCardStyle = rememberHomePosterCardStyleUiState()
     val effectiveStyle = effectiveContinueWatchingStyle(
         requestedStyle = style,
         tvModeEnabled = homeCatalogSettings.tvModeEnabled,
         catalogLandscapeModeEnabled = posterCardStyle.catalogLandscapeModeEnabled,
     )
+    // maxCardHeight comes only from a TV Mode shelf, which the cards fill (growing or shrinking)
+    // the way the shelf's posters do, instead of keeping their desktop size under empty space.
     val fittedPosterWidthDpOverride = basePosterWidthDpOverride
-        ?: maxCardHeight?.let { limit ->
-            continueWatchingCardBaseWidthDpFittingHeight(
-                naturalBaseWidthDp = effectiveContinueWatchingCardBaseWidthDp(
-                    basePosterWidthDpOverride = null,
-                    savedPosterWidthDp = posterCardStyle.widthDp,
-                    tvModeEnabled = homeCatalogSettings.tvModeEnabled,
-                ),
-                maxHeight = limit,
-            )
-        }
-    val fittedLayout = maxCardHeight?.let { layout.fittingPosterCardHeight(it) } ?: layout
+        ?: maxCardHeight?.let(::continueWatchingCardBaseWidthDpFillingHeight)
+    val fittedLayout = maxCardHeight?.let { layout.fillingPosterCardHeight(it) } ?: layout
 
     val itemOrderKey = remember(items) {
         items.joinToString(separator = "|") { item -> item.continueWatchingRowOrderKey() }
@@ -352,33 +460,279 @@ private fun HomeContinueWatchingSectionContent(
             key = { item -> item.videoId },
             rowState = rowState,
         ) { item ->
-            when (effectiveStyle) {
-                ContinueWatchingSectionStyle.Card -> ContinueWatchingCard(
-                    item = item,
-                    basePosterWidthDpOverride = fittedPosterWidthDpOverride,
-                    useEpisodeThumbnails = useEpisodeThumbnails,
-                    blurNextUp = blurNextUp,
-                    onClick = onItemClick?.let { { it(item) } },
-                    onLongClick = onItemLongPress?.let { { it(item) } },
-                )
-                ContinueWatchingSectionStyle.Wide -> ContinueWatchingWideCard(
-                    item = item,
-                    layout = layout,
-                    useEpisodeThumbnails = useEpisodeThumbnails,
-                    blurNextUp = blurNextUp,
-                    onClick = onItemClick?.let { { it(item) } },
-                    onLongClick = onItemLongPress?.let { { it(item) } },
-                )
-                ContinueWatchingSectionStyle.Poster -> ContinueWatchingPosterCard(
-                    item = item,
-                    layout = fittedLayout,
-                    useEpisodeThumbnails = useEpisodeThumbnails,
-                    blurNextUp = blurNextUp,
-                    onClick = onItemClick?.let { { it(item) } },
-                    onLongClick = onItemLongPress?.let { { it(item) } },
-                )
+            val sourceShortcutKind = continueWatchingSourceShortcutKind(
+                item = item,
+                mode = continueWatchingPreferences.sourceShortcut,
+                reuseLastLinkEnabled = playerSettings.streamReuseLastLinkEnabled,
+            ).takeIf { onItemSourceShortcut != null }
+            // The hover remove button is a shortcut for the action sheet's Remove, so it is offered
+            // exactly where that sheet is: surfaces that pass no long-press get neither.
+            ContinueWatchingRemovableCard(
+                onRemove = onItemLongPress?.let {
+                    { WatchProgressRepository.dismissContinueWatchingCard(item) }
+                },
+            ) { hovered ->
+                val sourceShortcut = sourceShortcutKind?.let { kind ->
+                    ContinueWatchingSourceShortcutState(
+                        kind = kind,
+                        centered = continueWatchingPreferences.sourceShortcut == ContinueWatchingSourceShortcut.CENTER,
+                        visible = hovered,
+                        onClick = { onItemSourceShortcut?.invoke(item) },
+                    )
+                }
+                when (effectiveStyle) {
+                    ContinueWatchingSectionStyle.Card -> ContinueWatchingCard(
+                        item = item,
+                        basePosterWidthDpOverride = fittedPosterWidthDpOverride,
+                        useEpisodeThumbnails = useEpisodeThumbnails,
+                        blurNextUp = blurNextUp,
+                        onClick = onItemClick?.let { { it(item) } },
+                        onLongClick = onItemLongPress?.let { { it(item) } },
+                        sourceShortcut = sourceShortcut,
+                    )
+                    ContinueWatchingSectionStyle.Wide -> ContinueWatchingWideCard(
+                        item = item,
+                        layout = layout,
+                        useEpisodeThumbnails = useEpisodeThumbnails,
+                        blurNextUp = blurNextUp,
+                        onClick = onItemClick?.let { { it(item) } },
+                        onLongClick = onItemLongPress?.let { { it(item) } },
+                        sourceShortcut = sourceShortcut,
+                    )
+                    ContinueWatchingSectionStyle.Poster -> ContinueWatchingPosterCard(
+                        item = item,
+                        layout = fittedLayout,
+                        useEpisodeThumbnails = useEpisodeThumbnails,
+                        blurNextUp = blurNextUp,
+                        onClick = onItemClick?.let { { it(item) } },
+                        onLongClick = onItemLongPress?.let { { it(item) } },
+                        sourceShortcut = sourceShortcut,
+                    )
+                }
             }
         }
+    }
+}
+
+private val ContinueWatchingRemoveButtonSize = 24.dp
+private val ContinueWatchingRemoveButtonInset = 7.dp
+private const val ContinueWatchingRemoveButtonFadeMs = 140
+private const val ContinueWatchingRemoveCardFadeMs = 220
+
+/**
+ * If the card is still here this long after its fade finished, the removal was refused (a stale
+ * entry, an unknown source) and the card is brought back rather than left as an invisible hole.
+ */
+private const val ContinueWatchingRemoveRestoreDelayMs = 1_500L
+
+/**
+ * Wraps a Continue Watching card with a small frosted-glass remove button in its top-left corner,
+ * shown on pointer hover. A quicker path than right-click → Remove: the card just fades out, with
+ * none of the zoom overlay's disintegration, and [onRemove] runs once it has faded.
+ *
+ * The button is a sibling drawn over the card, not part of it, so it can blur the card's own
+ * pixels through Haze; the card is only a Haze source while the button is on screen.
+ */
+@Composable
+private fun ContinueWatchingRemovableCard(
+    onRemove: (() -> Unit)?,
+    content: @Composable (hovered: Boolean) -> Unit,
+) {
+    val cardInteraction = remember { MutableInteractionSource() }
+    val cardHovered by cardInteraction.collectIsHoveredAsState()
+    if (onRemove == null) {
+        Box(modifier = Modifier.hoverable(cardInteraction)) {
+            content(cardHovered)
+        }
+        return
+    }
+    val currentOnRemove by rememberUpdatedState(onRemove)
+    var removing by remember { mutableStateOf(false) }
+    val cardAlpha = remember { Animatable(1f) }
+    LaunchedEffect(removing) {
+        if (!removing) return@LaunchedEffect
+        cardAlpha.animateTo(0f, tween(ContinueWatchingRemoveCardFadeMs, easing = FastOutLinearInEasing))
+        currentOnRemove()
+        delay(ContinueWatchingRemoveRestoreDelayMs)
+        removing = false
+        cardAlpha.animateTo(1f, tween(ContinueWatchingRemoveCardFadeMs))
+    }
+    val buttonAlpha by animateFloatAsState(
+        targetValue = if (cardHovered && !removing) 1f else 0f,
+        animationSpec = tween(ContinueWatchingRemoveButtonFadeMs),
+        label = "continueWatchingRemoveButton",
+    )
+    val hazeState = remember { HazeState() }
+
+    Box(
+        modifier = Modifier
+            .graphicsLayer { alpha = cardAlpha.value }
+            .hoverable(cardInteraction),
+    ) {
+        Box(modifier = if (buttonAlpha > 0f) Modifier.hazeSource(hazeState) else Modifier) {
+            content(cardHovered && !removing)
+        }
+        if (buttonAlpha > 0f) {
+            ContinueWatchingRemoveButton(
+                hazeState = hazeState,
+                enabled = !removing,
+                onClick = { removing = true },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(ContinueWatchingRemoveButtonInset)
+                    .graphicsLayer { alpha = buttonAlpha },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ContinueWatchingRemoveButton(
+    hazeState: HazeState,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    // Kept deliberately quiet at rest — a dim tint and a hairline rim — and only firmed up once
+    // the pointer is actually on it, so a row of hovered cards never reads as a row of X's.
+    val tintAlpha by animateFloatAsState(if (hovered) 0.42f else 0.22f, label = "removeButtonTint")
+    val iconAlpha by animateFloatAsState(if (hovered) 1f else 0.78f, label = "removeButtonIcon")
+    Box(
+        modifier = modifier
+            .size(ContinueWatchingRemoveButtonSize)
+            .clip(CircleShape)
+            .hazeEffect(state = hazeState) {
+                blurRadius = 10.dp
+                noiseFactor = 0f
+                tints = listOf(HazeTint(Color.Black.copy(alpha = tintAlpha)))
+            }
+            .background(
+                Brush.verticalGradient(
+                    0f to Color.White.copy(alpha = 0.14f),
+                    0.55f to Color.White.copy(alpha = 0.03f),
+                    1f to Color.Transparent,
+                ),
+            )
+            .border(0.75.dp, Color.White.copy(alpha = if (hovered) 0.34f else 0.20f), CircleShape)
+            .hoverable(interaction)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = enabled,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Close,
+            contentDescription = stringResource(Res.string.cw_action_remove),
+            tint = Color.White.copy(alpha = iconAlpha),
+            modifier = Modifier.size(14.dp),
+        )
+    }
+}
+
+internal enum class ContinueWatchingSourceShortcutKind {
+    OpenSourcePicker,
+    ReuseLastLink,
+}
+
+/**
+ * Which source shortcut a card offers, if any: the opposite of what a plain click does with
+ * streams. Replaying the last link needs a link, so it is only offered once the item has been
+ * played; Up Next rows and cloud-library files (which never go through the picker) get nothing.
+ */
+internal fun continueWatchingSourceShortcutKind(
+    item: ContinueWatchingItem,
+    mode: ContinueWatchingSourceShortcut,
+    reuseLastLinkEnabled: Boolean,
+): ContinueWatchingSourceShortcutKind? = when {
+    mode == ContinueWatchingSourceShortcut.OFF -> null
+    item.isCloudLibraryItem() -> null
+    reuseLastLinkEnabled -> ContinueWatchingSourceShortcutKind.OpenSourcePicker
+    item.progressFraction > 0f -> ContinueWatchingSourceShortcutKind.ReuseLastLink
+    else -> null
+}
+
+private class ContinueWatchingSourceShortcutState(
+    val kind: ContinueWatchingSourceShortcutKind,
+    val centered: Boolean,
+    val visible: Boolean,
+    val onClick: () -> Unit,
+)
+
+private val ContinueWatchingSourceShortcutCornerSize = 24.dp
+private val ContinueWatchingSourceShortcutCenterSize = 52.dp
+
+/**
+ * The card's source shortcut, drawn over its artwork on hover. In the corner it matches the remove
+ * button opposite it; centred it is a large Stremio-style button, and only that circle takes the
+ * shortcut — the rest of the card still clicks through to the normal action.
+ *
+ * Not composed at all while hidden, so a centred button never swallows clicks it is not showing.
+ */
+@Composable
+private fun BoxScope.ContinueWatchingSourceShortcutButton(
+    shortcut: ContinueWatchingSourceShortcutState?,
+    cornerBottomInset: Dp = ContinueWatchingRemoveButtonInset,
+) {
+    if (shortcut == null) return
+    val alpha by animateFloatAsState(
+        targetValue = if (shortcut.visible) 1f else 0f,
+        animationSpec = tween(ContinueWatchingRemoveButtonFadeMs),
+        label = "continueWatchingSourceShortcut",
+    )
+    if (alpha <= 0f) return
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val size = if (shortcut.centered) ContinueWatchingSourceShortcutCenterSize else ContinueWatchingSourceShortcutCornerSize
+    val placement = if (shortcut.centered) {
+        Modifier.align(Alignment.Center)
+    } else {
+        Modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = ContinueWatchingRemoveButtonInset, bottom = cornerBottomInset)
+    }
+    Box(
+        modifier = placement
+            .graphicsLayer { this.alpha = alpha }
+            .size(size)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = if (hovered) 0.66f else 0.46f))
+            .background(
+                Brush.verticalGradient(
+                    0f to Color.White.copy(alpha = 0.14f),
+                    0.55f to Color.White.copy(alpha = 0.03f),
+                    1f to Color.Transparent,
+                ),
+            )
+            .border(
+                if (shortcut.centered) 1.dp else 0.75.dp,
+                Color.White.copy(alpha = if (hovered) 0.40f else 0.22f),
+                CircleShape,
+            )
+            .hoverable(interaction)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = shortcut.onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        val (icon, label) = when (shortcut.kind) {
+            ContinueWatchingSourceShortcutKind.OpenSourcePicker ->
+                Icons.AutoMirrored.Filled.PlaylistPlay to stringResource(Res.string.play_choose_source)
+            ContinueWatchingSourceShortcutKind.ReuseLastLink ->
+                Icons.Default.PlayArrow to stringResource(Res.string.cw_action_play_last_link)
+        }
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = Color.White.copy(alpha = if (hovered) 1f else 0.85f),
+            modifier = Modifier.size(if (shortcut.centered) 30.dp else 15.dp),
+        )
     }
 }
 
@@ -389,14 +743,23 @@ private fun HomeContinueWatchingSectionContent(
  */
 internal fun continueWatchingCardBaseWidthDpFittingHeight(naturalBaseWidthDp: Int, maxHeight: Dp): Int? {
     if (continueWatchingLandscapeCardHeight(naturalBaseWidthDp) <= maxHeight) return null
-    return (maxHeight.value * PosterLandscapeAspectRatio / PosterLandscapeWidthScale).toInt()
+    return continueWatchingCardBaseWidthDpFillingHeight(maxHeight)
 }
+
+/** The poster base width whose Card-style card is [height] tall, larger or smaller than the natural card. */
+internal fun continueWatchingCardBaseWidthDpFillingHeight(height: Dp): Int =
+    (height.value * PosterLandscapeAspectRatio / PosterLandscapeWidthScale).toInt()
 
 /** The Poster style shrunk (keeping its aspect) until poster plus title block fit [maxHeight]. */
 internal fun ContinueWatchingLayout.fittingPosterCardHeight(maxHeight: Dp): ContinueWatchingLayout {
     val natural = posterCardHeight + posterTitleBlockHeight
     if (natural <= maxHeight) return this
-    val posterHeight = (maxHeight - posterTitleBlockHeight).coerceAtLeast(posterCardHeight / 2)
+    return fillingPosterCardHeight(maxHeight)
+}
+
+/** The Poster style scaled (keeping its aspect, up or down) so poster plus title block is [height]. */
+internal fun ContinueWatchingLayout.fillingPosterCardHeight(height: Dp): ContinueWatchingLayout {
+    val posterHeight = (height - posterTitleBlockHeight).coerceAtLeast(posterCardHeight / 2)
     val scale = posterHeight / posterCardHeight
     return copy(posterCardWidth = posterCardWidth * scale, posterCardHeight = posterHeight)
 }
@@ -640,6 +1003,51 @@ private fun PosterCardPreview() {
     }
 }
 
+/** The bar along a Continue Watching card's bottom edge (the Nuvio Tracker's `.art-bar`). */
+private val ContinueWatchingEdgeBarHeight = 5.dp
+
+/**
+ * Watch progress as a strip flush along the card's bottom edge, the style of the Nuvio Tracker
+ * site's Continue watching rail: a dark track with a faint lit top edge, and a white fill whose
+ * leading end is rounded. The card's own clip rounds it into the corners.
+ */
+@Composable
+private fun ContinueWatchingEdgeProgressBar(
+    progress: Float,
+    height: Dp,
+    modifier: Modifier = Modifier,
+) {
+    val fraction = progress.coerceIn(0f, 1f)
+    Canvas(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(height),
+    ) {
+        val barHeight = height.toPx()
+        val top = size.height - barHeight
+        val fillWidth = size.width * fraction
+        drawRect(color = Color.Black.copy(alpha = 0.45f), topLeft = Offset(0f, top), size = Size(size.width, barHeight))
+        drawRect(color = Color.White.copy(alpha = 0.12f), topLeft = Offset(0f, top), size = Size(size.width, 1.dp.toPx()))
+        if (fillWidth <= 0f) return@Canvas
+        val radius = 3.dp.toPx().coerceAtMost(barHeight)
+        drawPath(
+            path = Path().apply {
+                addRoundRect(
+                    RoundRect(
+                        left = 0f,
+                        top = top,
+                        right = fillWidth,
+                        bottom = size.height,
+                        topRightCornerRadius = CornerRadius(radius),
+                        bottomRightCornerRadius = CornerRadius(radius),
+                    ),
+                )
+            },
+            color = Color.White,
+        )
+    }
+}
+
 private data class ContinueWatchingLandscapeCardMetrics(
     val width: Dp,
     val cornerRadius: Dp,
@@ -671,9 +1079,9 @@ private fun continueWatchingLandscapeCardMetrics(
             badgeInset = 6.dp,
             badgeHorizontalPadding = 6.dp,
             badgeVerticalPadding = 2.dp,
-            progressHorizontalPadding = 8.dp,
-            progressBottomPadding = 3.dp,
-            progressHeight = 3.dp,
+            progressHorizontalPadding = 0.dp,
+            progressBottomPadding = 0.dp,
+            progressHeight = 4.dp,
             titleTextSize = 12.sp,
             metaTextSize = 9.sp,
             badgeTextSize = 8.sp,
@@ -686,9 +1094,9 @@ private fun continueWatchingLandscapeCardMetrics(
             badgeInset = 6.dp,
             badgeHorizontalPadding = 7.dp,
             badgeVerticalPadding = 3.dp,
-            progressHorizontalPadding = 8.dp,
-            progressBottomPadding = 3.dp,
-            progressHeight = 3.dp,
+            progressHorizontalPadding = 0.dp,
+            progressBottomPadding = 0.dp,
+            progressHeight = 4.dp,
             titleTextSize = 13.sp,
             metaTextSize = 10.sp,
             badgeTextSize = 9.sp,
@@ -701,9 +1109,9 @@ private fun continueWatchingLandscapeCardMetrics(
             badgeInset = 7.dp,
             badgeHorizontalPadding = 7.dp,
             badgeVerticalPadding = 3.dp,
-            progressHorizontalPadding = 9.dp,
-            progressBottomPadding = 4.dp,
-            progressHeight = 3.dp,
+            progressHorizontalPadding = 0.dp,
+            progressBottomPadding = 0.dp,
+            progressHeight = ContinueWatchingEdgeBarHeight,
             titleTextSize = 14.sp,
             metaTextSize = 10.sp,
             badgeTextSize = 10.sp,
@@ -720,6 +1128,7 @@ private fun ContinueWatchingCard(
     blurNextUp: Boolean,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
+    sourceShortcut: ContinueWatchingSourceShortcutState? = null,
 ) {
     val posterCardStyle = rememberHomePosterCardStyleUiState()
     val homeCatalogSettings by remember {
@@ -746,12 +1155,14 @@ private fun ContinueWatchingCard(
     }
     val preferBackdropForNextUp = item.isNextUp && compactAirDateText != null && !item.isReleaseAlert
     val (imageUrl, onArtworkLoadFailed) = rememberContinueWatchingArtwork(
-        item.continueWatchingCardArtworkUrls(
+        item.continueWatchingDisplayArtworkChain(
+            style = ContinueWatchingSectionStyle.Card,
             useEpisodeThumbnails = useEpisodeThumbnails,
             preferBackdropForNextUp = preferBackdropForNextUp,
         ),
     )
-    val shouldBlurArtwork = blurNextUp && useEpisodeThumbnails && item.isNextUp
+    val shouldBlurArtwork = blurNextUp && useEpisodeThumbnails && item.isNextUp &&
+        !item.isShowingCustomArt(imageUrl)
     val episodeCode = if (item.seasonNumber != null && item.episodeNumber != null) {
         stringResource(Res.string.streams_episode_badge, item.seasonNumber, item.episodeNumber)
     } else {
@@ -770,10 +1181,10 @@ private fun ContinueWatchingCard(
         modifier = Modifier
             .width(cardMetrics.width)
             .aspectRatio(PosterLandscapeAspectRatio)
-            .nuvioPosterHighlight(cardMetrics.cornerRadius)
+            .nuvioPosterHighlight(cardMetrics.cornerRadius, artworkUrl = imageUrl)
+            .nuvioCardDepth(RoundedCornerShape(cardMetrics.cornerRadius), NuvioCardDepthSurface.ContinueWatching)
             .clip(RoundedCornerShape(cardMetrics.cornerRadius))
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .nuvioCardDepth(RoundedCornerShape(cardMetrics.cornerRadius), NuvioCardDepthSurface.ContinueWatching)
             .posterCardClickable(
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -875,27 +1286,20 @@ private fun ContinueWatchingCard(
             )
         }
         if (item.progressFraction > 0f) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(
-                        horizontal = cardMetrics.progressHorizontalPadding,
-                        vertical = cardMetrics.progressBottomPadding,
-                    )
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(999.dp))
-                    .height(cardMetrics.progressHeight)
-                    .background(Color.Black.copy(alpha = 0.30f)),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(item.progressFraction.coerceIn(0f, 1f))
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(MaterialTheme.nuvio.colors.accentFill),
-                )
-            }
+            ContinueWatchingEdgeProgressBar(
+                progress = item.progressFraction,
+                height = cardMetrics.progressHeight,
+                modifier = Modifier.align(Alignment.BottomStart),
+            )
         }
+        ContinueWatchingSourceShortcutButton(
+            shortcut = sourceShortcut,
+            cornerBottomInset = if (item.progressFraction > 0f) {
+                cardMetrics.progressHeight + 6.dp
+            } else {
+                ContinueWatchingRemoveButtonInset
+            },
+        )
     }
 }
 
@@ -950,15 +1354,16 @@ private fun ContinueWatchingWideCard(
     blurNextUp: Boolean,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
+    sourceShortcut: ContinueWatchingSourceShortcutState? = null,
 ) {
     val (artworkUrl, onArtworkLoadFailed) = rememberContinueWatchingArtwork(
-        item.continueWatchingArtworkUrls(useEpisodeThumbnails),
+        item.continueWatchingDisplayArtworkChain(ContinueWatchingSectionStyle.Wide, useEpisodeThumbnails),
     )
     Row(
         modifier = Modifier
             .width(layout.wideCardWidth)
             .height(layout.wideCardHeight)
-            .nuvioPosterHighlight(layout.cardRadius)
+            .nuvioPosterHighlight(layout.cardRadius, artworkUrl = artworkUrl)
             .clip(RoundedCornerShape(layout.cardRadius))
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.92f))
             .border(
@@ -973,15 +1378,19 @@ private fun ContinueWatchingWideCard(
                 zoomCornerRadius = layout.cardRadius,
             ),
     ) {
-        val shouldBlurArtwork = blurNextUp && useEpisodeThumbnails && item.isNextUp
-        ArtworkPanel(
-            imageUrl = artworkUrl,
-            width = layout.widePosterStripWidth,
-            blurred = shouldBlurArtwork,
-            contentScale = if (item.isCloudLibraryItem()) ContentScale.Fit else ContentScale.Crop,
-            onLoadFailed = onArtworkLoadFailed,
-            modifier = Modifier.fillMaxHeight(),
-        )
+        val shouldBlurArtwork = blurNextUp && useEpisodeThumbnails && item.isNextUp &&
+            !item.isShowingCustomArt(artworkUrl)
+        Box(modifier = Modifier.fillMaxHeight()) {
+            ArtworkPanel(
+                imageUrl = artworkUrl,
+                width = layout.widePosterStripWidth,
+                blurred = shouldBlurArtwork,
+                contentScale = if (item.isCloudLibraryItem()) ContentScale.Fit else ContentScale.Crop,
+                onLoadFailed = onArtworkLoadFailed,
+                modifier = Modifier.fillMaxHeight(),
+            )
+            ContinueWatchingSourceShortcutButton(shortcut = sourceShortcut)
+        }
         Column(
             modifier = Modifier
                 .fillMaxHeight()
@@ -1081,9 +1490,10 @@ private fun ContinueWatchingPosterCard(
     blurNextUp: Boolean,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
+    sourceShortcut: ContinueWatchingSourceShortcutState? = null,
 ) {
     val (posterArtworkUrl, onArtworkLoadFailed) = rememberContinueWatchingArtwork(
-        item.continueWatchingPosterArtworkUrls(useEpisodeThumbnails),
+        item.continueWatchingDisplayArtworkChain(ContinueWatchingSectionStyle.Poster, useEpisodeThumbnails),
     )
     Column(
         modifier = Modifier.width(layout.posterCardWidth),
@@ -1093,10 +1503,10 @@ private fun ContinueWatchingPosterCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(layout.posterCardHeight)
-                .nuvioPosterHighlight(layout.cardRadius)
+                .nuvioPosterHighlight(layout.cardRadius, artworkUrl = posterArtworkUrl)
+                .nuvioCardDepth(RoundedCornerShape(layout.cardRadius), NuvioCardDepthSurface.ContinueWatching)
                 .clip(RoundedCornerShape(layout.cardRadius))
                 .background(MaterialTheme.colorScheme.surfaceVariant)
-                .nuvioCardDepth(RoundedCornerShape(layout.cardRadius), NuvioCardDepthSurface.ContinueWatching)
                 .posterCardClickable(
                     onClick = onClick,
                     onLongClick = onLongClick,
@@ -1140,22 +1550,21 @@ private fun ContinueWatchingPosterCard(
                 }
             }
             if (item.progressFraction > 0f) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(horizontal = 10.dp, vertical = 10.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(MaterialTheme.colorScheme.surface)
-                        .padding(horizontal = 6.dp, vertical = 6.dp),
-                ) {
-                    NuvioProgressBar(
-                        progress = item.progressFraction,
-                        modifier = Modifier.width(layout.posterCardWidth - 32.dp),
-                        height = layout.progressHeight,
-                        trackColor = MaterialTheme.colorScheme.surfaceTint.copy(alpha = 0.16f),
-                    )
-                }
+                ContinueWatchingEdgeProgressBar(
+                    progress = item.progressFraction,
+                    height = ContinueWatchingEdgeBarHeight,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
             }
+            ContinueWatchingSourceShortcutButton(
+                shortcut = sourceShortcut,
+                // Clears the bar along the bottom edge.
+                cornerBottomInset = if (item.progressFraction > 0f) {
+                    ContinueWatchingEdgeBarHeight + 6.dp
+                } else {
+                    ContinueWatchingRemoveButtonInset
+                },
+            )
         }
 
         Row(

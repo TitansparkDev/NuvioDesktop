@@ -1,5 +1,7 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.gradle.api.DefaultTask
+import java.util.concurrent.TimeUnit
+import java.security.MessageDigest
 import org.gradle.api.GradleException
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
@@ -31,6 +33,11 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     @get:InputFile
     abstract val localPropertiesFile: RegularFileProperty
 
+    // Bump when the built-in defaults written below change, so Gradle regenerates the file even
+    // though local.properties (the other input) is absent and unchanged.
+    @get:Input
+    abstract val defaultsRevision: Property<String>
+
     @get:Input
     abstract val appVersionName: Property<String>
 
@@ -48,6 +55,16 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
         val props = Properties()
         localPropertiesFile.asFile.orNull?.takeIf { it.exists() }?.inputStream()?.use { props.load(it) }
 
+        // With no local.properties (or blank values) fall back to the official Nuvio backend. The
+        // key is the public "anon" key the server itself publishes at
+        // https://api.nuvio.tv/.well-known/nuvio; it is meant to ship inside every client.
+        val supabaseUrl = props.getProperty("SUPABASE_URL").orEmpty().trim()
+            .ifBlank { "https://api.nuvio.tv" }
+        val supabaseAnonKey = props.getProperty("SUPABASE_ANON_KEY").orEmpty().trim()
+            .ifBlank {
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNTIxMzQ2LCJleHAiOjE5MzkyMDEzNDZ9.tmQaj682pwzehpqlgCDMnySOqiUvpgRbrE43T4VJpDI"
+            }
+
         val outDir = outputDir.get().asFile
         outDir.resolve("com/nuvio/app/core/network").apply {
             mkdirs()
@@ -56,8 +73,8 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.core.network
                 |
                 |object SupabaseConfig {
-                |    const val URL = "${props.getProperty("SUPABASE_URL", "")}" 
-                |    const val ANON_KEY = "${props.getProperty("SUPABASE_ANON_KEY", "")}" 
+                |    const val URL = "$supabaseUrl" 
+                |    const val ANON_KEY = "$supabaseAnonKey" 
                 |}
                 """.trimMargin()
             )
@@ -72,9 +89,7 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.features.trakt
                 |
                 |object TraktConfig {
-                |    const val CLIENT_ID = "" 
-                |    const val CLIENT_SECRET = "" 
-                |    const val REDIRECT_URI = "http://localhost:53682/callback" 
+                |    const val CLIENT_ID = "${props.getProperty("TRAKT_CLIENT_ID", "")}"
                 |}
                 """.trimMargin()
             )
@@ -269,10 +284,15 @@ val desktopChannelOverride = (
 require(desktopChannelOverride == null || desktopChannelOverride == "stable" || desktopChannelOverride == "nightly") {
     "Desktop release channel must be either stable or nightly: $desktopChannelOverride"
 }
+// The publisher Windows shows for Nuvio.exe (Explorer's Company, the jpackage vendor). This app is
+// a fork published by Umbra Projects, not an official Nuvio Media release.
+val desktopPublisher = "Umbra Projects"
 val releaseAppVersionName = desktopReleaseVersionName
 val releaseAppVersionCode = desktopReleaseVersionCode
 val desktopReleasePackageVersion = jpackageCompatibleVersion(desktopReleaseVersionName)
 val fullCommonSourceDir = project.file("src/fullCommonMain/kotlin")
+// fork:innertubex — see settings.gradle.kts. Off by default: the resolver library comes from JitPack.
+val innerTubeXEnabled = providers.gradleProperty("nuvio.innertubex").map { it.equals("true", ignoreCase = true) }.getOrElse(false)
 val fullPluginSourceDir = fullCommonSourceDir.resolve("com/nuvio/app/features/plugins")
 val generatedRuntimeConfigDir = layout.buildDirectory.dir("generated/runtime-config/kotlin")
 val requestedGradleTasks = gradle.startParameter.taskNames.map { taskName ->
@@ -289,7 +309,10 @@ val isAndroidAppBundleBuild = requestedGradleTasks.any { taskName ->
 
 val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generateRuntimeConfigs") {
     outputDir.set(generatedRuntimeConfigDir)
-    localPropertiesFile.set(rootProject.layout.projectDirectory.file("local.properties"))
+    defaultsRevision.set("official-backend-fallback-1")
+    val localProps = rootProject.layout.projectDirectory.file("local.properties")
+    // @Optional only tolerates null, not a missing file (local.properties is gitignored, absent in CI).
+    localPropertiesFile.set(providers.provider { localProps.takeIf { it.asFile.exists() } })
     appVersionName.set(releaseAppVersionName)
     appVersionCode.set(releaseAppVersionCode)
     desktopAppVersionName.set(desktopReleaseVersionName)
@@ -645,6 +668,10 @@ val nuvioEngineMsys2Root = providers.gradleProperty("nuvio.windows.msys2.ucrt64"
 val nuvioEngineConfiguredCMake = providers.gradleProperty("nuvio.windows.cmake").orNull
     ?.takeIf { it.isNotBlank() }
     ?.let(::File)
+// CI/dev escape hatch: -Pnuvio.engine.optional=true lets a distributable be created without
+// nuvio_engine.dll (P2P then falls back to TorrServer at runtime). Release builds leave it off.
+val nuvioEngineOptional =
+    providers.gradleProperty("nuvio.engine.optional").orNull?.toBoolean() == true
 val nuvioEngineJniIncludeDir = File(providers.systemProperty("java.home").get()).resolve("include")
 
 // Resolved at execution time: vswhere is a process launch, which the configuration cache forbids
@@ -756,6 +783,264 @@ val buildWindowsNuvioEngine = tasks.register("buildWindowsNuvioEngine") {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// quickjs-kt's native library, rebuilt from the vendored, patched sources in
+// src/desktopMain/native/quickjs-kt (README there): every JS -> Kotlin binding call gets its own
+// JNI local frame, so a scraper's page parse no longer grows the thread's handle table and keeps
+// every fetched page alive until its job ends. Same MSYS2 UCRT64 GCC as the engine; one gcc call,
+// no CMake. Best-effort like the engine: without the toolchain the app loads the jar's own
+// (unpatched) copy, and only createDistributable insists on it.
+// ---------------------------------------------------------------------------------------------
+val quickJsSourceDir = layout.projectDirectory.dir("src/desktopMain/native/quickjs-kt")
+val quickJsOutput = layout.buildDirectory.file("native/windows/libquickjs.dll")
+
+val buildWindowsQuickJs = tasks.register("buildWindowsQuickJs") {
+    notCompatibleWithConfigurationCache("Builds the host-local QuickJS DLL with the MSYS2 toolchain.")
+    enabled = isWindowsHost
+    inputs.dir(quickJsSourceDir)
+    outputs.file(quickJsOutput)
+    doLast {
+        val output = quickJsOutput.get().asFile
+        val msysBin = nuvioEngineMsys2Root.resolve("bin")
+        val gcc = msysBin.resolve("gcc.exe")
+        if (!gcc.isFile || !nuvioEngineJniIncludeDir.resolve("jni.h").isFile) {
+            logger.warn("Skipping QuickJS build; plugins will use quickjs-kt's bundled DLL. Missing: MSYS2 UCRT64 gcc under ${msysBin.absolutePath} or jni.h")
+            output.delete()
+            return@doLast
+        }
+        val src = quickJsSourceDir.asFile
+        val version = src.resolve("quickjs/VERSION").readText().trim()
+        val sources = listOf("cutils", "dtoa", "libregexp", "libunicode", "quickjs").map { "quickjs/$it.c" } +
+            listOf("common", "jni", "jni/mapping").flatMap { dir ->
+                src.resolve(dir).listFiles { file -> file.extension == "c" }.orEmpty().sortedBy { it.name }.map { "$dir/${it.name}" }
+            }
+        output.parentFile.mkdirs()
+        val command = listOf(
+            gcc.absolutePath, "-O2", "-std=gnu99", "-shared", "-static", "-s",
+            // ProcessBuilder passes embedded quotes through unescaped, and gcc's argv parsing would
+            // strip them; the backslashes keep CONFIG_VERSION a string literal.
+            "-DCONFIG_WIN32", "-DCONFIG_BIGNUM", "-DCONFIG_VERSION=\\\"$version\\\"",
+            "-Iquickjs", "-Icommon", "-Ic-vector", "-Ijni", "-Ijni/mapping",
+            "-I${nuvioEngineJniIncludeDir.absolutePath}", "-I${nuvioEngineJniIncludeDir.resolve("win32").absolutePath}",
+        ) + sources + listOf(
+            "quickjs.def",
+            "-Wl,--dynamicbase,--nxcompat,--high-entropy-va,--no-insert-timestamp",
+            "-o", output.absolutePath,
+        )
+        val process = ProcessBuilder(command)
+            .directory(src)
+            .redirectErrorStream(true)
+            .apply { environment()["PATH"] = "${msysBin.absolutePath};${System.getenv("PATH").orEmpty()}" }
+            .start()
+        val log = process.inputStream.bufferedReader().readText()
+        val code = process.waitFor()
+        if (code != 0 || !output.isFile) {
+            val detail = "QuickJS build failed (exit $code)\n${log.takeLast(8000)}"
+            if (nuvioEngineOptional) {
+                // Same escape hatch as the Nuvio Engine: the app falls back to quickjs-kt's bundled DLL.
+                logger.warn("$detail\nContinuing because -Pnuvio.engine.optional=true; using quickjs-kt's bundled DLL.")
+                output.delete()
+                return@doLast
+            }
+            throw GradleException(detail)
+        }
+        logger.lifecycle("QuickJS DLL: ${output.absolutePath} (${output.length() / 1024} KB)")
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// fork:voice-control - nuvio_whisper.dll: whisper.cpp + ggml (CPU) + the JNI bridge, one static DLL
+// (src/desktopMain/native/whisper-jni/CMakeLists.txt says why static). Same toolchain as the engine
+// (MSYS2 UCRT64 GCC + Visual Studio's CMake) and the same kind of sibling checkout:
+// ggml-org/whisper.cpp at the tag below beside NuvioDesktop, or -Pnuvio.whisper.sourceDir.
+// Best-effort like the engine: without it the Voice control page says the engine is missing, and
+// only createDistributable insists (unless -Pnuvio.engine.optional=true).
+// ---------------------------------------------------------------------------------------------
+val whisperSourceDir = providers.gradleProperty("nuvio.whisper.sourceDir").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let(::File)
+    ?: rootProject.projectDir.resolve("../whisper.cpp")
+val whisperExpectedTag = "v1.9.5"
+val whisperCMakeProject = layout.projectDirectory.dir("src/desktopMain/native/whisper-jni")
+val whisperBuildDir = layout.buildDirectory.dir("native/whisper/build")
+val whisperOutput = layout.buildDirectory.file("native/windows/nuvio_whisper.dll")
+
+fun missingWhisperInputs(cmake: File?): List<String> = listOfNotNull(
+    "whisper.cpp checkout ${whisperSourceDir.absolutePath} (git clone --depth 1 --branch $whisperExpectedTag https://github.com/ggml-org/whisper.cpp beside NuvioDesktop, or pass -Pnuvio.whisper.sourceDir)"
+        .takeUnless { whisperSourceDir.resolve("include/whisper.h").isFile },
+    "MSYS2 UCRT64 g++ under ${nuvioEngineMsys2Root.absolutePath} (pass -Pnuvio.windows.msys2.ucrt64)"
+        .takeUnless { nuvioEngineMsys2Root.resolve("bin/g++.exe").isFile },
+    "CMake (Visual Studio 'C++ CMake tools' component, or -Pnuvio.windows.cmake=C:/path/cmake.exe)"
+        .takeUnless { cmake?.isFile == true },
+    "jni.h under ${nuvioEngineJniIncludeDir.absolutePath}"
+        .takeUnless { nuvioEngineJniIncludeDir.resolve("jni.h").isFile },
+)
+
+val buildWindowsWhisper = tasks.register("buildWindowsWhisper") {
+    notCompatibleWithConfigurationCache("Builds the host-local whisper.cpp DLL with the MSYS2 toolchain.")
+    enabled = isWindowsHost
+    inputs.dir(whisperCMakeProject)
+    if (whisperSourceDir.resolve("src").isDirectory) {
+        inputs.dir(whisperSourceDir.resolve("src"))
+        inputs.dir(whisperSourceDir.resolve("include"))
+        inputs.dir(whisperSourceDir.resolve("ggml/src")).withPropertyName("ggmlSources")
+        inputs.file(whisperSourceDir.resolve("CMakeLists.txt"))
+    }
+    outputs.file(whisperOutput)
+    doLast {
+        val output = whisperOutput.get().asFile
+        val cmake = resolveNuvioEngineCMake()
+        val missing = missingWhisperInputs(cmake)
+        if (missing.isNotEmpty()) {
+            logger.warn("Skipping whisper.cpp build; voice control will be unavailable. Missing: " + missing.joinToString("; "))
+            output.delete()
+            return@doLast
+        }
+        // fork:live-tv-subtitles - best-effort like the engine: with -Pnuvio.engine.optional=true a failed whisper.cpp
+        // build only warns (voice control and the live subtitle word match are then unavailable) instead of failing the app.
+        try {
+            checkNotNull(cmake)
+            val buildDir = whisperBuildDir.get().asFile.apply { mkdirs() }
+            val msysBin = nuvioEngineMsys2Root.resolve("bin")
+            fun run(vararg command: String) {
+                val process = ProcessBuilder(*command)
+                    .directory(buildDir)
+                    .redirectErrorStream(true)
+                    .apply { environment()["PATH"] = "${msysBin.absolutePath};${System.getenv("PATH").orEmpty()}" }
+                    .start()
+                val log = process.inputStream.bufferedReader().readText()
+                val code = process.waitFor()
+                if (code != 0) {
+                    throw GradleException("whisper.cpp build step failed (exit $code): ${command.joinToString(" ")}\n${log.takeLast(6000)}")
+                }
+            }
+            val commonFlags = "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -ffunction-sections -fdata-sections"
+            run(
+                cmake.absolutePath,
+                "-S", whisperCMakeProject.asFile.absolutePath,
+                "-B", buildDir.absolutePath,
+                "-G", "Ninja",
+                "-DCMAKE_C_COMPILER=${msysBin.resolve("gcc.exe").absolutePath.replace('\\', '/')}",
+                "-DCMAKE_CXX_COMPILER=${msysBin.resolve("g++.exe").absolutePath.replace('\\', '/')}",
+                "-DCMAKE_MAKE_PROGRAM=${msysBin.resolve("ninja.exe").absolutePath.replace('\\', '/')}",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_C_FLAGS=$commonFlags",
+                "-DCMAKE_CXX_FLAGS=$commonFlags",
+                // Fully static, as the engine: the JVM must not need MSYS2 on PATH to load it.
+                "-DCMAKE_SHARED_LINKER_FLAGS=-static -s -Wl,--dynamicbase,--nxcompat,--high-entropy-va,--gc-sections,--exclude-all-symbols",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DNUVIO_WHISPER_ROOT=${whisperSourceDir.absolutePath.replace('\\', '/')}",
+                "-DNUVIO_JNI_INCLUDE_DIR=${nuvioEngineJniIncludeDir.absolutePath.replace('\\', '/')}",
+            )
+            run(cmake.absolutePath, "--build", buildDir.absolutePath, "--parallel", "--target", "nuvio_whisper")
+            val built = buildDir.resolve("nuvio_whisper.dll")
+            check(built.isFile) { "whisper.cpp build finished but ${built.absolutePath} is missing" }
+            output.parentFile.mkdirs()
+            built.copyTo(output, overwrite = true)
+            logger.lifecycle("Whisper DLL: ${output.absolutePath} (${output.length() / 1024} KB)")
+        } catch (failure: Exception) {
+            if (!nuvioEngineOptional) throw failure
+            logger.warn("whisper.cpp build failed; voice control will be unavailable: ${failure.message?.take(4000)}")
+            output.delete()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// fork:usenet - nuvio-usenet.exe: NuvioMedia/nuvio-usenet-engine (Go + cgo RapidYenc), the built-in
+// Usenet engine Nuvio runs as a child process (features/usenet/UsenetEngine.kt). Same kind of sibling
+// checkout as whisper.cpp: nuvio-usenet-engine at the commit below beside NuvioDesktop, or
+// -Pnuvio.usenet.sourceDir. Built with MSYS2's Go (pacman -S mingw-w64-ucrt-x86_64-go) and gcc; the
+// result links only Windows' own UCRT DLLs. Best-effort: without it Settings > Usenet says the engine
+// is missing and Usenet releases cannot play; nothing else is affected.
+// ---------------------------------------------------------------------------------------------
+val usenetSourceDir = providers.gradleProperty("nuvio.usenet.sourceDir").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let(::File)
+    ?: rootProject.projectDir.resolve("../nuvio-usenet-engine")
+val usenetExpectedCommit = "e4b0717ae5bfe44e76ca8c7662022bff326f3806"
+val usenetGoRoot = nuvioEngineMsys2Root.resolve("lib/go")
+val usenetOutput = layout.buildDirectory.file("native/windows/nuvio-usenet.exe")
+
+fun missingUsenetInputs(): List<String> = listOfNotNull(
+    "nuvio-usenet-engine checkout ${usenetSourceDir.absolutePath} (git clone https://github.com/NuvioMedia/nuvio-usenet-engine beside NuvioDesktop and check out $usenetExpectedCommit, or pass -Pnuvio.usenet.sourceDir)"
+        .takeUnless { usenetSourceDir.resolve("cmd/nuvio-usenet").isDirectory },
+    "Go under ${usenetGoRoot.absolutePath} (MSYS2: pacman -S mingw-w64-ucrt-x86_64-go)"
+        .takeUnless { usenetGoRoot.resolve("bin/go.exe").isFile },
+    "MSYS2 UCRT64 gcc under ${nuvioEngineMsys2Root.absolutePath}"
+        .takeUnless { nuvioEngineMsys2Root.resolve("bin/gcc.exe").isFile },
+)
+
+val buildWindowsUsenetEngine = tasks.register("buildWindowsUsenetEngine") {
+    notCompatibleWithConfigurationCache("Builds the host-local Usenet engine with MSYS2's Go toolchain.")
+    enabled = isWindowsHost
+    if (usenetSourceDir.resolve("internal").isDirectory) {
+        inputs.dir(usenetSourceDir.resolve("internal"))
+        inputs.dir(usenetSourceDir.resolve("cmd"))
+        inputs.dir(usenetSourceDir.resolve("third_party"))
+        inputs.file(usenetSourceDir.resolve("go.mod"))
+    }
+    outputs.file(usenetOutput)
+    doLast {
+        val output = usenetOutput.get().asFile
+        val missing = missingUsenetInputs()
+        if (missing.isNotEmpty()) {
+            logger.warn("Skipping the Usenet engine build; built-in Usenet will be unavailable. Missing: " + missing.joinToString("; "))
+            output.delete()
+            return@doLast
+        }
+        try {
+            val head = runCatching {
+                ProcessBuilder("git", "-C", usenetSourceDir.absolutePath, "rev-parse", "HEAD")
+                    .redirectErrorStream(true).start().let { it.inputStream.bufferedReader().readText().trim() }
+            }.getOrDefault("")
+            if (head.isNotEmpty() && head != usenetExpectedCommit) {
+                logger.warn("nuvio-usenet-engine is at $head, not the tested $usenetExpectedCommit")
+            }
+            val work = layout.buildDirectory.dir("native/usenet").get().asFile.apply { mkdirs() }
+            output.parentFile.mkdirs()
+            val msysBin = nuvioEngineMsys2Root.resolve("bin")
+            fun go(vararg args: String): Pair<Int, String> {
+                val process = ProcessBuilder(usenetGoRoot.resolve("bin/go.exe").absolutePath, *args)
+                    .directory(usenetSourceDir)
+                    .redirectErrorStream(true)
+                    .apply {
+                        val env = environment()
+                        // A shell's own Go or C settings (CGO_CFLAGS, GOFLAGS, CPATH ...) must not reach this build.
+                        listOf("CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_LDFLAGS", "CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH",
+                            "GOENV", "GOPATH", "GOOS", "GOARCH", "CXX", "AR", "PKG_CONFIG").forEach(env::remove)
+                        env["GOROOT"] = usenetGoRoot.absolutePath
+                        env["PATH"] = "${msysBin.absolutePath};${usenetGoRoot.resolve("bin").absolutePath};${System.getenv("SystemRoot") ?: "C:\\Windows"}\\System32"
+                        env["CGO_ENABLED"] = "1"
+                        env["CC"] = msysBin.resolve("gcc.exe").absolutePath
+                        env["GOTOOLCHAIN"] = "local"
+                        env["GOFLAGS"] = "-mod=mod"
+                        env["GOCACHE"] = work.resolve("gocache").absolutePath
+                        env["GOMODCACHE"] = work.resolve("gomod").absolutePath
+                        env["GOTMPDIR"] = work.resolve("tmp").apply { mkdirs() }.absolutePath
+                    }
+                    .start()
+                val log = process.inputStream.bufferedReader().readText()
+                return process.waitFor() to log
+            }
+            val (code, log) = go("build", "-trimpath", "-ldflags=-s -w", "-o", output.absolutePath, "./cmd/nuvio-usenet")
+            if (code != 0) {
+                // The first failure can be a bare "cgo.exe: exit status 2"; -x shows the command that failed.
+                val (_, verbose) = go("build", "-x", "-trimpath", "-ldflags=-s -w", "-o", output.absolutePath, "./cmd/nuvio-usenet")
+                val (_, env) = go("env", "GOROOT", "GOVERSION", "CC", "CGO_ENABLED", "GOTMPDIR", "GOCACHE")
+                throw GradleException(
+                    "Usenet engine build failed (exit $code):\n${log.takeLast(3000)}\n--- go env ---\n$env\n--- go build -x (tail) ---\n${verbose.takeLast(6000)}",
+                )
+            }
+            check(output.isFile) { "Usenet engine build finished but ${output.absolutePath} is missing" }
+            logger.lifecycle("Usenet engine: ${output.absolutePath} (${output.length() / 1024} KB)")
+        } catch (failure: Exception) {
+            logger.warn("Usenet engine build failed; built-in Usenet will be unavailable: ${failure.message?.take(4000)}")
+            output.delete()
+        }
+    }
+}
+
 val windowsPlaybackStartupTestSource = layout.projectDirectory.file("src/desktopTest/native/windows/playback_startup_test.cpp")
 val windowsPlaybackStartupTestOutput = layout.buildDirectory.file("native/windows/player_startup_test.exe")
 val buildWindowsPlaybackStartupTests = tasks.register<Exec>("buildWindowsPlaybackStartupTests") {
@@ -781,7 +1066,6 @@ tasks.register<Exec>("nativePlaybackStartupTest") {
 val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRuntime") {
     notCompatibleWithConfigurationCache("Validates and bundles host-local Windows native player runtime DLLs.")
     enabled = isWindowsHost
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     into(windowsPlayerRuntimeOutput)
     doFirst {
         if (missingWindowsPlayerRuntimeInputs.isNotEmpty()) {
@@ -799,7 +1083,8 @@ val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRunt
             ?.firstOrNull()
             ?: throw GradleException("The Windows libmpv runtime does not contain avfilter.dll.")
         val avfilterText = avfilter.readBytes().toString(Charsets.ISO_8859_1).lowercase()
-        val forbiddenImports = listOf("libwhisper-1.dll", "ggml.dll").filter(avfilterText::contains)
+        val forbiddenImports = if (windowsAllowWhisperAvfilter) emptyList() else
+            listOf("libwhisper-1.dll", "ggml.dll", "ggml-0.dll", "ggml-base-0.dll").filter(avfilterText::contains)
         if (forbiddenImports.isNotEmpty()) {
             throw GradleException(
                 "${avfilter.name} still imports ${forbiddenImports.joinToString()}. " +
@@ -813,7 +1098,6 @@ val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRunt
     if (windowsLibmpvRuntimeDir?.exists() == true) {
         from(windowsLibmpvRuntimeDir) {
             include("*.dll")
-            exclude("player_bridge.dll")
             exclude(windowsUnusedLibmpvRuntimeDlls)
         }
         // mpv's VapourSynth filter opens this fixed filename at runtime. Ship the alias in the
@@ -836,6 +1120,8 @@ val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRunt
 // SPIRV-Tools copies. ~140MB removed from the shipped app.
 //
 // NOT excluded (reverted after real-world failures):
+// - libssl-3-x64.dll, libmpg123-0.dll: mpv 0.42 streams http(s) through libcurl (OpenSSL), and
+//   LAME 4.0 imports mpg123. Both were unreachable with mpv 0.41 / FFmpeg 8 and are not now.
 // - glslang.dll, SPIRV.dll, libSPIRV-Tools*.dll, libglslang-default-resource-limits.dll: static
 //   PE-import analysis showed libshaderc_shared.dll only imports Windows CRT DLLs, which read as
 //   "these are unused" — but that only rules out *static* linking, not a dynamically loaded
@@ -852,10 +1138,22 @@ val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRunt
 // - ggml*.dll / libwhisper-1.dll: Nuvio's FFmpeg build omits --enable-whisper, so avfilter has
 //   no imports from these libraries. prepareWindowsPlayerRuntime verifies that invariant before
 //   copying any DLLs, preventing an unmodified MSYS2 FFmpeg package from reintroducing them.
-val windowsUnusedLibmpvRuntimeDlls = listOf(
+// CI escape hatch: stock MSYS2 FFmpeg is built with --enable-whisper, so avfilter imports
+// libwhisper-1.dll/ggml*.dll. With -Pnuvio.windows.allowWhisperAvfilter=true the check below is
+// skipped and those DLLs are bundled (otherwise avfilter would fail to load). Release builds
+// with Nuvio's own FFmpeg leave this off and keep the strict check + exclusion.
+val windowsAllowWhisperAvfilter =
+    providers.gradleProperty("nuvio.windows.allowWhisperAvfilter").orNull?.toBoolean() == true
+
+val windowsUnusedLibmpvRuntimeDllsAll = listOf(
     "OpenCL.dll", "edit.dll",
     "ggml.dll", "ggml-base.dll", "ggml-blas.dll", "ggml-opencl.dll", "ggml-rpc.dll",
-    "ggml-vulkan.dll", "libwhisper-1.dll",
+    "ggml-vulkan.dll", "libwhisper-1.dll", "ggml-0.dll", "ggml-base-0.dll",
+    // llama.cpp / mtmd / parakeet arrive with whisper.cpp (MSYS2, 2026-11); nothing in the player imports them.
+    "libllama-0.dll", "libllama-common-0.dll", "libllama-batched-bench-impl.dll",
+    "libllama-bench-impl.dll", "libllama-cli-impl.dll", "libllama-completion-impl.dll",
+    "libllama-fit-params-impl.dll", "libllama-perplexity-impl.dll", "libllama-quantize-impl.dll",
+    "libllama-server-impl.dll", "libmtmd-0.dll", "libparakeet-1.dll",
     "ggml-cpu-alderlake.dll", "ggml-cpu-cannonlake.dll", "ggml-cpu-cascadelake.dll",
     "ggml-cpu-cooperlake.dll", "ggml-cpu-haswell.dll", "ggml-cpu-icelake.dll",
     "ggml-cpu-ivybridge.dll", "ggml-cpu-piledriver.dll", "ggml-cpu-sandybridge.dll",
@@ -863,9 +1161,11 @@ val windowsUnusedLibmpvRuntimeDlls = listOf(
     "ggml-cpu-x64.dll", "ggml-cpu-zen4.dll",
     "libFLAC++.dll", "libFLAC.dll", "libIex-3_4.dll", "libIlmThread-3_4.dll",
     "libImath-3_2.dll", "libOpenEXR-3_4.dll", "libOpenEXRCore-3_4.dll", "libOpenEXRUtil-3_4.dll",
+    "libIex-3_5.dll", "libIlmThread-3_5.dll", "libOpenEXR-3_5.dll", "libOpenEXRCore-3_5.dll",
+    "libOpenEXRUtil-3_5.dll",
     "libPyImath_Python3_14-3_2.dll", "libasprintf-0.dll", "libatomic-1.dll",
     "libcairo-script-interpreter-2.dll", "libcddb-2.dll",
-    "libcdio++-1.dll", "libcharset-1.dll", "libexif-12.dll", "libfftw3_omp-3.dll",
+    "libcdio++-1.dll", "libcdio++-2.dll","libcharset-1.dll", "libexif-12.dll", "libfftw3_omp-3.dll",
     "libfftw3_threads-3.dll", "libfftw3f-3.dll", "libfftw3f_omp-3.dll", "libfftw3f_threads-3.dll",
     "libfftw3l-3.dll", "libfftw3l_omp-3.dll", "libfftw3l_threads-3.dll", "libformw6.dll",
     "libgfortran-5.dll", "libgif-7.dll", "libgirepository-2.0-0.dll",
@@ -873,17 +1173,36 @@ val windowsUnusedLibmpvRuntimeDlls = listOf(
     "libgnutlsxx-30.dll", "libgthread-2.0-0.dll", "libharfbuzz-gobject-0.dll",
     "libharfbuzz-raster-0.dll", "libharfbuzz-subset-0.dll", "libharfbuzz-vector-0.dll",
     "libhwy_contrib.dll", "libhwy_test.dll", "libisl-23.dll", "libiso9660++-1.dll",
-    "libiso9660-12.dll", "liblcms2_fast_float-2.dll", "liblzo2-2.dll", "libmenuw6.dll",
-    "libmpc-3.dll", "libmpdec++-4.dll", "libmpdec-4.dll", "libmpfr-6.dll", "libmpg123-0.dll",
+    "libiso9660-12.dll", "libiso9660-13.dll","liblcms2_fast_float-2.dll", "liblzo2-2.dll", "libmenuw6.dll",
+    "libmpc-3.dll", "libmpdec++-4.dll", "libmpdec-4.dll", "libmpfr-6.dll",
     "libmysofa.dll", "libncurses++w6.dll", "libncursesw6.dll",
-    "libopenblas.dll", "libopenjph-0.27.dll", "libopenjpip-7.dll", "libout123-0.dll",
+    "libopenblas.dll", "libopenjph-0.27.dll", "libopenjph-0.32.dll","libopenjpip-7.dll", "libout123-0.dll",
     "libpanelw6.dll", "libpcre2-16-0.dll", "libpcre2-32-0.dll", "libpcre2-posix-3.dll",
-    "libpkgconf-7.dll", "libpython3.dll", "libquadmath-0.dll", "libsndfile-1.dll",
-    "libsoxr-lsr.dll", "libspeexdsp-1.dll", "libsqlite3-0.dll", "libssl-3-x64.dll",
+    "libpkgconf-7.dll", "libpkgconf-8.dll","libpython3.dll", "libquadmath-0.dll", "libsndfile-1.dll",
+    "libsoxr-lsr.dll", "libspeexdsp-1.dll", "libsqlite3-0.dll",
     "libsyn123-0.dll", "libsystre-0.dll", "libtheora-1.dll", "libtiffxx-6.dll", "libtre-5.dll",
     "libturbojpeg.dll", "libudf-0.dll", "libvamp-hostsdk.dll", "libvamp-sdk.dll",
     "libvorbisfile-3.dll", "libwebpdecoder-3.dll", "libwebpdemux-2.dll", "tcl86.dll", "tk86.dll",
 )
+
+// CI escape hatch #2: the exclusion list above was traced against Nuvio's own FFmpeg/mpv build.
+// A stock MSYS2 mpv/ffmpeg links a different set of optional libraries (libmysofa, libtheora,
+// libFLAC, libvorbisfile, libsndfile, ...), and dropping any DLL that avcodec/avfilter/libmpv
+// import makes LoadLibrary fail for libmpv-2.dll with a generic "Unable to load libmpv-2.dll".
+// -Pnuvio.windows.bundleFullRuntime=true ships every DLL from the runtime dir instead.
+val windowsBundleFullRuntime =
+    providers.gradleProperty("nuvio.windows.bundleFullRuntime").orNull?.toBoolean() == true
+
+val windowsUnusedLibmpvRuntimeDlls =
+    if (windowsBundleFullRuntime) {
+        emptyList()
+    } else if (windowsAllowWhisperAvfilter) {
+        windowsUnusedLibmpvRuntimeDllsAll.filterNot {
+            it.startsWith("ggml", ignoreCase = true) || it.equals("libwhisper-1.dll", ignoreCase = true)
+        }
+    } else {
+        windowsUnusedLibmpvRuntimeDllsAll
+    }
 
 val prepareWindowsPythonLib = tasks.register<Sync>("prepareWindowsPythonLib") {
     notCompatibleWithConfigurationCache("Bundles a curated minimal Python stdlib subset for VapourSynth/SVP scripting.")
@@ -960,6 +1279,22 @@ val leanDesktopJar = providers.gradleProperty("nuvio.desktop.leanJar")
     .map(String::toBoolean)
     .getOrElse(true)
 
+// Large desktop resources that rarely change. The app jar changes every release, so everything in
+// it is re-downloaded on every update; these ~30MB (compressed) instead ship as loose files under
+// <install>\resources\ with the same relative path, staged by the app-image step below, and only
+// download again when they actually change. Readers go through PackagedResources, which falls back
+// to the classpath — so with -Pnuvio.desktop.leanJar=false they simply stay in the jar.
+val externalDesktopResources = listOf(
+    "torrserver/**",
+    "backdrop-framing/**",
+    // fork:visualiser - the Beat This! beat grid models (about 11 MB).
+    "beat-tracking/**",
+    "anime-list-mini.json",
+    // Third-party licence texts, so they ship beside the binaries they cover (<install>esources\licenses).
+    "licenses/**",
+)
+val desktopResourcesSourceDir = layout.projectDirectory.dir("src/desktopMain/resources").asFile
+
 tasks.withType<Jar>().configureEach {
     if (isMacHost && name == "desktopJar") {
         dependsOn(buildMacosPlayerBridge)
@@ -987,6 +1322,10 @@ tasks.withType<Jar>().configureEach {
         from(windowsPythonLibOutput) {
             into("native/windows/pylib")
         }
+        // Shipped as loose files under <install>\resources instead; see externalDesktopResources.
+        if (leanDesktopJar) {
+            exclude(externalDesktopResources)
+        }
     }
 }
 
@@ -1008,17 +1347,18 @@ if (isWindowsHost) {
         "package",
         "packageDistributionForCurrentOS",
         "packageMsi",
-        "packageExe",
         "packageUberJarForCurrentOS",
         "packageReleaseDistributionForCurrentOS",
         "packageReleaseMsi",
-        "packageReleaseExe",
         "packageReleaseUberJarForCurrentOS",
     )
     tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
         dependsOn(
             buildWindowsPlayerBridge,
             buildWindowsNuvioEngine,
+            buildWindowsQuickJs,
+            buildWindowsWhisper,
+            buildWindowsUsenetEngine,
             prepareWindowsPlayerRuntime,
             generateWindowsPlayerRuntimeIndex,
             prepareWindowsPythonLib,
@@ -1044,24 +1384,73 @@ if (isWindowsHost) {
             // The engine DLL is staged beside Nuvio.exe only (not via the jar), so it must be an
             // input here or a rebuilt DLL never reaches an otherwise up-to-date app image.
             inputs.files(nuvioEngineOutput).optional()
+            inputs.files(quickJsOutput).optional()
+            inputs.files(whisperOutput).optional()
+            inputs.files(usenetOutput).optional()
+            inputs.files(
+                fileTree(desktopResourcesSourceDir) { include(externalDesktopResources) },
+            )
+            // jpackage clears this folder before writing the image. A build run from it in portable
+            // mode keeps the user's whole data folder (settings, sign-ins, caches) right here, so
+            // building would delete it — and zipping the folder for a release would publish it.
+            doFirst {
+                val imageDir = layout.buildDirectory.dir("compose/binaries/$relativeImagePath").get().asFile
+                val portableData = listOf("data", "data.old", "portable", "portable.txt")
+                    .map(imageDir::resolve)
+                    .filter { it.exists() }
+                if (portableData.isNotEmpty()) {
+                    throw GradleException(
+                        "Portable-mode data found in the build output, which this task would delete: " +
+                            portableData.joinToString { it.name } + " in $imageDir. Turn Portable Mode off " +
+                            "in Settings > Account and restart Nuvio once (that moves the data back to " +
+                            "AppData), then delete data.old and build again.",
+                    )
+                }
+            }
             doLast {
                 val imageDir = layout.buildDirectory.dir("compose/binaries/$relativeImagePath").get().asFile
                 check(imageDir.resolve("Nuvio.exe").isFile) {
                     "Windows app image was not created at $imageDir"
                 }
                 copy {
-                    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
                     from(windowsPlayerBridgeOutput)
                     from(windowsPlayerRuntimeOutput)
-                    if (nuvioEngineOutput.get().asFile.isFile) {
-                        from(nuvioEngineOutput)
-                    }
+                    from(nuvioEngineOutput)
+                    from(quickJsOutput)
+                    from(whisperOutput)
+                    // fork:usenet - optional: a build without Go ships without built-in Usenet.
+                    from(usenetOutput)
                     into(imageDir)
                 }
+                check(nuvioEngineOptional || nuvioEngineOutput.get().asFile.isFile) {
+                    "Nuvio Engine DLL was not built; a distributable must not ship without it. " +
+                        "Missing inputs: ${missingNuvioEngineInputs(resolveNuvioEngineCMake()).joinToString("; ").ifBlank { "(build failed, see buildWindowsNuvioEngine output)" }}"
+                }
+                check(nuvioEngineOptional || quickJsOutput.get().asFile.isFile) {
+                    "libquickjs.dll was not built (see buildWindowsQuickJs); a distributable must not fall back to quickjs-kt's unpatched copy."
+                }
+                check(nuvioEngineOptional || whisperOutput.get().asFile.isFile) {
+                    "nuvio_whisper.dll was not built; a distributable must not ship without voice control. " +
+                        "Missing inputs: ${missingWhisperInputs(resolveNuvioEngineCMake()).joinToString("; ").ifBlank { "(build failed, see buildWindowsWhisper output)" }}"
+                }
                 copy {
-                    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
                     from(windowsPythonLibOutput)
                     into(imageDir.resolve("lib/python3.14"))
+                }
+                if (leanDesktopJar) {
+                    // A previous build's copy would survive a resource that was since removed.
+                    delete(imageDir.resolve("resources"))
+                    copy {
+                        from(desktopResourcesSourceDir) {
+                            include(externalDesktopResources)
+                        }
+                        into(imageDir.resolve("resources"))
+                    }
+                    // TorrServer.exe is gitignored, so a checkout without it builds an image
+                    // without TorrServer exactly as the jar used to.
+                    if (!imageDir.resolve("resources/torrserver/windows-amd64/TorrServer.exe").isFile) {
+                        logger.warn("TorrServer.exe not found under $desktopResourcesSourceDir; the app image ships without it.")
+                    }
                 }
 
                 val requiredNativeFiles = listOf("player_bridge.dll") +
@@ -1145,6 +1534,16 @@ fun resolveDesktopChannel(override: String?, logger: org.gradle.api.logging.Logg
  * configuration cache on, a timestamp captured at configuration time would be replayed from the
  * cache and every build would claim the same moment.
  */
+/** The checkout's short HEAD commit, or null outside a git checkout. */
+fun gitShortCommit(repoRoot: File): String? = runCatching {
+    val process = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(repoRoot)
+        .redirectErrorStream(true)
+        .start()
+    val output = process.inputStream.bufferedReader().readText().trim()
+    if (process.waitFor() == 0) output.takeIf { it.matches(Regex("[0-9a-f]{6,40}")) } else null
+}.getOrNull()
+
 fun writeAppImageBuildInfo(
     appDir: File,
     versionName: String,
@@ -1159,14 +1558,7 @@ fun writeAppImageBuildInfo(
     // stamp nobody checks.
     val now = ZonedDateTime.now(ZoneOffset.UTC).withNano(0)
     val buildId = now.format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
-    val gitCommit = runCatching {
-        val process = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
-            .directory(repoRoot)
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().readText().trim()
-        if (process.waitFor() == 0) output.takeIf { it.matches(Regex("[0-9a-f]{6,40}")) } else null
-    }.getOrNull()
+    val gitCommit = gitShortCommit(repoRoot)
 
     val buildInfo = appDir.resolve("build-info.properties")
     buildInfo.writeText(
@@ -1241,7 +1633,9 @@ fun trimMaterialIconsExtendedJar(appDir: File, logger: org.gradle.api.logging.Lo
                     return@forEach
                 }
                 kept++
-                out.putNextEntry(ZipEntry(entry.name))
+                // The source entry's time, not now: an unchanged jar must trim to the same bytes,
+                // or everything downstream of the app image (native-image above all) reruns.
+                out.putNextEntry(ZipEntry(entry.name).apply { time = entry.time })
                 zip.getInputStream(entry).use { it.copyTo(out) }
                 out.closeEntry()
             }
@@ -1257,6 +1651,215 @@ fun trimMaterialIconsExtendedJar(appDir: File, logger: org.gradle.api.logging.Lo
     )
 }
 
+// The onnxruntime jar (hero backdrop framing) carries natives for five platforms, ~51MB; this
+// app only ever loads win-x64 (~6MB compressed). Drop the rest from the packaged copy.
+fun trimOnnxRuntimeJar(appDir: File, logger: org.gradle.api.logging.Logger) {
+    val ortJar = appDir
+        .listFiles { file -> file.isFile && file.name.startsWith("onnxruntime") && file.name.endsWith(".jar") }
+        ?.singleOrNull()
+        ?: return
+    val nativeRoot = "ai/onnxruntime/native/"
+    val keptNatives = "${nativeRoot}win-x64/"
+    val trimmed = File(ortJar.parentFile, "${ortJar.name}.trimmed")
+    var dropped = 0
+    ZipFile(ortJar).use { zip ->
+        check(zip.getEntry("${keptNatives}onnxruntime.dll") != null) {
+            "Refusing to trim ${ortJar.name}: it has no ${keptNatives}onnxruntime.dll, so its layout changed."
+        }
+        ZipOutputStream(trimmed.outputStream().buffered()).use { out ->
+            zip.entries().asSequence().forEach { entry ->
+                val keep = !entry.name.startsWith(nativeRoot) ||
+                    entry.name == nativeRoot ||
+                    entry.name.startsWith(keptNatives)
+                if (!keep) {
+                    dropped++
+                    return@forEach
+                }
+                // Same as the icons trim: keep the source time so the output is reproducible.
+                out.putNextEntry(ZipEntry(entry.name).apply { time = entry.time })
+                zip.getInputStream(entry).use { it.copyTo(out) }
+                out.closeEntry()
+            }
+        }
+    }
+    val sizeBefore = ortJar.length()
+    check(ortJar.delete()) { "Could not replace ${ortJar.absolutePath} with its trimmed copy" }
+    check(trimmed.renameTo(ortJar)) { "Could not move ${trimmed.absolutePath} into place" }
+    logger.lifecycle(
+        "Trimmed ${ortJar.name} to win-x64 natives: dropped $dropped entries " +
+            "(${sizeBefore / 1024 / 1024}MB -> ${ortJar.length() / 1024 / 1024}MB)",
+    )
+}
+
+// Opts Nuvio.exe into the Windows Segment Heap (Windows 10 2004+; older builds ignore the element).
+// Every malloc in the process — the JVM's own, Skia's decoded artwork, libmpv/ffmpeg — lands in the
+// process heap, and on the default NT heap a 2026-10-15 dump on Home showed 149 MB of its 436 MB
+// committed segment sitting in free blocks (34% external fragmentation) that it never decommits.
+// The launcher's jpackage manifest (DPI awareness, supportedOS) is kept; only <heapType> is added.
+// Perf-only, so a missing SDK tool warns instead of failing the build.
+fun enableSegmentHeap(exe: File, logger: org.gradle.api.logging.Logger) {
+    val mt = File("C:/Program Files (x86)/Windows Kits/10/bin").listFiles()
+        ?.filter { it.isDirectory && it.name.startsWith("10.") }
+        ?.sortedByDescending { it.name }
+        ?.map { it.resolve("x64/mt.exe") }
+        ?.firstOrNull(File::isFile)
+    if (mt == null || !exe.isFile) {
+        logger.warn("Segment Heap not enabled: ${if (mt == null) "mt.exe (Windows SDK) not found" else "$exe missing"}")
+        return
+    }
+    fun run(vararg args: String) {
+        val process = ProcessBuilder(mt.absolutePath, "-nologo", *args).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        check(process.waitFor() == 0) { "mt.exe ${args.joinToString(" ")} failed: $output" }
+    }
+    val manifest = File(exe.parentFile, "${exe.name}.manifest.tmp")
+    try {
+        run("-inputresource:${exe.absolutePath};#1", "-out:${manifest.absolutePath}")
+        val original = manifest.readText()
+        if ("SegmentHeap" in original) return
+        val closing = "</asmv3:windowsSettings>"
+        if (closing !in original) {
+            logger.warn("Segment Heap not enabled: launcher manifest has no $closing to extend")
+            return
+        }
+        manifest.writeText(
+            original.replace(
+                closing,
+                "<heapType xmlns=\"http://schemas.microsoft.com/SMI/2020/WindowsSettings\">SegmentHeap</heapType>$closing",
+            ),
+        )
+        // jpackage leaves the launcher read-only, which UpdateResource reports as "Access is denied".
+        val wasReadOnly = !exe.canWrite()
+        exe.setWritable(true)
+        try {
+            run("-manifest", manifest.absolutePath, "-outputresource:${exe.absolutePath};#1")
+        } finally {
+            if (wasReadOnly) exe.setReadOnly()
+        }
+        logger.lifecycle("Enabled Segment Heap in ${exe.name}")
+    } finally {
+        manifest.delete()
+    }
+}
+
+// Gives the bundled runtime the default CDS archive (bin/server/classes.jsa) a stock JDK ships
+// with and jlink leaves out. Without it every launch parses and verifies the ~1,300 JDK classes
+// the JVM needs before main() from lib/modules; with it they are mapped in from the archive. The
+// runtime keeps no java.exe (jpackage strips native commands), so the build JDK's launcher is
+// copied in for the dump and removed again — valid only because the runtime's jvm.dll is that
+// JDK's byte for byte, which is checked first. Startup-only, so any failure warns and skips.
+fun generateBaseCdsArchive(runtimeDir: File, logger: org.gradle.api.logging.Logger) {
+    val jdk = File(System.getProperty("java.home"))
+    val runtimeJvm = runtimeDir.resolve("bin/server/jvm.dll")
+    val jdkJvm = jdk.resolve("bin/server/jvm.dll")
+    val jdkJava = jdk.resolve("bin/java.exe")
+    if (!runtimeJvm.isFile || !jdkJvm.isFile || !jdkJava.isFile ||
+        !runtimeJvm.readBytes().contentEquals(jdkJvm.readBytes())
+    ) {
+        logger.warn("Base CDS archive not generated: the runtime's jvm.dll is not the build JDK's ($jdk)")
+        return
+    }
+    val java = runtimeDir.resolve("bin/java.exe")
+    val archive = runtimeDir.resolve("bin/server/classes.jsa")
+    try {
+        jdkJava.copyTo(java, overwrite = true)
+        val process = ProcessBuilder(java.absolutePath, "-Xshare:dump").redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        if (process.waitFor() != 0 || !archive.isFile) {
+            logger.warn("Base CDS archive not generated: java -Xshare:dump failed:\n$output")
+            archive.delete()
+            return
+        }
+        logger.lifecycle("Generated base CDS archive ${archive.name} (${archive.length() / 1024 / 1024} MB)")
+    } finally {
+        java.delete()
+    }
+}
+
+// Ships startup-classes.lst beside the jars, keyed to this image, so StartupClassPreloader replays
+// it on the first launch after an update instead of running its JFR learning pass (no preload plus
+// a recording: the slowest, jankiest launch a user saw). The runtime accepts it without a key
+// check — sitting beside these jars is what ties it to this build — so the header is informational.
+fun bundleStartupClassList(appDir: File, source: File, logger: org.gradle.api.logging.Logger) {
+    syncLearnedStartupClassList(source, logger)
+    if (!source.isFile) {
+        logger.warn("Startup class list not bundled: $source missing")
+        return
+    }
+    val body = source.readText()
+    appDir.resolve("startup-classes.lst").writeText("# nuvio-startup-classes bundled\n$body")
+    logger.lifecycle("Bundled startup class list (${body.lines().count { it.isNotBlank() }} lines)")
+}
+
+// Keeps the shipped list fresh without a manual step: when this machine has learned a list newer
+// than composeApp/startup-classes.lst (the app relearns on its own once the bundled list goes
+// stale), its body replaces the repo copy before bundling, ready to commit with the release.
+fun syncLearnedStartupClassList(target: File, logger: org.gradle.api.logging.Logger) {
+    val learned = File(System.getenv("LOCALAPPDATA").orEmpty(), "NuvioHTPC/startup-classes.lst")
+    if (!learned.isFile || (target.isFile && learned.lastModified() <= target.lastModified())) return
+    val lines = learned.readLines()
+    if (lines.firstOrNull()?.startsWith("# nuvio-startup-classes ") != true || lines.size < 1_000) return
+    target.writeText(lines.drop(1).joinToString("\n", postfix = "\n"))
+    logger.lifecycle("Updated ${target.name} from this machine's learned list ($learned, ${lines.size - 1} lines)")
+}
+
+// On by default; -Pnuvio.trainClassArchive=false skips it for a quick iteration loop (the first
+// launch of that build then trains instead, behind its "Preparing Nuvio…" window).
+val trainClassArchive = providers.gradleProperty("nuvio.trainClassArchive").orNull?.toBooleanStrictOrNull() ?: true
+
+// A build heading for the GraalVM native image uses createDistributable only for its jars:
+// native-image ignores the JVM's CDS archives (createNativeDistributable drops the .jsa), so
+// generating the base archive and training the app archive there is time thrown away.
+val buildingNativeImage = gradle.startParameter.taskNames.any { name ->
+    name.substringAfterLast(':') in setOf(
+        "generateNativeMetadata",
+        "nativeCompile",
+        "createNativeDistributable",
+        "nativeSmoke",
+        "packageNativeReleaseZip",
+    )
+}
+
+// Builds the dev image's app class archive now, so its first launch is already a fast one rather
+// than the training launch (AppClassArchiveTraining). Runs the packaged app with
+// --build-class-archive: no window and none of the app's startup, it loads the startup class list
+// and exits, which is when the JVM writes the archive. Startup-only, so a failure warns.
+fun trainClassArchive(imageDir: File, logFile: File, logger: org.gradle.api.logging.Logger) {
+    val exe = imageDir.resolve("Nuvio.exe")
+    val archive = imageDir.resolve("app/nuvio-app.jsa")
+    if (!exe.isFile) return
+    archive.delete()
+    logFile.parentFile.mkdirs()
+    val startedAt = System.currentTimeMillis()
+    val process = ProcessBuilder(exe.absolutePath, "--build-class-archive")
+        .directory(imageDir)
+        .redirectErrorStream(true)
+        .redirectOutput(logFile)
+        .start()
+    if (!process.waitFor(3, TimeUnit.MINUTES)) {
+        process.descendants().forEach { it.destroyForcibly() }
+        process.destroyForcibly()
+        logger.warn("Class archive training timed out; the first launch will train instead. See $logFile")
+        return
+    }
+    // The launcher may hand off to a child JVM; the archive is written while that one exits.
+    val exePath = exe.canonicalPath
+    val deadline = System.currentTimeMillis() + 60_000
+    while (System.currentTimeMillis() < deadline &&
+        ProcessHandle.allProcesses().anyMatch { handle ->
+            handle.info().command().map { it.equals(exePath, ignoreCase = true) }.orElse(false)
+        }
+    ) {
+        Thread.sleep(200)
+    }
+    val seconds = (System.currentTimeMillis() - startedAt) / 1000.0
+    if (archive.isFile) {
+        logger.lifecycle("Trained app class archive ${archive.name} (${archive.length() / 1024 / 1024} MB) in ${"%.1f".format(seconds)}s")
+    } else {
+        logger.warn("Class archive training wrote no archive (exit ${process.exitValue()}); the first launch will train instead. See $logFile")
+    }
+}
+
 val repoRootDir = rootProject.layout.projectDirectory.asFile
 
 mapOf(
@@ -1264,7 +1867,25 @@ mapOf(
     "createReleaseDistributable" to "main-release",
 ).forEach { (taskName, imageFlavor) ->
     tasks.matching { it.name == taskName }.configureEach {
-        notCompatibleWithConfigurationCache("Rewrites the packaged material-icons-extended jar in the app image.")
+        notCompatibleWithConfigurationCache("Rewrites the packaged material-icons-extended and onnxruntime jars in the app image.")
+        inputs.file(layout.projectDirectory.file("startup-classes.lst")).optional()
+        // So a JVM build after a native one regenerates the archives the native one skipped.
+        inputs.property("cdsArchives", !buildingNativeImage)
+        // The channel and commit are stamped into build-info.properties below, so they are inputs:
+        // otherwise a stable build right after a nightly (or a nightly right after a stable) from
+        // unchanged code is UP-TO-DATE and ships the other channel's image with the old stamp.
+        // createNativeDistributable copies build-info.properties, so the native zip follows.
+        inputs.property("nuvioDesktopChannel", provider { resolveDesktopChannel(desktopChannelOverride, logger) })
+        // providers.exec, not ProcessBuilder: the configuration cache resolves inputs when it stores
+        // the build, and only allows external processes started this way.
+        inputs.property(
+            "nuvioGitCommit",
+            providers.exec {
+                commandLine("git", "rev-parse", "--short", "HEAD")
+                workingDir = repoRootDir
+                isIgnoreExitValue = true
+            }.standardOutput.asText.map { it.trim() },
+        )
         doLast {
             val binariesDir = layout.buildDirectory.dir("compose/binaries/$imageFlavor/app").get().asFile
             val appDir = listOf("Nuvio/app", "Nuvio.app/Contents/app", "nuvio/lib/app")
@@ -1272,6 +1893,13 @@ mapOf(
                 .firstOrNull(File::isDirectory)
             check(appDir != null) { "No packaged app directory found under $binariesDir" }
             trimMaterialIconsExtendedJar(appDir, logger)
+            trimOnnxRuntimeJar(appDir, logger)
+            // After the jar trims above: the key covers jar sizes, which they change.
+            bundleStartupClassList(appDir, layout.projectDirectory.file("startup-classes.lst").asFile, logger)
+            if (isWindowsHost) {
+                enableSegmentHeap(appDir.parentFile.resolve("Nuvio.exe"), logger)
+                if (!buildingNativeImage) generateBaseCdsArchive(appDir.parentFile.resolve("runtime"), logger)
+            }
             writeAppImageBuildInfo(
                 appDir = appDir,
                 versionName = desktopReleaseVersionName,
@@ -1280,6 +1908,12 @@ mapOf(
                 repoRoot = repoRootDir,
                 logger = logger,
             )
+            // Last: the archive is validated against the exact jars, so nothing may change them
+            // after it is written. Dev images only — a release zip must not carry a 100 MB archive
+            // tied to this machine's files; installs train their own on first launch.
+            if (isWindowsHost && imageFlavor == "main" && trainClassArchive && !buildingNativeImage) {
+                trainClassArchive(appDir.parentFile, layout.buildDirectory.file("tmp/class-archive-training.log").get().asFile, logger)
+            }
         }
     }
 }
@@ -1319,13 +1953,35 @@ kotlin {
             // variants. Desktop pulls in the extractor and the resolver actual and
             // provides its own TrailerExtractionPlatform (java.net.http based).
             kotlin.srcDir(fullCommonSourceDir.resolve("com/nuvio/app/features/trailer"))
+            // The album player resolves tracks through YouTube Music (MusicResolver, MusicMetadataClient),
+            // which reaches into the trailer extractor above.
+            kotlin.srcDir(fullCommonSourceDir.resolve("com/nuvio/app/features/music"))
+            if (innerTubeXEnabled) {
+                // The second-chance stream lookup for age-gated tracks (InnerTubeXFallback.kt). Found at
+                // runtime by name, so the app builds and runs the same without it.
+                kotlin.srcDir(project.file("src/desktopMain/innertubex/kotlin"))
+            }
             dependencies {
+                if (innerTubeXEnabled) {
+                    implementation("com.github.MetrolistGroup.innertubex:innertubex:v0.11.2")
+                    implementation("io.ktor:ktor-client-okhttp:${libs.versions.ktor.get()}")
+                    implementation("io.ktor:ktor-client-content-negotiation:${libs.versions.ktor.get()}")
+                    implementation("io.ktor:ktor-serialization-kotlinx-json:${libs.versions.ktor.get()}")
+                }
                 implementation(compose.desktop.currentOs)
                 implementation(libs.kotlinx.coroutines.swing)
                 implementation(libs.ktor.client.cio)
-                implementation("com.squareup.okhttp3:okhttp:4.12.0")
+                // 5.x: InnerTubeX's Ktor OkHttp engine resolves it there anyway, so state what ships.
+                implementation("com.squareup.okhttp3:okhttp:5.3.2")
+                // fork:music - reads MusicBrainz's .tar.xz data dumps for the offline copy (pure Java, public domain).
+                implementation("org.tukaani:xz:1.10")
                 implementation(libs.quickjs.kt)
                 implementation(libs.ksoup)
+                // Automatic hero backdrop framing (U2-Netp saliency + YuNet faces). The packaged jar
+                // is trimmed to its win-x64 natives; see trimOnnxRuntimeJar.
+                implementation("com.microsoft.onnxruntime:onnxruntime:1.31.0")
+                // fork:phone-remote - the QR code in Settings that the phone scans to pair (ZXing's encoder, Apache 2.0).
+                implementation("com.google.zxing:core:3.5.3")
             }
         }
         commonMain.dependencies {
@@ -1338,6 +1994,7 @@ kotlin {
             implementation(libs.compose.material3)
             implementation(compose.materialIconsExtended)
             implementation(libs.compose.ui)
+            implementation(libs.compose.ui.backhandler)
             implementation(libs.compose.components.resources)
             implementation(libs.compose.uiToolingPreview)
             implementation(libs.androidx.lifecycle.viewmodelCompose)
@@ -1349,10 +2006,13 @@ kotlin {
             implementation(libs.supabase.postgrest)
             implementation(libs.supabase.auth)
             implementation(libs.supabase.functions)
+            implementation(libs.supabase.realtime)
             implementation(libs.reorderable)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
+            // Media-server provider tests (features/servers) answer through Ktor's mock engine.
+            implementation("io.ktor:ktor-client-mock:${libs.versions.ktor.get()}")
         }
         val desktopTest by getting {
             dependencies {
@@ -1362,6 +2022,9 @@ kotlin {
                 implementation(compose.desktop.currentOs)
                 @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
                 implementation(compose.uiTest)
+                // Serves byte ranges to the AutoSync embedded-subtitle index loader tests.
+                // Must match OkHttp's major version: 4.x needs okhttp3.internal.Util, gone in OkHttp 5.
+                implementation("com.squareup.okhttp3:mockwebserver:5.3.2")
             }
         }
     }
@@ -1372,10 +2035,35 @@ kotlin {
 // opt-in: run them with `-Pnuvio.focusTests` before shipping input changes, and on CI where nobody
 // is at the keyboard.
 tasks.withType<Test>().configureEach {
+    // DesktopStorage would otherwise read and write the real %LOCALAPPDATA%/NuvioHTPC, including
+    // moving its settings into account folders the first time a test opens a store.
+    val testDataDir = layout.buildDirectory.dir("test-data-dir").get().asFile
+    systemProperty("nuvio.desktop.dataDir", testDataDir.absolutePath)
+    doFirst { testDataDir.deleteRecursively() }
     systemProperty(
         "nuvio.focusTests",
         (providers.gradleProperty("nuvio.focusTests").orNull ?: "false").ifBlank { "true" },
     )
+    // Plugin tests run on the patched libquickjs.dll the app ships, not the jar's own copy.
+    dependsOn(buildWindowsQuickJs)
+    val quickJsDll = quickJsOutput
+    inputs.files(quickJsDll).optional()
+    doFirst {
+        quickJsDll.get().asFile.takeIf(File::isFile)?.let { dll ->
+            systemProperty("com.dokar.quickjs.library.path", dll.parentFile.absolutePath)
+        }
+    }
+    // fork:voice-control - WhisperTranscriberTest runs on the built DLL with a model passed as
+    // -Pnuvio.whisperTestModel=<path to a ggml .bin>; without both it skips.
+    val whisperDll = whisperOutput
+    inputs.files(whisperDll).optional()
+    doFirst {
+        whisperDll.get().asFile.takeIf(File::isFile)?.let { dll ->
+            systemProperty("nuvio.whisper.library", dll.absolutePath)
+        }
+    }
+    systemProperty("nuvio.whisperTestModel", providers.gradleProperty("nuvio.whisperTestModel").orNull ?: "")
+    systemProperty("nuvio.whisperTestAudio", whisperSourceDir.resolve("samples/jfk.wav").absolutePath)
     // Opt-in live-swarm probe for the P2P engine (NuvioEngineNetworkProbeTest); off by default.
     systemProperty("nuvio.p2pProbeHash", providers.gradleProperty("nuvio.p2pProbeHash").orNull ?: "")
     systemProperty("nuvio.p2pProbePreloadMb", providers.gradleProperty("nuvio.p2pProbePreloadMb").orNull ?: "")
@@ -1393,17 +2081,31 @@ compose.desktop {
         mainClass = "com.nuvio.app.MainKt"
         val smokePlayerUrl = providers.gradleProperty("nuvio.desktop.smokePlayerUrl").orNull
             ?: System.getenv("NUVIO_DESKTOP_SMOKE_PLAYER_URL")
-        // OpenGL everywhere, matching DesktopRendererApi's default and what Settings shows.
-        // This was DIRECT3D on Windows as an experiment (sharing one graphics API with mpv's D3D11
-        // video surface), but it silently won on any install that had never saved the renderer
-        // setting, so new users ran Direct3D while the UI told them OpenGL. Measured 2026-09-07:
-        // D3D is not a win anyway — it helps the expensive display modes and hurts the cheap ones,
-        // and has a ~3 ms per-frame floor OpenGL does not. It remains selectable in Settings as the
-        // compatibility option it is described as.
-        val skikoRenderApi = "OPENGL"
+        // Direct3D, matching DesktopRendererApi's default and what Settings shows. main() overwrites
+        // this from the saved setting before the first window, so it only matters if that step
+        // fails. OpenGL was the default in 1.15.0 and
+        // black-screened fullscreen playback on some drivers (see DesktopRendererApi). The
+        // 2026-09-07 measurement still holds — D3D has a ~3 ms per-frame floor OpenGL does not —
+        // which is why OpenGL stays selectable in Settings.
+        val skikoRenderApi = "DIRECT3D"
         jvmArgs += listOfNotNull(
             "-Dapple.awt.application.appearance=NSAppearanceNameDarkAqua",
             "-Dskiko.renderApi=$skikoRenderApi",
+            // Java2D's own Direct3D 9 pipeline. Compose draws through Skiko (D3D12/OpenGL) and mpv
+            // through D3D11, so Java2D only paints the tray-menu dialog and the empty SwingPanel
+            // hosts — not worth a third GPU device (and its driver memory) in the process. GDI
+            // draws those few Swing pieces instead.
+            "-Dsun.java2d.d3d=false",
+            // App class-data sharing (JDK 19+). The JVM maps Nuvio's and its libraries' classes
+            // pre-parsed and pre-verified from this archive instead of loading them out of the jars,
+            // which was most of startup. Missing or stale (an update, a new JDK), the launch runs
+            // normally and the JVM writes a fresh one at exit. It sits on the base archive that
+            // generateBaseCdsArchive adds to the runtime. Never shipped: it is built on each machine.
+            if (isWindowsHost) "-XX:+AutoCreateSharedArchive" else null,
+            if (isWindowsHost) "-XX:SharedArchiveFile=\$APPDIR/nuvio-app.jsa" else null,
+            // Lets AppClassArchive ask the JDK whether this launch is building the archive
+            // (jdk.internal.misc.CDS.isDumpingArchive), which decides AppClassArchiveTraining.
+            if (isWindowsHost) "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED" else null,
             "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
@@ -1411,32 +2113,22 @@ compose.desktop {
             // Native-crash diagnostics (chasing the silent, log-less CTD on plugin users —
             // suspected QuickJS/JNI access violation). On an EXCEPTION_ACCESS_VIOLATION the
             // HotSpot handler writes an hs_err_pid<pid>.log naming the faulting native module,
-            // and CreateCoredumpOnCrash drops a .mdmp with the native stack beside it. Pinned to
-            // C:\Users\Public (always exists + world-writable, so it survives an install under
-            // Program Files) with %p to avoid PID collisions — ErrorFile is a static startup flag
-            // that can't expand %LOCALAPPDATA% into the per-user log dir, so on the next launch
-            // relocateNativeCrashArtifacts() in DesktopFileLogging.kt moves these files into
-            // %LOCALAPPDATA%\NuvioHTPC\logs beside nuvio.log. Windows-only; harmless if empty.
+            // and CreateCoredumpOnCrash drops a .mdmp with the native stack in the working
+            // directory. ErrorFile is a static startup flag that can't expand %LOCALAPPDATA%, so it
+            // points at the app image ($APPDIR, expanded by the jpackage launcher; in a Gradle run
+            // or an unwritable install the JVM falls back to the working directory, then TEMP), and
+            // relocateJvmDiagnosticArtifacts() in DesktopFileLogging.kt moves both into
+            // %LOCALAPPDATA%\NuvioHTPC\logs on the next launch, keeping the newest two dumps.
+            // (It used to be C:\Users\Public, which every local account can read and pre-create.)
             // NOTE: this does NOT catch abort()/fast-fail exits (e.g. a QuickJS assert) which
             // bypass the SEH handler — those need WER LocalDumps. No -Xrs is set, so the handler
             // stays installed.
-            if (isWindowsHost) "-XX:ErrorFile=C:/Users/Public/nuvio_hs_err_pid%p.log" else null,
+            if (isWindowsHost) "-XX:ErrorFile=\$APPDIR/nuvio_hs_err_pid%p.log" else null,
             if (isWindowsHost) "-XX:+CreateCoredumpOnCrash" else null,
-            // Stop-the-world diagnostics (chasing the intermittent "UI froze then recovered"
-            // hitch). A safepoint halts every Java thread — the Compose UI thread and all
-            // coroutines — so a long one freezes the window and can't log a thing about itself:
-            // nuvio.log just stops mid-burst with no error. Reconstructing one after the fact
-            // from the JVM's cumulative counters only gets you a total (a real case: 7.7s at
-            // safepoints across 57 of them, of which GC was 0.07s — so it was NOT GC, but the
-            // counters can't say which VM operation it was). This names each operation and
-            // splits reaching-the-safepoint from time-spent-at-it, which separates "the app
-            // allocated too hard" from "the OS wasn't scheduling/paging our threads back in".
-            // Cheap: one line per safepoint, capped at 3x2MB. Same fixed-path reasoning as
-            // ErrorFile above — relocateJvmDiagnosticArtifacts() moves these next to nuvio.log.
-            if (isWindowsHost) {
-                "-Xlog:safepoint,gc:file=C:/Users/Public/nuvio_safepoint_pid%p.log" +
-                    ":time,uptime,level,tags:filesize=2m,filecount=3"
-            } else null,
+            // The stop-the-world (safepoint + GC) log is no longer a startup flag: it was
+            // -Xlog:...:file=C:/Users/Public/... only because -Xlog cannot expand %LOCALAPPDATA%.
+            // enableSafepointLog() in DesktopFileLogging.kt turns it on from main() via VM.log,
+            // straight into the per-user logs folder.
             // Return idle heap to the OS. G1 only uncommits regions at the end of a concurrent
             // cycle, and with no flags set nothing triggers one while the app sits still — so the
             // heap ratchets up to whatever the busiest moment needed and stays there for the rest
@@ -1490,14 +2182,29 @@ compose.desktop {
             "-XX:+ExplicitGCInvokesConcurrent",
             "-XX:MinHeapFreeRatio=10",
             "-XX:MaxHeapFreeRatio=30",
+            // A ceiling, so allocation bursts cannot balloon the young generation. With no -Xmx
+            // the JVM allowed 1/4 of RAM (8 GB on a 32 GB machine), and fast Home scrolling grew
+            // the committed heap to 1,260 MB against a ~380 MB live set, which was the whole
+            // 2.3 GB working-set peak (2026-10-16, Docs/plans/image-memory-plan.md). Live data
+            // peaked ~550 MB in that day's logs, so 1 GB leaves ~2x headroom; if an
+            // OutOfMemoryError ever appears in nuvio.log, raise this rather than remove it.
+            "-Xmx1g",
+            // fork:huge-methods - HotSpot never JIT-compiles a method over 8000 bytes of bytecode, so it runs in the
+            // interpreter for the whole session. The CI step "Huge methods (summary)" (scripts/huge-methods.py) found 28 of
+            // them on 2026-11-10, and they are composables that run again on every recomposition: HomeScreen 47,570 bytes,
+            // MetaDetailsScreen 31,076, MainAppContent 27,858, AlbumContent 19,795, DesktopHomeHeroFrame 17,071,
+            // YouTubeTabScreen 15,954, StreamsScreen 9,643 and others. This lets the compiler take them. Cost: compile time
+            // on the background compiler threads for those few methods. If Home hitches in its first minute, or CPU stays
+            // high after start, take this line out and say so in TESTING.md; the better long-term fix is splitting them.
+            "-XX:-DontCompileHugeMethods",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
         )
 
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Exe, TargetFormat.Deb)
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Nuvio"
             packageVersion = desktopReleasePackageVersion
-            vendor = "Nuvio Media"
+            vendor = desktopPublisher
             // Becomes the exe's FileDescription, which is the name Explorer shows for a pin made
             // straight from Nuvio.exe (and the taskbar tooltip). The exe itself stays Nuvio.exe:
             // the in-place updater, taskbar pins and the official app's shortcut-name checks all
@@ -1545,4 +2252,675 @@ compose.desktop {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// GraalVM native image (Docs/plans/native-image-shipping.md, step 2). These replace the spike's
+// tools\ni-spike scripts. None of them runs as part of createDistributable or a normal build:
+//
+//   nativeImageTrace           run the JVM app image on GraalVM's JVM with the tracing agent
+//                              (user-driven; merges into native-image/agent/)
+//   nativeCompile              native-image over createDistributable's jars -> build/native-image/work
+//   createNativeDistributable  lay that out like the jpackage image -> build/native-image/Nuvio
+//   packageNativeReleaseZip    zip it as the release asset -> build/native-image/release/Nuvio.zip
+//
+// GraalVM for JDK 25 comes from -Pnuvio.graalvm.home, GRAALVM_HOME or local.properties. The build
+// takes ~2.5 min and peaks at ~12 GB RSS in its own process; afterwards run `gradlew --stop` and
+// kill leftover java.exe (a Kotlin daemon has been seen at 5 GB).
+// ---------------------------------------------------------------------------------------------
+val nativeImageInputsDir = layout.projectDirectory.dir("native-image")
+val nativeJvmAppImageDir = layout.buildDirectory.dir("compose/binaries/main/app/Nuvio")
+val nativeImageWorkDir = layout.buildDirectory.dir("native-image/work")
+val nativeImageDistDir = layout.buildDirectory.dir("native-image/Nuvio")
+val nativeImageReleaseDir = layout.buildDirectory.dir("native-image/release")
+// -march=native would build for this PC's CPU only (illegal-instruction crash elsewhere);
+// `compatibility` measured the same as `native` on a Ryzen 9 5900X (plan step 2b).
+val nativeImageMarch = providers.gradleProperty("nuvio.native.march").orNull?.trim()
+    ?.takeIf { it.isNotEmpty() } ?: "compatibility"
+// -Pnuvio.native.qa=true: a test build that REPORTS each missing reflection / JNI / resource /
+// serialization registration (with a stack trace) and carries on, instead of failing later at an
+// arbitrary point. Used like a nightly, its native-qa-console.log lists every metadata gap the
+// session hit (plan step 3). Never ship it.
+val nativeImageQa = providers.gradleProperty("nuvio.native.qa").orNull.toBoolean()
+// -Pnuvio.native.quick=true: GraalVM's quick build mode (-Ob) for local iteration. Skips most of the
+// compiler's optimisation work, so the image builds faster and runs somewhat slower. Never ship it.
+val nativeImageQuick = providers.gradleProperty("nuvio.native.quick").orNull.toBoolean()
 
+fun resolveGraalVmHome(): File {
+    val candidates = listOfNotNull(
+        localOrEnvProperty("nuvio.graalvm.home"),
+        localOrEnvProperty("GRAALVM_HOME"),
+        "C:/Software/Claude/tools/graalvm25/graalvm-community-25.4.4.1.1+1.1",
+    ).map(::File)
+    val home = candidates.firstOrNull { it.resolve("bin/native-image.cmd").isFile }
+        ?: throw GradleException(
+            "GraalVM for JDK 25 was not found. Pass -Pnuvio.graalvm.home=C:/path/to/graalvm or set GRAALVM_HOME.",
+        )
+    val javaVersion = home.resolve("release").takeIf { it.isFile }?.readText()
+        ?.let { Regex("JAVA_VERSION=\"([^\"]+)\"").find(it)?.groupValues?.get(1) }
+    if (javaVersion == null || !javaVersion.startsWith("25")) {
+        // CE 21.0.2 cannot build the app (Kotlin suspend try/catch parser bug), and the metadata
+        // targets the JDK 25 class library.
+        throw GradleException("native-image needs GraalVM for JDK 25; $home is ${javaVersion ?: "an unknown version"}.")
+    }
+    return home
+}
+
+fun resolveWindowsVcvars(): File {
+    windowsVcvarsPath?.let { path ->
+        return File(path).takeIf { it.isFile }
+            ?: throw GradleException("-Pnuvio.windows.vcvars.path points at a missing file: $path")
+    }
+    if (windowsVsWhere.isFile) {
+        val found = ProcessBuilder(
+            windowsVsWhere.absolutePath, "-latest", "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-find", windowsVcvarsRelativePath,
+        ).redirectErrorStream(true).start().inputStream.bufferedReader().readText()
+            .lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }
+        if (found != null && File(found).isFile) return File(found)
+    }
+    throw GradleException(
+        "Visual Studio C++ toolchain was not found. Install MSVC or pass -Pnuvio.windows.vcvars.path=C:\\path\\to\\vcvars64.bat.",
+    )
+}
+
+/** What jpackage's Nuvio.cfg says about the app: classpath, main class, JVM options. */
+class NativeAppImageConfig(val classpath: List<String>, val mainClass: String, val javaOptions: List<String>)
+
+fun readNativeAppImageConfig(appDir: File): NativeAppImageConfig {
+    val lines = appDir.resolve("Nuvio.cfg").readLines()
+    fun values(key: String) = lines.filter { it.startsWith("$key=") }
+        .map { it.substringAfter('=').replace("\$APPDIR", appDir.absolutePath) }
+    return NativeAppImageConfig(
+        classpath = values("app.classpath"),
+        mainClass = values("app.mainclass").single(),
+        javaOptions = values("java-options"),
+    )
+}
+
+fun isRunningFrom(exe: File): Boolean {
+    val target = exe.absoluteFile.normalize()
+    return ProcessHandle.allProcesses().anyMatch { process ->
+        process.info().command().map { File(it).absoluteFile.normalize() == target }.orElse(false)
+    }
+}
+
+// ---- Generated metadata (plan step 4) --------------------------------------------------------
+// Entries that follow a rule are derived at build time, so a new @Serializable class or a new JNI
+// lookup in the app's C++ can never be the one somebody forgot to list.
+val nativeImageGeneratedDir = layout.buildDirectory.dir("native-image/generated")
+val nativeJniSources = fileTree("src/desktopMain/native") {
+    include("windows/**/*.cpp", "windows/**/*.c", "nuvio-engine/**/*.cpp", "nuvio-engine/**/*.c")
+    include("whisper-jni/**/*.cpp") // fork:voice-control - String(byte[], String) for the transcript
+}
+
+/** One `reflection` entry of a reachability-metadata.json. */
+class NativeMetadataEntry(val type: String) {
+    var allDeclared = false
+    var jniAccessible = false
+    val methods = sortedMapOf<String, List<String>>()
+    val fields = sortedSetOf<String>()
+
+    fun toMap(): Map<String, Any> = buildMap {
+        put("type", type)
+        if (jniAccessible) put("jniAccessible", true)
+        if (allDeclared) {
+            put("allDeclaredConstructors", true)
+            put("allDeclaredMethods", true)
+            put("allDeclaredFields", true)
+        }
+        if (methods.isNotEmpty()) {
+            put("methods", methods.map { (key, params) -> mapOf("name" to key.substringBefore('('), "parameterTypes" to params) })
+        }
+        if (fields.isNotEmpty()) put("fields", fields.map { mapOf("name" to it) })
+    }
+}
+
+/**
+ * Serializers: every `X$$serializer` in the app's jars registers `X`, `X$Companion` (when it
+ * exists) and `X$$serializer`, plus every named class of `kotlinx.serialization.json`. Native
+ * sign-in once failed with "Serializer for class 'JsonLiteral' is not found" because one of these
+ * was missing; the spike listed ~1,900 of them by hand.
+ */
+fun collectSerializerTypes(jars: Collection<File>): Set<String> {
+    val classes = HashSet<String>()
+    jars.forEach { jar ->
+        ZipFile(jar).use { zip ->
+            zip.entries().asSequence()
+                .map { it.name }
+                .filter { it.endsWith(".class") && !it.startsWith("META-INF/") }
+                .mapTo(classes) { it.removeSuffix(".class").replace('/', '.') }
+        }
+    }
+    val anonymous = Regex("""\$\d""")
+    return buildSet {
+        classes.filter { it.endsWith("\$\$serializer") }.forEach { serializer ->
+            val owner = serializer.removeSuffix("\$\$serializer")
+            add(owner)
+            add(serializer)
+            "$owner\$Companion".takeIf { it in classes }?.let(::add)
+        }
+        classes.filter { name ->
+            name.startsWith("kotlinx.serialization.json.") &&
+                '.' !in name.removePrefix("kotlinx.serialization.json.") &&
+                !anonymous.containsMatchIn(name)
+        }.forEach(::add)
+    }
+}
+
+/** `(Ljava/lang/String;[BJ)V` -> `["java.lang.String", "byte[]", "long"]`. */
+fun jniParameterTypes(signature: String): List<String> {
+    val params = signature.substringAfter('(').substringBefore(')')
+    val primitives = mapOf('Z' to "boolean", 'B' to "byte", 'C' to "char", 'S' to "short", 'I' to "int", 'J' to "long", 'F' to "float", 'D' to "double")
+    val result = mutableListOf<String>()
+    var i = 0
+    while (i < params.length) {
+        var dims = 0
+        while (params[i] == '[') { dims++; i++ }
+        val base = if (params[i] == 'L') {
+            val end = params.indexOf(';', i)
+            params.substring(i + 1, end).replace('/', '.').also { i = end + 1 }
+        } else {
+            (primitives[params[i]] ?: throw GradleException("Unknown JNI type '${params[i]}' in $signature")).also { i++ }
+        }
+        result += base + "[]".repeat(dims)
+    }
+    return result
+}
+
+/**
+ * Bridge JNI: the `FindClass` / `Get[Static]MethodID` / `Get[Static]FieldID` / `ThrowNew` literals
+ * in the app's own C++. A playback failover loop once came from an unregistered sink class. Each
+ * member lookup must name its class through a variable assigned from `FindClass("…")`; anything
+ * else (`GetObjectClass`, an inline expression) fails the build here rather than at run time.
+ */
+fun collectJniEntries(sources: Collection<File>, into: MutableMap<String, NativeMetadataEntry>) {
+    val call = """(?:env->|\(\*env\)->)"""
+    val envArg = """(?:env\s*,\s*)?"""
+    val token = Regex(
+        """(\w+)\s*=\s*$call""" + """FindClass\(\s*$envArg"([^"]+)"\s*\)""" + // 1 var, 2 class
+            """|${call}FindClass\(\s*$envArg"([^"]+)"""" + // 3 class
+            """|${call}Get(?:Static)?MethodID\(\s*$envArg(\w+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"""" + // 4 var, 5 name, 6 sig
+            """|${call}Get(?:Static)?FieldID\(\s*$envArg(\w+)\s*,\s*"([^"]+)"""" + // 7 var, 8 name
+            """|${call}ThrowNew\(\s*$envArg(\w+)""" + // 9 var
+            """|${call}(GetObjectClass|Get(?:Static)?(?:Method|Field)ID)\(""", // 10 anything unparsed
+    )
+    sources.sortedBy { it.path }.forEach { source ->
+        val text = source.readText()
+        val classOf = mutableMapOf<String, String>()
+        fun entry(jniName: String) = into.getOrPut(jniName.replace('/', '.')) { NativeMetadataEntry(jniName.replace('/', '.')) }
+            .apply { jniAccessible = true }
+        fun owner(variable: String, at: Int): NativeMetadataEntry {
+            val name = classOf[variable] ?: throw GradleException(
+                "${source.name}:${text.take(at).count { it == '\n' } + 1}: JNI lookup on '$variable', which is not assigned " +
+                    "from FindClass(\"…\") in this file, so its native-image metadata cannot be generated.",
+            )
+            return entry(name)
+        }
+        token.findAll(text).forEach { match ->
+            val g = match.groupValues
+            when {
+                g[1].isNotEmpty() -> { classOf[g[1]] = g[2]; entry(g[2]) }
+                g[3].isNotEmpty() -> entry(g[3])
+                g[4].isNotEmpty() -> owner(g[4], match.range.first).methods["${g[5]}${g[6]}"] = jniParameterTypes(g[6])
+                g[7].isNotEmpty() -> owner(g[7], match.range.first).fields += g[8]
+                g[9].isNotEmpty() -> owner(g[9], match.range.first).methods["<init>(Ljava/lang/String;)V"] = listOf("java.lang.String")
+                else -> throw GradleException(
+                    "${source.name}:${text.take(match.range.first).count { it == '\n' } + 1}: ${g[10]} call the native-image " +
+                        "metadata generator cannot resolve; look classes up with FindClass(\"literal\") into a variable.",
+                )
+            }
+        }
+    }
+}
+
+val generateNativeMetadata = tasks.register("generateNativeMetadata") {
+    group = "native image"
+    description = "Generates the rule-based native-image metadata (serializers, bridge JNI) into build/native-image/generated."
+    notCompatibleWithConfigurationCache("Uses the script-level metadata generator functions.")
+    dependsOn("createDistributable")
+    val jars = nativeJvmAppImageDir.map { image -> fileTree(image.dir("app")) { include("*.jar") } }
+    inputs.files(jars)
+    inputs.files(nativeJniSources)
+    outputs.dir(nativeImageGeneratedDir)
+    doLast {
+        val entries = sortedMapOf<String, NativeMetadataEntry>()
+        collectSerializerTypes(jars.get().files).forEach { type ->
+            entries.getOrPut(type) { NativeMetadataEntry(type) }.allDeclared = true
+        }
+        val serializerCount = entries.size
+        collectJniEntries(nativeJniSources.files, entries)
+        val out = nativeImageGeneratedDir.get().asFile.apply { deleteRecursively(); mkdirs() }
+        val json = groovy.json.JsonOutput.prettyPrint(
+            groovy.json.JsonOutput.toJson(mapOf("reflection" to entries.values.map { it.toMap() })),
+        )
+        // UTF-8 without a BOM: native-image refuses a BOM (see native-image/README.md).
+        out.resolve("reachability-metadata.json").writeText(json + "\n", Charsets.UTF_8)
+        logger.lifecycle("Generated native-image metadata: $serializerCount serializer types, ${entries.size - serializerCount} more from bridge JNI -> $out")
+    }
+}
+
+val nativeCompile = tasks.register<Exec>("nativeCompile") {
+    group = "native image"
+    description = "Compiles createDistributable's jars into a native Nuvio.exe with GraalVM native-image."
+    notCompatibleWithConfigurationCache("Runs GraalVM native-image inside a host-local MSVC environment.")
+    enabled = isWindowsHost
+    dependsOn("createDistributable", generateNativeMetadata)
+    inputs.dir(nativeImageInputsDir)
+    inputs.dir(nativeImageGeneratedDir)
+    inputs.files(nativeJvmAppImageDir.map { image -> fileTree(image.dir("app")) { include("*.jar", "Nuvio.cfg") } })
+    inputs.property("march", nativeImageMarch)
+    inputs.property("qa", nativeImageQa)
+    inputs.property("quick", nativeImageQuick)
+    inputs.property("version", desktopReleaseVersionName)
+    outputs.dir(nativeImageWorkDir)
+    isIgnoreExitValue = true
+    doFirst {
+        val graal = resolveGraalVmHome()
+        val vcvars = resolveWindowsVcvars()
+        val work = nativeImageWorkDir.get().asFile.apply { deleteRecursively(); mkdirs() }
+        val appDir = nativeJvmAppImageDir.get().asFile.resolve("app")
+        val cfg = readNativeAppImageConfig(appDir)
+        val metadataRoot = nativeImageInputsDir.asFile
+        val metadataDirs = listOf(metadataRoot.resolve("agent")) +
+            metadataRoot.listFiles { file -> file.isDirectory && file.name != "agent" }.orEmpty().sortedBy { it.name } +
+            nativeImageGeneratedDir.get().asFile
+        fun slashes(file: File) = file.absolutePath.replace('\\', '/')
+
+        // Look like an app, not a console tool: native-image links a console program by default
+        // (a terminal opened before the start screen) with no icon or version details.
+        val rcFile = work.resolve("nuvio-native.rc")
+        val resFile = work.resolve("nuvio-native.res")
+        val numericVersion = (desktopReleasePackageVersion.split('.').map { part -> part.filter(Char::isDigit).ifEmpty { "0" } } +
+            listOf("0", "0", "0", "0")).take(4).joinToString(",")
+        val icon = project.file("src/desktopMain/resources/icons/nuvio-app-icon.ico")
+        val year = ZonedDateTime.now(ZoneOffset.UTC).year
+        rcFile.writeText(
+            """
+            1 ICON "${slashes(icon)}"
+            1 VERSIONINFO
+            FILEVERSION $numericVersion
+            PRODUCTVERSION $numericVersion
+            FILEOS 0x40004
+            FILETYPE 0x1
+            BEGIN
+              BLOCK "StringFileInfo"
+              BEGIN
+                BLOCK "040904B0"
+                BEGIN
+                  VALUE "CompanyName", "$desktopPublisher"
+                  VALUE "FileDescription", "Nuvio HTPC"
+                  VALUE "FileVersion", "$desktopReleaseVersionName"
+                  VALUE "InternalName", "Nuvio"
+                  VALUE "LegalCopyright", "Copyright (C) $year"
+                  VALUE "OriginalFilename", "Nuvio.exe"
+                  VALUE "ProductName", "Nuvio"
+                  VALUE "ProductVersion", "$desktopReleaseVersionName"
+                END
+              END
+              BLOCK "VarFileInfo"
+              BEGIN
+                VALUE "Translation", 0x409, 1200
+              END
+            END
+            """.trimIndent() + "\n",
+            Charsets.US_ASCII,
+        )
+
+        val args = buildList {
+            add("-H:ConfigurationFileDirectories=" + metadataDirs.joinToString(",") { slashes(it) })
+            add("-H:+ReportExceptionStackTraces")
+            add("-H:+UnlockExperimentalVMOptions")
+            // Build-time -D values; NativeImageSupport re-applies Nuvio.cfg's at run time.
+            add("-Djava.awt.headless=false")
+            add("-Dskiko.renderApi=DIRECT3D")
+            add("-Dsun.java2d.d3d=false")
+            add("-Dcompose.application.configure.swing.globals=true")
+            add("-Djpackage.app-version=$desktopReleasePackageVersion")
+            add("-march=$nativeImageMarch")
+            if (nativeImageQuick) add("-Ob")
+            // native-image enables only file: and resource: URLs by default; without this every
+            // java.net.URL http(s) connection throws (OkHttp is unaffected). The Discord artwork
+            // probe read that as "proxy down" and sent posters un-letterboxed, so they rendered
+            // squashed; NuvioEngine's localhost probe uses http: too.
+            add("--enable-url-protocols=http,https")
+            // HotSpotDiagnosticMXBean.dumpHeap for HeapDumpOnHighLiveSet (perf logging only).
+            add("--enable-monitoring=heapdump")
+            if (nativeImageQa) {
+                add("--exact-reachability-metadata")
+                add("-H:MissingRegistrationReportingMode=Warn")
+                // Never -H:+JNIVerboseLookupErrors: on every failed JNI class lookup it dumps the
+                // whole JNI dictionary to raw native stderr, and a windowed exe started normally
+                // has none, so the write was fatal and SVM called abort(). quickjs-kt probes
+                // FindClass("Error") on every JS error, so plugins crashed every double-clicked
+                // QA build (2026-10-17). (-H:+PrintJNIMethods only listed native linkages.)
+            }
+            add("-H:NativeLinkerOption=/SUBSYSTEM:WINDOWS")
+            add("-H:NativeLinkerOption=/ENTRY:mainCRTStartup")
+            add("-H:NativeLinkerOption=${slashes(resFile)}")
+            // The JVM build's -Xmx1g equivalent. MaxNewSize 512m was tried (2026-10-16): peak
+            // private memory 1.5 -> 2.2 GB and no fewer stalls of 200 ms or more, so 192m.
+            // -H:-RemoveLoopSafepoints was tried too and made no difference.
+            add("-R:MaxHeapSize=1g")
+            add("-R:MaxNewSize=192m")
+            // Heap floor for the old generation. Serial GC's default policy (Adaptive2) kept the old
+            // generation sized just above the ~200-280 MB live set, so ordinary browsing promoted
+            // it full every 20-40 s: a natural 250-316 ms stop-the-world full GC each time, every
+            // (UiStall) of 250 ms or more in the 2026-10-19 session, and back-to-back pairs ~400 ms
+            // apart. 512m leaves ~320 MB of old generation, so most growth is collected by
+            // IdleHeapCollector while the user is not interacting.
+            add("-R:MinHeapSize=512m")
+            // Objects are promoted after surviving 3 young collections instead of up to 15 (the
+            // serial GC's default). Startup builds ~60 MB of long-lived data (caches, catalogs, meta)
+            // that was copied between survivor spaces on every young collection until it aged out:
+            // (YoungGc) 2026-10-19 18:46, 26 young collections / 1,253 ms in the first 3.3 s, survivor
+            // space pinned at 55-63 MB, each pause 70-100 ms; once it tenured they took 7-10 ms.
+            // Hosted (build-time) option.
+            add("-H:MaxSurvivorSpaces=3")
+            add("-o")
+            add(slashes(work.resolve("Nuvio")))
+            add("-cp")
+            add("\"" + cfg.classpath.joinToString(";") { it.replace('\\', '/') } + "\"")
+            // --add-opens/--add-exports only take effect at build time (Component.peer for the HWND).
+            addAll(
+                cfg.javaOptions.filter { it.startsWith("--add-opens=") || it.startsWith("--add-exports=") }
+                    .filterNot { "lwawt" in it },
+            )
+            add(cfg.mainClass)
+        }
+        val argFile = work.resolve("ni-args.txt").apply { writeText(args.joinToString("\r\n") + "\r\n", Charsets.US_ASCII) }
+        val manifest = metadataRoot.resolve("nuvio-launcher.manifest")
+        val exe = work.resolve("Nuvio.exe")
+        val log = work.resolve("build.log")
+        val bat = work.resolve("native-compile.cmd")
+        bat.writeText(
+            listOf(
+                "@echo off",
+                "call ${cmdQuote(vcvars.absolutePath)} >nul",
+                "if errorlevel 1 exit /b %errorlevel%",
+                "set \"JAVA_HOME=${graal.absolutePath}\"",
+                "rc.exe /nologo /fo ${cmdQuote(resFile.absolutePath)} ${cmdQuote(rcFile.absolutePath)} > ${cmdQuote(log.absolutePath)} 2>&1",
+                "if errorlevel 1 exit /b %errorlevel%",
+                "call ${cmdQuote(graal.resolve("bin/native-image.cmd").absolutePath)} @${cmdQuote(argFile.absolutePath)} >> ${cmdQuote(log.absolutePath)} 2>&1",
+                "if errorlevel 1 exit /b %errorlevel%",
+                // The image has no manifest; without the launcher's PerMonitorV2 one Windows
+                // DPI-virtualises the window.
+                "mt.exe -nologo -manifest ${cmdQuote(manifest.absolutePath)} -outputresource:${cmdQuote(exe.absolutePath)};#1 >> ${cmdQuote(log.absolutePath)} 2>&1",
+                "exit /b %ERRORLEVEL%",
+            ).joinToString("\r\n") + "\r\n",
+            Charsets.US_ASCII,
+        )
+        logger.lifecycle(
+            "native-image: GraalVM ${graal.name}, -march=$nativeImageMarch${if (nativeImageQa) ", QA (reports missing registrations)" else ""}${if (nativeImageQuick) ", quick build (-Ob)" else ""}, " +
+                "${metadataDirs.size} metadata dirs; log in $log",
+        )
+        commandLine("cmd", "/d", "/c", bat.absolutePath)
+    }
+    doLast {
+        val work = nativeImageWorkDir.get().asFile
+        val log = work.resolve("build.log")
+        if (executionResult.get().exitValue != 0 || !work.resolve("Nuvio.exe").isFile) {
+            log.takeIf { it.isFile }?.readLines()?.takeLast(40)?.forEach { logger.error(it) }
+            throw GradleException("native-image failed; full log: $log")
+        }
+        log.readLines().filter { "registered for" in it || "Finished generating" in it }.forEach { logger.lifecycle(it.trim()) }
+    }
+}
+
+val createNativeDistributable = tasks.register("createNativeDistributable") {
+    group = "native image"
+    description = "Lays out the native Nuvio.exe like the jpackage image, in build/native-image/Nuvio."
+    notCompatibleWithConfigurationCache("Copies host-local GraalVM and MSVC runtime files.")
+    enabled = isWindowsHost
+    dependsOn(nativeCompile)
+    // Real inputs, or Gradle treats a task with outputs and no inputs as up to date whenever the
+    // output folder is unchanged, and skips laying out a freshly compiled exe (2026-10-17).
+    inputs.dir(nativeImageWorkDir)
+    inputs.files(nativeJvmAppImageDir.map { image -> fileTree(image) { exclude("app/*.jar", "app/*.jsa", "runtime/**", "runtime-graal/**") } })
+    inputs.property("qa", nativeImageQa)
+    outputs.dir(nativeImageDistDir)
+    doLast {
+        val root = nativeJvmAppImageDir.get().asFile
+        val work = nativeImageWorkDir.get().asFile
+        val dist = nativeImageDistDir.get().asFile
+        if (isRunningFrom(dist.resolve("Nuvio.exe"))) {
+            throw GradleException("Nuvio is running from $dist; quit it first (this task replaces that folder).")
+        }
+        dist.deleteRecursively()
+        dist.resolve("runtime/bin").mkdirs()
+        dist.resolve("runtime/lib").mkdirs()
+        dist.resolve("app").mkdirs()
+        // Everything beside jpackage's launcher (mpv, player bridge, engine, resources\, ...).
+        root.listFiles().orEmpty().forEach { entry ->
+            when {
+                entry.isFile && entry.name != "Nuvio.exe" -> entry.copyTo(dist.resolve(entry.name))
+                entry.isDirectory && entry.name !in setOf("app", "runtime", "runtime-graal") ->
+                    entry.copyRecursively(dist.resolve(entry.name))
+            }
+        }
+        // app\ without the jars (compiled into the exe), the class archives, or the startup class
+        // list (StartupClassPreloader is skipped natively).
+        root.resolve("app").listFiles().orEmpty()
+            .filterNot { it.extension == "jar" || it.extension == "jsa" || it.name == "startup-classes.lst" }
+            .forEach { entry -> entry.copyRecursively(dist.resolve("app/${entry.name}")) }
+        work.resolve("Nuvio.exe").copyTo(dist.resolve("Nuvio.exe"))
+        // The JDK libraries native-image emits (awt, jawt, fontmanager, ...): beside the exe, where
+        // the image loads them, and in runtime\bin, where skiko opens jawt via java.home.
+        work.listFiles { file -> file.extension == "dll" }.orEmpty().forEach { dll ->
+            dll.copyTo(dist.resolve(dll.name))
+            dll.copyTo(dist.resolve("runtime/bin/${dll.name}"))
+        }
+        // AWT's font manager reads %java.home%\lib\fontconfig.bfc.
+        resolveGraalVmHome().resolve("lib").listFiles { file ->
+            file.isFile && (file.name.startsWith("fontconfig") || file.name.startsWith("psfont"))
+        }.orEmpty().forEach { it.copyTo(dist.resolve("runtime/lib/${it.name}")) }
+        // The MSVC runtime the backdrop framer preloads from runtime\bin.
+        root.resolve("runtime/bin").listFiles { file ->
+            file.name.startsWith("vcruntime") || file.name.startsWith("msvcp")
+        }.orEmpty().forEach { it.copyTo(dist.resolve("runtime/bin/${it.name}")) }
+        // QA builds: the marker makes NativeImageSupport copy the console (where the image reports
+        // missing registrations) into native-qa-console.log beside the exe.
+        if (nativeImageQa) {
+            dist.resolve("native-qa").writeText("QA build: reports missing native-image registrations. Never ship.\n")
+            logger.lifecycle("QA build: missing registrations will be logged to ${dist.resolve("native-qa-console.log")}")
+            // A windowed exe has no stderr, so whatever a native crash prints first (an SVM fatal
+            // error, a QuickJS assert before abort()) was lost. Started through this, the process
+            // inherits a redirected stdout/stderr and that text lands in native-qa-stdio.log.
+            dist.resolve("Nuvio-qa.cmd").writeText(
+                "@echo off\r\n" +
+                    "rem QA build: runs Nuvio with native stdout/stderr captured in native-qa-stdio.log.\r\n" +
+                    "\"%~dp0Nuvio.exe\" %* 1>\"%~dp0native-qa-stdio.log\" 2>&1\r\n",
+            )
+        }
+        // The updater never swaps a folder carrying this for a downloaded release (plan step 6):
+        // this build is a stamped nightly, so it is offered updates. packageNativeReleaseZip leaves it out.
+        dist.resolve("dev-build").writeText("Development build: the in-place updater leaves this folder alone.\n")
+        val totalMb = dist.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024)
+        logger.lifecycle("Native image laid out in $dist ($totalMb MB, exe ${dist.resolve("Nuvio.exe").length() / (1024 * 1024)} MB)")
+    }
+}
+
+// -Pnuvio.native.skipSmoke=true: zip without the smoke gate. Local iteration only, never a release.
+val nativeSkipSmoke = providers.gradleProperty("nuvio.native.skipSmoke").orNull.toBoolean()
+
+// Plan step 5: launches the laid-out exe 5 times (plus once as the player smoke harness) against
+// a throwaway data directory and fails on an early exit, a missing start-screen / self-test marker,
+// a DPI-virtualised window or a native failure in the log. The gate before every nightly upload;
+// no CI can build a 1:1 release (the SVP DLLs are not in the repo). Opens real windows for under a minute.
+// Was 15 runs while the native exe was new (the skiko FontMgr race failed 1 in 3-7); cut to 5 on
+// 2026-11-08 after months without a real failure.
+val nativeSmoke = tasks.register<Exec>("nativeSmoke") {
+    group = "native image"
+    description = "Launches the native build repeatedly with its self-test and fails on any native failure (plan step 5)."
+    notCompatibleWithConfigurationCache("Launches the host-local native image.")
+    enabled = isWindowsHost
+    dependsOn(createNativeDistributable)
+    val runs = providers.gradleProperty("nuvio.native.smokeRuns").orNull ?: "5"
+    commandLine(
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", project.file("scripts/native-smoke.ps1").absolutePath,
+        "-Exe", nativeImageDistDir.get().asFile.resolve("Nuvio.exe").absolutePath,
+        "-Runs", runs,
+        "-WorkDir", layout.buildDirectory.dir("native-image/smoke").get().asFile.absolutePath,
+    )
+}
+
+tasks.register<Zip>("packageNativeReleaseZip") {
+    group = "native image"
+    description = "Zips build/native-image/Nuvio as the release asset Nuvio.zip."
+    notCompatibleWithConfigurationCache("Packages the host-local native image.")
+    enabled = isWindowsHost
+    dependsOn(createNativeDistributable)
+    if (!nativeSkipSmoke) dependsOn(nativeSmoke)
+    doFirst {
+        if (nativeImageDistDir.get().asFile.resolve("native-qa").isFile) {
+            throw GradleException(
+                "build/native-image/Nuvio is a QA build (-Pnuvio.native.qa=true); rebuild without it before packaging a release.",
+            )
+        }
+    }
+    from(nativeImageDistDir) {
+        into("Nuvio")
+        // Build-folder only: the dev marker (it would stop every user's in-place updates), QA
+        // files, and what a run of the build left behind (portable-mode data, logs).
+        exclude("dev-build", "native-qa", "native-qa-console.log", "native-qa-stdio.log", "Nuvio-qa.cmd")
+        exclude("data/**", "portable", "install-manifest.txt")
+    }
+    archiveFileName.set("Nuvio.zip")
+    destinationDirectory.set(nativeImageReleaseDir)
+}
+
+tasks.register<Exec>("nativeImageTrace") {
+    group = "native image"
+    description = "Runs the JVM app image on GraalVM's JVM with the tracing agent (user-driven; merges into native-image/agent)."
+    notCompatibleWithConfigurationCache("Launches the host-local app for an interactive tracing session.")
+    enabled = isWindowsHost
+    dependsOn("createDistributable")
+    doFirst {
+        if (ProcessHandle.allProcesses().anyMatch { process ->
+                process.info().command().map { File(it).name.equals("Nuvio.exe", ignoreCase = true) }.orElse(false)
+            }
+        ) {
+            throw GradleException("Close Nuvio first (it is single-instance).")
+        }
+        val root = nativeJvmAppImageDir.get().asFile
+        val appDir = root.resolve("app")
+        // Nuvio takes java.home's PARENT as its install folder (player bridge, engine, updater), so
+        // GraalVM runs from a copy inside the app image. A copy, not a junction: deleting the build
+        // folder could follow a junction and wipe the real GraalVM.
+        val graalCopy = root.resolve("runtime-graal")
+        val wantedRelease = resolveGraalVmHome().resolve("release").readText()
+        if (graalCopy.resolve("release").takeIf { it.isFile }?.readText() != wantedRelease) {
+            graalCopy.deleteRecursively()
+            logger.lifecycle("Copying GraalVM into the app image (once per build)...")
+            resolveGraalVmHome().copyRecursively(graalCopy)
+        }
+        val agentDir = nativeImageInputsDir.asFile.resolve("agent").apply { mkdirs() }
+        val cfg = readNativeAppImageConfig(appDir)
+        // The argfile carries local paths, so it stays in build/, not beside the agent output.
+        val argFile = layout.buildDirectory.file("native-image/trace-args.txt").get().asFile.apply { parentFile.mkdirs() }
+        // -Pnuvio.trace.freshProfile=true: a new, empty data folder for this run, so first-run paths
+        // (setup wizard, empty Home) get traced too. The sign-in token is in the Windows registry
+        // (Java Preferences), not in that folder, so the account stays signed in; sign out and back
+        // in during that session to trace the sign-in screens.
+        val freshProfile = providers.gradleProperty("nuvio.trace.freshProfile").orNull.toBoolean()
+        val freshProfileDir = layout.buildDirectory.dir("native-image/trace-profile").get().asFile
+        if (freshProfile) {
+            freshProfileDir.deleteRecursively()
+            freshProfileDir.mkdirs()
+            logger.lifecycle("Fresh profile: data folder $freshProfileDir")
+        }
+        val lines = buildList {
+            add("-agentlib:native-image-agent=config-merge-dir=${agentDir.absolutePath},config-write-period-secs=30,config-write-initial-delay-secs=20")
+            addAll(cfg.javaOptions.filterNot { "SharedArchive" in it })
+            add("-Djava.library.path=${appDir.absolutePath}")
+            add("-Dnuvio.nativeImageTracing=1")
+            if (freshProfile) add("-Dnuvio.desktop.dataDir=${freshProfileDir.absolutePath}")
+            add("-cp")
+            add("\"" + cfg.classpath.joinToString(";") + "\"")
+            add(cfg.mainClass)
+        }
+        // Java argfiles treat backslash as an escape: forward slashes throughout.
+        argFile.writeText(lines.joinToString("\r\n") { it.replace('\\', '/') } + "\r\n", Charsets.US_ASCII)
+        logger.lifecycle("Tracing Nuvio on GraalVM. Use the app (Docs/Native-Spike-Test-Checklist.md), then quit from the tray.")
+        logger.lifecycle("Agent output merges into $agentDir.")
+        commandLine(graalCopy.resolve("bin/java.exe").absolutePath, "@${argFile.absolutePath}")
+    }
+}
+
+
+
+/*
+ * fork:innertubex-pin — the InnerTubeX jars (and its JS engine, quackjs) are checked against the SHA-256 recorded
+ * here before anything compiles against them. They come from JitPack, which builds them from a git tag; a tag
+ * moved or a rebuild with other contents would otherwise reach the next clean build unnoticed. A jar of that
+ * group that is not listed (a new version, a new transitive library) fails too, naming its hash: bump the
+ * version, read the diff upstream, then record the new hash here.
+ */
+val innerTubeXPinnedSha256 = mapOf(
+    "innertubex-desktop-v0.11.2.jar" to "ca8f82ba87ca71b1674f4b2517b6559dea94ddb549532199cb2a2a461eb6b3c8",
+    "quackjs-jvm-0.1.2.jar" to "2cbd422c8290e3eb497cbefaa5a7021f094e16e8b6d9d6de010a17e9b15603a4",
+)
+
+abstract class VerifyPinnedJarsTask : DefaultTask() {
+    @get:org.gradle.api.tasks.InputFiles
+    @get:org.gradle.api.tasks.PathSensitive(org.gradle.api.tasks.PathSensitivity.NAME_ONLY)
+    abstract val jars: org.gradle.api.file.ConfigurableFileCollection
+
+    @get:Input
+    abstract val pinned: org.gradle.api.provider.MapProperty<String, String>
+
+    @get:OutputFile
+    abstract val stamp: RegularFileProperty
+
+    @TaskAction
+    fun verify() {
+        val expected = pinned.get()
+        val problems = mutableListOf<String>()
+        val seen = mutableSetOf<String>()
+        for (jar in jars.files.sortedBy { it.name }) {
+            seen += jar.name
+            val digest = MessageDigest.getInstance("SHA-256")
+            jar.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            val actual = digest.digest().joinToString("") { "%02x".format(it) }
+            when (val want = expected[jar.name]) {
+                null -> problems += "${jar.name} is not pinned (sha256 $actual)"
+                actual -> Unit
+                else -> problems += "${jar.name} changed: expected sha256 $want, got $actual"
+            }
+        }
+        (expected.keys - seen).forEach { problems += "$it is pinned but was not resolved" }
+        if (problems.isNotEmpty()) {
+            throw GradleException(
+                "InnerTubeX dependency check failed (composeApp/build.gradle.kts, innerTubeXPinnedSha256):\n  " +
+                    problems.joinToString("\n  "),
+            )
+        }
+        stamp.get().asFile.writeText(expected.entries.joinToString("\n") { "${it.key} ${it.value}" })
+    }
+}
+
+if (innerTubeXEnabled) {
+    val metrolistJars = configurations.named("desktopRuntimeClasspath").flatMap { classpath ->
+        classpath.incoming.artifacts.resolvedArtifacts.map { artifacts ->
+            artifacts.filter { artifact ->
+                val id = artifact.id.componentIdentifier as? org.gradle.api.artifacts.component.ModuleComponentIdentifier
+                id?.group?.startsWith("com.github.MetrolistGroup") == true
+            }.map { it.file }
+        }
+    }
+    val verifyInnerTubeXJars = tasks.register<VerifyPinnedJarsTask>("verifyInnerTubeXJars") {
+        group = "verification"
+        description = "Checks the InnerTubeX jars against their pinned SHA-256."
+        jars.from(metrolistJars)
+        pinned.set(innerTubeXPinnedSha256)
+        stamp.set(layout.buildDirectory.file("innertubex/pinned-jars.txt"))
+    }
+    tasks.matching { it.name == "compileKotlinDesktop" }.configureEach { dependsOn(verifyInnerTubeXJars) }
+}

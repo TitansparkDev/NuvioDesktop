@@ -38,7 +38,9 @@ import com.nuvio.app.features.player.AppShortcutAction
 import com.nuvio.app.features.player.AppShortcutRebindDialog
 import com.nuvio.app.features.player.PlayerShortcutRebindDialog
 import com.nuvio.app.features.player.ensurePlayerShortcutBindingsLoaded
+import com.nuvio.app.features.player.playerEscWindowedFirstState
 import com.nuvio.app.features.player.playerShortcutKeyLabels
+import com.nuvio.app.features.player.setPlayerEscWindowedFirst
 import com.nuvio.app.features.player.resetPlayerShortcuts
 import com.nuvio.app.features.player.appShortcutKeyLabels
 import com.nuvio.app.features.player.ensureAppShortcutBindingsLoaded
@@ -52,12 +54,58 @@ import com.nuvio.app.features.input.gamepadMappingRows
 import com.nuvio.app.features.input.gamepadRepeatIntervalRange
 import com.nuvio.app.features.input.gamepadRepeatIntervalState
 import com.nuvio.app.features.input.gamepadSupported
+import com.nuvio.app.features.input.mouseKeyboardState
+import com.nuvio.app.features.input.setMouseKeyboard
 import com.nuvio.app.features.input.resetGamepadSettings
 import com.nuvio.app.features.input.setGamepadDeadZone
 import com.nuvio.app.features.input.setGamepadEnabled
 import com.nuvio.app.features.input.setGamepadRepeatIntervalMs
+import com.nuvio.app.features.input.GamepadButton
+import com.nuvio.app.features.input.gamepadBindingsVersion
+import com.nuvio.app.features.input.gamepadButtonTargetIds
+import com.nuvio.app.features.input.gamepadTargetChoices
+import com.nuvio.app.features.input.panelRingMouseState
+import com.nuvio.app.features.input.ControllerLightBar
+import com.nuvio.app.features.input.controllerLightBarState
+import com.nuvio.app.features.input.setControllerLightBar
+import com.nuvio.app.features.input.controllerPlayerLightState
+import com.nuvio.app.features.input.setControllerPlayerLight
+import nuvio.composeapp.generated.resources.gamepad_lights_section
+import nuvio.composeapp.generated.resources.gamepad_lights_note
+import nuvio.composeapp.generated.resources.gamepad_light_bar
+import nuvio.composeapp.generated.resources.gamepad_light_bar_description
+import nuvio.composeapp.generated.resources.gamepad_light_bar_leave
+import nuvio.composeapp.generated.resources.gamepad_light_bar_off
+import nuvio.composeapp.generated.resources.gamepad_light_bar_accent
+import nuvio.composeapp.generated.resources.gamepad_player_light
+import nuvio.composeapp.generated.resources.gamepad_player_light_description
+import com.nuvio.app.features.input.panelRingPadButtonChoices
+import com.nuvio.app.features.input.ControllerCursorSpeed
+import com.nuvio.app.features.input.controllerCursorButtonChoices
+import com.nuvio.app.features.input.controllerCursorButtonState
+import com.nuvio.app.features.input.controllerCursorSpeedState
+import com.nuvio.app.features.input.setControllerCursorButton
+import com.nuvio.app.features.input.setControllerCursorSpeed
+import com.nuvio.app.features.input.controllerCursorByDefaultState
+import com.nuvio.app.features.input.setControllerCursorByDefault
+import com.nuvio.app.features.input.controllerCursorHintState
+import com.nuvio.app.features.input.setControllerCursorHint
+import com.nuvio.app.features.input.panelRingPadButtonState
+import com.nuvio.app.features.input.panelRingSizeState
+import com.nuvio.app.features.input.resetGamepadButton
+import com.nuvio.app.features.input.resetGamepadButtons
+import com.nuvio.app.features.input.setGamepadButtonTarget
+import com.nuvio.app.features.input.setPanelRingMouse
+import com.nuvio.app.features.input.setPanelRingPadButton
+import com.nuvio.app.features.input.setPanelRingSize
+import com.nuvio.app.features.panelring.PanelRingSize
+import androidx.compose.material3.BasicAlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.TextButton
+import com.nuvio.app.core.ui.NuvioDialogSurface
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.*
+import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.stringResource
 import com.nuvio.app.core.ui.NuvioActionLabel
 
@@ -84,20 +132,22 @@ private data class Shortcut(
 private fun key(vararg alternatives: String): List<List<String>> =
     alternatives.map { listOf(it) }
 
+@Composable
 private fun navigationShortcuts(labels: Map<AppShortcutAction, String>): List<Shortcut> =
     AppShortcutAction.entries.map { action ->
-        Shortcut(action.displayName, key(labels[action] ?: "—"), appAction = action)
+        Shortcut(stringResource(action.displayNameRes), key(labels[action] ?: "—"), appAction = action)
     } + browsingShortcuts()
 
 /**
  * Fixed browsing keys on Home, Library, Search and Collections. Not rebindable, so they carry no
  * [AppShortcutAction] — they are listed here because this page is the shortcut inventory.
  */
+@Composable
 private fun browsingShortcuts(): List<Shortcut> = listOf(
-    Shortcut("Page down (row in TV mode, page otherwise)", key("Page Down")),
-    Shortcut("Page up (row in TV mode, page otherwise)", key("Page Up")),
-    Shortcut("Jump to top", key("Home")),
-    Shortcut("Jump to bottom", key("End")),
+    Shortcut(stringResource(Res.string.settings_shortcuts_page_down), key("Page Down")),
+    Shortcut(stringResource(Res.string.settings_shortcuts_page_up), key("Page Up")),
+    Shortcut(stringResource(Res.string.settings_shortcuts_jump_to_top), key("Home")),
+    Shortcut(stringResource(Res.string.settings_shortcuts_jump_to_bottom), key("End")),
 )
 
 /**
@@ -106,44 +156,45 @@ private fun browsingShortcuts(): List<Shortcut> = listOf(
  * When [action] is null the row is fully fixed and uses [fixedKeys].
  */
 private class PlayerRowSpec(
-    val label: String,
+    val label: StringResource,
     val action: PlayerShortcutAction?,
     val extraKeys: List<String> = emptyList(),
     val fixedKeys: List<String> = emptyList(),
 )
 
+@Composable
 private fun PlayerRowSpec.toShortcut(labels: Map<PlayerShortcutAction, String>): Shortcut {
     val caps = if (action != null) listOfNotNull(labels[action]) + extraKeys else fixedKeys
-    return Shortcut(label, caps.map { listOf(it) })
+    return Shortcut(stringResource(label), caps.map { listOf(it) })
 }
 
-private val playerRowSections: List<Pair<String, List<PlayerRowSpec>>> = listOf(
-    "Player · Playback" to listOf(
-        PlayerRowSpec(PlayerShortcutAction.PlayPause.displayName, PlayerShortcutAction.PlayPause),
-        PlayerRowSpec(PlayerShortcutAction.AlternatePlayPause.displayName, PlayerShortcutAction.AlternatePlayPause),
-        PlayerRowSpec(PlayerShortcutAction.ToggleMute.displayName, PlayerShortcutAction.ToggleMute),
-        PlayerRowSpec(PlayerShortcutAction.SeekBackward.displayName, PlayerShortcutAction.SeekBackward, extraKeys = listOf("←")),
-        PlayerRowSpec(PlayerShortcutAction.SeekForward.displayName, PlayerShortcutAction.SeekForward, extraKeys = listOf("→")),
-        PlayerRowSpec(PlayerShortcutAction.SpeedUp.displayName, PlayerShortcutAction.SpeedUp),
-        PlayerRowSpec(PlayerShortcutAction.SpeedDown.displayName, PlayerShortcutAction.SpeedDown),
-        PlayerRowSpec(PlayerShortcutAction.ToggleSpeed.displayName, PlayerShortcutAction.ToggleSpeed),
-        PlayerRowSpec("Volume up", null, fixedKeys = listOf("↑")),
-        PlayerRowSpec("Volume down", null, fixedKeys = listOf("↓")),
+private val playerRowSections: List<Pair<StringResource, List<PlayerRowSpec>>> = listOf(
+    Res.string.settings_shortcuts_section_player_playback to listOf(
+        PlayerRowSpec(PlayerShortcutAction.PlayPause.displayNameRes, PlayerShortcutAction.PlayPause),
+        PlayerRowSpec(PlayerShortcutAction.AlternatePlayPause.displayNameRes, PlayerShortcutAction.AlternatePlayPause),
+        PlayerRowSpec(PlayerShortcutAction.ToggleMute.displayNameRes, PlayerShortcutAction.ToggleMute),
+        PlayerRowSpec(PlayerShortcutAction.SeekBackward.displayNameRes, PlayerShortcutAction.SeekBackward, extraKeys = listOf("←")),
+        PlayerRowSpec(PlayerShortcutAction.SeekForward.displayNameRes, PlayerShortcutAction.SeekForward, extraKeys = listOf("→")),
+        PlayerRowSpec(PlayerShortcutAction.SpeedUp.displayNameRes, PlayerShortcutAction.SpeedUp),
+        PlayerRowSpec(PlayerShortcutAction.SpeedDown.displayNameRes, PlayerShortcutAction.SpeedDown),
+        PlayerRowSpec(PlayerShortcutAction.ToggleSpeed.displayNameRes, PlayerShortcutAction.ToggleSpeed),
+        PlayerRowSpec(Res.string.settings_shortcuts_volume_up, null, fixedKeys = listOf("↑")),
+        PlayerRowSpec(Res.string.settings_shortcuts_volume_down, null, fixedKeys = listOf("↓")),
     ),
-    "Player · Tracks & Panels" to listOf(
-        PlayerRowSpec(PlayerShortcutAction.NextSubtitle.displayName, PlayerShortcutAction.NextSubtitle),
-        PlayerRowSpec(PlayerShortcutAction.NextAudio.displayName, PlayerShortcutAction.NextAudio),
-        PlayerRowSpec(PlayerShortcutAction.OpenSources.displayName, PlayerShortcutAction.OpenSources),
-        PlayerRowSpec(PlayerShortcutAction.OpenEpisodes.displayName, PlayerShortcutAction.OpenEpisodes),
-        PlayerRowSpec(PlayerShortcutAction.CycleZoom.displayName, PlayerShortcutAction.CycleZoom),
-        PlayerRowSpec(PlayerShortcutAction.SkipInterval.displayName, PlayerShortcutAction.SkipInterval),
+    Res.string.settings_shortcuts_section_player_tracks to listOf(
+        PlayerRowSpec(PlayerShortcutAction.NextSubtitle.displayNameRes, PlayerShortcutAction.NextSubtitle),
+        PlayerRowSpec(PlayerShortcutAction.NextAudio.displayNameRes, PlayerShortcutAction.NextAudio),
+        PlayerRowSpec(PlayerShortcutAction.OpenSources.displayNameRes, PlayerShortcutAction.OpenSources),
+        PlayerRowSpec(PlayerShortcutAction.OpenEpisodes.displayNameRes, PlayerShortcutAction.OpenEpisodes),
+        PlayerRowSpec(PlayerShortcutAction.CycleZoom.displayNameRes, PlayerShortcutAction.CycleZoom),
+        PlayerRowSpec(PlayerShortcutAction.SkipInterval.displayNameRes, PlayerShortcutAction.SkipInterval),
     ),
-    "Player · Video Enhancement" to listOf(
-        PlayerRowSpec(PlayerShortcutAction.CycleSvp.displayName, PlayerShortcutAction.CycleSvp),
-        PlayerRowSpec(PlayerShortcutAction.CycleHdr.displayName, PlayerShortcutAction.CycleHdr),
-        PlayerRowSpec(PlayerShortcutAction.CycleColorProfile.displayName, PlayerShortcutAction.CycleColorProfile),
-        PlayerRowSpec(PlayerShortcutAction.CycleAnime.displayName, PlayerShortcutAction.CycleAnime),
-        PlayerRowSpec(PlayerShortcutAction.ToggleMpvDiagnostics.displayName, PlayerShortcutAction.ToggleMpvDiagnostics),
+    Res.string.settings_shortcuts_section_player_video to listOf(
+        PlayerRowSpec(PlayerShortcutAction.CycleSvp.displayNameRes, PlayerShortcutAction.CycleSvp),
+        PlayerRowSpec(PlayerShortcutAction.CycleHdr.displayNameRes, PlayerShortcutAction.CycleHdr),
+        PlayerRowSpec(PlayerShortcutAction.CycleColorProfile.displayNameRes, PlayerShortcutAction.CycleColorProfile),
+        PlayerRowSpec(PlayerShortcutAction.CycleAnime.displayNameRes, PlayerShortcutAction.CycleAnime),
+        PlayerRowSpec(PlayerShortcutAction.ToggleMpvDiagnostics.displayNameRes, PlayerShortcutAction.ToggleMpvDiagnostics),
     ),
 )
 
@@ -162,9 +213,17 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
         )
     }
 
+    // Near the top: one binding for every panel is what spares learning the per-panel keys below.
+    item(key = "keyboard-shortcuts-panel-ring") { PanelRingSection(isTablet = isTablet) }
+    if (gamepadSupported()) {
+        item(key = "keyboard-shortcuts-controller-cursor") { ControllerCursorSection(isTablet = isTablet) }
+        item(key = "keyboard-shortcuts-controller-lights") { ControllerLightsSection(isTablet = isTablet) }
+    }
+
     item(key = "keyboard-shortcuts-navigation") {
         LaunchedEffect(Unit) { ensureAppShortcutBindingsLoaded() }
         val wasdEnabled by ThemeSettingsRepository.wasdNavigationEnabled.collectAsState()
+        val holdToSelectEnabled by ThemeSettingsRepository.holdToSelectEnabled.collectAsState()
         val appLabels by appShortcutKeyLabels().collectAsState()
         var rebindingApp by remember { mutableStateOf<AppShortcutAction?>(null) }
         SettingsSection(
@@ -187,6 +246,14 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
                         ensureAppShortcutBindingsLoaded()
                     },
                 )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_shortcuts_hold_to_select),
+                    description = stringResource(Res.string.settings_shortcuts_hold_to_select_description),
+                    checked = holdToSelectEnabled,
+                    isTablet = isTablet,
+                    onCheckedChange = ThemeSettingsRepository::setHoldToSelectEnabled,
+                )
                 navigationShortcuts(appLabels).forEach { shortcut ->
                     SettingsGroupDivider(isTablet = isTablet)
                     ShortcutRow(
@@ -205,16 +272,29 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
     item(key = "keyboard-shortcuts-player") {
         LaunchedEffect(Unit) { ensurePlayerShortcutBindingsLoaded() }
         val labels by playerShortcutKeyLabels().collectAsState()
+        val escWindowedFirst by playerEscWindowedFirstState().collectAsState()
         var rebinding by remember { mutableStateOf<PlayerShortcutAction?>(null) }
         Column(verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s18)) {
-            playerRowSections.forEach { (title, specs) ->
+            playerRowSections.forEachIndexed { sectionIndex, (title, specs) ->
                 val sectionActions = specs.mapNotNull { it.action }
                 SettingsSection(
-                    title = title,
+                    title = stringResource(title),
                     isTablet = isTablet,
                     actions = { ShortcutsResetLabel(onClick = { resetPlayerShortcuts(sectionActions) }) },
                 ) {
                     SettingsGroup(isTablet = isTablet) {
+                        // First in the section, as Navigation leads with its own switches: a
+                        // setting among the key bindings was easy to scroll past.
+                        if (sectionIndex == 0) {
+                            SettingsSwitchRow(
+                                title = stringResource(Res.string.settings_shortcuts_esc_windowed_first),
+                                description = stringResource(Res.string.settings_shortcuts_esc_windowed_first_description),
+                                checked = escWindowedFirst,
+                                isTablet = isTablet,
+                                onCheckedChange = ::setPlayerEscWindowedFirst,
+                            )
+                            SettingsGroupDivider(isTablet = isTablet)
+                        }
                         specs.forEachIndexed { index, spec ->
                             if (index > 0) SettingsGroupDivider(isTablet = isTablet)
                             ShortcutRow(
@@ -237,6 +317,8 @@ internal fun LazyListScope.keyboardShortcutsContent(isTablet: Boolean) {
     if (gamepadSupported()) {
         item(key = "keyboard-shortcuts-gamepad") { GamepadSection(isTablet = isTablet) }
     }
+    // fork:phone-remote - after the controller: the phone sends the same presses a pad does.
+    item(key = "keyboard-shortcuts-phone-remote") { PhoneRemoteSection(isTablet = isTablet) }
 }
 
 /** The desktop rows carry the 16.dp every settings row does, so they line up with the section
@@ -312,8 +394,8 @@ private fun ShortcutsResetLabel(onClick: () -> Unit) {
  * not a separate input model here — every button is replayed as the keystroke listed beside it, so
  * this inventory and the keyboard inventory describe the same bindings.
  *
- * The mapping list is read-only: rebinding a button means rebinding the underlying shortcut in the
- * sections above, which moves both at once.
+ * Each button row opens a picker for what the button does while browsing and during playback. A
+ * button set to a shortcut follows that shortcut's key, so rebinding the key above still moves both.
  */
 @Composable
 private fun GamepadSection(isTablet: Boolean) {
@@ -322,21 +404,38 @@ private fun GamepadSection(isTablet: Boolean) {
     val connected by gamepadConnectedState().collectAsState()
     val deadZone by gamepadDeadZoneState().collectAsState()
     val repeatInterval by gamepadRepeatIntervalState().collectAsState()
-    val rows = remember { gamepadMappingRows() }
+    val mouseKeyboard by mouseKeyboardState().collectAsState()
+    val bindingsVersion by gamepadBindingsVersion().collectAsState()
+    val rows = remember(bindingsVersion) { gamepadMappingRows() }
+    var rebindingButton by remember { mutableStateOf<GamepadButton?>(null) }
 
     Column(verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s18)) {
+        // Its own section rather than a Controller row: it works with no controller at all, and
+        // the Controller rows grey out while gamepad control is off.
+        SettingsSection(title = stringResource(Res.string.settings_shortcuts_on_screen_keyboard), isTablet = isTablet) {
+            SettingsGroup(isTablet = isTablet) {
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_shortcuts_osk_show_for_mouse),
+                    description = stringResource(Res.string.settings_shortcuts_osk_show_for_mouse_description),
+                    checked = mouseKeyboard,
+                    isTablet = isTablet,
+                    onCheckedChange = { setMouseKeyboard(it) },
+                )
+            }
+        }
+
         SettingsSection(
-            title = "Controller",
+            title = stringResource(Res.string.settings_shortcuts_controller),
             isTablet = isTablet,
             actions = { ShortcutsResetLabel(onClick = { resetGamepadSettings() }) },
         ) {
             SettingsGroup(isTablet = isTablet) {
                 SettingsSwitchRow(
-                    title = "Gamepad control",
+                    title = stringResource(Res.string.settings_shortcuts_gamepad_control),
                     description = when {
-                        !enabled -> "Drive Nuvio with a PlayStation or Xbox controller, wired or over Bluetooth."
-                        connected -> "Controller connected."
-                        else -> "No controller detected. Connect one over USB or Bluetooth — no extra drivers needed."
+                        !enabled -> stringResource(Res.string.settings_shortcuts_gamepad_control_off_description)
+                        connected -> stringResource(Res.string.settings_shortcuts_gamepad_connected)
+                        else -> stringResource(Res.string.settings_shortcuts_gamepad_not_detected)
                     },
                     checked = enabled,
                     isTablet = isTablet,
@@ -344,8 +443,8 @@ private fun GamepadSection(isTablet: Boolean) {
                 )
                 SettingsGroupDivider(isTablet = isTablet)
                 GamepadSliderRow(
-                    title = "Stick dead zone",
-                    description = "How far the left stick must move before it counts. Raise this if the UI drifts on its own.",
+                    title = stringResource(Res.string.settings_shortcuts_gamepad_dead_zone),
+                    description = stringResource(Res.string.settings_shortcuts_gamepad_dead_zone_description),
                     value = deadZone,
                     valueRange = gamepadDeadZoneRange(),
                     valueLabel = "${(deadZone * 100).roundToInt()}%",
@@ -355,8 +454,8 @@ private fun GamepadSection(isTablet: Boolean) {
                 )
                 SettingsGroupDivider(isTablet = isTablet)
                 GamepadSliderRow(
-                    title = "Repeat speed",
-                    description = "Gap between steps while a direction is held.",
+                    title = stringResource(Res.string.settings_shortcuts_gamepad_repeat_speed),
+                    description = stringResource(Res.string.settings_shortcuts_gamepad_repeat_speed_description),
                     value = repeatInterval.toFloat(),
                     valueRange = gamepadRepeatIntervalRange().let { it.first.toFloat()..it.last.toFloat() },
                     valueLabel = "$repeatInterval ms",
@@ -367,11 +466,12 @@ private fun GamepadSection(isTablet: Boolean) {
             }
         }
 
-        SettingsSection(title = "Controller · Buttons", isTablet = isTablet) {
-            SettingsSectionNote(
-                text = "While a panel is open during playback, the D-pad navigates the panel instead.",
-                isTablet = isTablet,
-            )
+        SettingsSection(
+            title = stringResource(Res.string.settings_shortcuts_controller_buttons),
+            isTablet = isTablet,
+            subtitle = stringResource(Res.string.settings_shortcuts_controller_buttons_note),
+            actions = { ShortcutsResetLabel(onClick = { resetGamepadButtons() }) },
+        ) {
             SettingsGroup(isTablet = isTablet) {
                 rows.forEachIndexed { index, row ->
                     if (index > 0) SettingsGroupDivider(isTablet = isTablet)
@@ -380,10 +480,226 @@ private fun GamepadSection(isTablet: Boolean) {
                     ShortcutRow(
                         shortcut = Shortcut(row.browsingLabel, key(row.button.displayName)),
                         isTablet = isTablet,
-                        description = "In player: ${row.playerLabel}",
+                        description = stringResource(Res.string.settings_shortcuts_gamepad_in_player, row.playerLabel) +
+                            if (row.rebound) " · " + stringResource(Res.string.gamepad_rebind_changed) else "",
+                        onRebind = { rebindingButton = row.button },
                     )
                 }
             }
+        }
+    }
+    rebindingButton?.let { button ->
+        GamepadRebindDialog(button = button, isTablet = isTablet, onDismiss = { rebindingButton = null })
+    }
+}
+
+/**
+ * A pad button's two meanings, each picked from the list of everything a button can do: the
+ * keyboard's shortcuts, the fixed keys (directions, paging) and nothing. A pad has no key to press
+ * in a capture box, so this is a choice rather than "press the new button".
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GamepadRebindDialog(button: GamepadButton, isTablet: Boolean, onDismiss: () -> Unit) {
+    val tokens = MaterialTheme.nuvio
+    val version by gamepadBindingsVersion().collectAsState()
+    val browsingChoices = remember { gamepadTargetChoices(inPlayer = false) }
+    val playerChoices = remember { gamepadTargetChoices(inPlayer = true) }
+    val (browsingId, playerId) = remember(version, button) { gamepadButtonTargetIds(button) }
+    BasicAlertDialog(onDismissRequest = onDismiss) {
+        NuvioDialogSurface {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(tokens.spacing.dialogPadding),
+                verticalArrangement = Arrangement.spacedBy(tokens.spacing.listGap),
+            ) {
+                Text(
+                    text = stringResource(Res.string.gamepad_rebind_title, button.displayName),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = tokens.colors.textPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                SettingsSubtext(text = stringResource(Res.string.gamepad_rebind_hint), isTablet = isTablet)
+                SettingsDropdownChoiceRow(
+                    title = stringResource(Res.string.gamepad_rebind_browsing),
+                    description = null,
+                    options = browsingChoices.map { SettingsChoiceOption(it.id, it.label) },
+                    selectedValue = browsingId,
+                    isTablet = isTablet,
+                    flushContent = true,
+                    onSelected = { setGamepadButtonTarget(button, inPlayer = false, id = it) },
+                )
+                SettingsDropdownChoiceRow(
+                    title = stringResource(Res.string.gamepad_rebind_player),
+                    description = null,
+                    options = playerChoices.map { SettingsChoiceOption(it.id, it.label) },
+                    selectedValue = playerId,
+                    isTablet = isTablet,
+                    flushContent = true,
+                    onSelected = { setGamepadButtonTarget(button, inPlayer = true, id = it) },
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(tokens.spacing.controlGap, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { resetGamepadButton(button) }) {
+                        Text(text = stringResource(Res.string.shortcuts_rebind_reset_default), maxLines = 1)
+                    }
+                    TextButton(onClick = onDismiss) {
+                        Text(text = stringResource(Res.string.action_done), maxLines = 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The controller cursor: hold a stick click to make the left stick the mouse pointer (GamepadCursor on desktop).
+ */
+@Composable
+private fun ControllerCursorSection(isTablet: Boolean) {
+    LaunchedEffect(Unit) { ensureGamepadSettingsLoaded() }
+    val button by controllerCursorButtonState().collectAsState()
+    val speed by controllerCursorSpeedState().collectAsState()
+    val byDefault by controllerCursorByDefaultState().collectAsState()
+    val hint by controllerCursorHintState().collectAsState()
+    SettingsSection(
+        title = stringResource(Res.string.gamepad_cursor_section),
+        isTablet = isTablet,
+        subtitle = stringResource(Res.string.gamepad_cursor_note),
+    ) {
+        SettingsGroup(isTablet = isTablet) {
+            SettingsChoiceRow(
+                title = stringResource(Res.string.gamepad_cursor_button),
+                description = stringResource(Res.string.gamepad_cursor_button_description),
+                options = listOf(SettingsChoiceOption<GamepadButton?>(null, stringResource(Res.string.panel_ring_off))) +
+                    controllerCursorButtonChoices().map { SettingsChoiceOption<GamepadButton?>(it, it.displayName) },
+                selectedValue = button,
+                isTablet = isTablet,
+                onSelected = { setControllerCursorButton(it) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsSwitchRow(
+                title = stringResource(Res.string.gamepad_cursor_default),
+                description = stringResource(Res.string.gamepad_cursor_default_description),
+                checked = byDefault,
+                isTablet = isTablet,
+                onCheckedChange = { setControllerCursorByDefault(it) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsSwitchRow(
+                title = stringResource(Res.string.gamepad_cursor_hint),
+                description = stringResource(Res.string.gamepad_cursor_hint_description),
+                checked = hint,
+                isTablet = isTablet,
+                onCheckedChange = { setControllerCursorHint(it) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsChoiceRow(
+                title = stringResource(Res.string.gamepad_cursor_speed),
+                description = null,
+                options = listOf(
+                    SettingsChoiceOption(ControllerCursorSpeed.Slow, stringResource(Res.string.gamepad_cursor_speed_slow)),
+                    SettingsChoiceOption(ControllerCursorSpeed.Medium, stringResource(Res.string.gamepad_cursor_speed_medium)),
+                    SettingsChoiceOption(ControllerCursorSpeed.Fast, stringResource(Res.string.gamepad_cursor_speed_fast)),
+                ),
+                selectedValue = speed,
+                isTablet = isTablet,
+                onSelected = { setControllerCursorSpeed(it) },
+            )
+        }
+    }
+}
+
+/** A DualSense's light bar and player light, written to the pad itself. */
+@Composable
+private fun ControllerLightsSection(isTablet: Boolean) {
+    LaunchedEffect(Unit) { ensureGamepadSettingsLoaded() }
+    val lightBar by controllerLightBarState().collectAsState()
+    val playerLight by controllerPlayerLightState().collectAsState()
+    SettingsSection(
+        title = stringResource(Res.string.gamepad_lights_section),
+        isTablet = isTablet,
+        subtitle = stringResource(Res.string.gamepad_lights_note),
+    ) {
+        SettingsGroup(isTablet = isTablet) {
+            SettingsChoiceRow(
+                title = stringResource(Res.string.gamepad_light_bar),
+                description = stringResource(Res.string.gamepad_light_bar_description),
+                options = listOf(
+                    SettingsChoiceOption(ControllerLightBar.LeaveAlone, stringResource(Res.string.gamepad_light_bar_leave)),
+                    SettingsChoiceOption(ControllerLightBar.Off, stringResource(Res.string.gamepad_light_bar_off)),
+                    SettingsChoiceOption(ControllerLightBar.Accent, stringResource(Res.string.gamepad_light_bar_accent)),
+                ),
+                selectedValue = lightBar,
+                isTablet = isTablet,
+                onSelected = { setControllerLightBar(it) },
+            )
+            // Leave as is writes nothing, so the player light has nothing to ride on.
+            if (lightBar != ControllerLightBar.LeaveAlone) {
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.gamepad_player_light),
+                    description = stringResource(Res.string.gamepad_player_light_description),
+                    checked = playerLight,
+                    isTablet = isTablet,
+                    onCheckedChange = { setControllerPlayerLight(it) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The panel ring: one key (R), a held pad button (LB) or the held middle mouse button opens a circle
+ * of every panel in the navigation; aim and let go to switch. The key itself is rebound in the
+ * Navigation list below, with the other shortcuts.
+ */
+@Composable
+private fun PanelRingSection(isTablet: Boolean) {
+    LaunchedEffect(Unit) { ensureGamepadSettingsLoaded() }
+    val padButton by panelRingPadButtonState().collectAsState()
+    val mouse by panelRingMouseState().collectAsState()
+    val size by panelRingSizeState().collectAsState()
+    SettingsSection(
+        title = stringResource(Res.string.panel_ring_settings_section),
+        isTablet = isTablet,
+        subtitle = stringResource(Res.string.panel_ring_settings_note),
+    ) {
+        SettingsGroup(isTablet = isTablet) {
+            if (gamepadSupported()) {
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.panel_ring_pad_button),
+                    description = stringResource(Res.string.panel_ring_pad_button_description),
+                    options = listOf(SettingsChoiceOption<GamepadButton?>(null, stringResource(Res.string.panel_ring_off))) +
+                        panelRingPadButtonChoices().map { SettingsChoiceOption<GamepadButton?>(it, it.displayName) },
+                    selectedValue = padButton,
+                    isTablet = isTablet,
+                    onSelected = { setPanelRingPadButton(it) },
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+            }
+            SettingsSwitchRow(
+                title = stringResource(Res.string.panel_ring_mouse),
+                description = stringResource(Res.string.panel_ring_mouse_description),
+                checked = mouse,
+                isTablet = isTablet,
+                onCheckedChange = { setPanelRingMouse(it) },
+            )
+            SettingsGroupDivider(isTablet = isTablet)
+            SettingsChoiceRow(
+                title = stringResource(Res.string.panel_ring_size),
+                description = null,
+                options = listOf(
+                    SettingsChoiceOption(PanelRingSize.Small, stringResource(Res.string.panel_ring_size_small)),
+                    SettingsChoiceOption(PanelRingSize.Medium, stringResource(Res.string.panel_ring_size_medium)),
+                    SettingsChoiceOption(PanelRingSize.Large, stringResource(Res.string.panel_ring_size_large)),
+                ),
+                selectedValue = size,
+                isTablet = isTablet,
+                onSelected = { setPanelRingSize(it) },
+            )
         }
     }
 }
@@ -414,25 +730,25 @@ private fun GamepadSliderRow(
         ) {
             Text(
                 text = title,
+                modifier = settingsRowTitleAccentMask(title),
                 style = if (isTablet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
-                color = if (enabled) tokens.colors.textPrimary else tokens.colors.textMuted,
+                color = if (enabled) settingsRowTitleColor(title) else tokens.colors.textMuted,
                 fontWeight = FontWeight.Medium,
             )
             SettingsSubtext(text = description, isTablet = isTablet)
         }
-        Column(
-            modifier = Modifier.width(if (isTablet) 210.dp else 220.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+        Row(
+            modifier = Modifier.width(if (isTablet) DesktopControlWidth else 220.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            ValueBox(text = valueLabel)
             SettingsModernSlider(
                 value = draft,
                 onValueChange = { if (enabled) draft = it },
                 onValueChangeFinished = { if (enabled) onValueChange(draft) },
                 enabled = enabled,
                 valueRange = valueRange,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.weight(1f),
+                valueLabel = valueLabel,
             )
         }
     }

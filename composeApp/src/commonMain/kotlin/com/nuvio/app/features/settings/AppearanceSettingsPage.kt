@@ -61,6 +61,11 @@ import com.nuvio.app.isDesktop
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_reset
+import nuvio.composeapp.generated.resources.settings_appearance_sidebar_items
+import nuvio.composeapp.generated.resources.settings_appearance_sidebar_items_centred
+import nuvio.composeapp.generated.resources.settings_appearance_sidebar_items_centred_description
+import nuvio.composeapp.generated.resources.settings_appearance_sidebar_items_top
+import nuvio.composeapp.generated.resources.settings_appearance_sidebar_items_top_description
 import nuvio.composeapp.generated.resources.settings_appearance_card_depth
 import nuvio.composeapp.generated.resources.settings_appearance_custom_theme
 import nuvio.composeapp.generated.resources.settings_appearance_custom_theme_accent
@@ -82,6 +87,8 @@ import nuvio.composeapp.generated.resources.settings_appearance_app_font_default
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_no_matches
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_none_installed
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_player_note
+import nuvio.composeapp.generated.resources.settings_appearance_app_font_scale
+import nuvio.composeapp.generated.resources.settings_appearance_app_font_scale_description
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_search_placeholder
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_sheet_title
 import nuvio.composeapp.generated.resources.settings_appearance_app_language
@@ -215,6 +222,7 @@ internal fun LazyListScope.appearanceSettingsContent(
         var showLanguageSheet by remember { mutableStateOf(false) }
         var showFontSheet by remember { mutableStateOf(false) }
         val appFontFamily by remember { ThemeSettingsRepository.appFontFamily }.collectAsState()
+        val appFontScalePercent by remember { ThemeSettingsRepository.appFontScalePercent }.collectAsState()
         val startWindowed by remember {
             DesktopWindowStartupPreference.ensureLoaded()
             DesktopWindowStartupPreference.startWindowed
@@ -271,6 +279,21 @@ internal fun LazyListScope.appearanceSettingsContent(
                         onClick = { showFontSheet = true },
                     )
                     SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSliderRow(
+                        title = stringResource(Res.string.settings_appearance_app_font_scale),
+                        description = stringResource(Res.string.settings_appearance_app_font_scale_description),
+                        value = appFontScalePercent,
+                        valueText = "$appFontScalePercent%",
+                        valueTextForValue = { "$it%" },
+                        valueRange = APP_FONT_SCALE_PERCENT_RANGE,
+                        step = 5,
+                        isTablet = isTablet,
+                        // Only a swapped-in font is rescaled; the bundled one is the reference.
+                        enabled = appFontFamily.isNotBlank(),
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("app-font-scale")),
+                        onValueChange = ThemeSettingsRepository::setAppFontScalePercent,
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
                     SettingsSwitchRow(
                         title = stringResource(Res.string.settings_appearance_start_windowed),
                         description = stringResource(Res.string.settings_appearance_start_windowed_description),
@@ -322,6 +345,33 @@ internal fun LazyListScope.appearanceSettingsContent(
                         modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("desktop-navigation")),
                         onSelected = onDesktopNavigationLayoutSelected,
                     )
+                    if (desktopNavigationLayout == DesktopNavigationLayout.Sidebar) {
+                        val itemsTop by ThemeSettingsRepository.desktopSidebarItemsTop.collectAsState()
+                        SettingsGroupDivider(isTablet = isTablet)
+                        SettingsChoiceRow(
+                            title = stringResource(Res.string.settings_appearance_sidebar_items),
+                            description = stringResource(
+                                if (itemsTop) Res.string.settings_appearance_sidebar_items_top_description
+                                else Res.string.settings_appearance_sidebar_items_centred_description,
+                            ),
+                            options = listOf(
+                                SettingsChoiceOption(false, stringResource(Res.string.settings_appearance_sidebar_items_centred)),
+                                SettingsChoiceOption(true, stringResource(Res.string.settings_appearance_sidebar_items_top)),
+                            ),
+                            selectedValue = itemsTop,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("sidebar-items")),
+                            onSelected = ThemeSettingsRepository::setDesktopSidebarItemsTop,
+                        )
+                    }
+                    SettingsGroupDivider(isTablet = isTablet)
+                    var navigationOrderOpen by remember { mutableStateOf(false) }
+                    Box(
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("navigation-order")),
+                    ) {
+                        NavigationOrderRow(isTablet = isTablet, onClick = { navigationOrderOpen = true })
+                    }
+                    if (navigationOrderOpen) NavigationOrderDialog(onDismiss = { navigationOrderOpen = false })
                     SettingsGroupDivider(isTablet = isTablet)
                     SettingsSwitchRow(
                         title = stringResource(Res.string.settings_appearance_desktop_discover_tab),
@@ -408,15 +458,18 @@ internal fun LazyListScope.appearanceSettingsContent(
                     collectionsPortraitPostersEnabled = posterCardStyleUiState.collectionsPortraitPostersEnabled,
                     landscapeTextTitlesEnabled = posterCardStyleUiState.landscapeTextTitlesEnabled,
                     landscapeRatingBadgeScale = posterCardStyleUiState.landscapeRatingBadgeScale,
+                    portraitRatingBadgeScale = posterCardStyleUiState.portraitRatingBadgeScale,
                     posterHighlightMode = posterCardStyleUiState.posterHighlightMode,
                     hideLabelsEnabled = posterCardStyleUiState.hideLabelsEnabled,
                     zoomActionPreviewEnabled = posterCardStyleUiState.zoomActionPreviewEnabled,
+                    watchlistBadgeEnabled = posterCardStyleUiState.watchlistBadgeEnabled,
                     onWidthSelected = PosterCardStyleRepository::setWidthDp,
                     onCornerRadiusSelected = PosterCardStyleRepository::setCornerRadiusDp,
                     onCatalogLandscapeModeChange = PosterCardStyleRepository::setCatalogLandscapeModeEnabled,
                     onCollectionsPortraitPostersChange = PosterCardStyleRepository::setCollectionsPortraitPostersEnabled,
                     onLandscapeTextTitlesChange = PosterCardStyleRepository::setLandscapeTextTitlesEnabled,
                     onLandscapeRatingBadgeScaleChange = PosterCardStyleRepository::setLandscapeRatingBadgeScale,
+                    onPortraitRatingBadgeScaleChange = PosterCardStyleRepository::setPortraitRatingBadgeScale,
                     onHideLabelsChange = PosterCardStyleRepository::setHideLabelsEnabled,
                 )
             }
@@ -444,10 +497,14 @@ internal fun LazyListScope.appearanceSettingsContent(
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppearanceFontBottomSheet(
+internal fun AppearanceFontBottomSheet(
     selectedFontFamily: String,
     onFontFamilySelected: (String) -> Unit,
     onDismiss: () -> Unit,
+    title: String = stringResource(Res.string.settings_appearance_app_font_sheet_title),
+    note: String = stringResource(Res.string.settings_appearance_app_font_player_note),
+    /** The "no system font" choice, which picking "" selects. */
+    defaultLabel: String = stringResource(Res.string.settings_appearance_app_font_default),
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
@@ -461,8 +518,6 @@ private fun AppearanceFontBottomSheet(
             installedFonts.filter { it.contains(trimmed, ignoreCase = true) }
         }
     }
-    val defaultLabel = stringResource(Res.string.settings_appearance_app_font_default)
-
     val dismiss = {
         coroutineScope.launch {
             dismissNuvioBottomSheet(sheetState = sheetState, onDismiss = onDismiss)
@@ -481,14 +536,14 @@ private fun AppearanceFontBottomSheet(
         ) {
             item {
                 Text(
-                    text = stringResource(Res.string.settings_appearance_app_font_sheet_title),
+                    text = title,
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
                 )
                 Text(
-                    text = stringResource(Res.string.settings_appearance_app_font_player_note),
+                    text = note,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 12.dp),

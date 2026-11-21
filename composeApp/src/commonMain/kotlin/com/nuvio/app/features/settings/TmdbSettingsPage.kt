@@ -11,20 +11,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import kotlinx.coroutines.launch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.nuvio.app.features.tmdb.CustomPosterTemplateProbe
 import com.nuvio.app.features.tmdb.HeroImageSource
 import com.nuvio.app.features.tmdb.TmdbSettings
-import com.nuvio.app.features.tmdb.probeCustomPosterTemplate
 import com.nuvio.app.features.tmdb.TmdbSettingsRepository
+import com.nuvio.app.features.tmdb.TmdbShowEnrichment
 import com.nuvio.app.features.tvdb.TvdbSettingsRepository
 import com.nuvio.app.features.tmdb.normalizeLanguage
 import nuvio.composeapp.generated.resources.Res
@@ -46,8 +41,6 @@ import nuvio.composeapp.generated.resources.settings_tmdb_module_details
 import nuvio.composeapp.generated.resources.settings_tmdb_module_details_description
 import nuvio.composeapp.generated.resources.settings_tmdb_module_episodes
 import nuvio.composeapp.generated.resources.settings_tmdb_module_episodes_description
-import nuvio.composeapp.generated.resources.settings_tmdb_module_more_like_this
-import nuvio.composeapp.generated.resources.settings_tmdb_module_more_like_this_description
 import nuvio.composeapp.generated.resources.settings_tmdb_module_networks
 import nuvio.composeapp.generated.resources.settings_tmdb_module_networks_description
 import nuvio.composeapp.generated.resources.settings_tmdb_module_production_companies
@@ -55,44 +48,33 @@ import nuvio.composeapp.generated.resources.settings_tmdb_module_production_comp
 import nuvio.composeapp.generated.resources.settings_tmdb_module_season_posters
 import nuvio.composeapp.generated.resources.settings_tmdb_module_season_posters_description
 import nuvio.composeapp.generated.resources.settings_tmdb_module_trailers
+import nuvio.composeapp.generated.resources.settings_tmdb_show_enrichment_title
+import nuvio.composeapp.generated.resources.settings_tmdb_show_enrichment_source_aware
+import nuvio.composeapp.generated.resources.settings_tmdb_show_enrichment_always
+import nuvio.composeapp.generated.resources.settings_tmdb_show_enrichment_source_aware_description
+import nuvio.composeapp.generated.resources.settings_tmdb_show_enrichment_always_description
 import nuvio.composeapp.generated.resources.settings_tmdb_module_trailers_description
 import nuvio.composeapp.generated.resources.settings_tmdb_personal_api_key
 import nuvio.composeapp.generated.resources.settings_tmdb_preferred_language
 import nuvio.composeapp.generated.resources.settings_tmdb_preferred_language_description
-import nuvio.composeapp.generated.resources.settings_tmdb_section_credentials
-import nuvio.composeapp.generated.resources.settings_tmdb_section_localization
 import nuvio.composeapp.generated.resources.settings_tmdb_section_modules
 import nuvio.composeapp.generated.resources.settings_tmdb_section_title
 import nuvio.composeapp.generated.resources.settings_tmdb_filename_catalogs
 import nuvio.composeapp.generated.resources.settings_tmdb_filename_catalogs_description
 import nuvio.composeapp.generated.resources.settings_tmdb_filename_catalogs_missing_key
-import nuvio.composeapp.generated.resources.settings_tmdb_filename_catalogs_section
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_addon
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_addon_description
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_missing_key
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_movies_tvdb_shows
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_movies_tvdb_shows_description
-import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_section
+import nuvio.composeapp.generated.resources.settings_tmdb_artwork_catalogs_section
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_tmdb
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_tmdb_description
 import nuvio.composeapp.generated.resources.settings_tmdb_hero_artwork_title
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_description
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_missing_template
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_section
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_test_description
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_test_ok
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_test_running
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_test_title
-import nuvio.composeapp.generated.resources.settings_tmdb_library_posters_title
-import nuvio.composeapp.generated.resources.settings_tmdb_poster_template
-import nuvio.composeapp.generated.resources.settings_tmdb_poster_template_description
-import nuvio.composeapp.generated.resources.settings_tmdb_poster_template_label
 import nuvio.composeapp.generated.resources.settings_tvdb_api_key
 import nuvio.composeapp.generated.resources.settings_tvdb_api_key_description
 import nuvio.composeapp.generated.resources.settings_tvdb_api_key_label
-import nuvio.composeapp.generated.resources.settings_tvdb_api_key_section
 import org.jetbrains.compose.resources.stringResource
-import androidx.compose.ui.text.input.KeyboardType
 
 internal fun LazyListScope.tmdbSettingsContent(
     isTablet: Boolean,
@@ -101,6 +83,7 @@ internal fun LazyListScope.tmdbSettingsContent(
     val enrichmentControlsEnabled = settings.enabled && settings.hasApiKey
     val localizationEnabled = settings.hasApiKey
 
+    // The switch, the key it needs and the language it fetches in, as one panel.
     item {
         SettingsSection(
             title = stringResource(Res.string.settings_tmdb_section_title),
@@ -123,32 +106,23 @@ internal fun LazyListScope.tmdbSettingsContent(
                         text = stringResource(Res.string.settings_tmdb_add_api_key_first),
                     )
                 }
-            }
-        }
-    }
-
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_tmdb_section_credentials),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
+                SettingsGroupDivider(isTablet = isTablet)
+                // The key check sits in the row's control column, and only a problem gets a
+                // sentence (in place of "Configured"); a separate line under the row sat oddly.
+                val keyStatus = if (settings.hasApiKey) rememberTmdbApiKeyStatus(settings.apiKey) else null
                 TmdbApiKeyRow(
                     isTablet = isTablet,
                     value = settings.apiKey,
+                    summaryOverride = tmdbApiKeyProblemText(keyStatus),
+                    rowTrailingContent = if (keyStatus != null) {
+                        { TmdbApiKeyStatusBadge(keyStatus) }
+                    } else {
+                        null
+                    },
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("tmdb-api-key")),
                     onApiKeyCommitted = TmdbSettingsRepository::setApiKey,
                 )
-            }
-        }
-    }
-
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_tmdb_section_localization),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
+                SettingsGroupDivider(isTablet = isTablet)
                 TmdbLanguageRow(
                     isTablet = isTablet,
                     value = settings.language,
@@ -166,6 +140,31 @@ internal fun LazyListScope.tmdbSettingsContent(
             isTablet = isTablet,
         ) {
             SettingsGroup(isTablet = isTablet) {
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.settings_tmdb_show_enrichment_title),
+                    description = when (settings.showEnrichment) {
+                        TmdbShowEnrichment.SourceAware ->
+                            stringResource(Res.string.settings_tmdb_show_enrichment_source_aware_description)
+                        TmdbShowEnrichment.Always ->
+                            stringResource(Res.string.settings_tmdb_show_enrichment_always_description)
+                    },
+                    options = listOf(
+                        SettingsChoiceOption(
+                            TmdbShowEnrichment.SourceAware,
+                            stringResource(Res.string.settings_tmdb_show_enrichment_source_aware),
+                        ),
+                        SettingsChoiceOption(
+                            TmdbShowEnrichment.Always,
+                            stringResource(Res.string.settings_tmdb_show_enrichment_always),
+                        ),
+                    ),
+                    selectedValue = settings.showEnrichment,
+                    enabled = enrichmentControlsEnabled,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("tmdb-show-enrichment")),
+                    onSelected = TmdbSettingsRepository::setShowEnrichment,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
                 TmdbToggleRow(
                     isTablet = isTablet,
                     title = stringResource(Res.string.settings_tmdb_module_trailers),
@@ -255,16 +254,7 @@ internal fun LazyListScope.tmdbSettingsContent(
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("tmdb-season-posters")),
                     onCheckedChange = TmdbSettingsRepository::setUseSeasonPosters,
                 )
-                SettingsGroupDivider(isTablet = isTablet)
-                TmdbToggleRow(
-                    isTablet = isTablet,
-                    title = stringResource(Res.string.settings_tmdb_module_more_like_this),
-                    description = stringResource(Res.string.settings_tmdb_module_more_like_this_description),
-                    checked = settings.useMoreLikeThis,
-                    enabled = enrichmentControlsEnabled,
-                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("tmdb-more-like-this")),
-                    onCheckedChange = TmdbSettingsRepository::setUseMoreLikeThis,
-                )
+                // More Like This is configured under Integrations, with its source.
                 SettingsGroupDivider(isTablet = isTablet)
                 TmdbToggleRow(
                     isTablet = isTablet,
@@ -279,16 +269,15 @@ internal fun LazyListScope.tmdbSettingsContent(
         }
     }
 
+    // Artwork and lookups beyond the enrichment modules, as one panel: where the hero art comes
+    // from, the TheTVDB key its "TMDB + TVDB" choice needs, and filename-only catalogs.
     item {
         val tvdbSettingsUiState by TvdbSettingsRepository.uiState.collectAsStateWithLifecycle()
         SettingsSection(
-            title = stringResource(Res.string.settings_tmdb_hero_artwork_section),
+            title = stringResource(Res.string.settings_tmdb_artwork_catalogs_section),
             isTablet = isTablet,
         ) {
-            SettingsGroup(
-                isTablet = isTablet,
-                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.TmdbHeroImages),
-            ) {
+            SettingsGroup(isTablet = isTablet) {
                 val heroImageOptions = buildList {
                     add(SettingsChoiceOption(HeroImageSource.Addon, stringResource(Res.string.settings_tmdb_hero_artwork_addon)))
                     if (settings.hasApiKey) {
@@ -303,48 +292,31 @@ internal fun LazyListScope.tmdbSettingsContent(
                 } else {
                     HeroImageSource.Addon
                 }
-                SettingsChoiceRow(
-                    title = stringResource(Res.string.settings_tmdb_hero_artwork_title),
-                    description = selectedHeroImageSource.settingsDescription(),
-                    options = heroImageOptions,
-                    selectedValue = selectedHeroImageSource,
-                    isTablet = isTablet,
-                    onSelected = TmdbSettingsRepository::setHeroImageSource,
-                )
-                if (!settings.hasApiKey) {
-                    SettingsGroupDivider(isTablet = isTablet)
-                    TmdbInfoRow(
+                Column(modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.TmdbHeroImages)) {
+                    SettingsChoiceRow(
+                        title = stringResource(Res.string.settings_tmdb_hero_artwork_title),
+                        description = selectedHeroImageSource.settingsDescription(),
+                        options = heroImageOptions,
+                        selectedValue = selectedHeroImageSource,
                         isTablet = isTablet,
-                        text = stringResource(Res.string.settings_tmdb_hero_artwork_missing_key),
+                        onSelected = TmdbSettingsRepository::setHeroImageSource,
                     )
+                    if (!settings.hasApiKey) {
+                        SettingsGroupDivider(isTablet = isTablet)
+                        TmdbInfoRow(
+                            isTablet = isTablet,
+                            text = stringResource(Res.string.settings_tmdb_hero_artwork_missing_key),
+                        )
+                    }
                 }
-            }
-        }
-    }
-
-    item {
-        val tvdbSettingsUiState by TvdbSettingsRepository.uiState.collectAsStateWithLifecycle()
-        SettingsSection(
-            title = stringResource(Res.string.settings_tvdb_api_key_section),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
+                SettingsGroupDivider(isTablet = isTablet)
                 TvdbApiKeyRow(
                     isTablet = isTablet,
                     value = tvdbSettingsUiState.apiKey,
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.TvdbApiKey),
                     onKeyCommitted = TvdbSettingsRepository::setApiKey,
                 )
-            }
-        }
-    }
-
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_tmdb_filename_catalogs_section),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
+                SettingsGroupDivider(isTablet = isTablet)
                 SettingsSwitchRow(
                     title = stringResource(Res.string.settings_tmdb_filename_catalogs),
                     description = stringResource(Res.string.settings_tmdb_filename_catalogs_description),
@@ -364,41 +336,6 @@ internal fun LazyListScope.tmdbSettingsContent(
             }
         }
     }
-
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_tmdb_library_posters_section),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(isTablet = isTablet) {
-                SettingsSwitchRow(
-                    title = stringResource(Res.string.settings_tmdb_library_posters_title),
-                    description = stringResource(Res.string.settings_tmdb_library_posters_description),
-                    checked = settings.libraryPosterEnabled,
-                    enabled = settings.libraryPosterUrlTemplate.isNotBlank(),
-                    isTablet = isTablet,
-                    onCheckedChange = TmdbSettingsRepository::setLibraryPosterEnabled,
-                )
-                if (settings.libraryPosterUrlTemplate.isBlank()) {
-                    SettingsGroupDivider(isTablet = isTablet)
-                    TmdbInfoRow(
-                        isTablet = isTablet,
-                        text = stringResource(Res.string.settings_tmdb_library_posters_missing_template),
-                    )
-                }
-                SettingsGroupDivider(isTablet = isTablet)
-                TmdbLibraryPosterRow(
-                    isTablet = isTablet,
-                    value = settings.libraryPosterUrlTemplate,
-                    onTemplateCommitted = TmdbSettingsRepository::setLibraryPosterUrlTemplate,
-                )
-                if (settings.libraryPosterUrlTemplate.isNotBlank()) {
-                    SettingsGroupDivider(isTablet = isTablet)
-                    TmdbLibraryPosterTestRow(isTablet = isTablet, settings = settings)
-                }
-            }
-        }
-    }
 }
 
 @Composable
@@ -414,6 +351,8 @@ private fun TmdbApiKeyRow(
     isTablet: Boolean,
     value: String,
     modifier: Modifier = Modifier,
+    summaryOverride: String? = null,
+    rowTrailingContent: (@Composable () -> Unit)? = null,
     onApiKeyCommitted: (String) -> Unit,
 ) {
     SettingsTextInputRow(
@@ -424,6 +363,8 @@ private fun TmdbApiKeyRow(
         secret = true,
         isTablet = isTablet,
         modifier = modifier,
+        summaryOverride = summaryOverride,
+        rowTrailingContent = rowTrailingContent,
         onSave = onApiKeyCommitted,
     )
 }
@@ -448,27 +389,6 @@ private fun TvdbApiKeyRow(
 }
 
 @Composable
-private fun TmdbLibraryPosterRow(
-    isTablet: Boolean,
-    value: String,
-    onTemplateCommitted: (String) -> Unit,
-) {
-    SettingsTextInputRow(
-        title = stringResource(Res.string.settings_tmdb_poster_template),
-        description = stringResource(Res.string.settings_tmdb_poster_template_description),
-        value = value,
-        placeholder = stringResource(Res.string.settings_tmdb_poster_template_label),
-        singleLine = false,
-        minLines = 2,
-        maxLines = 6,
-        keyboardType = KeyboardType.Uri,
-        summarizeAsConfigured = true,
-        isTablet = isTablet,
-        onSave = onTemplateCommitted,
-    )
-}
-
-@Composable
 private fun TmdbLanguageRow(
     isTablet: Boolean,
     value: String,
@@ -487,49 +407,6 @@ private fun TmdbLanguageRow(
         normalize = ::normalizeLanguage,
         onSave = onLanguageCommitted,
     )
-}
-
-/**
- * One-shot check of the poster template against the service, with its answer shown verbatim.
- *
- * A poster service that rejects the request is invisible from the library: the card quietly falls
- * back to the plain poster, so a broken template and a service with no art for a title look exactly
- * the same. The service's own error text names the problem (a missing `tmdb_key=` on a self-hosted
- * instance, a bad host, an expired key) far faster than reading the library ever could.
- */
-@Composable
-private fun TmdbLibraryPosterTestRow(
-    isTablet: Boolean,
-    settings: TmdbSettings,
-) {
-    val scope = rememberCoroutineScope()
-    val runningText = stringResource(Res.string.settings_tmdb_library_posters_test_running)
-    val okText = stringResource(Res.string.settings_tmdb_library_posters_test_ok)
-    var isRunning by remember { mutableStateOf(false) }
-    var result by remember(settings.libraryPosterUrlTemplate) { mutableStateOf<String?>(null) }
-
-    SettingsNavigationRow(
-        title = stringResource(Res.string.settings_tmdb_library_posters_test_title),
-        description = stringResource(Res.string.settings_tmdb_library_posters_test_description),
-        enabled = !isRunning,
-        isTablet = isTablet,
-        onClick = {
-            if (isRunning) return@SettingsNavigationRow
-            isRunning = true
-            result = null
-            scope.launch {
-                result = when (val probe = probeCustomPosterTemplate(settings)) {
-                    is CustomPosterTemplateProbe.Ok -> okText
-                    is CustomPosterTemplateProbe.Failed -> probe.detail
-                }
-                isRunning = false
-            }
-        },
-    )
-    val message = if (isRunning) runningText else result
-    if (message != null) {
-        TmdbInfoRow(isTablet = isTablet, text = message)
-    }
 }
 
 @Composable

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.catalog
 
+import com.nuvio.app.features.home.MetaPreview
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -34,6 +35,23 @@ class FilenameMetaResolverTest {
         ).forEach { name ->
             assertFalse(FilenameMetaResolver.looksLikeReleaseFilename(name), "expected title: $name")
         }
+    }
+
+    @Test
+    fun leavesMetadataAddonEpisodeRowsAlone() {
+        // AIOMetadata's MDBList Up Next: an episode marker in the name, but already identified.
+        val upNext = MetaPreview(id = "mdblist_upnext_tt1615919_S1E1", type = "series", name = "Raising Hope - S1E1")
+        assertFalse(FilenameMetaResolver.needsFilenameResolution(upNext))
+        assertFalse(
+            FilenameMetaResolver.needsFilenameResolution(
+                MetaPreview(id = "upnext:32815", type = "series", name = "Raising Hope - S1E1", addonTmdbId = 32815),
+            ),
+        )
+        assertTrue(
+            FilenameMetaResolver.needsFilenameResolution(
+                MetaPreview(id = "torbox:4821", type = "other", name = "Hanna S01E07"),
+            ),
+        )
     }
 
     @Test
@@ -282,5 +300,25 @@ class FilenameMetaResolverTest {
             FilenameMetaResolver.parseFilenameQuery("Severance.S02E06.2160p.WEB-DL.mkv", catalogType = "series"),
         )
         assertEquals(first.cacheKey, second.cacheKey)
+    }
+
+    @Test
+    fun dropsLeadingReleaseGroupTags() {
+        val anime = assertNotNull(
+            FilenameMetaResolver.parseFilenameQuery("[Erai-raws] InuYasha - 01 [1080p][Multiple Subtitle].mkv", catalogType = "other"),
+        )
+        assertEquals("InuYasha", anime.title)
+        val stacked = assertNotNull(
+            FilenameMetaResolver.parseFilenameQuery("[SubsPlease][Batch] Frieren S01E05 1080p.mkv", catalogType = "series"),
+        )
+        assertEquals("Frieren", stacked.title)
+    }
+
+    @Test
+    fun keepsATitleThatStartsWithParentheses() {
+        val query = assertNotNull(
+            FilenameMetaResolver.parseFilenameQuery("(500) Days of Summer 2009 1080p BluRay x264.mkv", catalogType = "movie"),
+        )
+        assertEquals(true, query.title.contains("500"))
     }
 }

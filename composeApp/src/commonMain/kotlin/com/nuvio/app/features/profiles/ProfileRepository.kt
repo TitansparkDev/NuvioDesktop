@@ -5,6 +5,7 @@ import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.auth.isAnonymous
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.collection.CollectionMobileSettingsRepository
 import com.nuvio.app.features.collection.CollectionRepository
@@ -27,6 +28,8 @@ import com.nuvio.app.features.search.SearchHistoryRepository
 import com.nuvio.app.features.settings.SettingsCategoryNamesRepository
 import com.nuvio.app.features.settings.SettingsCategoryOrderRepository
 import com.nuvio.app.features.settings.SettingsFavoritesRepository
+import com.nuvio.app.features.settings.SettingsSearchHistoryRepository
+import com.nuvio.app.features.settings.SettingsCollapsedSectionsRepository
 import com.nuvio.app.features.settings.SettingsHiddenCategoriesRepository
 import com.nuvio.app.features.settings.ThemeSettingsRepository
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
@@ -131,7 +134,9 @@ object ProfileRepository {
         SettingsCategoryOrderRepository.onProfileChanged()
         SettingsCategoryNamesRepository.onProfileChanged()
         SettingsFavoritesRepository.onProfileChanged()
+        SettingsSearchHistoryRepository.onProfileChanged()
         SettingsHiddenCategoriesRepository.onProfileChanged()
+        SettingsCollapsedSectionsRepository.onProfileChanged()
         ThemeSettingsRepository.onProfileChanged()
         return _state.value.profiles.isNotEmpty()
     }
@@ -157,7 +162,9 @@ object ProfileRepository {
         SettingsCategoryOrderRepository.onProfileChanged()
         SettingsCategoryNamesRepository.onProfileChanged()
         SettingsFavoritesRepository.onProfileChanged()
+        SettingsSearchHistoryRepository.onProfileChanged()
         SettingsHiddenCategoriesRepository.onProfileChanged()
+        SettingsCollapsedSectionsRepository.onProfileChanged()
     }
 
     fun clearInMemory() {
@@ -167,6 +174,7 @@ object ProfileRepository {
     }
 
     suspend fun pullProfiles() {
+        PerfTelemetry.count("ProfileRepository.pullProfiles")
         if (AuthRepository.state.value.isAnonymous) {
             if (!_state.value.isLoaded) {
                 _state.value = _state.value.copy(isLoaded = true)
@@ -210,6 +218,7 @@ object ProfileRepository {
             hasEverSelectedProfile = selectedProfile != null || _state.value.hasEverSelectedProfile,
         )
         persist()
+        reloadForkProfileSettings() // fork:profile-reload
         // Anime identity was already invalidated by the activeProfileIndex assignment above, which
         // has to happen before these reloads: they run legacy anime-id migrations against it, and a
         // stale value rewrites the incoming profile's native ids to franchise ids and persists them.
@@ -229,13 +238,16 @@ object ProfileRepository {
         SettingsCategoryOrderRepository.onProfileChanged()
         SettingsCategoryNamesRepository.onProfileChanged()
         SettingsFavoritesRepository.onProfileChanged()
+        SettingsSearchHistoryRepository.onProfileChanged()
         SettingsHiddenCategoriesRepository.onProfileChanged()
+        SettingsCollapsedSectionsRepository.onProfileChanged()
         PosterCardStyleRepository.onProfileChanged()
         LibraryDisplaySettingsRepository.onProfileChanged()
         PlayerSettingsRepository.onProfileChanged()
         com.nuvio.app.features.player.onPlayerShortcutsProfileChanged()
         StreamBadgeSettingsRepository.onProfileChanged()
         StreamScoreRepository.reload()
+        com.nuvio.app.features.livescores.LiveScoreSettingsRepository.reload() // fork:live-scores
         P2pSettingsRepository.onProfileChanged()
         HomeCatalogSettingsRepository.onProfileChanged()
         com.nuvio.app.features.discover.DiscoverRecommendationsRepository.onProfileChanged(profileIndex)
@@ -247,15 +259,21 @@ object ProfileRepository {
         EpisodeReleaseNotificationsRepository.onProfileChanged()
         TmdbSettingsRepository.onProfileChanged()
         MdbListSettingsRepository.onProfileChanged()
+        com.nuvio.app.features.posterservice.CustomPosterSettingsRepository.onProfileChanged()
         DiscoverAiSettingsRepository.onProfileChanged()
         CalendarSourceRepository.onProfileChanged()
         ContinueWatchingSourceRepository.onProfileChanged()
         LibrarySourceRepository.onProfileChanged()
         RatingPromptRepository.onProfileChanged()
+        com.nuvio.app.features.tracking.TrackingRatingSourceRepository.onProfileChanged()
         SearchHistoryRepository.onProfileChanged()
         CollectionRepository.onProfileChanged()
+        com.nuvio.app.features.playlist.PlaylistRepository.onProfileChanged()
+        com.nuvio.app.features.iptv.IptvRepository.onProfileChanged()
         CollectionMobileSettingsRepository.onProfileChanged()
         DownloadsRepository.onProfileChanged()
+        com.nuvio.app.features.servers.ServerRepository.onProfileChanged()
+        com.nuvio.app.features.usenet.UsenetSettingsRepository.onProfileChanged()
         com.nuvio.app.features.librarypvr.LibraryPvrRepository.onProfileChanged()
     }
 
@@ -345,6 +363,7 @@ object ProfileRepository {
         if (AuthRepository.state.value.isAnonymous) {
             val remaining = _state.value.profiles.filter { it.profileIndex != profileIndex }
             ProfilePinCacheStorage.removePayload(profileIndex)
+            com.nuvio.app.features.servers.ServerRepository.removeProfile(profileIndex)
             _state.value = _state.value.copy(
                 profiles = remaining,
                 activeProfile = if (_state.value.activeProfile?.profileIndex == profileIndex) remaining.firstOrNull() else _state.value.activeProfile,
@@ -358,6 +377,7 @@ object ProfileRepository {
         runCatching {
             val params = buildJsonObject { put("p_profile_id", profileIndex) }
             SupabaseProvider.client.postgrest.rpc("sync_delete_profile_data", params)
+            com.nuvio.app.features.servers.ServerRepository.removeProfile(profileIndex)
             pullProfiles()
         }.onFailure { e ->
             log.e(e) { "Failed to delete profile $profileIndex" }
@@ -444,6 +464,7 @@ object ProfileRepository {
     }
 
     suspend fun pullProfileLocks(): List<ProfileLockState> {
+        PerfTelemetry.count("ProfileRepository.pullProfileLocks")
         return runCatching {
             val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profile_locks")
             result.decodeList<ProfileLockState>()

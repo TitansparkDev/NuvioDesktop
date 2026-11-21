@@ -13,6 +13,8 @@ import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.size.Precision
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import okio.Path.Companion.toOkioPath
 import java.awt.Color
@@ -29,6 +31,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * The whole path a poster provider's `Cache-Control` takes through Nuvio, driven end to end: a real
@@ -51,6 +55,7 @@ class ImageCacheHeadersIntegrationTest {
     @BeforeTest
     fun start() {
         ImageFreshnessRegistry.clear()
+        ImageBackgroundRevalidation.reset()
         ImageFreshnessRegistry.nowMillis = { System.currentTimeMillis() + clockOffsetMillis }
         server = PosterServer()
         cacheDir = Files.createTempDirectory("nuvio-image-cache-it")
@@ -65,6 +70,7 @@ class ImageCacheHeadersIntegrationTest {
 
     @AfterTest
     fun stop() {
+        settle()
         loader.shutdown()
         server.stop()
         ImageFreshnessRegistry.nowMillis = System::currentTimeMillis
@@ -92,25 +98,29 @@ class ImageCacheHeadersIntegrationTest {
         assertEquals(DataSource.MEMORY_CACHE, load().dataSource)
         assertEquals(1, server.requests.size)
 
-        // The day is up: the memory copy is no longer trusted, the disk copy is revalidated, and
-        // the server's 304 costs no body. Freshness restarts from the 304's own headers.
+        // The day is up: the memory copy is no longer trusted, the disk copy is shown at once and
+        // revalidated in the background, and the server's 304 costs no body. Freshness restarts
+        // from the 304's own headers.
         clockOffsetMillis = 25 * 3_600_000L
-        val revalidated = load()
+        assertEquals(RED_ARGB, load().pixel())
+        settle()
         assertEquals(2, server.requests.size)
         assertEquals("\"red\"", server.requests.last().ifNoneMatch)
         assertEquals(304, server.responses.last())
-        assertEquals(RED_ARGB, revalidated.pixel())
         assertEquals(DataSource.MEMORY_CACHE, load().dataSource)
         assertEquals(2, server.requests.size)
 
-        // Another day on, the poster really changed (a trending sash came off): the conditional
-        // request is answered with new bytes, and every size stops serving the old ones.
+        // Another day on, the poster really changed (a trending sash came off): the old one is
+        // shown once more while the conditional request brings the new bytes, and from then on
+        // every size stops serving the old ones.
         server.serve(BLUE, etag = "\"blue\"", cacheControl = "public, max-age=86400")
         clockOffsetMillis = 50 * 3_600_000L
-        val replaced = load()
+        assertEquals(RED_ARGB, load().pixel(), "the stale copy, without waiting")
+        settle()
         assertEquals(3, server.requests.size)
         assertEquals("\"red\"", server.requests.last().ifNoneMatch)
         assertEquals(200, server.responses.last())
+        val replaced = load()
         assertEquals(BLUE_ARGB, replaced.pixel())
         val otherSize = load(size = 4)
         assertNotEquals(DataSource.MEMORY_CACHE, otherSize.dataSource, "decoded from the superseded bytes")
@@ -145,17 +155,47 @@ class ImageCacheHeadersIntegrationTest {
         server.fail(503)
         val stale = load()
         assertEquals(RED_ARGB, stale.pixel())
+        settle()
         assertEquals(2, server.requests.size, "the refresh was attempted")
 
         // And is not attempted again on every card for a while.
         assertEquals(DataSource.MEMORY_CACHE, load().dataSource)
         assertEquals(2, server.requests.size)
+        // Coil leaked the entry's snapshot on a failed refresh, locking it until a restart.
+        val editor = assertNotNull(loader.diskCache!!.openEditor(server.url), "the failed refresh left the entry locked")
+        editor.abort()
 
         // Once the grace period is over the service is back and the refresh goes through.
         clockOffsetMillis += 6 * 60_000L
         server.serve(BLUE, etag = "\"blue\"", cacheControl = "public, max-age=60")
-        assertEquals(BLUE_ARGB, load().pixel())
+        assertEquals(RED_ARGB, load().pixel())
+        settle()
         assertEquals(3, server.requests.size)
+        assertEquals(BLUE_ARGB, load().pixel(), "the refresh could write the entry the failure had touched")
+    }
+
+    @Test
+    fun `a stale poster is shown at once while a slow refresh runs`() {
+        server.serve(RED, etag = "\"red\"", cacheControl = "public, max-age=60")
+        load()
+
+        // 2026-11-18: refreshes that hung for 11-15 s held back every poster that was on disk.
+        clockOffsetMillis = 61_000L
+        server.delayMillis = 3_000
+        val startedAt = System.nanoTime()
+        val stale = load()
+        val tookMillis = (System.nanoTime() - startedAt) / 1_000_000
+        assertEquals(RED_ARGB, stale.pixel())
+        assertTrue(tookMillis < 1_500, "served in ${tookMillis}ms, not after the refresh")
+
+        // Other sizes of the same poster do not wait behind the refresh either.
+        val otherStartedAt = System.nanoTime()
+        assertEquals(RED_ARGB, load(size = 4).pixel())
+        assertTrue((System.nanoTime() - otherStartedAt) / 1_000_000 < 1_500)
+
+        settle()
+        assertEquals(2, server.requests.size, "one refresh for the poster, not one per card")
+        assertEquals(304, server.responses.last())
     }
 
     @Test
@@ -165,9 +205,54 @@ class ImageCacheHeadersIntegrationTest {
 
         clockOffsetMillis = 61_000L
         server.fail(404)
+        // Shown once more while the refresh finds out; then the copy is dropped.
+        assertEquals(RED_ARGB, load().pixel())
+        settle()
         val result = runBlocking { loader.execute(request(size = 2)) }
         val error = assertIs<ErrorResult>(result, "a 404 is the answer, not an outage")
         assertEquals(404, assertIs<HttpException>(error.throwable).response.code)
+    }
+
+    @Test
+    fun `identical requests in flight at once share one download`() {
+        server.serve(RED, etag = "\"red\"", cacheControl = "public, max-age=86400")
+        server.delayMillis = 300
+
+        val results = loadConcurrently(3)
+
+        assertEquals(1, server.requests.size, "the second and third waited for the first")
+        results.forEach { assertEquals(RED_ARGB, assertIs<SuccessResult>(it).pixel()) }
+    }
+
+    @Test
+    fun `a no-store poster requested three times at once is downloaded once`() {
+        // Without the follower marker the disk strategy refuses the copy the first request just
+        // wrote, and each waiter downloads it again anyway.
+        server.serve(RED, etag = null, cacheControl = "no-store, no-cache, must-revalidate")
+        server.delayMillis = 300
+
+        val results = loadConcurrently(3)
+
+        assertEquals(1, server.requests.size)
+        results.forEach { assertEquals(RED_ARGB, assertIs<SuccessResult>(it).pixel()) }
+        assertEquals(0, SharedImageRequestCoalescing.inFlightCount())
+    }
+
+    @Test
+    fun `when the shared download fails each waiter asks for itself`() {
+        server.fail(404)
+        server.delayMillis = 300
+
+        val results = loadConcurrently(3)
+
+        assertEquals(3, server.requests.size, "a failure is not handed on to the waiters")
+        results.forEach { assertIs<ErrorResult>(it) }
+        assertEquals(0, SharedImageRequestCoalescing.inFlightCount())
+    }
+
+    /** Distinct sizes, so no request can be answered by another's memory-cache entry. */
+    private fun loadConcurrently(count: Int) = runBlocking {
+        (0 until count).map { index -> async { loader.execute(request(size = 2 + index)) } }.awaitAll()
     }
 
     private fun request(size: Int): ImageRequest = ImageRequest.Builder(PlatformContext.INSTANCE)
@@ -176,6 +261,9 @@ class ImageCacheHeadersIntegrationTest {
         .precision(Precision.INEXACT)
         .desktopArtworkCacheSize()
         .build()
+
+    /** Waits for the background refreshes the loads so far have started. */
+    private fun settle() = runBlocking { ImageBackgroundRevalidation.awaitIdle() }
 
     private fun load(size: Int = 2): SuccessResult = runBlocking {
         assertIs<SuccessResult>(loader.execute(request(size)))
@@ -199,11 +287,14 @@ class ImageCacheHeadersIntegrationTest {
         @Volatile private var etag: String? = null
         @Volatile private var cacheControl: String? = null
         @Volatile private var failureCode: Int? = null
+        /** How long each answer takes, so concurrent requests overlap. */
+        @Volatile var delayMillis = 0L
 
         init {
             http.createContext("/poster.png") { exchange ->
                 val ifNoneMatch = exchange.requestHeaders.getFirst("If-None-Match")
                 requests += Request(ifNoneMatch)
+                if (delayMillis > 0) Thread.sleep(delayMillis)
                 val failure = failureCode
                 val code = when {
                     failure != null -> failure
@@ -224,6 +315,9 @@ class ImageCacheHeadersIntegrationTest {
                     exchange.close()
                 }
             }
+            // One thread per exchange: the default executor would answer overlapping requests in
+            // turn, which still counts them but hides how long the waiters really waited.
+            http.executor = java.util.concurrent.Executors.newCachedThreadPool()
             http.start()
         }
 

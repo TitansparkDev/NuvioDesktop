@@ -1,8 +1,12 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.i18n.localizedString
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -23,29 +27,63 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.runtime.CompositionLocalProvider
 import com.nuvio.app.core.ui.LocalNuvioBaseDensity
+import com.nuvio.app.features.player.desktop.NvidiaRtxDriverState
 import com.nuvio.app.features.player.desktop.DesktopAnimeShaders
+import com.nuvio.app.features.player.desktop.DESKTOP_DISPLAY_PANEL_OVERRIDE_KEY
+import com.nuvio.app.features.player.desktop.DESKTOP_FILM_GRAIN_OVERRIDE_KEY
+import com.nuvio.app.features.player.desktop.DESKTOP_INTERPOLATION_OVERRIDE_KEY
+import com.nuvio.app.features.player.desktop.DESKTOP_SHARPEN_OVERRIDE_KEY
+import com.nuvio.app.features.player.desktop.desktopDebandGrain
+import com.nuvio.app.features.player.desktop.desktopInterpolationProperties
+import com.nuvio.app.features.player.desktop.desktopCustomMpvOptionNames
+import com.nuvio.app.features.player.desktop.desktopInverseToneMappingProperties
+import com.nuvio.app.features.player.desktop.shouldEnableDesktopInverseToneMapping
+import com.nuvio.app.features.player.desktop.desktopTargetContrast
+import com.nuvio.app.features.player.desktop.desktopCasSharpness
+import com.nuvio.app.features.player.desktop.desktopShaderChainWithSharpen
 import com.nuvio.app.features.player.desktop.DesktopAnimeSvp
 import com.nuvio.app.features.player.desktop.DesktopCustomShaders
 import com.nuvio.app.features.player.desktop.DesktopWindowGeometryDiagnostics
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.preroll.PostShowKey
+import com.nuvio.app.features.preroll.PostShowScreen
 import com.nuvio.app.features.input.GamepadContext
 import com.nuvio.app.features.screensaver.DesktopScreensaver
 import com.nuvio.app.features.player.desktop.NativePlayerHost
 import com.nuvio.app.features.player.desktop.PlaybackRedirectResolution
 import com.nuvio.app.features.player.desktop.PlaybackRedirectResolver
+import com.nuvio.app.features.player.desktop.SeekRateLimitRecovery
+import com.nuvio.app.features.player.desktop.SeekThumbnailRateLimitGate
+import com.nuvio.app.features.player.desktop.TorBoxNodeHop
+import com.nuvio.app.features.player.desktop.DESKTOP_PLAYBACK_FALLBACK_USER_AGENT
 import com.nuvio.app.features.player.desktop.desktopAppFullscreenState
+import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import java.awt.KeyEventDispatcher
+import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.player_error_debrid_rate_limited
+import nuvio.composeapp.generated.resources.player_rate_limit_reconnecting
+import nuvio.composeapp.generated.resources.player_rate_limit_switching_server
+import org.jetbrains.compose.resources.getString
 import java.awt.KeyboardFocusManager
 import java.awt.event.KeyEvent
 import javax.swing.text.JTextComponent
+import nuvio.composeapp.generated.resources.*
+import org.jetbrains.compose.resources.stringResource
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -157,15 +195,50 @@ private fun NativePlayerSurface(
     val redirectResolutions = remember { mutableMapOf<String, PlaybackRedirectResolution>() }
     // Last real playhead this surface reported, for resuming after a pinned link is re-resolved.
     val lastKnownPositionMs = remember { mutableStateOf(0L) }
+    // Its duration, so a rate-limit reopen can refuse a resume target at the very end.
+    val lastKnownDurationMs = remember { mutableStateOf(0L) }
+    // The post-show cards are up and the video belongs in the corner box. A derived value, so the
+    // position ticking every 500 ms does not recompose this surface; only the flip does.
+    val postShowBoxed by PostShowController.active
+    // 0 -> 1 as the post-show starts: the cards fade in under the video's corner box. The video
+    // itself cannot be animated (it is a native window), so it snaps.
+    val postShowProgress by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (postShowBoxed) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = POST_SHOW_SHRINK_MS,
+            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+        ),
+        label = "postShowShrink",
+    )
+    // Keyed on the attempt, so closing the cards on one episode does not carry into the next.
+    DisposableEffect(playbackAttemptId) {
+        PostShowController.reset()
+        onDispose { PostShowController.reset() }
+    }
     val surfaceScope = rememberCoroutineScope()
     LaunchedEffect(playbackAttemptId, sourceUrl) {
-        DesktopPlayerLaunchShield.showForActiveWindow()
+        // fork:pip-browse - the next video opening in the corner box: the app stays in sight too.
+        if (com.nuvio.app.features.youtube.YouTubeWatchLayout.pageShown ||
+            com.nuvio.app.features.player.PlayerBrowsePip.active.value
+        ) {
+            // fork:youtube-watch-page - the video sits in a box on the page (or the mini player's corner):
+            // the page stays in sight and only the box is dark, the surface being black until a frame
+            // comes. A hand-over's shield goes once the page has had a frame to draw.
+            DesktopPlayerLaunchShield.hideAfter()
+        } else {
+            DesktopPlayerLaunchShield.showForActiveWindow()
+        }
     }
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
+    // What mpv will send, so a TorBox node probe looks like the player it is standing in for.
+    val playbackUserAgent = remember(playbackHeaders) {
+        playbackHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
+            ?: DESKTOP_PLAYBACK_FALLBACK_USER_AGENT
+    }
     val playerSettings by PlayerSettingsRepository.uiState.collectAsState()
     val initialAnimeSvpRequested = playerSettings.desktopAnimeSvpEnabled &&
         playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full &&
-        isAnimeContent &&
+        (isAnimeContent || playerSettings.desktopSvpAllContentEnabled) &&
         initialPlaybackSpeed < 1.5f
     // Keep one state holder for the controller callback's lifetime. Replacing it on a source
     // change would leave the callback writing to the previous file's state object.
@@ -193,6 +266,9 @@ private fun NativePlayerSurface(
     val latestOnError = rememberUpdatedState(onError)
 
     LaunchedEffect(controller, playbackAttemptId, sourceUrl) {
+        // The attach below (after redirect resolution) is what loads this source; until its file
+        // has loaded, the controller's tracks are still the previous file's.
+        controller.hideTracksUntilNextFileLoads()
         onControllerReady(controller)
     }
 
@@ -210,11 +286,29 @@ private fun NativePlayerSurface(
             hostFirstFullSizePaintComplete.value = true
             DesktopPlayerLaunchShield.hideAfter()
         }
+        host.onResized = { controller.layoutToHost() }
+        DesktopPlayerLaunchShield.activeVideoHost = host
         onDispose {
+            if (DesktopPlayerLaunchShield.activeVideoHost === host) DesktopPlayerLaunchShield.activeVideoHost = null
+            host.onResized = null
             host.onDisplayableChanged = null
             host.onFirstPaint = null
             host.onFirstFullSizePaint = null
             DesktopPlayerLaunchShield.hide()
+        }
+    }
+
+    // The attach below waits on a full-size paint. If Windows never sends one (seen on re-entering
+    // the player: 17s stall until a focus change exposed the window), stop waiting once the surface
+    // is on screen at full size.
+    LaunchedEffect(host, hostFirstFullSizePaintComplete.value) {
+        if (hostFirstFullSizePaintComplete.value) return@LaunchedEffect
+        while (true) {
+            delay(250L)
+            if (host.notifyFullSizeIfReady()) {
+                PlaybackStartTrace.markStartupDetail("surfacePaint:fallback")
+                return@LaunchedEffect
+            }
         }
     }
 
@@ -300,6 +394,86 @@ private fun NativePlayerSurface(
         )
     }
 
+    // fork:voice-control - spoken play / pause / next while this player is up, through the same
+    // paths as its buttons, so the screen's own state (watch party, next-episode rules) applies.
+    DisposableEffect(controller) {
+        val target = object : com.nuvio.app.features.voice.VoicePlaybackTarget {
+            override fun control(command: com.nuvio.app.features.voice.VoicePlaybackCommand): String? {
+                val wouldPlay = controller.toggleWouldPlay() ?: return "The player is not ready"
+                when (command) {
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.Play ->
+                        if (wouldPlay) latestOnPlayerControlsAction.value(PlayerControlsAction.TogglePlayback)
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.Pause ->
+                        if (!wouldPlay) latestOnPlayerControlsAction.value(PlayerControlsAction.TogglePlayback)
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.Next ->
+                        latestOnPlayerControlsEvent.value("nextEpisode", 0.0)
+                    // Through the screen, so a watch party seeks together and the HUD shows the jump.
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.Seek ->
+                        latestOnPlayerControlsEvent.value("voiceSeekBy", command.deltaMs.toDouble())
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.Speed ->
+                        latestOnPlayerControlsEvent.value("setPlaybackSpeed", command.rate.toDouble())
+                    // The rest go the way the HUD's own buttons and keys send them.
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.SkipSegment ->
+                        latestOnPlayerControlsEvent.value("voiceSkipSegment", 0.0)
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.Previous ->
+                        latestOnPlayerControlsEvent.value("previousEpisode", 0.0)
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.SeekTo ->
+                        latestOnPlayerControlsEvent.value("voiceSeekTo", command.positionMs.toDouble())
+                    // The HUD only learns of volume it didn't set itself through the pill, so show it.
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.VolumeChange -> {
+                        latestOnPlayerControlsEvent.value("volumeDelta", command.percent / 100.0)
+                        controller.showVolumePillFromNative()
+                    }
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.VolumeSet -> {
+                        latestOnPlayerControlsEvent.value("volumeSet", command.percent.toDouble())
+                        controller.showVolumePillFromNative()
+                    }
+                    // The mute key's own path (it shows the volume pill); only when it would change anything.
+                    is com.nuvio.app.features.voice.VoicePlaybackCommand.Mute ->
+                        if (controller.getVolume()?.isMuted != command.muted) controller.dispatchKeyboardShortcut("keyboardToggleMute")
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.NextSubtitles ->
+                        latestOnPlayerControlsEvent.value("keyboardNextSubtitle", 0.0)
+                    com.nuvio.app.features.voice.VoicePlaybackCommand.NextAudio ->
+                        latestOnPlayerControlsEvent.value("keyboardNextAudio", 0.0)
+                }
+                return null
+            }
+
+            override fun goBack() {
+                latestOnPlayerControlsAction.value(PlayerControlsAction.Back)
+            }
+
+            override fun close() {
+                latestOnPlayerControlsEvent.value("voiceClosePlayer", 0.0)
+            }
+        }
+        com.nuvio.app.features.voice.VoicePlayback.player = target
+        onDispose {
+            if (com.nuvio.app.features.voice.VoicePlayback.player === target) {
+                com.nuvio.app.features.voice.VoicePlayback.player = null
+            }
+        }
+    }
+
+    // fork:voice-control - the app's listening pill is drawn under the video, so the HUD's own pill
+    // stands in for it here.
+    LaunchedEffect(controller) {
+        var shown = false
+        com.nuvio.app.features.voice.VoiceControlRepository.session
+            .map(::voicePillText)
+            .distinctUntilChanged()
+            .collect { pill ->
+                if (pill == null) {
+                    // Cancelled mid-command: take the long-lived "Listening" pill down.
+                    if (shown) controller.showPresetPill("Voice", "Cancelled", 600)
+                    shown = false
+                    return@collect
+                }
+                controller.showPresetPill(pill.first, pill.second, pill.third)
+                shown = pill.third > VOICE_PILL_RESULT_MS
+            }
+    }
+
     DisposableEffect(controller) {
         PlayerShortcutsRepository.ensureLoaded()
         // Tells the gamepad poller which of a button's two meanings applies. Scoped to this
@@ -308,13 +482,66 @@ private fun NativePlayerSurface(
         GamepadContext.playerActive = true
         // The screensaver's "during playback" switch keys off the same fact.
         DesktopScreensaver.playerActive = true
+        // Holding the play/pause key while playing plays at 2x until it is let go; a tap still pauses on release.
+        // Paused, the key plays at once as before. Mirrors the HUD's own hold (controls.js, playHold*).
+        var playHoldKey = 0
+        var playHoldActive = false
+        var playHoldJob: kotlinx.coroutines.Job? = null
         val dispatcher = KeyEventDispatcher { event ->
+            if (event.id == KeyEvent.KEY_RELEASED && playHoldKey != 0 && event.keyCode == playHoldKey) {
+                playHoldJob?.cancel()
+                playHoldJob = null
+                playHoldKey = 0
+                if (playHoldActive) {
+                    playHoldActive = false
+                    controller.dispatchKeyboardShortcut("holdSpeedEnd", 0.0)
+                } else {
+                    controller.dispatchKeyboardShortcut("keyboardToggle", 1.0)
+                }
+                event.consume()
+                return@KeyEventDispatcher true
+            }
             if (event.id != KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
+            // Auto-repeat of a held play/pause key: the hold is already timing or running.
+            if (playHoldKey != 0 && event.keyCode == playHoldKey) {
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            // fork:pip-browse - the video in its corner box over the app: the keys drive the app.
+            if (com.nuvio.app.features.player.PlayerBrowsePip.active.value) return@KeyEventDispatcher false
             if (event.isMetaDown || event.isControlDown || event.isAltDown || event.isShiftDown) {
                 return@KeyEventDispatcher false
             }
             val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
             if (focusOwner is JTextComponent) return@KeyEventDispatcher false
+            // A Compose text field (the YouTube watch page's comment box) is being typed in: its keys are its own.
+            if (com.nuvio.app.core.ui.TextInputFocusTracker.active.value) return@KeyEventDispatcher false
+            // Post-show cards are up: a pad's D-pad, A and B (replayed here as arrows, the play/pause key
+            // and Escape) and the number keys drive the cards. Anything else, including the skip key,
+            // carries on below.
+            if (PostShowController.active.value) {
+                val postShowKey = when (event.keyCode) {
+                    KeyEvent.VK_LEFT -> PostShowKey.Left
+                    KeyEvent.VK_RIGHT -> PostShowKey.Right
+                    KeyEvent.VK_UP -> PostShowKey.Up
+                    KeyEvent.VK_DOWN -> PostShowKey.Down
+                    KeyEvent.VK_1, KeyEvent.VK_NUMPAD1 -> PostShowKey.Option1
+                    KeyEvent.VK_2, KeyEvent.VK_NUMPAD2 -> PostShowKey.Option2
+                    KeyEvent.VK_3, KeyEvent.VK_NUMPAD3 -> PostShowKey.Option3
+                    KeyEvent.VK_4, KeyEvent.VK_NUMPAD4 -> PostShowKey.Option4
+                    AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) -> PostShowKey.Back
+                    AppShortcutsRepository.keyCode(AppShortcutAction.SelectFocused) -> PostShowKey.Select
+                    else -> when (PlayerShortcutsRepository.actionForKeyCode(event.keyCode)) {
+                        PlayerShortcutAction.PlayPause, PlayerShortcutAction.AlternatePlayPause -> PostShowKey.Select
+                        else -> null
+                    }
+                }
+                if (postShowKey != null) {
+                    PostShowController.press(postShowKey)
+                    event.consume()
+                    return@KeyEventDispatcher true
+                }
+            }
             // Media keys are deliberately NOT handled here. A KeyEventDispatcher only sees keys
             // routed to a focused Nuvio window, which defeats the point of a media key; they are
             // owned by the Windows media session in player_bridge.cpp and arrive as the
@@ -326,9 +553,36 @@ private fun NativePlayerSurface(
                 KeyEvent.VK_RIGHT -> "ArrowRight"
                 AppShortcutsRepository.keyCode(AppShortcutAction.SelectFocused) -> "Enter"
                 AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) -> "Escape"
-                else -> null
+                // Play / pause (a pad's A in the player) picks while the keys drive a panel or the player menu.
+                else -> if (controller.isKeyboardPanelOpen && playHoldKey == 0 &&
+                    PlayerShortcutsRepository.actionForKeyCode(event.keyCode).let {
+                        it == PlayerShortcutAction.PlayPause || it == PlayerShortcutAction.AlternatePlayPause
+                    }
+                ) "Enter" else null
             }
             if (panelKey != null && controller.dispatchKeyboardPanelKey(panelKey)) {
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            if (event.keyCode == AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) &&
+                controller.dismissSkipSubmitToastIfShown()
+            ) {
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            // Escape reaching AWT (Compose focused, or a pad's B replayed as Escape) would otherwise
+            // fall through to back navigation and leave the player.
+            // A YouTube video filling the screen from its watch page: Escape goes back to the page.
+            if (event.keyCode == AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) &&
+                com.nuvio.app.features.youtube.handleYouTubeEscape(javax.swing.SwingUtilities.getWindowAncestor(host))
+            ) {
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            if (event.keyCode == AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) &&
+                controller.escapeShouldGoWindowed()
+            ) {
+                toggleDesktopAppFullscreen()
                 event.consume()
                 return@KeyEventDispatcher true
             }
@@ -345,12 +599,60 @@ private fun NativePlayerSurface(
                 event.consume()
                 return@KeyEventDispatcher true
             }
+            // Live TV: typing a channel number. The HUD shows and times the number box.
+            val digit = when (event.keyCode) {
+                in KeyEvent.VK_0..KeyEvent.VK_9 -> event.keyCode - KeyEvent.VK_0
+                in KeyEvent.VK_NUMPAD0..KeyEvent.VK_NUMPAD9 -> event.keyCode - KeyEvent.VK_NUMPAD0
+                else -> -1
+            }
+            if (digit >= 0 && com.nuvio.app.features.iptv.IptvPlaybackSession.active.value != null &&
+                PlayerShortcutsRepository.actionForKeyCode(event.keyCode) == null
+            ) {
+                controller.dispatchIptvDigit(digit)
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            // fork:voice-control - the voice key works over the player too (the HUD has the keyboard, so
+            // the window's own handler never sees it), and while listening Escape / a pad's B cancels
+            // the command instead of closing the film.
+            val voice = com.nuvio.app.features.voice.VoiceControlRepository
+            if (event.keyCode == AppShortcutsRepository.keyCode(AppShortcutAction.VoiceCommand) &&
+                PlayerShortcutsRepository.actionForKeyCode(event.keyCode) == null
+            ) {
+                voice.toggleListening()
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            if (event.keyCode == AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) &&
+                voice.session.value !is com.nuvio.app.features.voice.VoiceSessionState.Idle
+            ) {
+                voice.cancelListening()
+                event.consume()
+                return@KeyEventDispatcher true
+            }
+            // Enter no longer starts walking the on-screen controls (2026-11-15): the player menu (P, a pad's View)
+            // reaches everything they did.
             // Rebindable actions, resolved against the user's current bindings.
             val action = PlayerShortcutsRepository.actionForKeyCode(event.keyCode)
                 ?: return@KeyEventDispatcher false
             when (action) {
-                PlayerShortcutAction.PlayPause -> controller.dispatchKeyboardShortcut("keyboardToggle", 1.0)
-                PlayerShortcutAction.AlternatePlayPause -> controller.dispatchKeyboardShortcut("keyboardToggle", 1.0)
+                PlayerShortcutAction.PlayPause, PlayerShortcutAction.AlternatePlayPause -> {
+                    if (controller.toggleWouldPlay() == false) {
+                        // Playing: wait to see whether this is a tap (pause on release) or a hold (2x).
+                        val key = event.keyCode
+                        playHoldKey = key
+                        playHoldActive = false
+                        playHoldJob = surfaceScope.launch {
+                            kotlinx.coroutines.delay(PLAY_HOLD_DELAY_MS)
+                            if (playHoldKey == key) {
+                                playHoldActive = true
+                                controller.dispatchKeyboardShortcut("holdSpeedStart", 0.0)
+                            }
+                        }
+                    } else {
+                        controller.dispatchKeyboardShortcut("keyboardToggle", 1.0)
+                    }
+                }
                 PlayerShortcutAction.ToggleMute -> controller.dispatchKeyboardShortcut("keyboardToggleMute", 1.0)
                 PlayerShortcutAction.SeekBackward -> controller.dispatchKeyboardShortcut("keyboardSeekBack", 1.0)
                 PlayerShortcutAction.SeekForward -> controller.dispatchKeyboardShortcut("keyboardSeekForward", 1.0)
@@ -359,9 +661,28 @@ private fun NativePlayerSurface(
                 PlayerShortcutAction.ToggleSpeed -> controller.dispatchKeyboardShortcut("keyboardSpeedToggle", 1.0)
                 PlayerShortcutAction.NextSubtitle -> controller.dispatchKeyboardShortcut("keyboardNextSubtitle", 1.0)
                 PlayerShortcutAction.NextAudio -> controller.dispatchKeyboardShortcut("keyboardNextAudio", 1.0)
-                PlayerShortcutAction.OpenSources -> controller.openKeyboardPanel("sources")
-                PlayerShortcutAction.OpenEpisodes -> controller.openKeyboardPanel("episodes")
+                // Live TV has no sources or episodes panel: these keys (and the pad's RB/LB) open the
+                // channel switcher, which the D-pad then drives like the episodes panel.
+                PlayerShortcutAction.OpenSources -> if (com.nuvio.app.features.iptv.IptvPlaybackSession.active.value != null) {
+                    controller.openKeyboardPanel("iptvChannels")
+                } else {
+                    controller.openKeyboardPanel("sources")
+                }
+                PlayerShortcutAction.OpenEpisodes -> if (com.nuvio.app.features.iptv.IptvPlaybackSession.active.value != null) {
+                    controller.openKeyboardPanel("iptvChannels")
+                } else {
+                    controller.openKeyboardPanel("episodes")
+                }
+                PlayerShortcutAction.ChannelUp -> {
+                    if (com.nuvio.app.features.iptv.IptvPlaybackSession.active.value == null) return@KeyEventDispatcher false
+                    controller.dispatchKeyboardShortcut("iptvChannel", 1.0)
+                }
+                PlayerShortcutAction.ChannelDown -> {
+                    if (com.nuvio.app.features.iptv.IptvPlaybackSession.active.value == null) return@KeyEventDispatcher false
+                    controller.dispatchKeyboardShortcut("iptvChannel", -1.0)
+                }
                 PlayerShortcutAction.CycleZoom -> controller.dispatchKeyboardShortcut("resize", 1.0)
+                PlayerShortcutAction.OpenPlayerMenu -> controller.openPlayerMenu()
                 PlayerShortcutAction.SkipInterval -> {
                     if (!controller.triggerSkipIntervalIfAvailable()) return@KeyEventDispatcher false
                 }
@@ -375,10 +696,22 @@ private fun NativePlayerSurface(
             true
         }
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
+        // fork:pip-browse - and the pad uses its app layout meanwhile.
+        val browsePipJob = surfaceScope.launch {
+            com.nuvio.app.features.player.PlayerBrowsePip.active.collect { cornerBox ->
+                GamepadContext.playerActive = !cornerBox
+                if (cornerBox) javax.swing.SwingUtilities.getWindowAncestor(host)?.let { window ->
+                    // The HUD (a WebView2 child) had the keyboard; the app around the box takes it back.
+                    javax.swing.SwingUtilities.invokeLater { window.toFront(); window.requestFocus() }
+                }
+            }
+        }
         onDispose {
+            browsePipJob.cancel()
             GamepadContext.playerActive = false
             DesktopScreensaver.playerActive = false
             GamepadContext.animeShaderActive = false
+            playHoldJob?.cancel()
             KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(dispatcher)
         }
     }
@@ -399,6 +732,11 @@ private fun NativePlayerSurface(
         controller.isAnimeContentDetected = isAnimeContent
     }
 
+    // fork:faststream-optin - the YouTube watch page's FastStream button.
+    LaunchedEffect(controller) {
+        com.nuvio.app.features.youtube.YouTubeFastStream.toggleRequests.collect { on -> controller.setFastStream(on) }
+    }
+
     LaunchedEffect(
         controller,
         playbackAttemptId,
@@ -416,12 +754,37 @@ private fun NativePlayerSurface(
         }
         delay(16L)
         PlaybackStartTrace.mark("playerAttach")
+        // The attach below uses the last reading; this one reaches the profile pass when it lands.
+        NvidiaRtxDriverState.refreshAsync()
         // Follow the addon's redirect chain once here rather than letting FFmpeg re-walk it on
         // every seek (see PlaybackRedirectResolver). The source URL stays the stream's identity;
         // only what mpv opens changes.
-        val resolution = redirectResolutions[sourceUrl]
-            ?: PlaybackRedirectResolver.resolve(sourceUrl, playbackHeaders)
-                .also { redirectResolutions[sourceUrl] = it }
+        // A next episode's link was usually resolved during the previous one (PlaybackSourceWarmup).
+        var warmedResolution = false
+        var resolution = redirectResolutions[sourceUrl]
+            ?: (
+                PlaybackRedirectResolver.takeWarmed(sourceUrl, playbackHeaders)?.also { warmedResolution = true }
+                    ?: PlaybackRedirectResolver.resolve(sourceUrl, playbackHeaders)
+                ).also { redirectResolutions[sourceUrl] = it }
+        // A TorBox node that rate-limited us earlier this session keeps refusing our IP for over
+        // an hour, and addons hand back their cached link on that same node. Start on another
+        // node instead of opening straight into the ban.
+        if (TorBoxNodeHop.isBanned(resolution.playbackUrl)) {
+            TorBoxNodeHop.findAlternative(resolution.playbackUrl, playbackUserAgent)?.let { hopped ->
+                BingeAdvanceLog.i {
+                    "desktop TorBox node avoided at attach attemptId=$playbackAttemptId" +
+                        " from=${PlaybackRedirectResolver.hostOf(resolution.playbackUrl)}" +
+                        " to=${PlaybackRedirectResolver.hostOf(hopped)}"
+                }
+                resolution = PlaybackRedirectResolution(
+                    sourceUrl,
+                    hopped,
+                    resolution.hops,
+                    PlaybackRedirectResolution.Outcome.Pinned,
+                )
+                redirectResolutions[sourceUrl] = resolution
+            }
+        }
         PlaybackStartTrace.mark("redirect:${resolution.outcome.name.lowercase()}")
         // Logged so a binge/next-episode stall can be diagnosed: if the common layer reports it
         // set a new activeSourceUrl (see BingeAdvance "switchToEpisodeStream" log) but this line
@@ -430,11 +793,20 @@ private fun NativePlayerSurface(
         // 429 report needs: which resolver handed out the link, and which host mpv is actually
         // hammering with range requests.
         BingeAdvanceLog.i {
-            "desktop attach firing attemptId=$playbackAttemptId" +
-                " sourceHost=${PlaybackRedirectResolver.hostOf(sourceUrl)}" +
-                " playbackHost=${PlaybackRedirectResolver.hostOf(resolution.playbackUrl)}" +
-                " redirect=${resolution.outcome.name.lowercase()}/${resolution.hops}" +
-                " sourceUrl=${sourceUrl.takeLast(48)}"
+            com.nuvio.app.features.iptv.redactIptvCredentials(
+                "desktop attach firing attemptId=$playbackAttemptId" +
+                    " sourceHost=${PlaybackRedirectResolver.hostOf(sourceUrl)}" +
+                    " playbackHost=${PlaybackRedirectResolver.hostOf(resolution.playbackUrl)}" +
+                    " redirect=${resolution.outcome.name.lowercase()}/${resolution.hops}" +
+                    (if (warmedResolution) " warmed=yes" else "") +
+                    // Media-server links carry their access token in the query (Jellyfin/Emby api_key,
+                    // Plex X-Plex-Token): masked before the tail is taken, as users send these logs in.
+                    " sourceUrl=${
+                        com.nuvio.app.features.iptv.redactIptvCredentials(sourceUrl)
+                            .replace(PlaybackUrlTokenPattern, "$1=***")
+                            .takeLast(48)
+                    }",
+            )
         }
         fun attachWith(
             playbackUrl: String,
@@ -450,6 +822,7 @@ private fun NativePlayerSurface(
                 sourceHeaders = playbackHeaders,
                 mediaTitle = preferredMpvMediaTitle(
                     streamTitle = playerControlsState.streamTitle,
+                    streamFilename = playerControlsState.streamFilename,
                     title = playerControlsState.title,
                     episodeText = playerControlsState.episodeText,
                 ),
@@ -465,10 +838,20 @@ private fun NativePlayerSurface(
                 // a visible/audio-disrupting filter rebuild after playback has already begun.
                 animeSvpEnabled = initialAnimeSvpRequested,
                 isAnimeContent = isAnimeContent,
-                nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled &&
-                    playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
-                nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled &&
-                    playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full,
+                animeShaderRequested = desktopAnimeShaderRequested(playerSettings, isAnimeContent),
+                // The menu's session toggles carry into the next episode's attach. They are not
+                // keys of this effect, so flipping one mid-file never re-attaches; the profile
+                // pass applies it live instead.
+                nvidiaRtxSuperResolutionEnabled = (
+                    PlayerSettingsRepository.uiState.value.desktopRtxVsrSessionOverride
+                        ?: nvidiaRtxSuperResolutionEnabled
+                    ) && playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full &&
+                    NvidiaRtxDriverState.settings.value.superResolutionEnabled != false,
+                nvidiaRtxHdrEnabled = (
+                    PlayerSettingsRepository.uiState.value.desktopRtxTrueHdrSessionOverride
+                        ?: nvidiaRtxHdrEnabled
+                    ) && playerSettings.desktopMpvConfigMode != DesktopMpvConfigMode.Full &&
+                    NvidiaRtxDriverState.settings.value.trueHdrEnabled != false,
                 enableUserMpvOptions = true,
                 restoreVolume = true,
                 onError = onError,
@@ -477,10 +860,49 @@ private fun NativePlayerSurface(
         // A pinned CDN link can outlive its token where the resolver's own hop would have been
         // re-resolved by FFmpeg for free. On the first 401/403/404/410 from a pinned attach,
         // resolve again and re-attach at the last playhead instead of surfacing the error; a
-        // second failure, or anything else (429 included), goes to the common layer as before.
+        // second failure, or anything else, goes to the common layer as before. A 429 on a
+        // surface that was already playing is handled first, by recoverFromRateLimit.
         var pinnedLinkRefreshUsed = false
+        var rateLimitRecoveriesUsed = 0
+        var lastRateLimitRecoveryAtMs = 0L
+        var lastRateLimitResumeMs: Long? = null
+        // Set when Prefer Failover handed the incident back because failover had nothing to try;
+        // the rest of that incident stays with reconnect instead of re-running an empty failover.
+        var reconnectingForFailover = false
+        // Node hops spent on 429s before the first frame (see tryHopAtOpen).
+        var openHopsUsed = 0
+        // The one delayed reopen spent on a 429 at open from a host that had just answered the
+        // redirect probe (see tryRetryAtOpen).
+        var openRetryUsed = false
         val onSurfaceError = object : (String?) -> Unit {
             override fun invoke(message: String?) {
+                if (SeekRateLimitRecovery.isRateLimited(message)) {
+                    // Whatever happens next, previews must not keep opening ranges at a host
+                    // that has just refused one.
+                    SeekThumbnailRateLimitGate.onRateLimited()
+                    TorBoxNodeHop.markBanned(redirectResolutions[sourceUrl]?.playbackUrl ?: sourceUrl)
+                    val settings = PlayerSettingsRepository.uiState.value
+                    val inRecentIncident = System.currentTimeMillis() - lastRateLimitRecoveryAtMs <
+                        SeekRateLimitRecovery.EPISODE_WINDOW_MS
+                    val reconnect = SeekRateLimitRecovery.shouldReconnect(
+                        settings.desktopRateLimitRecoveryMode,
+                        settings.streamFailoverEnabled,
+                    ) || (reconnectingForFailover && inRecentIncident)
+                    if (reconnect && tryStartReconnect(message.orEmpty())) return
+                    if (tryHopAtOpen(message.orEmpty())) return
+                    if (tryRetryAtOpen(message.orEmpty())) return
+                }
+                if (TorBoxNodeHop.looksLikeNodeStall(message)) {
+                    val stalledUrl = redirectResolutions[sourceUrl]?.playbackUrl ?: sourceUrl
+                    if (TorBoxNodeHop.isTorBoxNode(stalledUrl)) {
+                        BingeAdvanceLog.i {
+                            "desktop TorBox node stalled attemptId=$playbackAttemptId" +
+                                " host=${PlaybackRedirectResolver.hostOf(stalledUrl)} after: $message"
+                        }
+                        TorBoxNodeHop.markStalled(stalledUrl)
+                        if (tryHopAtOpen(message.orEmpty())) return
+                    }
+                }
                 val current = redirectResolutions[sourceUrl]
                 val refreshable = message != null &&
                     current?.pinned == true &&
@@ -514,7 +936,274 @@ private fun NativePlayerSurface(
                     )
                 }
             }
+
+            /**
+             * Starts one reconnect for a mid-playback 429 when the budget and a sane resume point
+             * allow it. Only for a surface that has shown frames of this attempt: a 429 on the
+             * initial open stays with the common layer's provider-scoped failover.
+             */
+            fun tryStartReconnect(message: String): Boolean {
+                val nowMs = System.currentTimeMillis()
+                // A separate incident much later in the file gets a fresh budget; a failure of
+                // the reopen itself spends the remaining one.
+                if (nowMs - lastRateLimitRecoveryAtMs >= SeekRateLimitRecovery.EPISODE_WINDOW_MS) {
+                    rateLimitRecoveriesUsed = 0
+                    lastRateLimitResumeMs = null
+                    reconnectingForFailover = false
+                }
+                // A reopen that fails at open reports no seek target (the attach cleared it), so
+                // keep heading for the first incident's target.
+                val resumeMs = SeekRateLimitRecovery.safeResumeMs(
+                    seekTargetMs = controller.lastSeekFailureTargetMs ?: lastRateLimitResumeMs,
+                    lastKnownPositionMs = lastKnownPositionMs.value,
+                    durationMs = lastKnownDurationMs.value,
+                ) ?: return false
+                if (startedAttemptId.value != playbackAttemptId ||
+                    attachedAttemptId.value != playbackAttemptId ||
+                    rateLimitRecoveriesUsed >= SeekRateLimitRecovery.MAX_ATTEMPTS
+                ) {
+                    return false
+                }
+                val settings = PlayerSettingsRepository.uiState.value
+                val waitSeconds = if (rateLimitRecoveriesUsed == 0) {
+                    settings.desktopRateLimitReconnectFirstDelaySeconds
+                } else {
+                    settings.desktopRateLimitReconnectSecondDelaySeconds
+                }
+                rateLimitRecoveriesUsed += 1
+                lastRateLimitRecoveryAtMs = nowMs
+                lastRateLimitResumeMs = resumeMs
+                val failedUrl = redirectResolutions[sourceUrl]?.playbackUrl ?: sourceUrl
+                recoverFromRateLimit(message, failedUrl, waitSeconds * 1000L, resumeMs, this)
+                return true
+            }
+
+            /**
+             * A TorBox node that 429s the initial open (or its resume seek) has banned our IP for
+             * over an hour, and the attach-time hop only knows about nodes banned earlier this
+             * session — so without this the first open of a banned node always failed over or
+             * exited. Reopens the same link on another node at the original start position; no
+             * wait, since a node ban does not clear on any useful timescale. Off still never
+             * reconnects. When no node answers, the error goes on to failover / exit as before.
+             *
+             * A node that stalls the open or the resume seek ([TorBoxNodeHop.looksLikeNodeStall])
+             * takes the same path: the addon hands back the same node on every retry, so moving
+             * the link is the only retry that can land somewhere else.
+             */
+            fun tryHopAtOpen(message: String): Boolean {
+                if (startedAttemptId.value == playbackAttemptId) return false
+                if (openHopsUsed >= SeekRateLimitRecovery.MAX_ATTEMPTS) return false
+                if (PlayerSettingsRepository.uiState.value.desktopRateLimitRecoveryMode ==
+                    DesktopRateLimitRecoveryMode.Off
+                ) {
+                    return false
+                }
+                val failedUrl = redirectResolutions[sourceUrl]?.playbackUrl ?: sourceUrl
+                if (!TorBoxNodeHop.isTorBoxNode(failedUrl)) return false
+                openHopsUsed += 1
+                val handler = this
+                surfaceScope.launch {
+                    BingeAdvanceLog.i {
+                        "desktop TorBox hop at open attemptId=$playbackAttemptId" +
+                            " try=$openHopsUsed/${SeekRateLimitRecovery.MAX_ATTEMPTS}" +
+                            " from=${PlaybackRedirectResolver.hostOf(failedUrl)} after: $message"
+                    }
+                    val hopped = TorBoxNodeHop.findAlternative(failedUrl, playbackUserAgent)
+                    if (attachedAttemptId.value != playbackAttemptId) return@launch
+                    if (hopped == null) {
+                        BingeAdvanceLog.i {
+                            "desktop TorBox hop at open found no working node attemptId=$playbackAttemptId"
+                        }
+                        openHopsUsed = SeekRateLimitRecovery.MAX_ATTEMPTS
+                        handler(message)
+                        return@launch
+                    }
+                    BingeAdvanceLog.i {
+                        "desktop TorBox hop at open attemptId=$playbackAttemptId" +
+                            " to=${PlaybackRedirectResolver.hostOf(hopped)}"
+                    }
+                    redirectResolutions[sourceUrl] = PlaybackRedirectResolution(
+                        sourceUrl,
+                        hopped,
+                        redirectResolutions[sourceUrl]?.hops ?: 0,
+                        PlaybackRedirectResolution.Outcome.Pinned,
+                    )
+                    attachWith(
+                        playbackUrl = hopped,
+                        positionMs = initialPositionMs,
+                        progressFraction = initialProgressFraction ?: 0f,
+                        tracePlaybackStart = false,
+                        onError = handler,
+                    )
+                }
+                return true
+            }
+
+            /**
+             * A host that serves the file itself (the redirect probe got a 2xx moments ago) and
+             * then 429s mpv's open is throttling a burst, not refusing the link: the probe and the
+             * open land within a second or two, and a per-IP limit on a small worker counts both.
+             * Seen 2026-11-02 on an addon's `workers.dev` proxy. Waits the first reconnect delay
+             * and opens the same URL once more; a second 429 goes on to failover / exit. Off still
+             * never retries, and a TorBox node is [tryHopAtOpen]'s.
+             */
+            fun tryRetryAtOpen(message: String): Boolean {
+                if (startedAttemptId.value == playbackAttemptId || openRetryUsed) return false
+                val settings = PlayerSettingsRepository.uiState.value
+                if (settings.desktopRateLimitRecoveryMode == DesktopRateLimitRecoveryMode.Off) return false
+                val resolution = redirectResolutions[sourceUrl] ?: return false
+                if (resolution.outcome != PlaybackRedirectResolution.Outcome.NoRedirect) return false
+                if (TorBoxNodeHop.isTorBoxNode(resolution.playbackUrl)) return false
+                openRetryUsed = true
+                val waitMs = settings.desktopRateLimitReconnectFirstDelaySeconds * 1000L
+                val handler = this
+                surfaceScope.launch {
+                    BingeAdvanceLog.i {
+                        "desktop rate-limit retry at open attemptId=$playbackAttemptId" +
+                            " host=${PlaybackRedirectResolver.hostOf(resolution.playbackUrl)}" +
+                            " waitMs=$waitMs after: $message"
+                    }
+                    delay(waitMs)
+                    if (attachedAttemptId.value != playbackAttemptId) return@launch
+                    attachWith(
+                        playbackUrl = resolution.playbackUrl,
+                        positionMs = initialPositionMs,
+                        progressFraction = initialProgressFraction ?: 0f,
+                        tracePlaybackStart = false,
+                        onError = handler,
+                    )
+                }
+                return true
+            }
+
+            /**
+             * Prefer Failover's fallback: the common layer calls this when failover after a 429
+             * found nothing to switch to (a single source, or only the throttled provider's).
+             * Off still exits, and Prefer Reconnect has already spent its reconnects before
+             * failover ran, so only Prefer Failover reconnects here.
+             */
+            fun reconnectAsFailoverFallback(message: String): Boolean {
+                val mode = PlayerSettingsRepository.uiState.value.desktopRateLimitRecoveryMode
+                if (mode != DesktopRateLimitRecoveryMode.PreferFailover) return false
+                if (!tryStartReconnect(message)) return false
+                reconnectingForFailover = true
+                BingeAdvanceLog.i {
+                    "desktop rate-limit reconnect after failover found no source attemptId=$playbackAttemptId"
+                }
+                return true
+            }
+
+            /**
+             * A host throttled a mid-playback range open (see [SeekRateLimitRecovery]). The bridge
+             * has already stopped the dead demuxer, so nothing counts as ended while this runs.
+             *
+             * TorBox: the node has banned our IP for over an hour, so waiting is pointless — reopen
+             * the same link through another node right away ([TorBoxNodeHop]); when no node
+             * answers, go straight on to failover / exit.
+             *
+             * Anything else: wait [waitMs], then reopen at the seek target. A resolver that is
+             * still answering with its status clip is never opened (the clip would "finish" the
+             * title from the resume position); once the budget runs out the error reaches the
+             * common layer (failover / exit), exactly as before.
+             */
+            private fun recoverFromRateLimit(
+                message: String,
+                failedUrl: String,
+                waitMs: Long,
+                resumeMs: Long,
+                handler: (String?) -> Unit,
+            ) {
+                surfaceScope.launch {
+                    val rateLimitedTitle = runCatching {
+                        getString(Res.string.player_error_debrid_rate_limited)
+                    }.getOrDefault("Debrid Rate Limited")
+                    if (TorBoxNodeHop.isTorBoxNode(failedUrl)) {
+                        BingeAdvanceLog.i {
+                            "desktop rate-limit recovery attemptId=$playbackAttemptId" +
+                                " try=$rateLimitRecoveriesUsed/${SeekRateLimitRecovery.MAX_ATTEMPTS}" +
+                                " torboxHopFrom=${PlaybackRedirectResolver.hostOf(failedUrl)}" +
+                                " resumeMs=$resumeMs after: $message"
+                        }
+                        runCatching {
+                            controller.showPresetPill(
+                                rateLimitedTitle,
+                                getString(Res.string.player_rate_limit_switching_server),
+                                durationMs = 3000,
+                            )
+                        }
+                        val hopped = TorBoxNodeHop.findAlternative(failedUrl, playbackUserAgent)
+                        if (attachedAttemptId.value != playbackAttemptId) return@launch
+                        if (hopped == null) {
+                            BingeAdvanceLog.i {
+                                "desktop TorBox hop found no working node attemptId=$playbackAttemptId"
+                            }
+                            // Nothing to reconnect to: spend the budget so the handler hands the
+                            // error straight to failover / exit instead of waiting on a ban.
+                            rateLimitRecoveriesUsed = SeekRateLimitRecovery.MAX_ATTEMPTS
+                            handler(message)
+                            return@launch
+                        }
+                        BingeAdvanceLog.i {
+                            "desktop TorBox hop attemptId=$playbackAttemptId" +
+                                " to=${PlaybackRedirectResolver.hostOf(hopped)} resumeMs=$resumeMs"
+                        }
+                        redirectResolutions[sourceUrl] = PlaybackRedirectResolution(
+                            sourceUrl,
+                            hopped,
+                            redirectResolutions[sourceUrl]?.hops ?: 0,
+                            PlaybackRedirectResolution.Outcome.Pinned,
+                        )
+                        attachWith(
+                            playbackUrl = hopped,
+                            positionMs = resumeMs,
+                            progressFraction = 0f,
+                            tracePlaybackStart = false,
+                            onError = handler,
+                        )
+                        return@launch
+                    }
+                    BingeAdvanceLog.i {
+                        "desktop rate-limit recovery attemptId=$playbackAttemptId" +
+                            " try=$rateLimitRecoveriesUsed/${SeekRateLimitRecovery.MAX_ATTEMPTS}" +
+                            " waitMs=$waitMs resumeMs=$resumeMs after: $message"
+                    }
+                    runCatching {
+                        controller.showPresetPill(
+                            rateLimitedTitle,
+                            getString(Res.string.player_rate_limit_reconnecting, (waitMs / 1000L).toInt()),
+                            durationMs = waitMs.toInt(),
+                        )
+                    }
+                    delay(waitMs)
+                    if (attachedAttemptId.value != playbackAttemptId) return@launch
+                    // A resolver or proxy in front is asked what it answers now; for AIOStreams
+                    // that re-runs its failover chain, which is exactly the retry it is built for.
+                    val reopen = redirectResolutions[sourceUrl]
+                        ?.takeIf(SeekRateLimitRecovery::canReopenWithoutProbe)
+                        ?: PlaybackRedirectResolver.resolve(sourceUrl, playbackHeaders, forceProbe = true)
+                    if (attachedAttemptId.value != playbackAttemptId) return@launch
+                    if (!SeekRateLimitRecovery.isReopenable(reopen)) {
+                        BingeAdvanceLog.i {
+                            "desktop rate-limit recovery not reopening attemptId=$playbackAttemptId" +
+                                " redirect=${reopen.outcome.name.lowercase()}"
+                        }
+                        // Feed the same error back through the handler: with budget left it waits
+                        // again, otherwise it reaches the common layer as before.
+                        handler(message)
+                        return@launch
+                    }
+                    redirectResolutions[sourceUrl] = reopen
+                    attachWith(
+                        playbackUrl = reopen.playbackUrl,
+                        positionMs = resumeMs,
+                        progressFraction = 0f,
+                        tracePlaybackStart = false,
+                        onError = handler,
+                    )
+                }
+            }
         }
+        controller.rateLimitFailoverFallback = onSurfaceError::reconnectAsFailoverFallback
         attachWith(
             playbackUrl = resolution.playbackUrl,
             positionMs = initialPositionMs,
@@ -538,8 +1227,59 @@ private fun NativePlayerSurface(
         controller.setResizeMode(resizeMode)
     }
 
-    LaunchedEffect(controller, playerControlsState) {
-        controller.updateControls(playerControlsState)
+    val youTubeMiniPlayer by com.nuvio.app.features.youtube.YouTubeWatchLayout.mini.collectAsState()
+    val youTubePageWindowed by com.nuvio.app.features.youtube.YouTubeWatchLayout.windowed.collectAsState()
+    val youTubePageAvailable by com.nuvio.app.features.youtube.YouTubeWatchLayout.available.collectAsState()
+    val youTubeTheater by com.nuvio.app.features.youtube.YouTubeFeedRepository.theaterMode.collectAsState()
+    // fork:youtube-mini-player - the tab drawn around the video in its corner box: the HUD shows nothing there either.
+    val youTubeBrowsing by com.nuvio.app.features.youtube.YouTubeWatchLayout.browsing.collectAsState()
+    // fork:pip-browse - the corner box over the app wears the same controls as YouTube's corner player.
+    val browsePip by com.nuvio.app.features.player.PlayerBrowsePip.active.collectAsState()
+    val browsePipAvailable by com.nuvio.app.features.player.PlayerBrowsePip.hostedPlayerAvailable.collectAsState()
+    LaunchedEffect(controller, playerControlsState, postShowBoxed, youTubeMiniPlayer, youTubePageWindowed, youTubePageAvailable, youTubeTheater, youTubeBrowsing, browsePip, browsePipAvailable) {
+        controller.pipBrowseAvailable = browsePipAvailable && !browsePip
+        controller.pipBrowseBox = browsePip
+        val youTubeBrowse = youTubePageAvailable && youTubeBrowsing
+        val youTubePage = ((youTubePageAvailable && youTubePageWindowed) || youTubeBrowse) && !browsePip
+        controller.watchPage = youTubePage
+        controller.miniPlayer = (youTubeMiniPlayer && youTubePage) || youTubeBrowse || browsePip
+        controller.miniPlayerClosable = youTubeBrowse || browsePip
+        controller.updateControls(
+            if (youTubePage && !youTubeTheater && !postShowBoxed) {
+                // The watch page shows the comments and related videos beside the video, larger than
+                // the HUD's panels: their buttons go. Theater fills the window, so it keeps them.
+                playerControlsState.copy(
+                    hud = playerControlsState.hud.copy(
+                        hiddenHudButtons = listOf(playerControlsState.hud.hiddenHudButtons, "sources", "episodes")
+                            .filter { it.isNotBlank() }
+                            .joinToString(","),
+                    ),
+                )
+            } else if (postShowBoxed) {
+                // The HUD lives inside the video's container, so it would be squashed into the box.
+                // Its keyboard focus stays, though, so it forwards the D-pad to the cards.
+                // The skip prompt is drawn by the cards screen instead (skipKeyAction stays, so the key works).
+                playerControlsState.copy(
+                    controlsVisible = false,
+                    hud = playerControlsState.hud.copy(mouseMoveRevealsControlsEnabled = false),
+                    skipPrompt = playerControlsState.skipPrompt.copy(skipPromptVisible = false),
+                    heroTrailer = playerControlsState.heroTrailer.copy(postShowInput = true),
+                )
+            } else {
+                playerControlsState
+            },
+        )
+    }
+
+    LaunchedEffect(controller) {
+        snapshotFlow { PostShowController.active.value }.drop(1).collect {
+            // mpv repaints a wid-embedded surface oddly after a size change (see forceVideoRedraw),
+            // so nudge it once the new size has settled, and again for a swapchain that lags.
+            delay(250L)
+            controller.forceVideoRedraw()
+            delay(750L)
+            controller.forceVideoRedraw()
+        }
     }
 
     LaunchedEffect(playbackAttemptId, sourceUrl) {
@@ -574,9 +1314,16 @@ private fun NativePlayerSurface(
                     startupProfileRequested = svpStartupProfileAcknowledgementPending.value,
                 )
             },
-            PlayerSettingsRepository.uiState,
-        ) { videoState, settings -> videoState to settings }
-            .collect { (videoState, settings) ->
+            // The subtitle style lives in the same settings state but plays no part in the video
+            // profile. Left in, every click in the subtitle Style tab re-ran the whole profile
+            // (vf, scalers, shaders, and a forced redraw that waits up to 1.8 s on the VO), which
+            // made the panel lag and, while paused, buried the subtitle repaint under it.
+            PlayerSettingsRepository.uiState
+                .map { it.copy(subtitleStyle = SubtitleStyleState.DEFAULT) }
+                .distinctUntilChanged(),
+            NvidiaRtxDriverState.settings,
+        ) { videoState, settings, driver -> Triple(videoState, settings, driver) }
+            .collect { (videoState, settings, driver) ->
                 // Native code owns hwdec/vf from FILE_LOADED until the initial VapourSynth graph
                 // has produced a real runtime-ready signal. Applying the ordinary profile in
                 // this interval can otherwise replace d3d11va-copy with d3d11va and clear vf,
@@ -592,6 +1339,7 @@ private fun NativePlayerSurface(
                         svpActive = false,
                         videoLabel = "",
                         shaderLabel = null,
+                        qualityLabel = desktopVideoQualityLabel(videoState.sourceSize, videoState.isHdr),
                     )
                     if (svpStartupProfileAcknowledgementPending.value) {
                         svpStartupProfileAcknowledgementPending.value = false
@@ -616,7 +1364,11 @@ private fun NativePlayerSurface(
                         "sourceSize=${videoState.sourceSize?.let { "${it.width}x${it.height}" } ?: "unknown"}, " +
                         "animeSkipUhd=${settings.desktopAnimeSkipUltraHdEnabled}",
                 )
-                val animeProfile = controller.withVideoProfile {
+                // Off the UI thread: endVideoProfile waits on mpv's VO, which with SVP starting and an
+                // Anime4K chain compiling took 1.08 s, all of it a frozen player (2026-10-19 soak).
+                // The collector still waits, so profiles apply in order and the acknowledgement
+                // below still follows its profile.
+                val (animeProfile, inverseToneMappingActive) = withContext(Dispatchers.IO) { controller.withVideoProfile {
                     applyDesktopVideoProfile(
                         controller = controller,
                         hdrMode = settings.desktopHdrMode,
@@ -625,7 +1377,7 @@ private fun NativePlayerSurface(
                         isHdr = isHdr,
                     )
                     controller.applyDesktopBufferPreset(settings.desktopBufferPreset)
-                    applyDesktopAnimeProfile(
+                    val profile = applyDesktopAnimeProfile(
                         controller = controller,
                         mode = settings.desktopAnimeMode,
                         autoEnabled = settings.desktopAnimeModeAutoEnabled,
@@ -635,35 +1387,62 @@ private fun NativePlayerSurface(
                         // in that window can kill the native process before fileLoaded is emitted.
                         animeSvpEnabled = settings.desktopAnimeSvpEnabled && fileLoaded,
                         animeSvpSessionForced = settings.desktopAnimeSvpSessionForced,
+                        svpAllContent = settings.desktopSvpAllContentEnabled,
                         isAnime = isAnimeContent,
                         isHdr = isHdr,
+                        displayHdr = videoState.displayHdr,
                         sourceSize = videoState.sourceSize,
                         skipShadersOnUltraHdSources = settings.desktopAnimeSkipUltraHdEnabled,
-                        nvidiaRtxSuperResolutionEnabled = settings.nvidiaRtxSuperResolutionEnabled,
+                        // An NVIDIA App switch that is off wins over the app setting; see
+                        // NvidiaRtxDriverState for what each filter does without the driver.
+                        nvidiaRtxSuperResolutionEnabled = settings.effectiveRtxVsrEnabled &&
+                            driver.superResolutionEnabled != false,
                         nvidiaRtxSuperResolutionScale = vsrScale,
-                        nvidiaRtxHdrEnabled = settings.nvidiaRtxHdrEnabled,
+                        nvidiaRtxHdrEnabled = settings.effectiveRtxTrueHdrEnabled &&
+                            driver.trueHdrEnabled != false,
+                        nvidiaRtxHdrAnimeEnabled = settings.effectiveRtxTrueHdrAnimeEnabled,
+                        nvidiaRtxHdrAnimeShadersEnabled = settings.effectiveRtxTrueHdrAnimeShadersEnabled,
                         customShaderPaths = settings.desktopCustomShaderPaths,
                         customShaderSelectedPath = settings.desktopCustomShaderSelectedPath,
                     )
-                }
+                    // After the anime profile, which is what knows whether True HDR ended up running.
+                    val inverseToneMapping = shouldEnableDesktopInverseToneMapping(
+                        enabled = settings.desktopInverseToneMappingEnabled,
+                        isHdr = isHdr,
+                        displayHdr = videoState.displayHdr,
+                        rtxTrueHdrActive = profile.rtxTrueHdrActive,
+                    )
+                    desktopInverseToneMappingProperties(
+                        active = inverseToneMapping,
+                        peakNits = settings.desktopInverseToneMappingPeakNits,
+                        customOptionNames = desktopCustomMpvOptionNames(settings.desktopCustomMpvOptions),
+                    ).forEach { (key, value) -> controller.setMpvProperty(key, value) }
+                    profile to inverseToneMapping
+                } }
                 // The outcome, not just the inputs above: whether a chain actually took is the
                 // only thing a bug report about shaders can be checked against, and deriving it
                 // from the inputs by hand is exactly the step that gets it wrong.
                 System.out.println(
                     "Desktop anime profile applied: shader=${animeProfile.shaderLabel ?: "none"}, " +
-                        "svp=${videoState.svpActive}",
+                        "svp=${videoState.svpActive}, rtxTrueHdr=${animeProfile.rtxTrueHdrActive}, " +
+                        "inverseToneMapping=$inverseToneMappingActive",
                 )
                 // Same pass, same inputs: the info panel reports what was just applied rather than
                 // re-deriving it from the settings, which would disagree with the picture whenever a
                 // preset didn't actually take (SDR file + HDR mode, live action + anime preset).
                 controller.setPlaybackInfo(
                     session = "$playbackAttemptId:${sourceUrl.hashCode()}",
-                    hdrLabel = desktopHdrInfoLabel(
-                        isHdr = isHdr,
-                        hdrMode = settings.desktopHdrMode,
-                        displayHdr = videoState.displayHdr,
-                    ),
+                    hdrLabel = if (inverseToneMappingActive) {
+                        "SDR Expanded to HDR (mpv)"
+                    } else {
+                        desktopHdrInfoLabel(
+                            isHdr = isHdr,
+                            hdrMode = settings.desktopHdrMode,
+                            displayHdr = videoState.displayHdr,
+                        )
+                    },
                     svpActive = videoState.svpActive,
+                    svpInChain = animeProfile.svpActive,
                     // Both, not one or the other: a shader chain runs on top of the colour preset,
                     // it does not replace it.
                     videoLabel = desktopColorProfileInfoLabel(
@@ -672,12 +1451,43 @@ private fun NativePlayerSurface(
                         hdrMode = settings.desktopHdrMode,
                     ),
                     shaderLabel = animeProfile.shaderLabel,
+                    qualityLabel = desktopVideoQualityLabel(videoState.sourceSize, isHdr),
                 )
                 if (svpStartupProfileAcknowledgementPending.value) {
                     svpStartupProfileAcknowledgementPending.value = false
                     controller.completeSvpStartupProfile()
                 }
             }
+    }
+
+    // Player badges (upstream 344117e73): the badge pack matched against what mpv is actually
+    // decoding, shown in the title block. Polled because the inputs arrive at different moments
+    // (frame size, then the track list, then an audio switch at any time); each read is a cached
+    // JSON string from the bridge, and the HUD is only told when the result changes.
+    LaunchedEffect(controller, playbackAttemptId, sourceUrl) {
+        var lastSent: List<com.nuvio.app.features.streams.StreamBadge>? = null
+        com.nuvio.app.features.streams.StreamBadgeSettingsRepository.ensureLoaded()
+        while (true) {
+            val settings = com.nuvio.app.features.streams.StreamBadgeSettingsRepository.uiState.value
+            // Read every tick even with badges off: it also records the decoded frame for the
+            // stream info panel (NativePlayerController.playingMediaFacts()).
+            val size = videoSourceSize.value
+            val facts = controller.playingMediaFacts(
+                width = size?.width,
+                height = size?.height,
+                isHdr = videoIsHdr.value == true,
+            )
+            val badges = if (settings.showInPlayer) {
+                facts?.let { playerBadges(it, settings.rules.forPlayer(settings.playerBadgeSource)) }.orEmpty()
+            } else {
+                emptyList()
+            }
+            if (badges != lastSent) {
+                lastSent = badges
+                controller.setPlayerBadges(badges)
+            }
+            kotlinx.coroutines.delay(PLAYER_BADGES_POLL_MS)
+        }
     }
 
     LaunchedEffect(controller) {
@@ -729,9 +1539,24 @@ private fun NativePlayerSurface(
             }
             if (!snapshot.isLoading && snapshot.positionMs > 0L && !snapshot.isEnded) {
                 lastKnownPositionMs.value = snapshot.positionMs
+                if (snapshot.durationMs > 0L) lastKnownDurationMs.value = snapshot.durationMs
+                PostShowController.onTick(snapshot.positionMs, lastKnownDurationMs.value)
             }
             latestOnSnapshot.value(snapshot)
             delay(500L)
+        }
+    }
+
+    // fork:usenet - times each seek or stall of a Usenet session to 0.1 s and logs what the
+    // engine did meanwhile (UsenetSeekProbe). Its own loop, so the 500 ms snapshot cadence the
+    // rest of the player relies on is unchanged; nothing runs for other sources.
+    LaunchedEffect(controller, playbackAttemptId, sourceUrl) {
+        if (!com.nuvio.app.features.usenet.UsenetEngine.isSessionUrl(sourceUrl)) return@LaunchedEffect
+        while (true) {
+            if (startedAttemptId.value == playbackAttemptId) {
+                com.nuvio.app.features.usenet.UsenetSeekProbe.onSnapshot(sourceUrl, controller.snapshotOffUiThread())
+            }
+            delay(100L)
         }
     }
 
@@ -740,6 +1565,20 @@ private fun NativePlayerSurface(
             .fillMaxSize()
             .background(Color.Black),
     ) {
+        // Drawn first, so the SwingPanel's corner box sits on top of it.
+        if (postShowBoxed) {
+            val skipOffered = playerControlsState.skipPrompt.skipPromptVisible &&
+                !playerControlsState.skipPrompt.skipPromptDismissed &&
+                playerControlsState.skipKeyAction.isNotEmpty()
+            PostShowScreen(
+                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = postShowProgress },
+                skipLabel = if (skipOffered) playerControlsState.skipPrompt.skipPromptLabel else null,
+                skipKeyLabel = playerShortcutKeyCodeLabel(
+                    PlayerShortcutsRepository.keyCode(PlayerShortcutAction.SkipInterval),
+                ),
+                onSkip = { controller.triggerSkipIntervalIfAvailable() },
+            )
+        }
         // SwingPanel positions/sizes the native mpv surface (a real OS window) using whatever
         // LocalDensity is ambient — but that surface must match real screen pixels, not the
         // app's (possibly artificially inflated, see NuvioDesktopViewportDensityScaler) UI
@@ -750,7 +1589,15 @@ private fun NativePlayerSurface(
                 factory = {
                     host
                 },
-                modifier = if (hostFirstPaintComplete.value) {
+                modifier = if (hostFirstPaintComplete.value && postShowBoxed) {
+                    // One step, not an animation: resizing the native video window every frame
+                    // stuttered on the HTPC. The cards fade in underneath instead.
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = POST_SHOW_BOX_MARGIN_DP.dp, bottom = POST_SHOW_BOX_MARGIN_DP.dp)
+                        .fillMaxWidth(POST_SHOW_BOX_WIDTH)
+                        .aspectRatio(16f / 9f)
+                } else if (hostFirstPaintComplete.value) {
                     Modifier.fillMaxSize()
                 } else {
                     Modifier
@@ -782,6 +1629,8 @@ private data class DesktopAnimeProfileResult(
     /** Active shader chain's display name, or null when the picture is running ungraded by one. */
     val shaderLabel: String?,
     val svpActive: Boolean,
+    /** RTX True HDR is in the vf chain, including the copy the native side swaps in when SVP skips. */
+    val rtxTrueHdrActive: Boolean = false,
 )
 
 /**
@@ -816,9 +1665,9 @@ private fun desktopColorProfileInfoLabel(
     isHdr: Boolean?,
     hdrMode: DesktopHdrMode,
 ): String = if (isHdr != false && hdrMode != DesktopHdrMode.AlwaysTonemap) {
-    DesktopColorProfile.Neutral.label
+    localizedString(DesktopColorProfile.Neutral.labelRes)
 } else {
-    colorProfile.label
+    localizedString(colorProfile.labelRes)
 }
 
 /**
@@ -871,6 +1720,8 @@ private fun applyDesktopVideoProfile(
     customGrade: DesktopColorGrade,
     isHdr: Boolean?,
 ) {
+    val displayPanel = PlayerSettingsRepository.uiState.value
+        .desktopMpvPropertyOverrides[DESKTOP_DISPLAY_PANEL_OVERRIDE_KEY]
     when (hdrMode) {
         DesktopHdrMode.Auto -> {
             controller.setMpvProperty("target-colorspace-hint", "auto")
@@ -878,7 +1729,7 @@ private fun applyDesktopVideoProfile(
             controller.setMpvProperty("target-prim", "auto")
             controller.setMpvProperty("target-trc", "auto")
             controller.setMpvProperty("target-peak", "auto")
-            controller.setMpvProperty("target-contrast", "auto")
+            controller.setMpvProperty("target-contrast", desktopTargetContrast(displayPanel, "auto"))
         }
         DesktopHdrMode.AlwaysTonemap -> {
             // Force an SDR BT.709/BT.1886 target. Merely disabling the colorspace hint does
@@ -888,7 +1739,7 @@ private fun applyDesktopVideoProfile(
             controller.setMpvProperty("target-prim", "bt.709")
             controller.setMpvProperty("target-trc", "bt.1886")
             controller.setMpvProperty("target-peak", "203")
-            controller.setMpvProperty("target-contrast", "1000")
+            controller.setMpvProperty("target-contrast", desktopTargetContrast(displayPanel, "1000"))
         }
         DesktopHdrMode.AlwaysPassthrough -> {
             // Source mode signals the source metadata to the compositor/display and is mpv's
@@ -898,7 +1749,7 @@ private fun applyDesktopVideoProfile(
             controller.setMpvProperty("target-prim", "auto")
             controller.setMpvProperty("target-trc", "auto")
             controller.setMpvProperty("target-peak", "auto")
-            controller.setMpvProperty("target-contrast", "auto")
+            controller.setMpvProperty("target-contrast", desktopTargetContrast(displayPanel, "auto"))
         }
     }
     // Color-preset equalizer values adopted from Stremio-Kai by allecsc, used with
@@ -944,6 +1795,21 @@ private fun applyDesktopVideoProfile(
  *
  * SVP / motion interpolation from Kai is intentionally not ported (it needs a paid external runtime).
  */
+/**
+ * The quality badge beside the player title: the decoded resolution class plus HDR, e.g. "4K HDR".
+ * Either side can decide the class, so a 1920x800 scope encode still reads as 1080p.
+ */
+internal fun desktopVideoQualityLabel(size: DesktopVideoSourceSize?, isHdr: Boolean?): String {
+    if (size == null) return ""
+    val resolution = when {
+        size.longestSide >= 3200 || size.shortestSide >= 1800 -> "4K"
+        size.longestSide >= 1800 || size.shortestSide >= 1000 -> "1080p"
+        size.longestSide >= 1200 || size.shortestSide >= 700 -> "720p"
+        else -> "${size.shortestSide}p"
+    }
+    return if (isHdr == true) "$resolution HDR" else resolution
+}
+
 /**
  * Decoded source dimensions, as packed by the native bridge's `videoSourceSize` event
  * (`width * 65536 + height`). Both values arrive together so no caller can see half a size.
@@ -1055,16 +1921,65 @@ internal fun planDesktopAnimeShaders(
     )
 }
 
+// The d3d11vpp chain for the RTX features. The scale is written exactly as player_bridge.cpp's
+// roundTripFloatText writes it at file load ("2", "1.90277779"): a different spelling of the same
+// number ("2.0") makes mpv rebuild the video processor for nothing.
+internal fun desktopRtxVideoFilter(vsrActive: Boolean, trueHdrActive: Boolean, scale: Double?): String =
+    buildString {
+        if (!vsrActive && !trueHdrActive) return@buildString
+        append("d3d11vpp=")
+        if (vsrActive) {
+            append("scale=${desktopVsrScaleText(scale!!.coerceIn(1.0, 4.0))}:scaling-mode=nvidia")
+            if (trueHdrActive) append(":")
+        }
+        if (trueHdrActive) append("nvidia-true-hdr=yes")
+    }
+
+// C++ `ostream << setprecision(max_digits10 = 9) << float`: %.9g of the float, trailing zeros
+// dropped. Scales are 1..4, so %g never switches to exponent notation here.
+internal fun desktopVsrScaleText(scale: Double): String =
+    java.math.BigDecimal(scale.toFloat().toDouble())
+        .round(java.math.MathContext(9, java.math.RoundingMode.HALF_EVEN))
+        .stripTrailingZeros()
+        .toPlainString()
+
+// Same mode resolution as applyDesktopAnimeProfile, for the attach-time guess the native
+// file-load RTX install works from. The 4K shader skip is ignored: VSR has no scale there anyway.
+private fun desktopAnimeShaderRequested(settings: PlayerSettingsUiState, isAnime: Boolean): Boolean {
+    val mode = settings.desktopAnimeSessionOverride?.mode
+        ?: if (settings.desktopAnimeModeAutoEnabled && isAnime) settings.desktopAnimeMode else DesktopAnimeMode.Off
+    return mode != DesktopAnimeMode.Off
+}
+
+// `animeLayerActive` is the anime enhancement layer actually running (Anime4K / custom GLSL / SVP),
+// not anime detection: a detected anime title with no shader or SVP is plain video to the scaler.
 internal fun shouldEnableDesktopRtxSuperResolution(
     enabled: Boolean,
     isHdr: Boolean?,
-    isEffectivelyAnime: Boolean,
+    animeLayerActive: Boolean,
     scale: Double?,
 ): Boolean = enabled &&
     isHdr == false &&
-    !isEffectivelyAnime &&
+    !animeLayerActive &&
     scale != null &&
     scale > 1.01
+
+// True HDR's SDR->HDR pass tends to over-saturate/band flat cel-shaded anime and fights the
+// SDR-tuned colour presets, so detected anime needs the separate opt-in even with no anime layer.
+internal fun shouldEnableDesktopRtxTrueHdr(
+    enabled: Boolean,
+    isHdr: Boolean?,
+    displayHdr: Boolean?,
+    isEffectivelyAnime: Boolean,
+    animeOptIn: Boolean,
+    animeLayerActive: Boolean,
+): Boolean = enabled &&
+    isHdr == false &&
+    // True HDR outputs BT.2020/PQ, which breaks the colours on an SDR desktop. Unknown counts as
+    // off, like isHdr; player_bridge.cpp applies the same gate at FILE_LOADED.
+    displayHdr == true &&
+    !animeLayerActive &&
+    (!isEffectivelyAnime || animeOptIn)
 
 private fun applyDesktopAnimeProfile(
     controller: NativePlayerController,
@@ -1075,11 +1990,15 @@ private fun applyDesktopAnimeProfile(
     animeSvpSessionForced: Boolean,
     isAnime: Boolean,
     isHdr: Boolean?,
+    displayHdr: Boolean?,
+    svpAllContent: Boolean = false,
     sourceSize: DesktopVideoSourceSize? = null,
     skipShadersOnUltraHdSources: Boolean = true,
     nvidiaRtxSuperResolutionEnabled: Boolean = false,
     nvidiaRtxSuperResolutionScale: Double? = null,
     nvidiaRtxHdrEnabled: Boolean = false,
+    nvidiaRtxHdrAnimeEnabled: Boolean = false,
+    nvidiaRtxHdrAnimeShadersEnabled: Boolean = false,
     customShaderPaths: String = "",
     customShaderSelectedPath: String = "",
 ): DesktopAnimeProfileResult {
@@ -1121,22 +2040,41 @@ private fun applyDesktopAnimeProfile(
     val isEffectivelyAnime = isAnime || requestedPreset != null ||
         requestedCustomShaderChain.isNotEmpty() || animeSvpSessionForced
 
+    // With "all videos" on, everything else gets SVP too, with the cinema (live-action) tuning.
+    // The tuning follows what the video is, not why SVP runs: an in-player SVP toggle forces SVP
+    // on, but on live action it must still get the cinema profile.
+    val looksLikeAnime = isAnime || requestedPreset != null || requestedCustomShaderChain.isNotEmpty()
+    val svpFilter = if ((isEffectivelyAnime || svpAllContent) && animeSvpEnabled) {
+        DesktopAnimeSvp.vapoursynthArgument(
+            debugOverlay = PlayerSettingsRepository.uiState.value.desktopAnimeSvpDebugOverlayEnabled,
+            cinema = !looksLikeAnime,
+        )
+    } else null
+    val svpActive = svpFilter != null
+
     // This function is the single owner of the mpv `vf` chain. NVIDIA RTX VSR and RTX True HDR
     // are both d3d11vpp sub-options; they must be set here so a profile rebuild doesn't wipe them.
-    // Anime4K (when active) takes the vf entirely — RTX features are suppressed while Anime4K runs.
     //
-    // RTX VSR and RTX True HDR are live-action enhancements; neither must stack on top of the
-    // anime enhancement layer (Anime4K / custom GLSL / SVP interpolation). The heavier anime
-    // branches below drop baselineVf entirely, but the SVP-only path reuses it, so gate both
-    // off for any effectively anime session here too. (True HDR's AI SDR->HDR pass tends to
-    // over-saturate/band flat cel-shaded anime and fights the SDR-tuned colour presets.)
+    // Neither must stack on top of the anime enhancement layer (Anime4K / custom GLSL / SVP
+    // interpolation). The shader branches below replace vf outright, so baselineVf only reaches
+    // mpv on the no-shader path, where the one layer that can still be running is SVP. Anime
+    // detection alone does not block VSR: a 1080p episode on a 4K screen with no shader is
+    // exactly what it is for. True HDR additionally needs its anime opt-in.
     // Native HDR, especially Dolby Vision decoded as P010, can turn into a solid green video
     // plane when passed through NVIDIA's d3d11vpp VSR scaler. Wait for positive SDR detection;
     // unknown/HDR content stays on gpu-next's normal colour-managed path.
     val vsrActive = shouldEnableDesktopRtxSuperResolution(
         enabled = nvidiaRtxSuperResolutionEnabled,
         isHdr = isHdr,
-        isEffectivelyAnime = isEffectivelyAnime,
+        animeLayerActive = svpActive,
+        scale = nvidiaRtxSuperResolutionScale,
+    )
+    // What RTX would be with no SVP. The native side skips SVP at >= 1.5x speed (live, without
+    // another profile pass), and should then run this rather than nothing.
+    val vsrActiveWithoutSvp = shouldEnableDesktopRtxSuperResolution(
+        enabled = nvidiaRtxSuperResolutionEnabled,
+        isHdr = isHdr,
+        animeLayerActive = false,
         scale = nvidiaRtxSuperResolutionScale,
     )
     // RTX True HDR requires mpv master ≥ Feb 19 2026: mpv sets IMGFMT_X2BGR10 output
@@ -1146,50 +2084,84 @@ private fun applyDesktopAnimeProfile(
     // True HDR is an SDR -> HDR enhancement. Wait until the stream is positively identified
     // as SDR before enabling it: treating the initial "unknown" state as SDR briefly applied
     // the filter to every file, and leaving this independent of isHdr applied it to native HDR.
-    val trueHdrActive = nvidiaRtxHdrEnabled && isHdr == false && !isEffectivelyAnime
-    val baselineVf = buildString {
-        if (vsrActive || trueHdrActive) {
-            append("d3d11vpp=")
-            if (vsrActive) {
-                append("scale=${nvidiaRtxSuperResolutionScale!!.coerceIn(1.0, 4.0)}:scaling-mode=nvidia")
-                if (trueHdrActive) append(":")
-            }
-            if (trueHdrActive) append("nvidia-true-hdr=yes")
-        }
+    val trueHdrActive = shouldEnableDesktopRtxTrueHdr(
+        enabled = nvidiaRtxHdrEnabled,
+        isHdr = isHdr,
+        displayHdr = displayHdr,
+        isEffectivelyAnime = isEffectivelyAnime,
+        animeOptIn = nvidiaRtxHdrAnimeEnabled,
+        animeLayerActive = svpActive,
+    )
+    val trueHdrActiveWithoutSvp = shouldEnableDesktopRtxTrueHdr(
+        enabled = nvidiaRtxHdrEnabled,
+        isHdr = isHdr,
+        displayHdr = displayHdr,
+        isEffectivelyAnime = isEffectivelyAnime,
+        animeOptIn = nvidiaRtxHdrAnimeEnabled,
+        animeLayerActive = false,
+    )
+    val baselineVf = desktopRtxVideoFilter(vsrActive, trueHdrActive, nvidiaRtxSuperResolutionScale)
+    // The shader branches below normally drop RTX entirely. With the opt-in, True HDR (only — VSR
+    // would upscale ahead of shaders that upscale themselves) stays in front of them: d3d11vpp
+    // runs on the decoder's GPU frames, and the GLSL shaders run later, in the renderer.
+    // trueHdrActive already excludes SVP, the one CPU layer it cannot follow.
+    val shaderTrueHdrVf = if (nvidiaRtxHdrAnimeShadersEnabled && trueHdrActive) {
+        desktopRtxVideoFilter(vsrActive = false, trueHdrActive = true, scale = null)
+    } else {
+        ""
     }
+    val svpBypassVf = if (svpActive) {
+        desktopRtxVideoFilter(vsrActiveWithoutSvp, trueHdrActiveWithoutSvp, nvidiaRtxSuperResolutionScale)
+    } else ""
 
-    val svpFilter = if (isEffectivelyAnime && animeSvpEnabled) {
-        DesktopAnimeSvp.vapoursynthArgument(
-            debugOverlay = PlayerSettingsRepository.uiState.value.desktopAnimeSvpDebugOverlayEnabled,
-        )
-    } else null
-    val svpActive = svpFilter != null
+    // Advanced (mpv) menu rows this profile owns. Interpolation is decided here because this is
+    // where SVP is decided: mpv's own interpolation must never run on top of it.
+    val advancedOverrides = PlayerSettingsRepository.uiState.value.desktopMpvPropertyOverrides
+    val filmGrain = advancedOverrides[DESKTOP_FILM_GRAIN_OVERRIDE_KEY]
+    desktopInterpolationProperties(
+        choice = advancedOverrides[DESKTOP_INTERPOLATION_OVERRIDE_KEY],
+        svpActive = svpActive,
+        audioPassthrough = PlayerSettingsRepository.uiState.value.desktopAudioPassthroughEnabled,
+    ).forEach { (key, value) -> controller.setMpvProperty(key, value) }
 
     if (customShaderChain.isNotEmpty()) {
         controller.setMpvProperty("scale", "ewa_lanczos")
         controller.setMpvProperty("cscale", "ewa_lanczos")
         controller.setMpvProperty("scale-blur", "1.05")
         controller.setMpvProperty("deband-threshold", "45")
-        controller.setMpvProperty("deband-grain", "20")
-        controller.setMpvProperty("glsl-shaders", customShaderChain)
+        controller.setMpvProperty("deband-grain", desktopDebandGrain(filmGrain, "20"))
+        // Same chroma realign pass the Anime4K chain gets under True HDR; see chromaRealignPath.
+        controller.setDesktopShaderChain(
+            if (shaderTrueHdrVf.isNotEmpty()) {
+                listOfNotNull(DesktopAnimeShaders.chromaRealignPath(), customShaderChain).joinToString(";")
+            } else {
+                customShaderChain
+            },
+        )
 
-
-        controller.setMpvProperty("vf", listOfNotNull(svpFilter).joinToString(","))
+        controller.setSvpBypassVideoFilters("")
+        controller.setMpvProperty(
+            "vf",
+            listOfNotNull(shaderTrueHdrVf.takeIf { it.isNotEmpty() }, svpFilter).joinToString(","),
+        )
         controller.forceVideoRedraw()
         return DesktopAnimeProfileResult(
-            shaderLabel = customShaderChain.customShaderDisplayName(customShaderPaths),
+            shaderLabel = customShaderChain.customShaderDisplayName(customShaderPaths)
+                ?.withTrueHdrSuffix(shaderTrueHdrVf.isNotEmpty()),
             svpActive = svpActive,
+            rtxTrueHdrActive = shaderTrueHdrVf.isNotEmpty(),
         )
     }
 
     if (effectivePreset == null) {
         // Restore the bridge's baseline live-action rendering (see startMpv in player_bridge.cpp).
-        controller.setMpvProperty("glsl-shaders", "")
-        
+        controller.setDesktopShaderChain("")
+
         // Restore the standard D3D11VA hardware decoder so d3d11vpp (RTX features) works.
         // However, if SVP is active, we MUST use a copy-back decoder for the CPU filter.
         
         val finalVf = listOfNotNull(baselineVf.takeIf { it.isNotEmpty() }, svpFilter).joinToString(",")
+        controller.setSvpBypassVideoFilters(svpBypassVf)
         controller.setMpvProperty("vf", finalVf)
         // Honour the user's "Upscaling" choice from the Advanced (mpv) menu for live-action; fall
         // back to the baseline scaler. Re-applied here because this profile refresh would otherwise
@@ -1199,7 +2171,7 @@ private fun applyDesktopAnimeProfile(
         controller.setMpvProperty("cscale", "lanczos")
         controller.setMpvProperty("scale-blur", "0.0")
         controller.setMpvProperty("deband-threshold", "35")
-        controller.setMpvProperty("deband-grain", "0")
+        controller.setMpvProperty("deband-grain", desktopDebandGrain(filmGrain, "0"))
         controller.forceVideoRedraw()
         // Say so rather than showing nothing: an anime title playing with no shader row looks like
         // the setting failed, and this is the one case where that is a deliberate decision. Named
@@ -1209,7 +2181,11 @@ private fun applyDesktopAnimeProfile(
             requestedPreset != null -> "Anime4K off — 4K source"
             else -> "Shader off — 4K source"
         }
-        return DesktopAnimeProfileResult(shaderLabel = skippedLabel, svpActive = svpActive)
+        return DesktopAnimeProfileResult(
+            shaderLabel = skippedLabel,
+            svpActive = svpActive,
+            rtxTrueHdrActive = trueHdrActive || (svpActive && trueHdrActiveWithoutSvp),
+        )
     }
 
     // Anime-tuned scaling + deband (Stremio-Kai's anime-sdr base profile).
@@ -1217,27 +2193,59 @@ private fun applyDesktopAnimeProfile(
     controller.setMpvProperty("cscale", "ewa_lanczos")
     controller.setMpvProperty("scale-blur", "1.05")
     controller.setMpvProperty("deband-threshold", "45")
-    controller.setMpvProperty("deband-grain", "20")
+    controller.setMpvProperty("deband-grain", desktopDebandGrain(filmGrain, "20"))
 
-    controller.setMpvProperty("glsl-shaders", DesktopAnimeShaders.shaderChain(effectivePreset))
+    // Under True HDR the CNNs see PQ BT.2020 frames; their per-channel residuals then tint edges.
+    controller.setDesktopShaderChain(
+        DesktopAnimeShaders.shaderChain(effectivePreset, lumaOnly = shaderTrueHdrVf.isNotEmpty()),
+    )
 
     // hqdn3d temporal/spatial denoise (Kai's standard anime VF). Skipped on HDR to avoid the heavier
     // filter chain fighting the tonemap path, matching Kai's denoise removal for HDR anime.
-    val hqdn3d = if (isHdr == true) "" else "@HQDN3D:lavfi=[hqdn3d=luma_spatial=5:chroma_spatial=5:luma_tmp=6:chroma_tmp=6]"
-    val finalVf = listOfNotNull(hqdn3d.takeIf { it.isNotEmpty() }, svpFilter).joinToString(",")
+    // Also skipped under True HDR: hqdn3d is a CPU (lavfi) filter, which moves decoding to
+    // copy-back, and d3d11vpp cannot take CPU frames.
+    val hqdn3d = if (isHdr == true || shaderTrueHdrVf.isNotEmpty()) {
+        ""
+    } else {
+        "@HQDN3D:lavfi=[hqdn3d=luma_spatial=5:chroma_spatial=5:luma_tmp=6:chroma_tmp=6]"
+    }
+    val finalVf = listOfNotNull(
+        shaderTrueHdrVf.takeIf { it.isNotEmpty() },
+        hqdn3d.takeIf { it.isNotEmpty() },
+        svpFilter,
+    ).joinToString(",")
 
     // When injecting CPU/software-based lavfi filters (hqdn3d, vapoursynth), we MUST dynamically switch
     // the hardware decoder to a copy-back mode, otherwise FFmpeg fails to map the d3d11 surface to RAM.
+    controller.setSvpBypassVideoFilters("")
     controller.setMpvProperty("vf", finalVf)
     controller.forceVideoRedraw()
     // Named as the shader family plus its preset. The chain behind a preset is six to ten
     // Anime4K_* files, which is not something to print, and the bare preset label ("Mode A (HQ)")
     // never says what is doing the work.
     return DesktopAnimeProfileResult(
-        shaderLabel = "Anime4K ${effectivePreset.label}",
+        shaderLabel = "Anime4K ${localizedString(effectivePreset.labelRes)}".withTrueHdrSuffix(shaderTrueHdrVf.isNotEmpty()),
         svpActive = svpActive,
+        rtxTrueHdrActive = shaderTrueHdrVf.isNotEmpty(),
     )
 }
+
+/**
+ * Every `glsl-shaders` write in the profile goes through here so the Sharpen menu's CAS pass rides
+ * on whichever chain is active (none, Anime4K or a custom shader). Opts before shaders, so the
+ * chain never compiles once with a stale strength.
+ */
+private fun NativePlayerController.setDesktopShaderChain(chain: String) {
+    val sharpness = desktopCasSharpness(
+        PlayerSettingsRepository.uiState.value.desktopMpvPropertyOverrides[DESKTOP_SHARPEN_OVERRIDE_KEY],
+    )
+    val (shaders, opts) = desktopShaderChainWithSharpen(chain, sharpness)
+    setMpvProperty("glsl-shader-opts", opts)
+    setMpvProperty("glsl-shaders", shaders)
+}
+
+/** Shader labels say when True HDR is stacked on them, since it changes the look outright. */
+private fun String.withTrueHdrSuffix(trueHdr: Boolean): String = if (trueHdr) "$this + True HDR" else this
 
 @Composable
 private fun DesktopStubPlayerSurface(
@@ -1261,7 +2269,7 @@ private fun DesktopStubPlayerSurface(
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "Desktop in-app playback is not available yet.",
+            text = stringResource(Res.string.player_desktop_unavailable),
             color = Color.White,
             style = MaterialTheme.typography.bodyMedium,
         )
@@ -1295,3 +2303,35 @@ private val EXPIRED_PINNED_LINK_STATUS =
 
 private fun looksLikeExpiredPinnedLink(message: String): Boolean =
     EXPIRED_PINNED_LINK_STATUS.containsMatchIn(message)
+
+private const val PLAYER_BADGES_POLL_MS = 2_000L
+/** How long the play/pause key is held before it means 2x rather than pause. */
+private const val PLAY_HOLD_DELAY_MS = 350L
+
+/** How long the post-show cards take to fade in. */
+private const val POST_SHOW_SHRINK_MS = 500
+
+/** The box's gap from the bottom and right edges, and its width as a share of the space left. */
+private const val POST_SHOW_BOX_MARGIN_DP = 64
+private const val POST_SHOW_BOX_WIDTH = 0.3f
+
+// fork:voice-control - the HUD pill's title, value and how long it stays, for each listening state.
+private const val VOICE_PILL_RESULT_MS = 3_000
+private const val VOICE_PILL_LISTENING_MS = 12_000
+
+private fun voicePillText(state: com.nuvio.app.features.voice.VoiceSessionState): Triple<String, String, Int>? {
+    fun quoted(text: String) = "\u201C${text.trim().trimEnd('.')}\u201D"
+    return when (state) {
+        is com.nuvio.app.features.voice.VoiceSessionState.Listening ->
+            Triple("Listening\u2026", state.transcript.takeIf { it.isNotBlank() }?.let(::quoted) ?: "Say a command", VOICE_PILL_LISTENING_MS)
+        is com.nuvio.app.features.voice.VoiceSessionState.Transcribing ->
+            Triple("Listening\u2026", state.transcript.takeIf { it.isNotBlank() }?.let(::quoted) ?: "\u2026", VOICE_PILL_LISTENING_MS)
+        is com.nuvio.app.features.voice.VoiceSessionState.Heard ->
+            Triple(com.nuvio.app.features.voice.describeVoiceIntent(state.intent), quoted(state.text), VOICE_PILL_RESULT_MS)
+        is com.nuvio.app.features.voice.VoiceSessionState.Failed -> Triple("Voice", state.message, VOICE_PILL_RESULT_MS)
+        com.nuvio.app.features.voice.VoiceSessionState.Idle -> null
+    }
+}
+
+/** Access tokens in a playback URL query (media servers, generic token params), for log lines. */
+private val PlaybackUrlTokenPattern = Regex("""(?i)\b(api_key|x-plex-token|access_token|token)=[^&#\s]+""")

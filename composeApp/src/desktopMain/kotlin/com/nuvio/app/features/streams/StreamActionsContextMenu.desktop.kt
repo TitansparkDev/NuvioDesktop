@@ -1,5 +1,6 @@
 package com.nuvio.app.features.streams
 
+import com.nuvio.app.core.ui.NuvioGlassMenuSurface
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Language
@@ -58,6 +60,7 @@ import nuvio.composeapp.generated.resources.streams_download_season
 import nuvio.composeapp.generated.resources.streams_inspect_source
 import nuvio.composeapp.generated.resources.streams_open_external_player
 import nuvio.composeapp.generated.resources.streams_open_in_browser
+import nuvio.composeapp.generated.resources.streams_play_on_device
 import org.jetbrains.compose.resources.stringResource
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -75,6 +78,7 @@ internal actual fun StreamRowContextMenu(
     val inspectSourceLabel = stringResource(Res.string.streams_inspect_source)
     val openInBrowserLabel = stringResource(Res.string.streams_open_in_browser)
     val externalLabel = stringResource(Res.string.streams_open_external_player)
+    val castLabel = stringResource(Res.string.streams_play_on_device)
     var menuOpen by remember(stream) { mutableStateOf(false) }
     var clickPosition by remember(stream) { mutableStateOf(Offset.Zero) }
     var rowCoordinates by remember(stream) { mutableStateOf<LayoutCoordinates?>(null) }
@@ -99,6 +103,9 @@ internal actual fun StreamRowContextMenu(
     // *label*, not the availability: when we are confident it says what it will find, and when we
     // are not it says "inspect", which is exactly the fallback for detection getting it wrong.
     val canInspectSource = stream.canInspectSource
+    // A Usenet row before the engine opens it: its NZB link can be copied and its score read, but
+    // there is no file to download, open in a browser, hand to another player or cast.
+    val usenet = stream.needsUsenetPreparation
 
     if (actions == null || !enabled) {
         content()
@@ -135,6 +142,7 @@ internal actual fun StreamRowContextMenu(
                 onDismissRequest = { menuOpen = false },
                 properties = PopupProperties(focusable = true),
             ) {
+                com.nuvio.app.core.ui.KeyRouteLayer("stream actions menu") // the focus router leaves an open menu alone
                 StreamActionsMenu(
                     scoreBreakdown = scoreBreakdown,
                     copyLabel = copyLabel,
@@ -146,11 +154,12 @@ internal actual fun StreamRowContextMenu(
                     downloadSeasonLabel = if (isSeasonPack) downloadSeasonLabel else inspectSourceLabel,
                     openInBrowserLabel = openInBrowserLabel,
                     externalLabel = externalLabel,
+                    castLabel = castLabel,
                     onCopy = {
                         menuOpen = false
                         actions.onCopyUrl(stream)
                     },
-                    onDownload = actions.onDownload?.let { download ->
+                    onDownload = actions.onDownload?.takeUnless { usenet }?.let { download ->
                         {
                             menuOpen = false
                             download(stream)
@@ -159,22 +168,30 @@ internal actual fun StreamRowContextMenu(
                     // Shown when either route could work: a detected pack (the per-episode search
                     // needs nothing but a release identity) or a source we can list outright.
                     onDownloadSeason = actions.onDownloadSeason
-                        ?.takeIf { isSeasonPack || canInspectSource }
+                        ?.takeIf { !usenet && (isSeasonPack || canInspectSource) }
                         ?.let { downloadSeason ->
                             {
                                 menuOpen = false
                                 downloadSeason(stream)
                             }
                         },
-                    onOpenInBrowser = actions.onOpenInBrowser?.let { openInBrowser ->
+                    onOpenInBrowser = actions.onOpenInBrowser?.takeUnless { usenet }?.let { openInBrowser ->
                         {
                             menuOpen = false
                             openInBrowser(stream)
                         }
                     },
-                    onExternal = {
-                        menuOpen = false
-                        actions.onOpenExternal(stream)
+                    onExternal = if (usenet) null else {
+                        {
+                            menuOpen = false
+                            actions.onOpenExternal(stream)
+                        }
+                    },
+                    onCast = actions.onCastToDevice?.takeUnless { usenet }?.let { cast ->
+                        {
+                            menuOpen = false
+                            cast(stream)
+                        }
                     },
                 )
             }
@@ -207,20 +224,15 @@ private fun StreamActionsMenu(
     downloadSeasonLabel: String,
     openInBrowserLabel: String,
     externalLabel: String,
+    castLabel: String,
     onCopy: () -> Unit,
     onDownload: (() -> Unit)?,
     onDownloadSeason: (() -> Unit)?,
     onOpenInBrowser: (() -> Unit)?,
-    onExternal: () -> Unit,
+    onExternal: (() -> Unit)?,
+    onCast: (() -> Unit)?,
 ) {
-    Surface(
-        modifier = Modifier.width(244.dp),
-        shape = RoundedCornerShape(10.dp),
-        color = Color(0xFA18191D),
-        contentColor = Color.White,
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)),
-        shadowElevation = 16.dp,
-    ) {
+    NuvioGlassMenuSurface(modifier = Modifier.width(244.dp)) {
         Column(modifier = Modifier.padding(6.dp)) {
             StreamActionRow(copyLabel, Icons.Rounded.ContentCopy, onCopy)
             if (onDownload != null) {
@@ -232,7 +244,12 @@ private fun StreamActionsMenu(
             if (onOpenInBrowser != null) {
                 StreamActionRow(openInBrowserLabel, Icons.Rounded.Language, onOpenInBrowser)
             }
-            StreamActionRow(externalLabel, Icons.AutoMirrored.Rounded.OpenInNew, onExternal)
+            if (onExternal != null) {
+                StreamActionRow(externalLabel, Icons.AutoMirrored.Rounded.OpenInNew, onExternal)
+            }
+            if (onCast != null) {
+                StreamActionRow(castLabel, Icons.Rounded.Cast, onCast)
+            }
             // Below the actions on purpose: the breakdown is read-only, so the clickable rows stay
             // closest to the cursor where the menu opens.
             scoreBreakdown?.let { score ->

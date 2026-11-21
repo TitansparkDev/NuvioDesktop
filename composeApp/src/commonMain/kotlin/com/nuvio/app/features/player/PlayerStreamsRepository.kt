@@ -2,6 +2,7 @@ package com.nuvio.app.features.player
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.enabledAddons
@@ -18,13 +19,17 @@ import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import com.nuvio.app.features.metadata.MediaIdResolver
 import com.nuvio.app.features.plugins.PluginRepository
 import com.nuvio.app.features.plugins.PluginsUiState
-import com.nuvio.app.features.plugins.pluginContentId
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.InstalledStreamAddonTarget
 import com.nuvio.app.features.streams.StreamAutoPlaySelector
 import com.nuvio.app.features.streams.StreamBadgePresentation
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
+import com.nuvio.app.features.streams.AnimeTmdbEpisodeLocator
+import com.nuvio.app.features.streams.AnimeFranchiseEpisodeLocator
+import com.nuvio.app.features.streams.animeFranchiseFallbackStreams
 import com.nuvio.app.features.streams.filterForRequestedEpisode
+import com.nuvio.app.features.streams.hasPlayableStream
+import com.nuvio.app.features.streams.pluginEpisodeTarget
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamLoadCompletion
 import com.nuvio.app.features.streams.StreamParser
@@ -80,6 +85,7 @@ object PlayerStreamsRepository {
         episode: Int? = null,
         forceRefresh: Boolean = false,
     ) {
+        PerfTelemetry.count("PlayerStreamsRepository.loadSources")
         fetchStreams(
             type = type,
             videoId = videoId,
@@ -105,7 +111,14 @@ object PlayerStreamsRepository {
         episode: Int? = null,
         sourceAffinity: PlayerSourceAffinity = PlayerSourceAffinity.Stream,
         forceRefresh: Boolean = false,
+        /**
+         * Serve provider answers from the prefetch cache even on a forced refresh. Next-episode
+         * autoplay forces a refresh to get past the request-key reuse that once stalled it, but
+         * what the next-episode preload found minutes ago is a real answer, not that stale state.
+         */
+        readPrefetchOnForceRefresh: Boolean = false,
     ) {
+        PerfTelemetry.count("PlayerStreamsRepository.loadEpisodeStreams")
         fetchStreams(
             type = type,
             videoId = videoId,
@@ -115,6 +128,7 @@ object PlayerStreamsRepository {
             episode = episode,
             sourceAffinity = sourceAffinity,
             forceRefresh = forceRefresh,
+            readPrefetchOnForceRefresh = readPrefetchOnForceRefresh,
             stateFlow = _episodeStreamsState,
             requestKeyHolder = { episodeStreamsRequestKey },
             setRequestKey = { episodeStreamsRequestKey = it },
@@ -127,6 +141,9 @@ object PlayerStreamsRepository {
         _sourceState.update { it.copy(selectedFilter = addonId) }
     }
 
+    /** Identifies the load [episodeStreamsState] currently belongs to (null once cleared). */
+    fun episodeStreamsRequestKey(): String? = episodeStreamsRequestKey
+
     fun selectEpisodeStreamsFilter(addonId: String?) {
         _episodeStreamsState.update { it.copy(selectedFilter = addonId) }
     }
@@ -135,6 +152,12 @@ object PlayerStreamsRepository {
         episodeStreamsJob?.cancel()
         episodeStreamsRequestKey = null
         _episodeStreamsState.value = StreamsUiState()
+    }
+
+    /** Rewrites the loaded source rows in place (both lists), e.g. a Usenet row's 📖. */
+    internal fun mapGroups(transform: (List<AddonStreamGroup>) -> List<AddonStreamGroup>) {
+        _sourceState.update { state -> transform(state.groups).let { if (it === state.groups) state else state.copy(groups = it) } }
+        _episodeStreamsState.update { state -> transform(state.groups).let { if (it === state.groups) state else state.copy(groups = it) } }
     }
 
     fun clearAll() {
@@ -153,6 +176,7 @@ object PlayerStreamsRepository {
         episode: Int?,
         sourceAffinity: PlayerSourceAffinity = PlayerSourceAffinity.Stream,
         forceRefresh: Boolean,
+        readPrefetchOnForceRefresh: Boolean = false,
         stateFlow: MutableStateFlow<StreamsUiState>,
         requestKeyHolder: () -> String?,
         setRequestKey: (String?) -> Unit,
@@ -247,6 +271,16 @@ object PlayerStreamsRepository {
                 isLoading = false,
             )
         }
+        // Media servers: one group per connection that can serve this episode, beside the addons.
+        val serverSources = com.nuvio.app.features.servers.ServerStreams.sources(
+            type = type,
+            videoId = effectiveVideoId,
+            season = effectiveSeason,
+            episode = effectiveEpisode,
+            forceRefresh = forceRefresh,
+        )
+        val preferredGroupIds = serverSources.filter { it.preferred }.mapTo(mutableSetOf()) { it.addonId }
+        val searchUsenet = com.nuvio.app.features.usenet.BuiltInUsenet.canSearch(type, effectiveVideoId)
         // A local-library playback session (opened via the library) stays local across episode
         // switches and next-episode auto-play — mirror StreamsRepository's local-first behaviour
         // instead of scraping addons for a file that is already on disk.
@@ -259,7 +293,7 @@ object PlayerStreamsRepository {
         val installedAddons = AddonRepository.uiState.value.addons.enabledAddons()
         PlayerSettingsRepository.ensureLoaded()
         val playerSettings = PlayerSettingsRepository.uiState.value
-        val prefetchMaxAgeMs = if (forceRefresh) {
+        val prefetchMaxAgeMs = if (forceRefresh && !readPrefetchOnForceRefresh) {
             0L
         } else {
             playerSettings.streamPrefetchCacheMinutes * 60L * 1000L
@@ -275,7 +309,7 @@ object PlayerStreamsRepository {
             groupByRepository = pluginUiState.groupStreamsByRepository,
         )
 
-        if (installedAddons.isEmpty() && pluginProviderGroups.isEmpty()) {
+        if (installedAddons.isEmpty() && pluginProviderGroups.isEmpty() && serverSources.isEmpty() && !searchUsenet) {
             // No scrapers at all — a local file is still a valid (and the only) source.
             if (localGroup != null) {
                 stateFlow.value = singleGroupState(localGroup)
@@ -306,7 +340,7 @@ object PlayerStreamsRepository {
                 )
             }
 
-        if (streamAddons.isEmpty() && pluginProviderGroups.isEmpty()) {
+        if (streamAddons.isEmpty() && pluginProviderGroups.isEmpty() && serverSources.isEmpty() && !searchUsenet) {
             if (localGroup != null) {
                 stateFlow.value = singleGroupState(localGroup)
             } else {
@@ -335,7 +369,9 @@ object PlayerStreamsRepository {
                 streams = emptyList(),
                 isLoading = true,
             )
-        }, installedAddonOrder)
+        } + serverSources.map { it.loadingGroup() } +
+            listOfNotNull(com.nuvio.app.features.usenet.BuiltInUsenet.loadingGroup().takeIf { searchUsenet }),
+            installedAddonOrder, preferredGroupIds)
         val isInitiallyLoading = initialGroups.any { it.isLoading }
         stateFlow.value = StreamsUiState(
             groups = initialGroups,
@@ -405,6 +441,7 @@ object PlayerStreamsRepository {
                             if (currentGroup.addonId == group.addonId) group else currentGroup
                         },
                         installedOrder = installedAddonOrder,
+                        preferredGroupIds = preferredGroupIds,
                     )
                     val anyLoading = updated.any { it.isLoading }
                     current.copy(
@@ -446,6 +483,19 @@ object PlayerStreamsRepository {
                 debridAvailabilityJobs += availabilityJob
             }
 
+            serverSources.forEach { source ->
+                launch { publishStreamGroup(presentStreamGroup(source.load())) }
+            }
+            if (searchUsenet) {
+                launch {
+                    publishStreamGroup(
+                        presentStreamGroup(
+                            com.nuvio.app.features.usenet.BuiltInUsenet.group(type, effectiveVideoId, effectiveSeason, effectiveEpisode),
+                        ),
+                    )
+                }
+            }
+
             streamAddons.forEach { addon ->
                 launch {
                     val prefetched = (
@@ -458,7 +508,7 @@ object PlayerStreamsRepository {
                     if (prefetched != null) {
                         log.i {
                             "Provider served from prefetch addon=${addon.addonName} " +
-                                "id=${addon.addonId} streams=${prefetched.size}"
+                                "id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} streams=${prefetched.size}"
                         }
                         publishCompletion(
                             StreamLoadCompletion.Addon(
@@ -470,7 +520,7 @@ object PlayerStreamsRepository {
 
                     val providerStarted = TimeSource.Monotonic.markNow()
                     log.i {
-                        "Provider started addon=${addon.addonName} id=${addon.addonId} " +
+                        "Provider started addon=${addon.addonName} id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                             "type=$type contentId=$effectiveVideoId"
                     }
                     val url = buildAddonResourceUrl(
@@ -499,18 +549,45 @@ object PlayerStreamsRepository {
                                 type = type,
                                 id = parentMetaId ?: videoId,
                             ),
-                        )
+                        ).let { streams ->
+                            if (!streams.hasPlayableStream() && AnimeFranchiseEpisodeLocator.appliesTo(resolvedEpisode)) {
+                                animeFranchiseFallbackStreams(
+                                    franchiseVideoId = AnimeFranchiseEpisodeLocator.franchiseVideoId(
+                                        identity = resolvedEpisode,
+                                        type = type,
+                                        parentMetaId = parentMetaId,
+                                    ),
+                                    manifest = addon.manifest,
+                                    type = type,
+                                    seriesTitle = MetaDetailsRepository.seriesTitleFor(
+                                        type = type,
+                                        id = parentMetaId ?: videoId,
+                                    ),
+                                    fetch = { fallbackUrl -> httpGetText(fallbackUrl) },
+                                    parse = { fallbackPayload ->
+                                        StreamParser.parse(
+                                            payload = fallbackPayload,
+                                            addonName = displayName,
+                                            addonId = addon.addonId,
+                                            addonLogo = addon.manifest.logoUrl,
+                                        )
+                                    },
+                                ) ?: streams
+                            } else {
+                                streams
+                            }
+                        }
                     }.fold(
                         onSuccess = { streams ->
                             log.i {
-                                "Provider completed addon=${addon.addonName} id=${addon.addonId} " +
+                                "Provider completed addon=${addon.addonName} id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                                     "streams=${streams.size} elapsedMs=${providerStarted.elapsedNow().inWholeMilliseconds}"
                             }
                             AddonStreamGroup(displayName, addon.addonId, streams, isLoading = false)
                         },
                         onFailure = { err ->
                             log.w(err) {
-                                "Provider failed addon=$displayName id=${addon.addonId} " +
+                                "Provider failed addon=$displayName id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                                     "elapsedMs=${providerStarted.elapsedNow().inWholeMilliseconds}"
                             }
                             AddonStreamGroup(displayName, addon.addonId, emptyList(), isLoading = false, error = err.message)
@@ -552,16 +629,19 @@ object PlayerStreamsRepository {
                             "Plugin provider started group=${providerGroup.addonName} " +
                                 "scraper=${scraper.name} type=$type contentId=$effectiveVideoId"
                         }
+                        val pluginTarget = resolvedEpisode.pluginEpisodeTarget(
+                            if (AnimeTmdbEpisodeLocator.appliesTo(resolvedEpisode)) {
+                                runCatchingUnlessCancelled { AnimeTmdbEpisodeLocator.locate(resolvedEpisode) }.getOrNull()
+                            } else {
+                                null
+                            },
+                        )
                         val completion = PluginRepository.executeScraper(
                             scraper = scraper,
-                            tmdbId = pluginContentId(
-                                videoId = effectiveVideoId,
-                                season = effectiveSeason,
-                                episode = effectiveEpisode,
-                            ),
+                            tmdbId = pluginTarget.contentId,
                             mediaType = type,
-                            season = effectiveSeason,
-                            episode = effectiveEpisode,
+                            season = pluginTarget.season,
+                            episode = pluginTarget.episode,
                         ).fold(
                             onSuccess = { results ->
                                 log.i {
@@ -638,6 +718,7 @@ object PlayerStreamsRepository {
                                     }
                                 },
                                 installedOrder = installedAddonOrder,
+                                preferredGroupIds = preferredGroupIds,
                             )
                             val anyLoading = updated.any { it.isLoading }
                             current.copy(

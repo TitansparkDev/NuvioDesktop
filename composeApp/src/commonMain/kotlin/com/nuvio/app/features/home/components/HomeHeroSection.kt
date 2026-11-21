@@ -1,13 +1,21 @@
 package com.nuvio.app.features.home.components
 
+import com.nuvio.app.core.i18n.localizedString
+import com.nuvio.app.core.ui.LocalScreenCovered
+import com.nuvio.app.core.ui.PosterZoomOverlayCoordinator
+import androidx.compose.ui.layout.onSizeChanged
 import coil3.SingletonImageLoader
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.size.Scale
+import com.nuvio.app.core.ui.rememberHeroLogoModel
+import com.nuvio.app.core.ui.nuvioDitheredVerticalGradient
+import com.nuvio.app.core.ui.HdrFadeCorrected
 import com.nuvio.app.core.ui.RecompositionProbe
 import com.nuvio.app.core.ui.nuvioArtworkRequestSize
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import co.touchlab.kermit.Logger
+import com.nuvio.app.features.watchprogress.WatchProgressClock
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Animatable
@@ -60,10 +68,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.collectAsState
+import com.nuvio.app.features.tracking.RatingPromptRepository
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.settings.DesktopNavigationLayout
 import com.nuvio.app.features.settings.ThemeSettingsRepository
@@ -78,11 +88,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import com.nuvio.app.features.streams.StreamPickerController
+import com.nuvio.app.features.streams.StreamPickerDock
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
@@ -95,8 +113,11 @@ import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -134,6 +155,9 @@ import com.nuvio.app.features.qualicache.QualityInlineBadges
 import com.nuvio.app.features.qualicache.rememberQualityBadgesEnabled
 import com.nuvio.app.features.qualicache.rememberQualityHighlights
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.home.heroPeopleLabel
+import com.nuvio.app.features.home.isOffCatalogHeroItem
+import com.nuvio.app.features.playlist.isPlaylistPreview
 import com.nuvio.app.features.home.randomPlayCategoryOrNull
 import com.nuvio.app.features.home.HeroCastMember
 import com.nuvio.app.features.home.HeroBadgePlacement
@@ -152,6 +176,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -168,6 +194,7 @@ import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+private const val HERO_AUTO_SCROLL_INTERVAL_MS = 8_000L
 private const val HERO_BACKGROUND_PARALLAX = 0.055f
 private const val HERO_CONTENT_PARALLAX = 0.18f
 private const val HERO_SCROLL_PARALLAX = 0.3f
@@ -200,10 +227,22 @@ object HomeHeroPeoplePanelToggleTrigger {
 }
 
 private const val HERO_BACKDROP_WIDTH_FRACTION = 0.85f
+
+/** TV mode's source picker dock: the hero's right-hand share, clear of the metadata column. */
+private const val HERO_PICKER_DOCK_WIDTH_FRACTION = 0.6f
+private const val HERO_PICKER_FROST_BLUR_DP = 28f
+// Darker than the details page's 0.25: home backdrops are brighter key art, and the source list
+// has to read over them.
+private const val HERO_PICKER_FROST_DIM = 0.45f
 private const val HERO_BACKDROP_FADE_FRACTION = 0.35f
 private const val HERO_METADATA_PREFETCH_CONCURRENCY = 4
+
+/** How many heroes each side of the one on screen are warmed ahead (see the warm-up in HomeHeroSection). */
+private const val HERO_METADATA_WARM_RADIUS = 2
 private val heroImageLog = Logger.withTag("HomeHeroImages")
 private val heroTrailerLog = Logger.withTag("HomeHeroTrailer")
+private val heroPrefetchLog = Logger.withTag("HeroDiscovery")
+private const val HERO_PREFETCH_SLOW_WAIT_LOG_MS = 400L
 
 /**
  * How long focus must rest on an item before its trailer is extracted from YouTube. Long enough
@@ -298,6 +337,20 @@ fun HomeHeroSection(
      */
     immersiveFullBackdrop: Boolean = false,
     adaptiveHeroMode: Boolean = false,
+    /**
+     * Basic's hero: a carousel the user pages through, never following focus. Its slides carry their
+     * own fade, so backdrops don't crossfade on top of it, and its content scales with
+     * [heightOverride] like Adaptive's does.
+     */
+    pagedHero: Boolean = false,
+    /**
+     * Ambient background: the hero fades its backdrop out to transparency instead of to the theme
+     * background, so it ends on the wash that the rows below sit on. [ambientUnderlay], when given,
+     * is that wash drawn again inside the hero (lined up with the screen through [viewportHeight]),
+     * for a hero that overlays scrolling rows and so cannot simply be see-through.
+     */
+    ambientBackground: Boolean = false,
+    ambientUnderlay: (@Composable () -> Unit)? = null,
     heroEnabled: Boolean = true,
     heroInfoLines: Int = 2,
     heroInfoPriority: String = "wins,gg_wins,festival,pic_noms,gg_noms,emmy_noms,studio,director,trending,cult,foreign,new_release,metacritic,true_story,stinger,short_film,mini_series,binge_ready,release_status",
@@ -324,6 +377,20 @@ fun HomeHeroSection(
     RecompositionProbe("hero")
     val pagerState = rememberPagerState(pageCount = { items.size })
     val coroutineScope = rememberCoroutineScope()
+
+    // Basic's carousel rotates on its own, as upstream's hero does. Keyed on the settled page so a
+    // manual swipe or dot click restarts the interval. It holds while the hero follows focus, while
+    // Home isn't the foreground screen (player, settings, game mode, stream picker) and while a
+    // trailer is playing on it; the last slide wraps back to the first.
+    val heroHomeActive by HomeHeroTrailerGate.homeActive.collectAsState()
+    val heroTrailerShowing by HomeHeroTrailerManualTrigger.active.collectAsState()
+    val autoRotate = pagedHero && focusedItem == null && heroHomeActive && !heroTrailerShowing && items.size > 1
+    LaunchedEffect(pagerState.settledPage, items.size, autoRotate) {
+        if (!autoRotate) return@LaunchedEffect
+        delay(HERO_AUTO_SCROLL_INTERVAL_MS)
+        while (pagerState.isScrollInProgress) delay(100L)
+        pagerState.animateScrollToPage((pagerState.currentPage + 1) % items.size)
+    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -352,7 +419,7 @@ fun HomeHeroSection(
             // relative to the natural base height so the logo and content placement scale with it.
             // Only the Adaptive (non-immersive) hero should scale — TV Mode / full-screen trailer
             // overrides blow the hero up to the whole viewport and must not drag the logo along.
-            val scale = if (adaptiveHeroMode && !immersiveMode && baseLayout.heroHeight > 0.dp) {
+            val scale = if ((adaptiveHeroMode || pagedHero) && !immersiveMode && baseLayout.heroHeight > 0.dp) {
                 (override / baseLayout.heroHeight).coerceIn(0.5f, 2.5f)
             } else {
                 baseLayout.heroHeightScale
@@ -428,7 +495,15 @@ fun HomeHeroSection(
             item.type == displayCurrentItem.type && item.id == displayCurrentItem.id
         } ?: displayCurrentItem
 
-        LaunchedEffect(displayCurrentItem.type, displayCurrentItem.id) {
+        // Keyed on the artwork too: an item often arrives poster-only and gets its backdrop from
+        // enrichment a moment later. Keyed on id alone, the ambient wash stayed on the poster
+        // (e.g. an orange key-art poster tinting the wash under a blue backdrop).
+        LaunchedEffect(
+            displayCurrentItem.type,
+            displayCurrentItem.id,
+            displayCurrentItem.banner,
+            displayCurrentItem.poster,
+        ) {
             onActiveItemChanged?.invoke(displayCurrentItem)
         }
 
@@ -444,23 +519,51 @@ fun HomeHeroSection(
         val discoveryPriority = remember(heroInfoPriority) {
             HeroDiscoveryMetadataService.normalizePriority(heroInfoPriority)
         }
-        // Keep warming all nearby metadata, but put what the user can see first and avoid
-        // flooding the add-on/TMDB/image hosts with dozens of simultaneous cold requests.
-        val metadataTargets = (listOf(displayCurrentItemWithCast) + metadataPrefetchItems + displayItemsWithCast)
+        // Warm the hero on screen and its neighbours, not the whole carousel: every carousel item used to be warmed at
+        // launch (33 on one install, each a hero summary plus badges, credits, ratings and IMDb sub-genres; optimization
+        // audit B1). The rest is fetched as the carousel or the focus comes within reach of it.
+        val heroWarmNeighbours = run {
+            val count = displayItemsWithCast.size
+            val at = displayItemsWithCast.indexOfFirst { item ->
+                item.type == displayCurrentItemWithCast.type && item.id == displayCurrentItemWithCast.id
+            }
+            if (count == 0 || at < 0) {
+                displayItemsWithCast.take(HERO_METADATA_WARM_RADIUS + 1)
+            } else {
+                (-HERO_METADATA_WARM_RADIUS..HERO_METADATA_WARM_RADIUS)
+                    .map { step -> displayItemsWithCast[((at + step) % count + count) % count] }
+            }
+        }
+        val metadataTargets = (listOf(displayCurrentItemWithCast) + heroWarmNeighbours + metadataPrefetchItems)
             .distinctBy { item ->
                 "${item.type}:${item.id}"
             }
+        // The lookups run in a scope that outlives the effect below. The effect restarts each time the hero moves, and
+        // used to cancel every lookup still in flight, including those for titles that were still in range.
+        val heroWarmScope = rememberCoroutineScope()
+        val prefetchSlots = remember { Semaphore(HERO_METADATA_PREFETCH_CONCURRENCY) }
+        // Lookups already running, so a restart does not queue a second one for the same title.
+        val warmInFlight = remember { mutableSetOf<String>() }
         LaunchedEffect(metadataTargets, HeroDiscoveryMetadataService.CACHE_VERSION) {
             val settings = MdbListSettingsRepository.snapshot()
-            val prefetchSlots = Semaphore(HERO_METADATA_PREFETCH_CONCURRENCY)
+            fun launchOnce(tag: String, block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) {
+                if (!warmInFlight.add(tag)) return
+                heroWarmScope.launch {
+                    try {
+                        block()
+                    } finally {
+                        warmInFlight.remove(tag)
+                    }
+                }
+            }
             for (target in metadataTargets) {
                 val key = "${target.type}:${target.id}"
                 val discoveryKey = "$key:heroDiscoveryV${HeroDiscoveryMetadataService.CACHE_VERSION}"
                 // Every lookup below goes through the item's metadata identity rather than its own
                 // id: a cloud-library row is listed under a provider download key that resolves to
                 // nothing anywhere, so without this it has no cast, no ratings and no badges.
-                if (!castCache.containsKey(key) && target.type != "collection") {
-                    launch {
+                if (!castCache.containsKey(key) && !target.isOffCatalogHeroItem()) {
+                    launchOnce("cast:$key") {
                         prefetchSlots.withPermit {
                             castCache[key] = HeroCastMetadataService.fetch(
                                 type = target.metadataType,
@@ -469,9 +572,14 @@ fun HomeHeroSection(
                         }
                     }
                 }
-                if (!discoveryCache.containsKey(discoveryKey) && target.type != "collection") {
-                    launch {
+                if (!discoveryCache.containsKey(discoveryKey) && !target.isOffCatalogHeroItem()) {
+                    launchOnce("badges:$discoveryKey") {
+                        val queuedAtMs = WatchProgressClock.nowEpochMs()
                         prefetchSlots.withPermit {
+                            val waitedMs = WatchProgressClock.nowEpochMs() - queuedAtMs
+                            if (waitedMs >= HERO_PREFETCH_SLOW_WAIT_LOG_MS) {
+                                heroPrefetchLog.i { "Badges for $key waited ${waitedMs}ms for a prefetch slot" }
+                            }
                             discoveryCache[discoveryKey] = HeroDiscoveryMetadataService.fetch(
                                 type = target.metadataType,
                                 id = target.metadataId,
@@ -481,8 +589,8 @@ fun HomeHeroSection(
                         }
                     }
                 }
-                if (!productionCache.containsKey(key) && target.type != "collection") {
-                    launch {
+                if (!productionCache.containsKey(key) && !target.isOffCatalogHeroItem()) {
+                    launchOnce("credits:$key") {
                         prefetchSlots.withPermit {
                             productionCache[key] = fetchHeroProductionCredits(
                                 type = target.metadataType,
@@ -491,12 +599,12 @@ fun HomeHeroSection(
                         }
                     }
                 }
-                if (!interestsCache.containsKey(key) && target.type != "collection") {
+                if (!interestsCache.containsKey(key) && !target.isOffCatalogHeroItem()) {
                     val imdbId = target.metadataId.takeIf { it.startsWith("tt", ignoreCase = true) }
                     if (imdbId == null) {
                         interestsCache[key] = emptyList()
                     } else {
-                        launch {
+                        launchOnce("interests:$key") {
                             prefetchSlots.withPermit {
                                 interestsCache[key] = ImdbInterestsService.fetch(imdbId)
                             }
@@ -504,7 +612,7 @@ fun HomeHeroSection(
                     }
                 }
                 if (ratingsCache.containsKey(key)) continue
-                if (target.type == "collection") {
+                if (target.isOffCatalogHeroItem()) {
                     ratingsCache[key] = emptyList()
                     continue
                 }
@@ -517,7 +625,7 @@ fun HomeHeroSection(
                     ratingsCache[key] = emptyList()
                     continue
                 }
-                launch {
+                launchOnce("ratings:$key") {
                     prefetchSlots.withPermit {
                         val enriched = MdbListMetadataService.enrichMeta(
                             meta = baseMeta,
@@ -567,6 +675,14 @@ fun HomeHeroSection(
                     immersiveMode = immersiveMode,
                     immersiveFullBackdrop = immersiveFullBackdrop,
                     adaptiveHeroMode = adaptiveHeroMode,
+                    pagedHero = pagedHero && focusedItem == null,
+                    // Several pages are laid out whenever no item is focused (a TV-mode hero with its
+                    // CW preview dismissed too, not only Basic's carousel), and a swipe across them
+                    // must keep each title in its own layer.
+                    pagesKeyed = focusedItem == null,
+                    ambientBackground = ambientBackground,
+                    ambientUnderlay = ambientUnderlay,
+                    viewportHeight = viewportHeight,
                     heroEnabled = heroEnabled,
                     heroInfoLines = heroInfoLines,
                     heroInfoPriority = heroInfoPriority,
@@ -612,6 +728,21 @@ private data class HeroPageLayer(
     val visibility: Float,
     val offset: Float,
 )
+
+/**
+ * A paged hero keys its layers by page, so a slide never hands one title's slot (and whatever that
+ * slot is animating) to the next title as the layers re-sort by visibility. A focus-following hero
+ * shows a single unkeyed layer, so a focus change crossfades in place.
+ */
+@Composable
+private inline fun List<HeroPageLayer>.forEachPage(
+    keyedByPage: Boolean,
+    content: @Composable (HeroPageLayer) -> Unit,
+) {
+    forEach { layer ->
+        if (keyedByPage) key(layer.page) { content(layer) } else content(layer)
+    }
+}
 
 @Composable
 private fun DefaultHomeHeroFrame(
@@ -754,20 +885,35 @@ private fun HeroBackdropImage(
     alignment: Alignment,
     contentScale: ContentScale,
     onImageLoaded: ((coil3.Image) -> Unit)? = null,
+    framingPriorBias: Float? = null,
+    crossfade: Boolean = true,
 ) {
     // Addons that don't supply a backdrop (only a poster) would otherwise render a blank/black
     // hero — fall back to the poster like the rest of the hero pipeline (e.g. the ambient
     // background wash) already does.
-    val model = item.banner?.takeIf(String::isNotBlank)
-        ?: item.poster?.takeIf(String::isNotBlank)
+    // A TMDB backdrop is asked for at full size whatever size the addon supplied (see
+    // fullSizeTmdbBackdrop); the poster fallback is left alone.
+    val model = heroBackdropModel(item)
+    // The prefetcher decodes neighbouring backdrops at this slot's size.
+    val slotModifier = modifier.onSizeChanged { size ->
+        if (size.width > 0 && size.height > 0) HeroBackdropPrefetcher.slotSizePx.value = size.width to size.height
+    }
+    // Diagnostic (2026-10-16, "ghost" double images in the hero): logs when the SAME title's
+    // backdrop image changes, e.g. the addon's art replaced by TMDB's after enrichment, which the
+    // crossfade then blends with the outgoing title. One line per change, never per frame.
+    val backdropSwapTracker = remember { HeroBackdropSwapTracker() }
+    SideEffect { backdropSwapTracker.observe(item, model) }
 
     val homeCatalogSettings by HomeCatalogSettingsRepository.uiState.collectAsStateWithLifecycle()
     val crossfadeMillis = homeCatalogSettings.heroBackdropCrossfadeMillis
-    if (crossfadeMillis > 0) {
+    // Auto-framing goes through the crossfade even when the fade is off (0 ms = a cut): the layer
+    // keeps the previous backdrop up until the new one has its crop, instead of drawing the new
+    // picture at the fallback crop and moving it a moment later (2026-10-17, crossfade at 0).
+    if (crossfade && (crossfadeMillis > 0 || framingPriorBias != null)) {
         HeroBackdropCrossfade(
             model = model,
             durationMillis = crossfadeMillis,
-            modifier = modifier,
+            modifier = slotModifier,
         ) { current, onResolved ->
             HeroBackdropImageLayer(
                 model = current,
@@ -777,11 +923,40 @@ private fun HeroBackdropImage(
                 contentScale = contentScale,
                 onImageLoaded = onImageLoaded,
                 onResolved = onResolved,
+                framingPriorBias = framingPriorBias,
+                heldUntilResolved = true,
             )
         }
         return
     }
-    HeroBackdropImageLayer(model, contentDescription, modifier, alignment, contentScale, onImageLoaded)
+    HeroBackdropImageLayer(
+        model = model,
+        contentDescription = contentDescription,
+        modifier = slotModifier,
+        alignment = alignment,
+        contentScale = contentScale,
+        onImageLoaded = onImageLoaded,
+        framingPriorBias = framingPriorBias,
+    )
+}
+
+/** See the diagnostic in [HeroBackdropImage]. */
+private class HeroBackdropSwapTracker {
+    private var lastKey: String? = null
+    private var lastModel: String? = null
+
+    fun observe(item: MetaPreview, model: String?) {
+        val key = "${item.type}:${item.id}"
+        if (key == lastKey && model != lastModel) {
+            heroImageLog.i {
+                "backdrop swap for same title $key: " +
+                    "${lastModel?.safeImageUrlForLog() ?: "none"} -> ${model?.safeImageUrlForLog() ?: "none"} " +
+                    "(poster fallback=${model != null && model == item.poster})"
+            }
+        }
+        lastKey = key
+        lastModel = model
+    }
 }
 
 /**
@@ -850,8 +1025,10 @@ internal fun HeroBackdropCrossfade(
                         // screen is the backdrop underneath.
                         snapshotFlow { layer.resolved }.first { it }
                         if (layer.hasArtwork) {
+                            com.nuvio.app.core.ui.UiMotion.markBusy(durationMillis.toLong())
                             layer.alpha.animateTo(1f, tween(durationMillis))
                         } else {
+                            com.nuvio.app.core.ui.UiMotion.markBusy(durationMillis.toLong())
                             // Resolved with nothing to draw: artwork that 404s, or an item that has
                             // none. Raising this layer would do nothing at all, since it paints
                             // nothing, so the fade has to be the one underneath going out - or the
@@ -930,11 +1107,34 @@ private fun HeroBackdropImageLayer(
     contentScale: ContentScale,
     onImageLoaded: ((coil3.Image) -> Unit)?,
     onResolved: (hasArtwork: Boolean) -> Unit = {},
+    /** Non-null turns on automatic framing, falling back to (and pulled gently toward) this bias. */
+    framingPriorBias: Float? = null,
+    /** True under [HeroBackdropCrossfade], which keeps the layer invisible until [onResolved]. */
+    heldUntilResolved: Boolean = false,
 ) {
     // A backdrop with no url draws nothing and will never report, so it resolves the moment it is
     // asked for - otherwise the fade would wait on a load that is never going to run.
     LaunchedEffect(model) {
         if (model == null) onResolved(false)
+    }
+    // fork:music-search - a music result whose backdrop is its own cover: not the cover itself (a small square picture blown
+    // up across the screen), but a clean gradient of the cover's own colours.
+    if (model != null && com.nuvio.app.features.music.home.MusicHeroLogos.isBlurred(model)) {
+        CoverColourBackdrop(coverUrl = model, modifier = modifier, onResolved = onResolved)
+        return
+    }
+    if (framingPriorBias != null && model != null) {
+        FramedHeroBackdropImageLayer(
+            model = model,
+            contentDescription = contentDescription,
+            modifier = modifier,
+            priorBias = framingPriorBias,
+            contentScale = contentScale,
+            onImageLoaded = onImageLoaded,
+            onResolved = onResolved,
+            heldUntilResolved = heldUntilResolved,
+        )
+        return
     }
     AsyncImage(
         model = model,
@@ -958,6 +1158,214 @@ private fun HeroBackdropImageLayer(
     )
 }
 
+/**
+ * fork:music-search - a record's own cover as the hero's backdrop. Covers are square and the hero is wide, so a cover is
+ * never cropped to fill it (a square cut to 16:9 loses almost half of itself): the hero is a gradient of the cover's own
+ * colours (the main colour across it, the second and third drifting in from the far corners), and a large cover (at
+ * least [COVER_BACKDROP_MIN_PX] on both sides) stands whole at the right, full height, fading into that gradient at its
+ * left edge. A smaller one would be a small picture blown up, so it is the gradient alone. The hero's own scrims and the
+ * text sit on top. Resolves once it knows which, so the crossfade waits for it like for a picture.
+ */
+@Composable
+private fun CoverColourBackdrop(coverUrl: String, modifier: Modifier, onResolved: (hasArtwork: Boolean) -> Unit) {
+    val context = coil3.compose.LocalPlatformContext.current
+    val look by androidx.compose.runtime.produceState(CoverLookCache[coverUrl], coverUrl) {
+        if (value != null) return@produceState
+        // At its own size: that says whether it is big enough, and the colours are sampled from the same picture.
+        val image = (
+            coil3.SingletonImageLoader.get(context).execute(
+                coil3.request.ImageRequest.Builder(context).data(coverUrl).size(coil3.size.Size.ORIGINAL).build(),
+            ) as? coil3.request.SuccessResult
+        )?.image
+        val found = if (image == null) {
+            CoverLook(large = false, aspect = 1f, colours = emptyList())
+        } else {
+            CoverLook(
+                large = minOf(image.width, image.height) >= COVER_BACKDROP_MIN_PX,
+                aspect = image.width.toFloat() / image.height.coerceAtLeast(1),
+                colours = com.nuvio.app.features.home.extractHeroPaletteColors(image, count = 3),
+            )
+        }
+        CoverLookCache[coverUrl] = found
+        value = found
+    }
+    val known = look
+    val picked = known?.colours
+    LaunchedEffect(known != null) { if (known != null) onResolved(known.large || !picked.isNullOrEmpty()) }
+    if (known == null) return
+    Box(modifier) {
+        if (!picked.isNullOrEmpty()) CoverColourGradient(picked, Modifier.fillMaxSize())
+        if (known.large) {
+            AsyncImage(
+                model = coverUrl,
+                contentDescription = null,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight()
+                    .aspectRatio(known.aspect.coerceIn(0.5f, 2f))
+                    // The cover's left edge melts into the gradient, so it reads as one picture rather than a square
+                    // pasted on.
+                    .graphicsLayer { compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen }
+                    .drawWithContent {
+                        drawContent()
+                        drawRect(
+                            Brush.horizontalGradient(
+                                0f to Color.Transparent,
+                                COVER_EDGE_FADE to Color.Black,
+                                1f to Color.Black,
+                            ),
+                            blendMode = androidx.compose.ui.graphics.BlendMode.DstIn,
+                        )
+                    },
+                contentScale = ContentScale.Fit,
+                desktopImageScaling = NuvioDesktopImageScaling.Disabled,
+            )
+        }
+    }
+}
+
+/** The colour gradient behind (or instead of) a record's cover. */
+@Composable
+private fun CoverColourGradient(picked: List<Color>, modifier: Modifier) {
+    // A backdrop, not a poster, but bright enough to read as the cover's colours.
+    fun tone(c: Color, keep: Float) = androidx.compose.ui.graphics.lerp(Color.Black, c, keep)
+    val main = tone(picked[0], 0.86f)
+    val second = tone(picked.getOrElse(1) { picked[0] }, 0.8f)
+    val third = tone(picked.getOrElse(2) { picked.getOrElse(1) { picked[0] } }, 0.72f)
+    Box(
+        modifier
+            .background(Brush.linearGradient(listOf(main, tone(picked[0], 0.58f), Color.Black.copy(alpha = 0.7f).compositeOver(main))))
+            .drawBehind {
+                // The other colours as soft light from the top right and the bottom right, where no text sits.
+                drawRect(
+                    Brush.radialGradient(
+                        listOf(second.copy(alpha = 0.95f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(size.width * 0.86f, size.height * 0.12f),
+                        radius = size.maxDimension * 0.62f,
+                    ),
+                )
+                drawRect(
+                    Brush.radialGradient(
+                        listOf(third.copy(alpha = 0.75f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(size.width * 0.7f, size.height * 0.95f),
+                        radius = size.maxDimension * 0.5f,
+                    ),
+                )
+            },
+    )
+}
+
+/** Whether a cover stands whole at the right ([large]), its shape, and its [colours]; kept for the session. */
+private class CoverLook(val large: Boolean, val aspect: Float, val colours: List<Color>)
+
+private val CoverLookCache = HashMap<String, CoverLook>()
+
+/** A cover at least this many pixels on both sides is sharp enough to stand whole in the hero. */
+private const val COVER_BACKDROP_MIN_PX = 1000
+
+/** How much of the cover's width, from its left edge, fades into the gradient. */
+private const val COVER_EDGE_FADE = 0.28f
+
+/**
+ * [HeroBackdropImageLayer] with automatic framing: the crop follows this backdrop's own
+ * [HeroBackdropFramingProfile] instead of one bias for every backdrop.
+ *
+ * A backdrop seen before is framed from the first frame (memory, else the disk cache). A new one
+ * is analysed once its artwork loads, and its fade-in is held for up to
+ * [FramingResolveWaitMillis] so it usually arrives already framed; an analysis that outlasts that
+ * eases the crop into place instead of cutting.
+ */
+@Composable
+private fun FramedHeroBackdropImageLayer(
+    model: String,
+    contentDescription: String?,
+    modifier: Modifier,
+    priorBias: Float,
+    contentScale: ContentScale,
+    onImageLoaded: ((coil3.Image) -> Unit)?,
+    onResolved: (hasArtwork: Boolean) -> Unit,
+    heldUntilResolved: Boolean,
+) {
+    val scope = rememberCoroutineScope()
+    var profile by remember(model) { mutableStateOf(HeroBackdropFramer.peek(model)) }
+    // Whether the picture is on screen yet. Until it is, a crop change is a snap nobody sees.
+    var displayed by remember(model) { mutableStateOf(false) }
+    LaunchedEffect(model) {
+        if (profile == null) HeroBackdropFramer.profile(model, image = null)?.let { profile = it }
+    }
+    // Constraints rather than onSizeChanged: the hero's aspect is known in the first composition,
+    // so a cached backdrop never starts at the fallback and slides.
+    BoxWithConstraints(modifier) {
+        val heroAspect = if (constraints.hasBoundedHeight && constraints.maxHeight > 0) {
+            constraints.maxWidth.toFloat() / constraints.maxHeight
+        } else {
+            0f
+        }
+        val currentProfile = profile
+        val targetBias = remember(currentProfile, heroAspect, priorBias) {
+            currentProfile?.let { heroBackdropFramingBias(it, heroAspect, priorBias) } ?: priorBias
+        }
+        val bias = remember(model) { Animatable(targetBias) }
+        var framedProfile by remember(model) { mutableStateOf(currentProfile) }
+        LaunchedEffect(targetBias) {
+            val analysisLanded = framedProfile !== currentProfile
+            framedProfile = currentProfile
+            if (analysisLanded && displayed) {
+                // The analysis finished after the picture was up: ease into the new crop.
+                bias.animateTo(targetBias, tween(FramingSettleMillis))
+            } else {
+                // Not shown yet, or the hero itself changed size (window resize, Hero height):
+                // follow exactly.
+                bias.snapTo(targetBias)
+            }
+        }
+        AsyncImage(
+            model = model,
+            contentDescription = contentDescription,
+            modifier = Modifier.fillMaxSize(),
+            alignment = BiasAlignment(horizontalBias = 0f, verticalBias = bias.value),
+            contentScale = contentScale,
+            desktopImageScaling = NuvioDesktopImageScaling.Disabled,
+            onError = {
+                heroImageLog.w { "Hero artwork failed: ${model.safeImageUrlForLog()}" }
+                onResolved(false)
+            },
+            onSuccess = { state ->
+                val image = state.result.image
+                onImageLoaded?.invoke(image)
+                // Without the crossfade nothing waits on onResolved: the picture is up already.
+                if (!heldUntilResolved) displayed = true
+                if (profile != null) {
+                    displayed = true
+                    onResolved(true)
+                } else {
+                    scope.launch {
+                        val analysis = async { HeroBackdropFramer.profile(model, image) }
+                        withTimeoutOrNull(FramingResolveWaitMillis) { analysis.await() }?.let { landed ->
+                            profile = landed
+                            // Frame it before it shows, rather than letting the effect below see
+                            // a displayed picture and ease toward a crop nobody saw it leave.
+                            bias.snapTo(heroBackdropFramingBias(landed, heroAspect, priorBias))
+                        }
+                        displayed = true
+                        onResolved(true)
+                        analysis.await()?.let { profile = it }
+                    }
+                }
+            },
+        )
+    }
+}
+
+/**
+ * How long a new backdrop's fade-in may wait for its analysis (~100-200ms on the JVM build;
+ * 238-516ms, mean 262, on the native build, 2026-10-17). Past this it fades in at the fallback
+ * crop and eases over when the analysis finishes. Only the first sighting of a backdrop waits:
+ * the result is cached in memory and on disk.
+ */
+private const val FramingResolveWaitMillis = 700L
+private const val FramingSettleMillis = 350
+
 @Composable
 private fun DesktopHomeHeroFrame(
     items: List<MetaPreview>,
@@ -974,6 +1382,11 @@ private fun DesktopHomeHeroFrame(
     immersiveMode: Boolean,
     immersiveFullBackdrop: Boolean = false,
     adaptiveHeroMode: Boolean = false,
+    pagedHero: Boolean = false,
+    pagesKeyed: Boolean = pagedHero,
+    ambientBackground: Boolean = false,
+    ambientUnderlay: (@Composable () -> Unit)? = null,
+    viewportHeight: Dp? = null,
     heroEnabled: Boolean,
     heroInfoLines: Int,
     heroInfoPriority: String,
@@ -996,6 +1409,10 @@ private fun DesktopHomeHeroFrame(
     onHeroTrailerSurfaceDisposed: () -> Unit = {},
 ) {
     val backgroundColor = if (immersiveMode) Color.Black else MaterialTheme.colorScheme.background
+    // Ambient: the hero stays the opaque dark hero above, and its lower part dissolves into the
+    // ambient wash the rows sit on, so the two meet without an edge. TV Mode only passes this when
+    // its own ambient toggle is on.
+    val ambientFade = ambientBackground
 
     val playerSettings by PlayerSettingsRepository.uiState.collectAsState()
     // TV-mode hero trailer (desktop only; mirrors Nuvio TV). The feature applies to the
@@ -1017,11 +1434,12 @@ private fun DesktopHomeHeroFrame(
     var heroTrailerErrorToken by remember { mutableIntStateOf(0) }
     var heroTrailerRetriedKey by remember { mutableStateOf<String?>(null) }
     var peoplePanelTab by remember { mutableStateOf(HeroPeoplePanelTab.Starring) }
-    // Manual override: automatic saliency-based crop detection was removed (unreliable across a
-    // wide enough variety of backdrops that it wasn't worth the complexity) in favor of a single
-    // user-tunable vertical bias applied to every adaptive-hero backdrop. See Homescreen settings.
+    // Adaptive-hero crop: automatic framing per backdrop (HeroBackdropFraming.kt) by default,
+    // or one user-set vertical bias for every backdrop. The manual bias is also automatic
+    // framing's fallback while a backdrop is being analysed, and the position it leans toward.
     val homeCatalogSettings by HomeCatalogSettingsRepository.uiState.collectAsState()
     val adaptiveHeroVerticalBias = homeCatalogSettings.adaptiveHeroVerticalBias
+    val adaptiveHeroAutoFraming = homeCatalogSettings.adaptiveHeroAutoFraming
     val peoplePanelToggleToken by HomeHeroPeoplePanelToggleTrigger.tokens.collectAsState(initial = 0)
     LaunchedEffect(peoplePanelToggleToken) {
         if (peoplePanelToggleToken == 0) return@LaunchedEffect
@@ -1064,7 +1482,7 @@ private fun DesktopHomeHeroFrame(
     // per poster passed over — dozens of extractions a minute, which is both wasted work and the
     // surest way to get this client's media URLs refused.
     LaunchedEffect(heroTrailerFocusKey, tvHeroActive, heroTrailerHomeActive) {
-        if (!tvHeroActive || !heroTrailerHomeActive || currentItem.type == "collection") {
+        if (!tvHeroActive || !heroTrailerHomeActive || currentItem.isOffCatalogHeroItem()) {
             return@LaunchedEffect
         }
         delay(HERO_TRAILER_PREFETCH_DWELL_MS)
@@ -1097,7 +1515,7 @@ private fun DesktopHomeHeroFrame(
         heroTrailerFocusNonce,
         heroTrailerHomeActive,
     ) {
-        if (!heroTrailerAutoplayEnabled || !heroTrailerHomeActive || currentItem.type == "collection") {
+        if (!heroTrailerAutoplayEnabled || !heroTrailerHomeActive || currentItem.isOffCatalogHeroItem()) {
             return@LaunchedEffect
         }
         // Don't count dwell time during the app's startup grace window, while continue-watching
@@ -1124,13 +1542,14 @@ private fun DesktopHomeHeroFrame(
                 "homeActive=$heroTrailerHomeActive key=$heroTrailerFocusKey"
         }
         if (request == null || !tvHeroActive || !heroTrailerHomeActive ||
-            currentItem.type == "collection"
+            currentItem.isOffCatalogHeroItem()
         ) {
             return@LaunchedEffect
         }
         // Toggle: if a trailer is already showing, the same input dismisses it (an explicit way
         // out in addition to simply moving focus to another item).
         if (heroTrailerPlaybackRequested && heroTrailerSource != null && !heroTrailerFinished) {
+            heroTrailerLog.i { "trailer dismissed by toggle for $heroTrailerFocusKey" }
             heroTrailerSurfaceReady = false
             heroTrailerPlaybackRequested = false
             heroTrailerFinished = true
@@ -1155,7 +1574,46 @@ private fun DesktopHomeHeroFrame(
     }
     val heroTrailerMuted = heroTrailerAudioMuted
     val heroTrailerVolume by HeroTrailerAudioState.volume.collectAsState()
+    // Covered by a pushed screen (Home stays composed under it): the trailer's heavyweight surface
+    // would paint over that screen, and the gate's reset below only lands a frame later.
+    val heroTrailerCovered = LocalScreenCovered.current
+    // The after-playback rating prompt is drawn above every screen, so Home only hears of it through this flag.
+    val ratingPromptShowing by RatingPromptRepository.isShowing.collectAsState()
+    // The poster zoom overlay (long-press / right-click on a card) is Compose, so the heavyweight
+    // trailer surface would paint straight over the zoomed poster. Opening it dismisses the trailer
+    // for this item, the same as the toggle does: it does not start again when the overlay closes.
+    val posterZoomOverlayOpen = PosterZoomOverlayCoordinator.isVisible
+    LaunchedEffect(posterZoomOverlayOpen) {
+        if (!posterZoomOverlayOpen) return@LaunchedEffect
+        if (heroTrailerFinished && heroTrailerSource == null) return@LaunchedEffect
+        heroTrailerLog.i { "trailer dismissed by poster zoom overlay for $heroTrailerFocusKey" }
+        heroTrailerSurfaceReady = false
+        heroTrailerPlaybackRequested = false
+        heroTrailerFinished = true
+        heroTrailerSource = null
+    }
+    // fork:music - the enlarged music player (the full-window lyric view, or a fullscreen music video) covers the
+    // hero, and the trailer's native surface would paint over it and play its sound on top of the music. Enlarging
+    // it stops the trailer for this item, as the poster zoom does.
+    val musicState by com.nuvio.app.features.music.MusicPlayback.player.state.collectAsState()
+    val musicNowPlayingOpen by com.nuvio.app.features.music.MusicPlayback.nowPlayingOpen.collectAsState()
+    val musicVideoView by com.nuvio.app.features.music.MusicPlayback.videoView.collectAsState()
+    val musicPlayerEnlarged = musicState.isActive &&
+        (musicNowPlayingOpen || musicVideoView == com.nuvio.app.features.music.MusicVideoView.Fullscreen)
+    LaunchedEffect(musicPlayerEnlarged) {
+        if (!musicPlayerEnlarged) return@LaunchedEffect
+        if (heroTrailerFinished && heroTrailerSource == null) return@LaunchedEffect
+        heroTrailerLog.i { "trailer dismissed by enlarged music player for $heroTrailerFocusKey" }
+        heroTrailerSurfaceReady = false
+        heroTrailerPlaybackRequested = false
+        heroTrailerFinished = true
+        heroTrailerSource = null
+    }
     val heroTrailerMounted = tvHeroActive &&
+        !heroTrailerCovered &&
+        !ratingPromptShowing &&
+        !posterZoomOverlayOpen &&
+        !musicPlayerEnlarged &&
         heroTrailerSource != null &&
         !heroTrailerFinished
     val heroTrailerVisible = heroTrailerMounted && heroTrailerPlaybackRequested
@@ -1194,8 +1652,16 @@ private fun DesktopHomeHeroFrame(
     LaunchedEffect(heroTrailerVisible, tvHeroActive) {
         if (tvHeroActive) HomeHeroTrailerManualTrigger.setActive(heroTrailerVisible)
     }
+    LaunchedEffect(heroTrailerReady, tvHeroActive) {
+        if (tvHeroActive) HomeHeroTrailerManualTrigger.setOnScreen(heroTrailerReady)
+    }
     DisposableEffect(tvHeroActive) {
-        onDispose { if (tvHeroActive) HomeHeroTrailerManualTrigger.setActive(false) }
+        onDispose {
+            if (tvHeroActive) {
+                HomeHeroTrailerManualTrigger.setActive(false)
+                HomeHeroTrailerManualTrigger.setOnScreen(false)
+            }
+        }
     }
     // Full backdrop runs the artwork the whole way down and the whole way across; the default
     // stops it above the shelf and confines it to the right-hand region, which is what makes the
@@ -1215,75 +1681,180 @@ private fun DesktopHomeHeroFrame(
         if (immersiveFullBackdropActive) layout.heroHeight else immersiveBackdropHeight
     val heroBackdropWidthFraction =
         if (immersiveFullBackdropActive) 1f else HERO_BACKDROP_WIDTH_FRACTION
+    // TV mode hosts the source picker (continue watching) in its backdrop area, the way the details
+    // page does in its trailer area: the artwork frosts behind it and the badges step aside.
+    val streamPickerRequest by StreamPickerController.request.collectAsState()
+    val heroDocksStreamPicker = immersiveMode && isDesktop
+    val heroFrost by animateFloatAsState(
+        targetValue = if (heroDocksStreamPicker && streamPickerRequest != null) 1f else 0f,
+        animationSpec = tween(durationMillis = 260),
+        label = "home_hero_picker_frost",
+    )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(backgroundColor),
+            .then(if (ambientFade) Modifier.clipToBounds() else Modifier.background(backgroundColor)),
     ) {
-        Box(
+        if (ambientFade && ambientUnderlay != null && viewportHeight != null) {
+            // The screen's wash at full viewport height from the hero's top edge (the screen's
+            // top), so it lines up pixel for pixel with the one behind the rows.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .wrapContentHeight(Alignment.Top, unbounded = true)
+                    .height(viewportHeight),
+            ) {
+                ambientUnderlay()
+            }
+        }
+        // The backdrop and every fade over it, composited first and then corrected as one for
+        // Windows HDR (a no-op on SDR); see nuvioHdrFadeCorrection. The bottom fade sits in here
+        // rather than after the trailer because the correction is not linear: applied to the
+        // artwork and the fade separately, the fade's dark tail would still be lifted. The trailer
+        // is a heavyweight native surface, so nothing in Compose draws over or under it anyway.
+        HdrFadeCorrected(
+            background = backgroundColor,
             modifier = Modifier
-                .align(if (immersiveMode) Alignment.TopEnd else Alignment.CenterEnd)
+                .matchParentSize()
                 .then(
-                    if (immersiveMode) {
-                        Modifier.height(heroArtworkHeight)
-                    } else {
-                        Modifier.fillMaxHeight()
-                    },
-                )
-                .fillMaxWidth(heroBackdropWidthFraction)
-                // Clip the backdrop region: during a transition the layers are parallax-shifted
-                // and scaled, and without this they paint a cropped sliver outside the box (over
-                // the content panel, where the fade mask doesn't reach) — a stray vertical band.
-                .clipToBounds()
-                // The left-hand fade stays in both layouts: it is what keeps the logo and metadata
-                // legible over the artwork. The immersive extra mask does not — its vertical half
-                // fades the picture out to solid black before the bottom of its own box, which is
-                // precisely the band full backdrop exists to remove.
-                .heroBackdropFadeMask(backgroundColor, immersiveFullBackdropActive)
-                .then(
-                    if (immersiveMode && !immersiveFullBackdropActive) {
-                        Modifier.immersiveHeroExtraMask(backgroundColor)
+                    if (ambientFade) {
+                        // Own layer, so the dissolve cuts the hero rather than what is under it.
+                        Modifier
+                            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                            .heroAmbientDissolve(
+                                // TV Mode's artwork stops at the shelf, not the hero's bottom: the
+                                // dissolve has to be complete there or the artwork ends on a hard edge.
+                                endFraction = if (immersiveMode && layout.heroHeight > 0.dp) {
+                                    (heroArtworkHeight / layout.heroHeight).coerceIn(0.2f, 1f)
+                                } else {
+                                    1f
+                                },
+                            )
                     } else {
                         Modifier
                     },
-                )
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    enabled = onItemClick != null,
-                ) {
-                    onItemClick?.invoke(currentItem)
-                },
+                ),
         ) {
-            visiblePages.forEach { layer ->
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .graphicsLayer {
-                            // Hide the static backdrop once the trailer has a frame so the
-                            // video blends into the background instead of seaming against it.
-                            alpha = if (heroTrailerReady) 0f else layer.visibility
-                            translationX = -layer.offset * heroWidthPx * HERO_BACKGROUND_PARALLAX
-                            translationY = heroScrollTranslationY
-                            scaleX = heroScrollScale
-                            scaleY = heroScrollScale
-                            transformOrigin = TransformOrigin(0.5f, 0f)
+            if (ambientFade) {
+                // The hero's own background, inside the layer so it dissolves with the artwork.
+                Box(modifier = Modifier.matchParentSize().background(backgroundColor))
+            }
+            Box(
+                modifier = Modifier
+                    .align(if (immersiveMode) Alignment.TopEnd else Alignment.CenterEnd)
+                    .then(
+                        if (immersiveMode) {
+                            Modifier.height(heroArtworkHeight)
+                        } else {
+                            Modifier.fillMaxHeight()
                         },
-                ) {
-                    HeroBackdropImage(
-                        item = items[layer.page],
-                        contentDescription = items[layer.page].name,
-                        modifier = Modifier.fillMaxSize(),
-                        alignment = when {
-                            immersiveMode -> ImmersiveHeroBackdropAlignment
-                            adaptiveHeroMode -> BiasAlignment(horizontalBias = 0f, verticalBias = adaptiveHeroVerticalBias)
-                            else -> DesktopHeroBackdropAlignment
+                    )
+                    .fillMaxWidth(heroBackdropWidthFraction)
+                    // Clip the backdrop region: during a transition the layers are parallax-shifted
+                    // and scaled, and without this they paint a cropped sliver outside the box (over
+                    // the content panel, where the fade mask doesn't reach) — a stray vertical band.
+                    .clipToBounds()
+                    // The left-hand fade stays in both layouts: it is what keeps the logo and metadata
+                    // legible over the artwork. The immersive extra mask does not — its vertical half
+                    // fades the picture out to solid black before the bottom of its own box, which is
+                    // precisely the band full backdrop exists to remove.
+                    .heroBackdropFadeMask(
+                        backgroundColor = backgroundColor,
+                        fullWidth = immersiveFullBackdropActive,
+                        longFade = !immersiveMode,
+                    )
+                    .then(
+                        // Basic and Adaptive take TV Mode's vignette as well: without it the text
+                        // column's right half sits on artwork at near full brightness.
+                        if (!immersiveFullBackdropActive) {
+                            // Ambient drops the vignette's bottom band: darkening there before the
+                            // dissolve would leave a dark stripe between the artwork and the wash.
+                            Modifier.immersiveHeroExtraMask(backgroundColor, bottomBand = !ambientFade)
+                        } else {
+                            Modifier
                         },
-                        contentScale = ContentScale.Crop,
+                    )
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        enabled = onItemClick != null,
+                    ) {
+                        onItemClick?.invoke(currentItem)
+                    },
+            ) {
+                visiblePages.forEachPage(keyedByPage = pagesKeyed) { layer ->
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .graphicsLayer {
+                                // Hide the static backdrop once the trailer has a frame so the
+                                // video blends into the background instead of seaming against it.
+                                alpha = if (heroTrailerReady) 0f else layer.visibility
+                                translationX = -layer.offset * heroWidthPx * HERO_BACKGROUND_PARALLAX
+                                translationY = heroScrollTranslationY
+                                scaleX = heroScrollScale
+                                scaleY = heroScrollScale
+                                transformOrigin = TransformOrigin(0.5f, 0f)
+                            },
+                    ) {
+                        HeroBackdropImage(
+                            item = items[layer.page],
+                            contentDescription = items[layer.page].name,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .then(
+                                    if (heroFrost > 0f) {
+                                        Modifier.blur((HERO_PICKER_FROST_BLUR_DP * heroFrost).dp)
+                                    } else {
+                                        Modifier
+                                    },
+                                ),
+                            crossfade = !pagesKeyed,
+                            alignment = when {
+                                immersiveMode -> ImmersiveHeroBackdropAlignment
+                                adaptiveHeroMode -> BiasAlignment(horizontalBias = 0f, verticalBias = adaptiveHeroVerticalBias)
+                                else -> DesktopHeroBackdropAlignment
+                            },
+                            contentScale = ContentScale.Crop,
+                            framingPriorBias = adaptiveHeroVerticalBias.takeIf {
+                                adaptiveHeroMode && !immersiveMode && adaptiveHeroAutoFraming
+                            },
+                        )
+                    }
+                }
+                if (heroFrost > 0f) {
+                    // Darker as well as blurred, so the source list reads on it.
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .background(Color.Black.copy(alpha = HERO_PICKER_FROST_DIM * heroFrost)),
                     )
                 }
             }
+
+            // Ambient's dissolve takes the place of the bottom fade.
+            if (!ambientFade) Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(if (immersiveMode) layout.heroHeight * 0.52f else layout.bottomFadeHeight)
+                    .align(Alignment.BottomCenter)
+                    .background(
+                        nuvioDitheredVerticalGradient(
+                            if (immersiveMode) {
+                                immersiveHeroBottomFadeStops(
+                                    backgroundColor = backgroundColor,
+                                    fullBackdrop = immersiveFullBackdropActive,
+                                )
+                            } else {
+                                arrayOf(
+                                    0f to backgroundColor.copy(alpha = 0f),
+                                    1f to backgroundColor,
+                                )
+                            },
+                        ),
+                    ),
+            )
         }
 
         if (heroTrailerMounted) {
@@ -1295,6 +1866,7 @@ private fun DesktopHomeHeroFrame(
                 HomeHeroTrailerSurface(
                     sourceUrl = source.videoUrl,
                     sourceAudioUrl = source.audioUrl,
+                    sourceHeaders = source.headers, // fork:trailer-signed-in
                     playWhenReady = heroTrailerPlaybackRequested,
                     muted = heroTrailerMuted,
                     volume = heroTrailerVolume,
@@ -1321,6 +1893,7 @@ private fun DesktopHomeHeroFrame(
                     navDismissBandFraction = heroTrailerNavDismissBandFraction,
                     onReady = { heroTrailerSurfaceReady = true },
                     onEnded = {
+                        heroTrailerLog.i { "trailer ended for $heroTrailerFocusKey" }
                         heroTrailerSurfaceReady = false
                         heroTrailerPlaybackRequested = false
                         heroTrailerFinished = true
@@ -1328,11 +1901,13 @@ private fun DesktopHomeHeroFrame(
                     // Pointer reached the navbar edge: stop the trailer so the navbar is usable.
                     // Stays stopped (heroTrailerFinished) until focus moves to another hero item.
                     onNavChromeDismiss = {
+                        heroTrailerLog.i { "trailer dismissed from the nav edge for $heroTrailerFocusKey" }
                         heroTrailerSurfaceReady = false
                         heroTrailerPlaybackRequested = false
                         heroTrailerFinished = true
                     },
                     onError = {
+                        heroTrailerLog.i { "trailer playback error for $heroTrailerFocusKey" }
                         heroTrailerSurfaceReady = false
                         heroTrailerPlaybackRequested = false
                         heroTrailerFinished = true
@@ -1346,32 +1921,34 @@ private fun DesktopHomeHeroFrame(
             }
         }
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(if (immersiveMode) layout.heroHeight * 0.52f else layout.bottomFadeHeight)
-                .align(Alignment.BottomCenter)
-                .background(
-                    Brush.verticalGradient(
-                        colorStops = if (immersiveMode) {
-                            immersiveHeroBottomFadeStops(
-                                backgroundColor = backgroundColor,
-                                fullBackdrop = immersiveFullBackdropActive,
-                            )
+        if (heroDocksStreamPicker) {
+            // The backdrop area right of the metadata column, down to where the shelf starts.
+            val density = LocalDensity.current
+            DisposableEffect(Unit) {
+                onDispose { StreamPickerController.clearDock(StreamPickerDock.HOME) }
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .height(immersiveBackdropHeight)
+                    .fillMaxWidth(HERO_PICKER_DOCK_WIDTH_FRACTION)
+                    .onGloballyPositioned { coordinates ->
+                        val bounds = coordinates.boundsInWindow()
+                        if (bounds.height >= with(density) { 240.dp.toPx() }) {
+                            StreamPickerController.reportDock(StreamPickerDock.HOME, bounds)
                         } else {
-                            arrayOf(
-                                0f to backgroundColor.copy(alpha = 0f),
-                                1f to backgroundColor,
-                            )
-                        },
-                    ),
-                ),
-        )
+                            StreamPickerController.clearDock(StreamPickerDock.HOME)
+                        }
+                    },
+            )
+        }
 
         // Where the metadata column's box ends and how tall it would naturally be; the people
         // panel above it decides how much of that it actually gets.
+        // fork:music-search - a screen can lift TV Mode's column and give its plot more lines (LocalImmersiveHeroTuning).
+        val heroTuning = LocalImmersiveHeroTuning.current
         val immersiveContentBottom = layout.heroHeight - immersiveContentBottomPadding +
-            immersiveHeroContentOffsetY(layout.heroHeight)
+            immersiveHeroContentOffsetY(layout.heroHeight) - heroTuning.lift
         val immersiveNaturalContentHeight = immersiveHeroContentHeight(layout.heroHeight)
         val immersiveCompactPeoplePanel = immersiveMode &&
             immersiveContentBottom - immersiveHeroPeoplePanelBottom(rows = 2) <
@@ -1408,7 +1985,7 @@ private fun DesktopHomeHeroFrame(
                     .widthIn(max = 600.dp),
                 contentAlignment = Alignment.TopStart,
             ) {
-                visiblePages.forEach { layer ->
+                visiblePages.forEachPage(keyedByPage = pagesKeyed) { layer ->
                     val item = items[layer.page]
                     val cast = heroDisplayCast(item, maxCount = immersivePeopleMaxCount)
                     val production = productionCache["${item.type}:${item.id}"].orEmpty()
@@ -1425,6 +2002,7 @@ private fun DesktopHomeHeroFrame(
                             HeroPeopleBlock(
                                 cast = cast,
                                 production = production,
+                                starringLabel = item.heroPeopleLabel(),
                                 activeTab = peoplePanelTab,
                                 onTabChange = { peoplePanelTab = it },
                                 onCastClick = onCastClick,
@@ -1445,7 +2023,7 @@ private fun DesktopHomeHeroFrame(
                             Modifier
                                 .padding(bottom = immersiveContentBottomPadding)
                                 .height(immersiveContentHeight)
-                                .offset(y = immersiveHeroContentOffsetY(layout.heroHeight))
+                                .offset(y = immersiveHeroContentOffsetY(layout.heroHeight) - heroTuning.lift)
                         } else {
                             // Anchor to a fixed top baseline so cast/genre/ratings/synopsis stay
                             // put between items instead of drifting as content height changes
@@ -1453,23 +2031,21 @@ private fun DesktopHomeHeroFrame(
                             Modifier.padding(top = adaptiveHeroContentTopBaseline(layout.heroHeight))
                         },
                     )
-                    .fillMaxWidth(
+                    .then(
                         when {
-                            immersiveMode -> 0.32f
-                            adaptiveHeroMode -> 0.38f
-                            else -> layout.contentWidthFraction
-                        },
-                    )
-                    .widthIn(
-                        max = when {
-                            immersiveMode -> 600.dp
-                            adaptiveHeroMode -> 480.dp
-                            else -> layout.contentMaxWidth
+                            // TV Mode keeps fillMaxWidth().widthIn(), whose cap is nominal (widthIn
+                            // cannot narrow a width the fraction already fixed); its look was tuned
+                            // that way.
+                            immersiveMode -> Modifier.fillMaxWidth(0.32f).widthIn(max = 600.dp)
+                            // Adaptive and Basic share one column: the cap has to bite, or a wide
+                            // window runs the synopsis and the logo (a fraction of this width)
+                            // across the screen.
+                            else -> Modifier.fractionalWidthAtMost(layout.contentWidthFraction, layout.contentMaxWidth)
                         },
                     ),
                 contentAlignment = Alignment.TopStart,
             ) {
-                visiblePages.forEach { layer ->
+                visiblePages.forEachPage(keyedByPage = pagesKeyed) { layer ->
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1511,17 +2087,17 @@ private fun DesktopHomeHeroFrame(
             }
         }
 
-        if (discoveryCache.isNotEmpty()) {
+        if (discoveryCache.isNotEmpty() && heroFrost < 1f) {
             Box(
                 modifier = heroDiscoveryMedalOverlayModifier(
                     placement = heroBadgePlacement,
                     immersiveMode = immersiveMode,
                     heroHeight = layout.heroHeight,
                     immersiveBackdropHeight = immersiveBackdropHeight,
-                ),
+                ).graphicsLayer { alpha = 1f - heroFrost },
                 contentAlignment = heroBadgePlacement.heroDiscoveryMedalAlignment(),
             ) {
-                visiblePages.forEach { layer ->
+                visiblePages.forEachPage(keyedByPage = pagesKeyed) { layer ->
                     val itemKey = "${items[layer.page].type}:${items[layer.page].id}"
                     val discoveryKey = "$itemKey:heroDiscoveryV${HeroDiscoveryMetadataService.CACHE_VERSION}"
                     val facts = discoveryCache[discoveryKey].orEmpty()
@@ -1574,6 +2150,12 @@ private fun DesktopHomeHeroFrame(
 private fun Modifier.heroBackdropFadeMask(
     backgroundColor: Color,
     fullWidth: Boolean = false,
+    /**
+     * Basic and Adaptive: an eased ramp that runs further into the artwork, so the whole metadata
+     * column sits on darkened backdrop rather than its right half on near-full artwork. TV Mode's
+     * own text sits lower and narrower, under its vignette, and keeps the short ramp.
+     */
+    longFade: Boolean = false,
 ): Modifier =
     drawWithContent {
         drawContent()
@@ -1581,6 +2163,15 @@ private fun Modifier.heroBackdropFadeMask(
             brush = Brush.horizontalGradient(
                 colorStops = if (fullWidth) {
                     immersiveHeroSideScrimStops(backgroundColor)
+                } else if (longFade) {
+                    arrayOf(
+                        0f to backgroundColor,
+                        0.12f to backgroundColor.copy(alpha = 0.9f),
+                        0.28f to backgroundColor.copy(alpha = 0.6f),
+                        0.42f to backgroundColor.copy(alpha = 0.25f),
+                        0.55f to Color.Transparent,
+                        1f to Color.Transparent,
+                    )
                 } else {
                     arrayOf(
                         0f to backgroundColor,
@@ -1592,18 +2183,23 @@ private fun Modifier.heroBackdropFadeMask(
         )
     }
 
-private fun Modifier.immersiveHeroExtraMask(backgroundColor: Color): Modifier =
+private fun Modifier.immersiveHeroExtraMask(
+    backgroundColor: Color,
+    bottomBand: Boolean = true,
+): Modifier =
     drawWithContent {
         drawContent()
-        drawRect(
-            brush = Brush.verticalGradient(
-                colorStops = arrayOf(
-                    0f to Color.Transparent,
-                    0.82f to Color.Transparent,
-                    1f to backgroundColor,
+        if (bottomBand) {
+            drawRect(
+                brush = Brush.verticalGradient(
+                    colorStops = arrayOf(
+                        0f to Color.Transparent,
+                        0.82f to Color.Transparent,
+                        1f to backgroundColor,
+                    ),
                 ),
-            ),
-        )
+            )
+        }
         drawRect(
             brush = Brush.radialGradient(
                 colorStops = arrayOf(
@@ -1616,6 +2212,35 @@ private fun Modifier.immersiveHeroExtraMask(backgroundColor: Color): Modifier =
             ),
         )
     }
+
+/**
+ * Dissolves the lower part of the hero to transparency, eased at both ends so neither the start nor
+ * the end of the ramp reads as a line. Cuts with DstOut, so it needs an offscreen layer.
+ */
+private fun Modifier.heroAmbientDissolve(
+    /** Fraction of the height where the hero is fully gone; the ramp is scaled to end there. */
+    endFraction: Float = 1f,
+): Modifier =
+    drawWithContent {
+        drawContent()
+        drawRect(
+            brush = Brush.verticalGradient(
+                colorStops = arrayOf(
+                    0f to Color.Transparent,
+                    HERO_AMBIENT_DISSOLVE_START * endFraction to Color.Transparent,
+                    0.64f * endFraction to Color.Black.copy(alpha = 0.12f),
+                    0.78f * endFraction to Color.Black.copy(alpha = 0.45f),
+                    0.9f * endFraction to Color.Black.copy(alpha = 0.82f),
+                    endFraction to Color.Black,
+                    1f to Color.Black,
+                ),
+            ),
+            blendMode = BlendMode.DstOut,
+        )
+    }
+
+/** Fraction of the hero's height where the ambient dissolve begins. */
+private const val HERO_AMBIENT_DISSOLVE_START = 0.5f
 
 internal fun immersiveHeroContentHeight(heroHeight: Dp): Dp =
     (heroHeight * 0.38f).coerceIn(
@@ -1655,6 +2280,19 @@ internal fun immersiveHeroBackdropHeight(
     }
 }
 
+/** [fraction] of the incoming width, but never wider than [max]. */
+private fun Modifier.fractionalWidthAtMost(fraction: Float, max: Dp): Modifier =
+    layout { measurable, constraints ->
+        val fractional = if (constraints.hasBoundedWidth) {
+            (constraints.maxWidth * fraction).roundToInt()
+        } else {
+            max.roundToPx()
+        }
+        val width = minOf(fractional, max.roundToPx()).coerceIn(constraints.minWidth, constraints.maxWidth)
+        val placeable = measurable.measure(constraints.copy(minWidth = width, maxWidth = width))
+        layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+    }
+
 // Fixed top offset for the adaptive hero's metadata column so it sits in a consistent spot
 // without drifting as content height changes between items. Kept fairly high since this mode's
 // hero is short and the content otherwise leaves a lot of empty space below.
@@ -1662,7 +2300,18 @@ private fun adaptiveHeroContentTopBaseline(heroHeight: Dp): Dp =
     // heroHeight already carries the Hero-height slider multiplier, so this baseline naturally
     // drifts down as the hero grows — keeping the content block visually placed within the taller
     // backdrop rather than clustered at the top. Raised cap lets that continue at large sizes.
-    (heroHeight * 0.12f).coerceIn(36.dp, 140.dp)
+    // 0.09 rather than 0.12: the logo sits at the bottom of its slot, so the slot's own headroom
+    // already spaces it from the top, and the room saved goes to the larger cast portraits.
+    (heroHeight * 0.09f).coerceIn(32.dp, 110.dp)
+
+/** Cast portrait size at the natural hero height. */
+private val HeroCastPortraitSize = 34.dp
+
+/** Portraits grow a little faster than the hero; at 34dp they read as specks on a tall one. */
+private const val HeroCastPortraitGrowth = 1.15f
+
+/** Past this the names (bodyLarge from 48dp) start truncating in the capped content column. */
+private val HeroCastPortraitMaxSize = 46.dp
 
 @Composable
 private fun HeroPageIndicatorRow(
@@ -1854,30 +2503,6 @@ private fun DesktopHeroContentBlock(
     val interactionSource = remember { MutableInteractionSource() }
     var logoLoadError by remember(item.type, item.id, item.logo) { mutableStateOf(false) }
     val logoUrl = item.logo?.takeIf { it.isNotBlank() && !logoLoadError }
-    // TEMPORARY (hero race diagnosis) — remove with logHeroPick. Reports what the slot actually
-    // paints, not merely the logo value: the first version of this probe printed TITLE-TEXT
-    // whenever logo was null, which is also true while the slot is deliberately held blank, so it
-    // could not see whether the hold was working. Text completeness rides along so a
-    // partially-enriched frame (ratings present, genres/synopsis missing) is visible too.
-    LaunchedEffect(
-        item.type,
-        item.id,
-        item.logo,
-        item.heroMetadataPending,
-        item.genres.size,
-        item.description,
-    ) {
-        co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
-            val slot = when {
-                !item.logo.isNullOrBlank() -> "logo:" + item.logo!!.takeLast(26)
-                item.heroMetadataPending -> "BLANK-HELD"
-                else -> "TITLE-TEXT"
-            }
-            "t=${com.nuvio.app.features.home.heroProbeMs()} RENDER ${item.type}:${item.id} slot=$slot " +
-                "genres=${item.genres.size} hasDescr=${!item.description.isNullOrBlank()} " +
-                "year=${item.releaseInfo ?: "-"} runtime=${item.runtime ?: "-"}"
-        }
-    }
     // A resume prompt puts its two actions on the hero itself rather than on buttons: left click
     // resumes, right click dismisses. The buttons they replace sat at the bottom of the metadata
     // column, so they inherited its layout — they appeared before the metadata they were positioned
@@ -1915,7 +2540,7 @@ private fun DesktopHeroContentBlock(
                     showReleaseMetadata = !qualityBadgesEnabled,
                     includeAgeRating = false,
                 ).isNotBlank() || !item.ageRating.isNullOrBlank(),
-                hasRatings = ratings.isNotEmpty(),
+                hasRatings = ratings.isNotEmpty() || com.nuvio.app.features.music.home.MusicHeroLogos.factsFor(item.id) != null,
                 hasSynopsis = !item.description.isNullOrBlank(),
                 hasFooter = qualityHighlights.isNotEmpty() ||
                     (qualityBadgesEnabled && (!item.releaseInfo.isNullOrBlank() || item.runtime != null)),
@@ -1923,7 +2548,13 @@ private fun DesktopHeroContentBlock(
         } else {
             null
         }
-        val synopsisMaxLines = immersiveBudget?.synopsisMaxLines ?: HeroSynopsisMaxLines
+        // Adaptive and Basic grow the hero with its height (the Hero-height slider, Basic's
+        // upstream-height hero); the gaps and the synopsis window grow with it, so the column fills
+        // a taller hero in proportion instead of the same fixed rows floating in more space. TV
+        // Mode budgets its own column above, so it stays at the nominal sizes.
+        val sizeScale = if (showExtendedMetadata) 1f else layout.heroHeightScale.coerceIn(1f, 1.5f)
+        val synopsisMaxLines = immersiveBudget?.synopsisMaxLines
+            ?: (HeroSynopsisMaxLines * sizeScale).toInt().coerceIn(HeroSynopsisMaxLines, HeroSynopsisMaxLines + 2)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1967,18 +2598,73 @@ private fun DesktopHeroContentBlock(
                     .height(desktopHeroLogoSlotHeight(layout))
             }
 
-            if (logoUrl != null) {
+            if (logoUrl != null && item.type.startsWith(com.nuvio.app.features.home.MUSIC_HERO_TYPE_PREFIX) &&
+                // An artist's name logo is drawn like a film's (the branch below); only artwork gets the lockup.
+                !com.nuvio.app.features.music.home.MusicHeroLogos.isNameLogo(logoUrl)
+            ) {
+                // fork:music-search - a music result's "logo" is its artwork (a cover is no title on its own): the picture
+                // in the logo slot with the name under it, within the slot's height so nothing below moves.
+                androidx.compose.foundation.layout.Column(
+                    modifier = logoSlotModifier,
+                    verticalArrangement = Arrangement.spacedBy(10.dp, if (immersiveBudget != null) Alignment.Bottom else Alignment.CenterVertically),
+                    horizontalAlignment = Alignment.Start,
+                ) {
+                    val disc = com.nuvio.app.features.music.home.MusicHeroLogos.discFor(logoUrl)
+                    if (disc != null && item.posterShape != com.nuvio.app.features.home.PosterShape.Landscape) {
+                        // The record's disc out to the right of its cover, as on the album page and the Stage.
+                        Box(Modifier.weight(1f, fill = false).aspectRatio(1f + HERO_DISC_PEEK)) {
+                            AsyncImage(
+                                model = disc,
+                                contentDescription = null,
+                                modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight(0.94f).aspectRatio(1f)
+                                    .clip(androidx.compose.foundation.shape.CircleShape),
+                                contentScale = ContentScale.Crop,
+                            )
+                            AsyncImage(
+                                model = logoUrl,
+                                contentDescription = item.name,
+                                modifier = Modifier.align(Alignment.CenterStart).fillMaxHeight().aspectRatio(1f)
+                                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)),
+                                contentScale = ContentScale.Crop,
+                            )
+                        }
+                    } else AsyncImage(
+                        model = logoUrl,
+                        contentDescription = item.name,
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .aspectRatio(if (item.posterShape == com.nuvio.app.features.home.PosterShape.Landscape) 16f / 9f else 1f)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Crop,
+                    )
+                    Text(
+                        text = item.name,
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            } else if (logoUrl != null) {
+                // Adaptive and Basic centre the logo in the space above the cast row, so a wide,
+                // short logo no longer sits on the cast with the space above it empty, and a tall
+                // one grows evenly both ways. TV Mode keeps it on the cast row: its slot is a
+                // weighted remainder whose height varies with the rows below, and a centred logo
+                // would drift with it. The margins are trimmed first (rememberHeroLogoModel), or
+                // a logo's baked-in padding would decide its position instead.
+                val logoAlignment = if (immersiveBudget != null) Alignment.BottomStart else Alignment.CenterStart
                 Box(
                     modifier = logoSlotModifier,
-                    contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                    contentAlignment = logoAlignment,
                 ) {
                     AsyncImage(
-                        model = logoUrl,
+                        model = rememberHeroLogoModel(logoUrl),
                         contentDescription = item.name,
                         modifier = Modifier
                             .fillMaxWidth(desktopHeroLogoWidthFraction(layout))
                             .fillMaxHeight(),
-                        alignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                        alignment = logoAlignment,
                         contentScale = ContentScale.Fit,
                         clipToBounds = false,
                         onError = { state ->
@@ -1990,13 +2676,13 @@ private fun DesktopHeroContentBlock(
                     )
                 }
             } else {
-                // Same fixed-height slot and alignment as the logo branch above (including the
-                // showExtendedMetadata-based alignment switch) — otherwise the title's vertical
-                // position shifts depending on whether this item has a logo, dragging everything
-                // below it (cast, genre line, description) along with it.
+                // Same fixed-height slot and the same alignment as the logo branch above (centred in
+                // Adaptive and Basic, on the cast row in TV Mode), so the title sits where a logo
+                // would — otherwise it reads as misplaced next to items that have one, and the
+                // slot height still keeps everything below it (cast, genre line, description) put.
                 Box(
                     modifier = logoSlotModifier,
-                    contentAlignment = if (showExtendedMetadata) Alignment.BottomStart else Alignment.CenterStart,
+                    contentAlignment = if (immersiveBudget != null) Alignment.BottomStart else Alignment.CenterStart,
                 ) {
                     // Third state: the item is a pre-enrichment copy whose logo has not been decided
                     // yet, so the title would only be painted for the moment it takes the logo to
@@ -2027,15 +2713,21 @@ private fun DesktopHeroContentBlock(
                 !showExtendedMetadata &&
                 (cast.isNotEmpty() || production.isNotEmpty())
             ) {
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(14.dp * sizeScale))
                 if (
                     allowProductionHotkeySwap &&
                     peoplePanelTab == HeroPeoplePanelTab.Production &&
                     production.isNotEmpty()
                 ) {
-                    HeroProductionRow(production)
+                    HeroProductionRow(production, onCastClick = onCastClick)
                 } else {
-                    HeroCastRow(cast, onCastClick = onCastClick)
+                    HeroCastRow(
+                        cast,
+                        onCastClick = onCastClick,
+                        // Portraits grow with the hero too, into the room the raised content leaves.
+                        imageSize = (HeroCastPortraitSize * sizeScale * HeroCastPortraitGrowth)
+                            .coerceIn(HeroCastPortraitSize, HeroCastPortraitMaxSize),
+                    )
                 }
                 Spacer(modifier = Modifier.height(2.dp))
             }
@@ -2054,7 +2746,7 @@ private fun DesktopHeroContentBlock(
                 includeAgeRating = false,
             )
             if (!item.heroMetadataPending && (genreParts.isNotEmpty() || ageRating != null)) {
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(14.dp * sizeScale))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -2073,13 +2765,26 @@ private fun DesktopHeroContentBlock(
 
             if (!item.heroMetadataPending) {
                 HomeHeroRatingsRow(ratings = ratings)
+                // fork:music-search - a song's or record's facts (year, tempo, label, length) in the ratings' place.
+                if (item.type.startsWith(com.nuvio.app.features.home.MUSIC_HERO_TYPE_PREFIX)) {
+                    com.nuvio.app.features.music.home.MusicHeroLogos.factsFor(item.id)?.let { facts ->
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = facts,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
 
                 item.description
                     ?.replace(Regex("\\s+"), " ")
                     ?.trim()
                     ?.takeIf { it.isNotBlank() }
                     ?.let { description ->
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(16.dp * sizeScale))
                         HeroSynopsis(
                             text = description,
                             resetKey = "${item.type}:${item.id}",
@@ -2101,8 +2806,20 @@ private fun DesktopHeroContentBlock(
     }
 }
 
+/** fork:music-search - how far a record's disc peeks out of its cover in the logo slot. */
+private const val HERO_DISC_PEEK = 0.32f
+
 /** Lines of synopsis the hero shows before the rest has to be scrolled into view. */
 private const val HeroSynopsisMaxLines = 5
+
+/**
+ * fork:music-search - how one screen's TV Mode hero differs from Home's: the metadata column (logo, genres, plot) [lift]ed
+ * that far above the shelf, and the plot allowed up to [synopsisMaxLines] lines when the column has the room (Home's is 5).
+ * A composition local rather than a parameter: the hero's composables are near the JVM's argument limit.
+ */
+internal data class ImmersiveHeroTuning(val lift: Dp = 0.dp, val synopsisMaxLines: Int = HeroSynopsisMaxLines)
+
+internal val LocalImmersiveHeroTuning = androidx.compose.runtime.staticCompositionLocalOf { ImmersiveHeroTuning() }
 
 private class ImmersiveHeroColumnBudget(val synopsisMaxLines: Int)
 
@@ -2137,7 +2854,7 @@ private fun immersiveHeroColumnBudget(
     val synopsisLine = typography.bodyLarge.lineHeightDp()
     val lines = ((availableHeight - fixed) / synopsisLine).toInt()
     return ImmersiveHeroColumnBudget(
-        lines.coerceIn(IMMERSIVE_HERO_SYNOPSIS_MIN_LINES, HeroSynopsisMaxLines),
+        lines.coerceIn(IMMERSIVE_HERO_SYNOPSIS_MIN_LINES, maxOf(HeroSynopsisMaxLines, LocalImmersiveHeroTuning.current.synopsisMaxLines)),
     )
 }
 
@@ -2249,6 +2966,10 @@ private fun HeroSynopsis(
                             val scrolled = scrollState.value.toFloat()
                             val enteringFromTop = (scrolled / fade).coerceIn(0f, 1f)
                             val remainingBelow = ((overflowPx - scrolled) / fade).coerceIn(0f, 1f)
+                            // Keep the resting bottom line completely crisp until scrolling starts:
+                            // windowHeight already cuts on an exact full-line boundary, so fading at
+                            // scrolled == 0 erased the bottom half of the last visible line.
+                            val bottomFade = enteringFromTop * remainingBelow
                             if (enteringFromTop > 0f) {
                                 drawRect(
                                     brush = Brush.verticalGradient(
@@ -2260,12 +2981,12 @@ private fun HeroSynopsis(
                                     blendMode = BlendMode.DstIn,
                                 )
                             }
-                            if (remainingBelow > 0f) {
+                            if (bottomFade > 0f) {
                                 drawRect(
                                     brush = Brush.verticalGradient(
                                         colorStops = arrayOf(
                                             1f - fade / size.height to Color.Black,
-                                            1f to Color.Black.copy(alpha = 1f - remainingBelow),
+                                            1f to Color.Black.copy(alpha = 1f - bottomFade),
                                         ),
                                     ),
                                     blendMode = BlendMode.DstIn,
@@ -2299,16 +3020,21 @@ private enum class HeroPeoplePanelTab {
     Production,
 }
 
+@kotlinx.serialization.Serializable
 private data class HeroProductionCredit(
     val label: String,
     val role: String,
     val imageUrl: String? = null,
+    /** TMDB person id when the details carry one; without it a click looks the name up. */
+    val tmdbId: Int? = null,
 )
 
 @Composable
 private fun HeroPeopleBlock(
     cast: List<HeroCastMember>,
     production: List<HeroProductionCredit>,
+    /** Replaces "Starring" (a music result's artists). */
+    starringLabel: String? = null,
     activeTab: HeroPeoplePanelTab,
     onTabChange: (HeroPeoplePanelTab) -> Unit,
     onCastClick: ((HeroCastMember) -> Unit)?,
@@ -2326,12 +3052,13 @@ private fun HeroPeopleBlock(
         HeroPeopleTabs(
             activeTab = effectiveTab,
             showProduction = production.isNotEmpty(),
+            starringLabel = starringLabel,
             onTabChange = onTabChange,
         )
         Spacer(modifier = Modifier.height(18.dp))
         when (effectiveTab) {
             HeroPeoplePanelTab.Starring -> HeroCastGrid(cast, onCastClick = onCastClick)
-            HeroPeoplePanelTab.Production -> HeroProductionGrid(production)
+            HeroPeoplePanelTab.Production -> HeroProductionGrid(production, onCastClick = onCastClick)
         }
     }
 }
@@ -2340,6 +3067,7 @@ private fun HeroPeopleBlock(
 private fun HeroPeopleTabs(
     activeTab: HeroPeoplePanelTab,
     showProduction: Boolean,
+    starringLabel: String? = null,
     onTabChange: (HeroPeoplePanelTab) -> Unit,
 ) {
     Row(
@@ -2347,7 +3075,7 @@ private fun HeroPeopleTabs(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         HeroPeopleTabLabel(
-            text = stringResource(Res.string.meta_starring),
+            text = starringLabel ?: stringResource(Res.string.meta_starring),
             selected = activeTab == HeroPeoplePanelTab.Starring,
             onClick = { onTabChange(HeroPeoplePanelTab.Starring) },
         )
@@ -2397,7 +3125,10 @@ private fun HeroPeopleTabLabel(
 }
 
 @Composable
-private fun HeroProductionGrid(production: List<HeroProductionCredit>) {
+private fun HeroProductionGrid(
+    production: List<HeroProductionCredit>,
+    onCastClick: ((HeroCastMember) -> Unit)?,
+) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -2412,6 +3143,7 @@ private fun HeroProductionGrid(production: List<HeroProductionCredit>) {
                     HeroProductionChip(
                         credit = credit,
                         modifier = Modifier.weight(1f),
+                        onCastClick = onCastClick,
                     )
                 }
                 if (row.size == 1) {
@@ -2427,7 +3159,10 @@ private fun HeroProductionGrid(production: List<HeroProductionCredit>) {
 // (TV keeps 4) since the adaptive hero has less room; company/studio credits are dropped
 // first when trimming so director/producer/writer are kept.
 @Composable
-private fun HeroProductionRow(production: List<HeroProductionCredit>) {
+private fun HeroProductionRow(
+    production: List<HeroProductionCredit>,
+    onCastClick: ((HeroCastMember) -> Unit)?,
+) {
     val visible = production
         .sortedBy { it.role.isHeroCompanyRole() }
         .take(3)
@@ -2442,6 +3177,7 @@ private fun HeroProductionRow(production: List<HeroProductionCredit>) {
                 modifier = Modifier.weight(1f, fill = false),
                 imageSize = 34.dp,
                 textFillsWidth = false,
+                onCastClick = onCastClick,
             )
         }
     }
@@ -2453,10 +3189,32 @@ private fun HeroProductionChip(
     modifier: Modifier = Modifier,
     imageSize: Dp = 52.dp,
     textFillsWidth: Boolean = true,
+    onCastClick: ((HeroCastMember) -> Unit)? = null,
 ) {
     val isCompanyLogo = credit.role.isHeroCompanyRole()
+    // People (director, creator, producer, writer) open their page like the Starring chips;
+    // studios and networks stay labels.
+    val clickHandler = onCastClick?.takeIf { !isCompanyLogo && credit.label.isNotBlank() }
+    val interactionSource = remember { MutableInteractionSource() }
+    val isHovered by interactionSource.collectIsHoveredAsState()
+    val highlightAlpha by animateFloatAsState(
+        targetValue = if (isHovered && clickHandler != null) 0.12f else 0f,
+        label = "hero_production_portrait_highlight",
+    )
+    val clickModifier = clickHandler?.let { handler ->
+        Modifier.clickable(interactionSource = interactionSource, indication = null) {
+            handler(
+                HeroCastMember(
+                    name = credit.label,
+                    photo = credit.imageUrl,
+                    role = credit.role,
+                    tmdbId = credit.tmdbId,
+                ),
+            )
+        }
+    } ?: Modifier
     Row(
-        modifier = modifier,
+        modifier = modifier.then(clickModifier),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -2484,6 +3242,9 @@ private fun HeroProductionChip(
                     fontWeight = FontWeight.Black,
                     maxLines = 1,
                 )
+            }
+            if (highlightAlpha > 0f) {
+                Box(modifier = Modifier.matchParentSize().background(Color.White.copy(alpha = highlightAlpha)))
             }
         }
         Column(
@@ -2575,6 +3336,7 @@ private fun HeroCastPortraitPreloader(cast: List<HeroCastMember>) {
 private fun HeroCastRow(
     cast: List<HeroCastMember>,
     onCastClick: ((HeroCastMember) -> Unit)?,
+    imageSize: Dp = HeroCastPortraitSize,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -2585,7 +3347,7 @@ private fun HeroCastRow(
             HeroCastChip(
                 person = person,
                 modifier = Modifier.weight(1f, fill = false),
-                imageSize = 34.dp,
+                imageSize = imageSize,
                 onCastClick = onCastClick,
             )
         }
@@ -2602,11 +3364,12 @@ private fun HeroCastChip(
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
     val portraitHighlightAlpha by animateFloatAsState(
-        targetValue = if (isHovered && onCastClick != null && person.tmdbId != null && person.tmdbId > 0) 0.12f else 0f,
+        targetValue = if (isHovered && onCastClick != null && person.name.isNotBlank()) 0.12f else 0f,
         label = "hero_cast_portrait_highlight",
     )
+    // A name without a TMDB id is looked up by name when clicked.
     val clickModifier = onCastClick
-        ?.takeIf { person.tmdbId != null && person.tmdbId > 0 }
+        ?.takeIf { person.name.isNotBlank() }
         ?.let { handler ->
             Modifier.clickable(
                 interactionSource = interactionSource,
@@ -2681,30 +3444,43 @@ private suspend fun fetchHeroProductionCredits(
     type: String,
     id: String,
 ): List<HeroProductionCredit> {
+    // Kept between launches (see HeroBundleCache).
+    val serializer = kotlinx.serialization.builtins.ListSerializer(HeroProductionCredit.serializer())
+    val key = "$type:$id"
+    com.nuvio.app.features.home.HeroBundleCache.get("credits", key, serializer)?.let { return it }
     // Summary rather than the details-screen record: a director and a writer do not need every
     // episode of every season fetched to find them.
     val meta = MetaDetailsRepository.peek(type = type, id = id)
         ?: MetaDetailsRepository.fetchHeroSummary(type = type, id = id)
         ?: return emptyList()
-    return heroProductionCredits(meta)
+    return heroProductionCredits(meta).also { credits ->
+        com.nuvio.app.features.home.HeroBundleCache.put(
+            "credits", key, credits, serializer,
+            isEmpty = credits.isEmpty(),
+            isSeries = type.equals("series", ignoreCase = true) || type.equals("tv", ignoreCase = true),
+        )
+    }
 }
 
 private fun heroProductionCredits(meta: MetaDetails): List<HeroProductionCredit> =
     listOfNotNull(
         meta.director.firstHeroName()
-            ?.let { name -> HeroProductionCredit(label = name, role = "Director", imageUrl = meta.heroCrewImage(name, "director")) }
+            ?.let { name -> HeroProductionCredit(label = name, role = "Director", imageUrl = meta.heroCrewImage(name, "director"), tmdbId = meta.heroCrewId(name)) }
             ?: meta.creator.firstHeroName()
-                ?.let { name -> HeroProductionCredit(label = name, role = "Creator", imageUrl = meta.heroCrewImage(name, "creator")) },
+                ?.let { name -> HeroProductionCredit(label = name, role = "Creator", imageUrl = meta.heroCrewImage(name, "creator"), tmdbId = meta.heroCrewId(name)) },
         meta.producer.firstHeroName()
-            ?.let { name -> HeroProductionCredit(label = name, role = "Producer", imageUrl = meta.heroCrewImage(name, "producer")) },
+            ?.let { name -> HeroProductionCredit(label = name, role = "Producer", imageUrl = meta.heroCrewImage(name, "producer"), tmdbId = meta.heroCrewId(name)) },
         meta.writer.firstHeroName()
-            ?.let { name -> HeroProductionCredit(label = name, role = "Writer", imageUrl = meta.heroCrewImage(name, "writer")) },
+            ?.let { name -> HeroProductionCredit(label = name, role = "Writer", imageUrl = meta.heroCrewImage(name, "writer"), tmdbId = meta.heroCrewId(name)) },
         meta.productionCompanies.firstHeroCompany()
             ?.let { company -> HeroProductionCredit(label = company.name, role = "Studio", imageUrl = company.logo) }
             ?: meta.networks.firstHeroCompany()
                 ?.let { network -> HeroProductionCredit(label = network.name, role = "Network", imageUrl = network.logo) },
     )
         .distinctBy { credit -> credit.label.trim().lowercase() }
+
+private fun MetaDetails.heroCrewId(name: String): Int? =
+    cast.firstOrNull { person -> person.name.equals(name, ignoreCase = true) && (person.tmdbId ?: 0) > 0 }?.tmdbId
 
 private fun List<String>.firstHeroName(): String? =
     firstOrNull { name -> name.isNotBlank() }?.trim()
@@ -2858,14 +3634,14 @@ internal fun desktopHeroLogoSlotHeight(layout: HomeHeroLayout): Dp {
 
 private fun compactHeroMetaParts(item: MetaPreview): List<String> =
     buildList {
-        if (item.type != "collection" && item.randomPlayCategoryOrNull() == null) {
+        if (!item.isOffCatalogHeroItem() && !item.isPlaylistPreview() && item.randomPlayCategoryOrNull() == null) {
             // metadataType, not type: a cloud-library row's own type is the addon's `library`, which
             // would otherwise read as the literal word "Library" where the genres belong.
             add(item.metadataType.replaceFirstChar(Char::uppercase))
         }
         item.genres.firstOrNull()
             ?.takeIf(String::isNotBlank)
-            ?.let(::add)
+            ?.let { add(heroGenreDisplayText(it)) }
         item.releaseInfo
             ?.takeIf(String::isNotBlank)
             ?.let(::formatReleaseDateForDisplay)
@@ -2881,8 +3657,28 @@ private fun desktopHeroGenreText(
 ): String = desktopHeroGenreParts(item, showExtendedMetadata, showReleaseMetadata, includeAgeRating)
     .joinToString(" • ") { it.text }
 
+/**
+ * A genre as the hero shows it: each word capitalised. Some sources send genres in lower case
+ * ("action", "science fiction"), which read as a typo beside the year and runtime. Only first
+ * letters are raised, so names already styled ("Sci-Fi & Fantasy", "TV Movie") come through
+ * unchanged. Display only: the genre itself, which hover cards and filters match on, is untouched.
+ */
+internal fun heroGenreDisplayText(genre: String): String {
+    val text = genre.trim()
+    return buildString(text.length) {
+        var startOfWord = true
+        for (character in text) {
+            append(if (startOfWord && character.isLetter()) character.uppercaseChar() else character)
+            startOfWord = character == ' ' || character == '-' || character == '/' || character == '&'
+        }
+    }
+}
+
 /** One entry of the hero's genre line; [genre] is set on the entries that are genres. */
 private data class HeroGenrePart(val text: String, val genre: String? = null)
+
+/** An episode code in a genre line part ("S12E7", "S1 E3"). */
+private val HeroEpisodeCode = Regex("""\bS\d+\s*E\d+""", RegexOption.IGNORE_CASE)
 
 /**
  * The genre line as separate parts so each genre can carry its own hover card. Genres first,
@@ -2897,7 +3693,7 @@ private fun desktopHeroGenreParts(
     includeAgeRating: Boolean = true,
 ): List<HeroGenrePart> {
     val values = buildList {
-        item.genres.take(3).filter(String::isNotBlank).forEach { add(HeroGenrePart(it, genre = it)) }
+        item.genres.take(3).filter(String::isNotBlank).forEach { add(HeroGenrePart(heroGenreDisplayText(it), genre = it)) }
         if (showReleaseMetadata) {
             item.releaseInfo
                 ?.takeIf(String::isNotBlank)
@@ -2915,7 +3711,7 @@ private fun desktopHeroGenreParts(
             }
         }
     }
-    if (values.isEmpty() && (item.type == "collection" || item.randomPlayCategoryOrNull() != null)) return emptyList()
+    if (values.isEmpty() && (item.isOffCatalogHeroItem() || item.isPlaylistPreview() || item.randomPlayCategoryOrNull() != null)) return emptyList()
     // metadataType, not type: see [compactHeroMetaParts].
     return values.ifEmpty { listOf(HeroGenrePart(item.metadataType.replaceFirstChar(Char::uppercase))) }
 }
@@ -2933,11 +3729,43 @@ private fun HeroGenreLine(
     interests: List<ImdbInterest>,
     modifier: Modifier = Modifier,
 ) {
-    val card = GenreSubgenres.card(parts.mapNotNull { it.genre }, interests, keywords)
+    val genres = parts.mapNotNull { it.genre }
+    val card = GenreSubgenres.card(genres, interests, keywords)
+    // A couple of the card's tags join the genres on the line (deduplicated against them), right after the last
+    // genre and with the same hover, so the most telling ones are seen without hovering.
+    val shownParts = remember(parts, card) {
+        // Not beside an episode (a Continue watching or Next up item: "S12E7 • Borders and Boundaries"): the line has
+        // no room for both, and the tags pushed the episode title into an ellipsis (Nov 16).
+        val showsEpisode = parts.any { it.genre == null && HeroEpisodeCode.containsMatchIn(it.text) }
+        val tags = if (showsEpisode) emptyList() else GenreSubgenres.lineTags(card, genres).map { HeroGenrePart(it, genre = it) }
+        val afterGenres = parts.indexOfLast { it.genre != null } + 1
+        if (tags.isEmpty() || afterGenres == 0) parts else parts.take(afterGenres) + tags + parts.drop(afterGenres)
+    }
+    val tagCount = shownParts.size - parts.size
     val style = MaterialTheme.typography.titleMedium
     val color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.76f)
-    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        parts.forEachIndexed { index, part ->
+    val measurer = rememberTextMeasurer()
+    BoxWithConstraints(modifier = modifier) {
+    // The tags are extras: when the line is too long they go first, the last one first. Only the
+    // last part may shrink, and that was the runtime: with five genres and tags it shrank to
+    // nothing, leaving a "•" with the age badge far past it (Midsommar, Nov 18).
+    val maxWidthPx = constraints.maxWidth
+    val fittedParts = remember(shownParts, maxWidthPx, style) {
+        if (tagCount <= 0 || maxWidthPx == Constraints.Infinity) return@remember shownParts
+        val measured = style.copy(fontWeight = FontWeight.SemiBold)
+        fun width(text: String) = measurer.measure(text, measured, maxLines = 1).size.width
+        val firstTag = parts.indexOfLast { it.genre != null } + 1 // Where the tags were put in.
+        val keep = heroLineTagsThatFit(
+            widths = shownParts.map { width(it.text) },
+            separatorWidth = width(" • "),
+            firstTag = firstTag,
+            tagCount = tagCount,
+            maxWidth = maxWidthPx,
+        )
+        shownParts.filterIndexed { index, _ -> index < firstTag || index >= firstTag + tagCount || index < firstTag + keep }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        fittedParts.forEachIndexed { index, part ->
             if (index > 0) {
                 Text(
                     text = " • ",
@@ -2952,7 +3780,7 @@ private fun HeroGenreLine(
             NuvioPosterHoverTooltip(
                 title = if (part.genre != null) card.headline else "",
                 subtitle = if (part.genre != null) card.themeLine else "",
-                modifier = if (index == parts.lastIndex) Modifier.weight(1f, fill = false) else Modifier,
+                modifier = if (index == fittedParts.lastIndex) Modifier.weight(1f, fill = false) else Modifier,
             ) {
                 Text(
                     text = part.text,
@@ -2965,6 +3793,28 @@ private fun HeroGenreLine(
             }
         }
     }
+    }
+}
+
+/**
+ * How many of the genre line's [tagCount] tags (starting at [firstTag]) fit in [maxWidth] beside
+ * everything else, dropping the last tag first. The rest of the line is never dropped here.
+ */
+internal fun heroLineTagsThatFit(
+    widths: List<Int>,
+    separatorWidth: Int,
+    firstTag: Int,
+    tagCount: Int,
+    maxWidth: Int,
+): Int {
+    if (firstTag < 0 || tagCount <= 0) return 0
+    var keep = tagCount
+    fun lineWidth(): Int {
+        val shown = widths.filterIndexed { index, _ -> index < firstTag || index >= firstTag + tagCount || index < firstTag + keep }
+        return shown.sum() + separatorWidth * (shown.size - 1).coerceAtLeast(0)
+    }
+    while (keep > 0 && lineWidth() > maxWidth) keep--
+    return keep
 }
 
 @Composable
@@ -2978,6 +3828,13 @@ private fun HeroMetaText(text: String) {
         overflow = TextOverflow.Ellipsis,
     )
 }
+
+/**
+ * Basic's desktop hero height: upstream NuvioDesktop's desktop hero baseline (`desktopHeroHeight`,
+ * without its ultrawide stretch). Basic doesn't follow focus, so it can afford upstream's taller
+ * hero rather than the 360-440dp band Adaptive scales from.
+ */
+internal fun basicDesktopHeroHeight(maxWidthDp: Float): Dp = (maxWidthDp * 0.56f).dp.coerceIn(460.dp, 640.dp)
 
 internal fun homeHeroLayout(
     maxWidthDp: Float,
@@ -3270,7 +4127,7 @@ private fun HeroDiscoveryAwardMedal(
     scale: Float = 1f,
     onClick: (() -> Unit)? = null,
 ) {
-    val awardLabel = fact.heroDiscoveryAwardLabel()
+    val awardLabel = remember(fact) { fact.heroDiscoveryAwardLabel() }
     var hoverPosition by remember { mutableStateOf<Offset?>(null) }
     // Same affordance as the cast avatars: no ripple, a soft highlight while hovered — and only
     // on medals that actually go somewhere, so an inert badge doesn't invite a click.
@@ -3325,7 +4182,7 @@ private fun HeroDiscoveryAwardMedal(
             }
         }
 
-        hoverPosition?.let { position ->
+        hoverPosition?.takeIf { !LocalScreenCovered.current }?.let { position ->
             Popup(
                 popupPositionProvider = remember(position, tooltipOffsetPx) {
                     HeroDiscoveryTooltipPositionProvider(
@@ -3470,23 +4327,23 @@ private fun List<HeroDiscoveryFact>.heroVisibleAwardFacts(maxCount: Int): List<H
 
 internal fun HeroDiscoveryFact.heroDiscoveryAwardLabel(): String =
     when (category) {
-        "award:best_picture" -> "Best Picture"
-        "award:best_picture_nom" -> "Best Picture Nominee"
-        "award:globe_win" -> "Golden Globe"
-        "award:globe_nom" -> "Globe Nominee"
-        "award:emmy_win" -> "Emmy Winner"
-        "award:emmy_nom" -> "Emmy Nominee"
-        "award:palme" -> "Palme d'Or"
-        "award:golden_lion" -> "Golden Lion"
-        "award:golden_bear" -> "Golden Bear"
-        "award:people_choice" -> "People's Choice"
-        "metacritic" -> "Must-See"
-        "cult" -> "Cult Classic"
-        "trending" -> "Trending"
-        "short_film" -> "Short Film"
-        "mini_series" -> "Mini Series"
-        "binge_ready" -> "Binge Ready"
-        "new_release", "digital_release" -> "New Release"
+        "award:best_picture" -> localizedString(Res.string.hero_badge_label_award_best_picture)
+        "award:best_picture_nom" -> localizedString(Res.string.hero_badge_label_award_best_picture_nom)
+        "award:globe_win" -> localizedString(Res.string.hero_badge_label_award_globe_win)
+        "award:globe_nom" -> localizedString(Res.string.hero_badge_label_award_globe_nom)
+        "award:emmy_win" -> localizedString(Res.string.hero_badge_label_award_emmy_win)
+        "award:emmy_nom" -> localizedString(Res.string.hero_badge_label_award_emmy_nom)
+        "award:palme" -> localizedString(Res.string.hero_badge_label_award_palme)
+        "award:golden_lion" -> localizedString(Res.string.hero_badge_label_award_golden_lion)
+        "award:golden_bear" -> localizedString(Res.string.hero_badge_label_award_golden_bear)
+        "award:people_choice" -> localizedString(Res.string.hero_badge_label_award_people_choice)
+        "metacritic" -> localizedString(Res.string.hero_badge_label_metacritic)
+        "cult" -> localizedString(Res.string.hero_badge_label_cult)
+        "trending" -> localizedString(Res.string.hero_badge_label_trending)
+        "short_film" -> localizedString(Res.string.hero_badge_label_short_film)
+        "mini_series" -> localizedString(Res.string.hero_badge_label_mini_series)
+        "binge_ready" -> localizedString(Res.string.hero_badge_label_binge_ready)
+        "new_release", "digital_release" -> localizedString(Res.string.hero_badge_label_new_release)
         // festival, foreign:<lang>, director, studio, release_status, stinger carry a dynamic label.
         else -> label
     }
@@ -3494,91 +4351,91 @@ internal fun HeroDiscoveryFact.heroDiscoveryAwardLabel(): String =
 private fun HeroDiscoveryFact.heroDiscoveryTooltipDescription(): String =
     // Foreign carries a `foreign:<lang>` category, so match the prefix before the exact keys.
     if (category.startsWith("foreign:")) {
-        "The title's original language is not English, shown as a quick language context badge."
+        localizedString(Res.string.hero_badge_desc_foreign)
     } else when (category) {
         "award:best_picture" ->
-            "The Academy Award for Best Picture, the top film award presented annually by the Academy of Motion Picture Arts and Sciences."
+            localizedString(Res.string.hero_badge_desc_award_best_picture)
         "award:best_picture_nom" ->
-            "Nominated for the Academy Award for Best Picture, the Academy's top annual film category."
+            localizedString(Res.string.hero_badge_desc_award_best_picture_nom)
         "award:globe_win" ->
-            "Won a major Golden Globe, presented by the Hollywood Foreign Press Association for film and television."
+            localizedString(Res.string.hero_badge_desc_award_globe_win)
         "award:globe_nom" ->
-            "Nominated for a major Golden Globe, highlighting higher-profile film or television categories."
+            localizedString(Res.string.hero_badge_desc_award_globe_nom)
         "award:emmy_win" ->
-            "Won a major Emmy Award, one of television's most recognized industry honors."
+            localizedString(Res.string.hero_badge_desc_award_emmy_win)
         "award:emmy_nom" ->
-            "Nominated for a major Emmy Award, filtered to highlight higher-profile television recognition."
+            localizedString(Res.string.hero_badge_desc_award_emmy_nom)
         "award:palme" ->
-            "The most prestigious award from the Cannes Film Festival held in France, awarded to one film per year since 1975."
+            localizedString(Res.string.hero_badge_desc_award_palme)
         "award:golden_lion" ->
-            "The top prize from the Venice Film Festival, awarded to the best film in the main competition."
+            localizedString(Res.string.hero_badge_desc_award_golden_lion)
         "award:golden_bear" ->
-            "The top prize from the Berlin International Film Festival, awarded to the best film in competition."
+            localizedString(Res.string.hero_badge_desc_award_golden_bear)
         "award:people_choice" ->
-            "Toronto International Film Festival's audience-voted top prize, often a strong signal for broad festival appeal."
+            localizedString(Res.string.hero_badge_desc_award_people_choice)
         "metacritic" ->
-            "Metacritic's Must-See designation, reserved for titles with especially strong critic consensus."
+            localizedString(Res.string.hero_badge_desc_metacritic)
         "cult" ->
-            "Flagged by cult-film keywords or curated metadata as a title with lasting niche, midnight-movie, or fan-driven appeal."
+            localizedString(Res.string.hero_badge_desc_cult)
         "release_status" ->
             when {
                 label.equals("Cinema", ignoreCase = true) ->
-                    "This title is still marked as cinema-only, so it may not be available to stream or watch yet."
+                    localizedString(Res.string.hero_badge_desc_release_cinema)
                 label.equals("Production", ignoreCase = true) ->
-                    "This title is still marked as in production, so it may not be available to stream or watch yet."
+                    localizedString(Res.string.hero_badge_desc_release_production)
                 label.equals("Streaming", ignoreCase = true) ->
-                    "This title is marked as available to stream or watch at home."
+                    localizedString(Res.string.hero_badge_desc_release_streaming)
                 label.equals("Physical", ignoreCase = true) ->
-                    "This title has a physical home release, such as Blu-ray or DVD."
+                    localizedString(Res.string.hero_badge_desc_release_physical)
                 else ->
-                    "Release status: $label."
+                    localizedString(Res.string.hero_badge_desc_release_other, label)
             }
         "true_story" ->
-            "Detected from true-story metadata and keywords, meaning the title is based on real people, events, or reported history."
+            localizedString(Res.string.hero_badge_desc_true_story)
         "stinger" ->
             when {
                 label.startsWith("Mid &") ->
-                    "This film has an extra scene partway through the credits and another after they finish, so it is worth staying to the end."
+                    localizedString(Res.string.hero_badge_desc_stinger_mid_and_post)
                 label.startsWith("Mid-") ->
-                    "This film has an extra scene partway through the credits, so it is worth staying past the first block of names."
+                    localizedString(Res.string.hero_badge_desc_stinger_mid)
                 else ->
-                    "This film has an extra scene once the credits have finished, so it is worth staying to the very end."
+                    localizedString(Res.string.hero_badge_desc_stinger_post)
             }
         "studio", "prestige" ->
-            "Highlights a favored or notable production company attached to the title."
+            localizedString(Res.string.hero_badge_desc_studio)
         "director" ->
-            "Highlights a favored or notable director attached to the title."
+            localizedString(Res.string.hero_badge_desc_director)
         "foreign", "info" ->
-            "The title's original language is not English, shown as a quick language context badge."
+            localizedString(Res.string.hero_badge_desc_foreign)
         "award:festival", "festival" ->
             when (label) {
                 "Sundance Grand Jury" ->
-                    "The Grand Jury Prize from the Sundance Film Festival, the top honor at the leading festival for American independent film."
+                    localizedString(Res.string.hero_badge_desc_festival_sundance)
                 "New Currents" ->
-                    "The New Currents award from the Busan International Film Festival, recognizing first or second features by Asian directors."
+                    localizedString(Res.string.hero_badge_desc_festival_new_currents)
                 "Golden Leopard" ->
-                    "The top prize from the Locarno Film Festival in Switzerland, one of the longest-running festivals for auteur and independent cinema."
+                    localizedString(Res.string.hero_badge_desc_festival_golden_leopard)
                 "Tiger Award" ->
-                    "The top prize from the International Film Festival Rotterdam, spotlighting bold work from first- or second-time filmmakers."
+                    localizedString(Res.string.hero_badge_desc_festival_tiger)
                 "SXSW Jury" ->
-                    "The jury-selected top prize at South by Southwest (SXSW), a major festival for independent film."
+                    localizedString(Res.string.hero_badge_desc_festival_sxsw)
                 "Tribeca Audience Award" ->
-                    "The audience-voted top prize at the Tribeca Festival in New York."
+                    localizedString(Res.string.hero_badge_desc_festival_tribeca)
                 else ->
-                    "Recognized at a major film festival, such as Cannes, Venice, Berlin, Sundance, or Toronto."
+                    localizedString(Res.string.hero_badge_desc_festival_other)
             }
         "trending" ->
-            "Currently trending, among the most popular titles being watched right now."
+            localizedString(Res.string.hero_badge_desc_trending)
         "short_film" ->
-            "A short film, with a runtime under 40 minutes."
+            localizedString(Res.string.hero_badge_desc_short_film)
         "mini_series" ->
-            "A limited or mini series, a self-contained story told over a single short season."
+            localizedString(Res.string.hero_badge_desc_mini_series)
         "binge_ready" ->
-            "A finished series with a small enough episode count to watch from start to end in a few sittings."
+            localizedString(Res.string.hero_badge_desc_binge_ready)
         "new_release", "digital_release" ->
-            "Recently released or newly available to stream, based on the title's release date."
+            localizedString(Res.string.hero_badge_desc_new_release)
         else ->
-            "Shown because this title matched one of your configured hero discovery signals."
+            localizedString(Res.string.hero_badge_desc_other)
     }
 
 private fun heroDiscoveryBadgeResource(category: String, label: String): DrawableResource =

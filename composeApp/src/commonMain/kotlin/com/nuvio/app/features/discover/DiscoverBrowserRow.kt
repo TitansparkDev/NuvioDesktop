@@ -1,310 +1,447 @@
 package com.nuvio.app.features.discover
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Sort
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Business
+import androidx.compose.material.icons.rounded.Event
+import androidx.compose.material.icons.rounded.FilterAltOff
+import androidx.compose.material.icons.rounded.FilterList
+import androidx.compose.material.icons.rounded.Language
+import androidx.compose.material.icons.rounded.LiveTv
+import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.Sell
+import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.TheaterComedy
+import androidx.compose.material.icons.rounded.Theaters
+import androidx.compose.material.icons.rounded.Tv
+import androidx.compose.material.icons.rounded.Update
+import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.foundation.layout.BoxScope
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.boundsInRoot
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInParent
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.i18n.localizedMediaTypeLabel
-import com.nuvio.app.core.ui.accentFill
+import com.nuvio.app.core.ui.NuvioAsyncImage
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.search.DiscoverCatalogOption
 import com.nuvio.app.features.search.DiscoverUiState
 import com.nuvio.app.features.search.SearchRepository
 import com.nuvio.app.features.search.discoverCatalogDisplayLabels
-import nuvio.composeapp.generated.resources.Res
-import nuvio.composeapp.generated.resources.discover_all_filters
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 import org.jetbrains.compose.resources.stringResource
 
-/**
- * The three header segments, in display order: media type, catalog, filter. The last is called
- * Filter, not Genre: the addon protocol calls this extra "genre", but its values are routinely
- * years, decades, or providers, so "genre" is misleading in the UI. Wire-level naming
- * (SearchRepository.selectDiscoverGenre) keeps the protocol term.
+/*
+ * Discover row 1's header: the Nuvio Tracker's filter bar. An addon catalog offers what the addon
+ * protocol has — its type, the catalog, and the one "genre" extra (called Filter, because addons
+ * routinely put years, decades or providers in it). The built-in TMDB browser, listed first among
+ * the catalogs, brings the tracker's whole set: sort, genres, streaming service, network, studio,
+ * year, rating, length, language, status and US rating.
  */
-enum class DiscoverPickerSegment {
-    Type,
-    Catalog,
-    Filter,
-}
 
-/**
- * One selectable entry in the picker panel. Catalog rows carry a display label disambiguated
- * against their neighbours; type rows carry the localized media-type name.
- */
-data class DiscoverPickerEntry(
-    val key: String,
-    val label: String,
-    val selected: Boolean,
+const val DiscoverTmdbCatalogLabel = "TMDB"
+
+private val TmdbMediaChoices = listOf(
+    TmdbBrowseMedia.Movie.name to "Movies",
+    TmdbBrowseMedia.Tv.name to "Shows",
+    TmdbBrowseMedia.All.name to "Movies & shows",
 )
 
-/** Media types offered by the installed addons' discover catalogs, in the repository's order. */
-fun DiscoverUiState.typePickerEntries(): List<DiscoverPickerEntry> =
-    typeOptions.map { type ->
-        DiscoverPickerEntry(
-            key = type,
-            label = localizedMediaTypeLabel(type),
-            selected = type == selectedType,
-        )
-    }
+private val TmdbSortChoices = listOf(
+    TmdbBrowseSort.Popular to "Popular",
+    TmdbBrowseSort.Trending to localizedString(Res.string.browse_filter_trending_this_week),
+    TmdbBrowseSort.TopRated to localizedString(Res.string.browse_filter_top_rated),
+    TmdbBrowseSort.MostVoted to localizedString(Res.string.browse_filter_most_voted),
+    TmdbBrowseSort.Newest to "Newest",
+    TmdbBrowseSort.Oldest to "Oldest",
+)
 
-/**
- * Catalog labels for the picker, scoped to the selected type — the Type segment owns the
- * cross-type choice. [discoverCatalogDisplayLabels] still appends a type qualifier where two
- * neighbouring names would otherwise read identically (an addon can expose "tv" and "series").
- */
-fun DiscoverUiState.catalogPickerEntries(): List<DiscoverPickerEntry> {
-    val catalogs = catalogOptions
-    val labels = discoverCatalogDisplayLabels(catalogs)
-    return catalogs.mapIndexed { index, catalog ->
-        DiscoverPickerEntry(
-            key = catalog.key,
-            label = labels.getOrElse(index) { catalog.catalogName },
-            selected = catalog.key == selectedCatalogKey,
-        )
-    }
+val BrowseLanguages: List<Pair<String, String>> = listOf(
+    "en" to "English", "ja" to "Japanese", "ko" to "Korean", "zh" to "Chinese", "hi" to "Hindi",
+    "fr" to "French", "de" to "German", "es" to "Spanish", "it" to "Italian", "pt" to "Portuguese",
+    "ru" to "Russian", "sv" to "Swedish", "da" to "Danish", "no" to "Norwegian", "fi" to "Finnish",
+    "nl" to "Dutch", "pl" to "Polish", "tr" to "Turkish", "th" to "Thai", "ar" to "Arabic",
+)
+
+val BrowseRatings: List<Pair<String, String>> = listOf(
+    "" to localizedString(Res.string.browse_filter_any_rating), "5" to "5+", "6" to "6+", "7" to "7+", "7.5" to "7.5+", "8" to "8+",
+)
+
+val BrowseVotes: List<Pair<String, String>> = listOf(
+    "" to localizedString(Res.string.browse_filter_any_number_of_votes), "50" to localizedString(Res.string.browse_filter_50_votes), "200" to localizedString(Res.string.browse_filter_200_votes), "1000" to localizedString(Res.string.browse_filter_1_000_votes),
+    "5000" to "5,000+ votes", "20000" to "20,000+ votes",
+)
+
+/** Length bands: min, max, label. */
+val BrowseRuntimes: List<Triple<Int?, Int?, String>> = listOf(
+    Triple(null, null, localizedString(Res.string.browse_filter_any_length)), Triple(null, 30, localizedString(Res.string.browse_filter_under_30_min)), Triple(30, 60, localizedString(Res.string.browse_filter_30_60_min)),
+    Triple(60, 90, "60–90 min"), Triple(90, 120, "90–120 min"), Triple(120, 150, "2–2½ hours"),
+    Triple(150, null, "Over 2½ hours"),
+)
+
+private val UsCertifications = listOf("G", "PG", "PG-13", "R", "NC-17")
+
+/** "Rating: 7+, 1,000+ votes", or just "Rating". */
+fun browseRatingLabel(minRating: Double?, minVotes: Int?): String {
+    if (minRating == null && minVotes == null) return "Rating"
+    val parts = listOfNotNull(
+        minRating?.let { "${it.formatRating()}+" },
+        minVotes?.let { "%,d+ votes".format(it) },
+    )
+    return "Rating: ${parts.joinToString(", ")}"
 }
 
-/**
- * Filter values for the selected catalog. "All" leads unless the catalog requires a value, in
- * which case there is no unfiltered option to offer.
- */
-@Composable
-fun DiscoverUiState.filterPickerEntries(): List<DiscoverPickerEntry> {
-    val catalog = selectedCatalog ?: return emptyList()
-    val allLabel = stringResource(Res.string.discover_all_filters)
-    return buildList {
-        if (!catalog.genreRequired) {
-            add(
-                DiscoverPickerEntry(
-                    key = "",
-                    label = allLabel,
-                    selected = selectedGenre == null,
-                ),
-            )
-        }
-        catalog.genreOptions.forEach { genre ->
-            add(DiscoverPickerEntry(key = genre, label = genre, selected = genre == selectedGenre))
-        }
-    }
-}
+fun Double.formatRating(): String = if (this % 1.0 == 0.0) toInt().toString() else toString()
+
+fun browseYearLabel(yearFrom: Int?, yearTo: Int?): String =
+    if (yearFrom == null && yearTo == null) "Year" else "Year: ${yearFrom ?: "…"}–${yearTo ?: "…"}"
+
+fun browseRuntimeLabel(min: Int?, max: Int?): String =
+    BrowseRuntimes.firstOrNull { it.first == min && it.second == max }?.third?.takeIf { min != null || max != null } ?: "Length"
 
 /**
- * The row-1 header: the media type, the catalog name, then — once a catalog is chosen — the
- * filter, all clickable and each opening its list into the row body. Rendered through
- * `NuvioShelfSection`'s `titleContent` slot so it keeps the shelf's header line, accent bar, and
- * view-all pill.
+ * The row-1 header. Rendered through `NuvioShelfSection`'s `titleContent` slot so it keeps the
+ * shelf's header line, accent bar and view-all pill. [onMenuOpenChange] reports whether one of its
+ * menus is open, so the page can stop scrolling under it.
  */
 @Composable
 fun DiscoverRowHeader(
-    typeLabel: String?,
-    catalogLabel: String,
-    filterLabel: String?,
-    activeSegment: DiscoverPickerSegment?,
-    onSegmentClick: (DiscoverPickerSegment) -> Unit,
-    onSegmentPositioned: (DiscoverPickerSegment, Float) -> Unit,
-    onHeaderBoundsChanged: (Rect) -> Unit,
+    state: DiscoverUiState,
+    allFiltersLabel: String,
+    onMenuOpenChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        // Root-space bounds, so the screen can tell a press on the header (which still toggles
-        // segments while a picker is open) from a press anywhere else (which only closes it).
-        modifier = modifier.onGloballyPositioned { onHeaderBoundsChanged(it.boundsInRoot()) },
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // The type segment only exists once the addons have been scanned and a type resolved.
-        if (typeLabel != null) {
-            DiscoverHeaderSegment(
-                label = typeLabel,
-                active = activeSegment == DiscoverPickerSegment.Type,
-                onClick = { onSegmentClick(DiscoverPickerSegment.Type) },
-                onPositioned = { x -> onSegmentPositioned(DiscoverPickerSegment.Type, x) },
-            )
-            DiscoverHeaderDivider()
-        }
-        DiscoverHeaderSegment(
-            label = catalogLabel,
-            active = activeSegment == DiscoverPickerSegment.Catalog,
-            onClick = { onSegmentClick(DiscoverPickerSegment.Catalog) },
-            onPositioned = { x -> onSegmentPositioned(DiscoverPickerSegment.Catalog, x) },
-        )
-        // The filter segment only exists once a catalog is selected and that catalog exposes
-        // filter values.
-        if (filterLabel != null) {
-            DiscoverHeaderDivider()
-            DiscoverHeaderSegment(
-                label = filterLabel,
-                active = activeSegment == DiscoverPickerSegment.Filter,
-                onClick = { onSegmentClick(DiscoverPickerSegment.Filter) },
-                onPositioned = { x -> onSegmentPositioned(DiscoverPickerSegment.Filter, x) },
-            )
-        }
-    }
-}
-
-@Composable
-private fun DiscoverHeaderDivider() {
-    Text(
-        text = "·",
-        style = MaterialTheme.typography.titleLarge,
-        color = MaterialTheme.nuvio.colors.textMuted,
-    )
-}
-
-@Composable
-private fun DiscoverHeaderSegment(
-    label: String,
-    active: Boolean,
-    onClick: () -> Unit,
-    onPositioned: (Float) -> Unit,
-) {
-    val tokens = MaterialTheme.nuvio
-    Row(
-        modifier = Modifier
-            // Reported in the header Row's own coordinates so the panel can hang off this segment
-            // rather than off the row's left edge.
-            .onGloballyPositioned { onPositioned(it.positionInParent().x) }
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.titleLarge,
-            color = if (active) tokens.colors.accent else tokens.colors.textPrimary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            // Rotating a caret glyph would need a layout pass per frame for no real gain; swapping
-            // the glyph reads the same and costs nothing.
-            text = if (active) "▴" else "▾",
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (active) tokens.colors.accent else tokens.colors.textMuted,
-        )
-    }
-}
-
-/**
- * The picker panel that takes over the row body while a segment is open. Sized and placed relative
- * to the row it belongs to — never to the window — because the row's position on screen moves with
- * TV mode, adaptive hero, and hero height.
- */
-@Composable
-fun BoxScope.DiscoverPickerPanel(
-    entries: List<DiscoverPickerEntry>,
-    maxHeight: Dp,
-    maxWidth: Dp,
-    horizontalPadding: Dp,
-    anchorX: Dp,
-    onEntryClick: (DiscoverPickerEntry) -> Unit,
-    onPanelBoundsChanged: (Rect) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val tokens = MaterialTheme.nuvio
-    val listState = rememberLazyListState()
-    val selectedIndex = entries.indexOfFirst { it.selected }
-    // Open on the current selection rather than at the top: with a few hundred catalogs installed,
-    // the one in use is otherwise nowhere near the visible window.
-    LaunchedEffect(entries) {
-        if (selectedIndex > 0) listState.scrollToItem(selectedIndex)
-    }
-    // Width follows the longest label. LazyColumn cannot be measured intrinsically (it is a
-    // SubcomposeLayout), so the text is measured directly instead — otherwise the panel is a fixed
-    // fraction of the row and mostly empty for short catalog names. Measured once per list, and the
-    // selected row's SemiBold weight is covered by DiscoverPickerWidthSlack.
-    val textMeasurer = rememberTextMeasurer()
-    val labelStyle = MaterialTheme.typography.bodyLarge
-    val density = LocalDensity.current
-    val panelWidth = remember(entries, labelStyle, density, maxWidth) {
-        val widestPx = entries.maxOfOrNull { entry ->
-            textMeasurer.measure(entry.label, labelStyle, maxLines = 1).size.width
-        } ?: 0
-        val contentWidth = with(density) { widestPx.toDp() }
-        (contentWidth + DiscoverPickerRowPadding * 2 + DiscoverPickerWidthSlack)
-            .coerceIn(DiscoverPickerMinWidth, maxWidth.coerceAtLeast(DiscoverPickerMinWidth))
-    }
-    // Left-align the panel with the segment that opened it, but never let it run off the right edge.
-    val offsetX = anchorX.coerceIn(0.dp, (maxWidth - panelWidth).coerceAtLeast(0.dp))
-    Surface(
-        modifier = modifier
-            .align(Alignment.TopStart)
-            .padding(start = horizontalPadding + offsetX, end = horizontalPadding)
-            .width(panelWidth)
-            .onGloballyPositioned { onPanelBoundsChanged(it.boundsInRoot()) },
-        color = tokens.colors.surfaceCard,
-        shape = RoundedCornerShape(12.dp),
-        tonalElevation = 0.dp,
-        shadowElevation = tokens.elevation.overlay,
-    ) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.heightIn(max = maxHeight).padding(vertical = 6.dp),
-        ) {
-            items(entries, key = { it.key }) { entry ->
-                Text(
-                    text = entry.label,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onEntryClick(entry) }
-                        .background(
-                            if (entry.selected) {
-                                tokens.colors.accentFill(0.16f)
-                            } else {
-                                androidx.compose.ui.graphics.SolidColor(androidx.compose.ui.graphics.Color.Transparent)
-                            },
-                        )
-                        .padding(horizontal = DiscoverPickerRowPadding, vertical = 10.dp),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = if (entry.selected) tokens.colors.accent else tokens.colors.textPrimary,
-                    fontWeight = if (entry.selected) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+    BrowseFilterStrip(modifier = modifier) {
+        if (state.tmdbSelected) {
+            BrowseFilterTitle(DiscoverTmdbCatalogLabel)
+            TmdbMediaMenu(state.tmdbQuery.media, onMenuOpenChange)
+            CatalogMenu(state, onMenuOpenChange)
+            BrowseFilterSeparator()
+            TmdbFilterMenus(state, onMenuOpenChange)
+        } else {
+            // The icons don't name what's picked, so the title does: the catalog and its filter.
+            state.selectedCatalog?.let { catalog ->
+                BrowseFilterTitle(listOfNotNull(catalog.catalogName, state.selectedGenre).joinToString(" · "))
+            }
+            state.selectedType?.let { type ->
+                BrowseFilterMenu(icon = Icons.Rounded.Theaters, label = "Type: ${localizedMediaTypeLabel(type)}", on = false, onOpenChange = onMenuOpenChange) { close ->
+                    BrowseMenuChoices(
+                        options = state.typeOptions.map { it to localizedMediaTypeLabel(it) },
+                        value = type,
+                        onPick = { picked ->
+                            SearchRepository.selectDiscoverType(picked)
+                            close()
+                        },
+                    )
+                }
+            }
+            CatalogMenu(state, onMenuOpenChange)
+            val catalog = state.selectedCatalog
+            if (catalog != null && catalog.genreOptions.isNotEmpty()) {
+                BrowseFilterSeparator()
+                BrowseFilterMenu(
+                    icon = Icons.Rounded.FilterList,
+                    label = "Filter: ${state.selectedGenre ?: allFiltersLabel}",
+                    on = state.selectedGenre != null && !catalog.genreRequired,
+                    onOpenChange = onMenuOpenChange,
+                ) { close ->
+                    val options = buildList {
+                        if (!catalog.genreRequired) add("" to allFiltersLabel)
+                        catalog.genreOptions.forEach { add(it to it) }
+                    }
+                    BrowseMenuChoices(options = options, value = state.selectedGenre.orEmpty(), onPick = { picked ->
+                        SearchRepository.selectDiscoverGenre(picked.ifBlank { null })
+                        close()
+                    })
+                }
             }
         }
     }
 }
 
+@Composable
+private fun TmdbMediaMenu(media: TmdbBrowseMedia, onMenuOpenChange: (Boolean) -> Unit) {
+    BrowseFilterMenu(
+        icon = Icons.Rounded.Theaters,
+        label = "Type: ${TmdbMediaChoices.first { it.first == media.name }.second}",
+        on = false,
+        onOpenChange = onMenuOpenChange,
+    ) { close ->
+        BrowseMenuChoices(options = TmdbMediaChoices, value = media.name, onPick = { picked ->
+            val next = TmdbBrowseMedia.valueOf(picked)
+            // Genre ids are namespaced per media type, so a switch starts the genres over.
+            SearchRepository.updateTmdbQuery { q ->
+                if (q.media == next) q else q.copy(media = next, genres = emptyList(), withoutGenres = emptyList())
+            }
+            close()
+        })
+    }
+}
+
 /**
- * Stand-in for the poster strip when the selected catalog returns nothing (or is still loading).
- * Occupies real height so the row cannot collapse to a bare header — the header is the only way
- * back to a different catalog, so it must always be visible and clickable.
+ * Every catalog in one menu: the TMDB browser first, then each type's addon catalogs under its own
+ * heading — so the TMDB browser and any addon catalog are always one pick apart.
+ */
+@Composable
+private fun CatalogMenu(state: DiscoverUiState, onMenuOpenChange: (Boolean) -> Unit) {
+    val label = if (state.tmdbSelected) DiscoverTmdbCatalogLabel else state.selectedCatalog.headerLabel("Catalog")
+    BrowseFilterMenu(icon = Icons.Rounded.VideoLibrary, label = "Catalog: $label", on = false, onOpenChange = onMenuOpenChange) { close ->
+        if (state.tmdbAvailable) {
+            BrowseMenuChoices(
+                options = listOf("tmdb" to "TMDB — browse & filter everything"),
+                value = if (state.tmdbSelected) "tmdb" else "",
+                onPick = {
+                    SearchRepository.selectTmdbBrowse()
+                    close()
+                },
+            )
+        }
+        val byType = state.availableCatalogs.groupBy { it.typeGroup }
+        byType.forEach { (type, catalogs) ->
+            BrowseMenuNote(localizedMediaTypeLabel(type))
+            val labels = discoverCatalogDisplayLabels(catalogs)
+            BrowseMenuChoices(
+                options = catalogs.mapIndexed { index, catalog -> catalog.key to labels.getOrElse(index) { catalog.catalogName } },
+                value = if (state.tmdbSelected) "" else state.selectedCatalogKey.orEmpty(),
+                onPick = { key ->
+                    SearchRepository.selectDiscoverCatalog(key)
+                    close()
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun TmdbFilterMenus(state: DiscoverUiState, onMenuOpenChange: (Boolean) -> Unit) {
+    val q = state.tmdbQuery
+    val opts = state.tmdbOptions
+    val update = SearchRepository::updateTmdbQuery
+    val tv = q.media == TmdbBrowseMedia.Tv
+    val movies = q.media == TmdbBrowseMedia.Movie
+
+    BrowseFilterMenu(
+        icon = Icons.AutoMirrored.Rounded.Sort,
+        label = "Sort: ${TmdbSortChoices.first { it.first == q.sort }.second}",
+        on = false,
+        onOpenChange = onMenuOpenChange,
+    ) { close ->
+        BrowseMenuChoices(
+            options = TmdbSortChoices.map { it.first.name to it.second },
+            value = q.sort.name,
+            onPick = { picked ->
+                update { it.copy(sort = TmdbBrowseSort.valueOf(picked)) }
+                close()
+            },
+        )
+    }
+    BrowseFilterSeparator()
+
+    val genreNames = q.genres.mapNotNull { id -> opts.genres.firstOrNull { it.id == id }?.name }
+    BrowseFilterMenu(icon = Icons.Rounded.TheaterComedy, label = browseFilterSummary("Genres", genreNames), on = q.genres.isNotEmpty(), onOpenChange = onMenuOpenChange) {
+        BrowseMenuCheck(on = q.allGenres, onClick = { update { it.copy(allGenres = !it.allGenres) } }) {
+            Text(stringResource(Res.string.browse_filter_must_match_every_genre_picked))
+        }
+        BrowseMenuCheckColumns(
+            items = opts.genres,
+            isOn = { it.id in q.genres },
+            onToggle = { g -> update { it.copy(genres = it.genres.toggle(g.id)) } },
+            label = { it.name },
+        )
+    }
+
+    val animeLabel = when (q.anime) {
+        TmdbBrowseAnime.Include -> stringResource(Res.string.browse_filter_anime_included)
+        TmdbBrowseAnime.Only -> stringResource(Res.string.browse_filter_anime_only)
+        TmdbBrowseAnime.Exclude -> stringResource(Res.string.browse_filter_anime_excluded)
+    }
+    // One press steps through included, only, excluded.
+    BrowseFilterIconAction(Icons.Rounded.AutoAwesome, animeLabel, on = q.anime != TmdbBrowseAnime.Include) {
+        update {
+            it.copy(
+                anime = when (it.anime) {
+                    TmdbBrowseAnime.Include -> TmdbBrowseAnime.Only
+                    TmdbBrowseAnime.Only -> TmdbBrowseAnime.Exclude
+                    TmdbBrowseAnime.Exclude -> TmdbBrowseAnime.Include
+                },
+            )
+        }
+    }
+
+    if (opts.providers.isNotEmpty()) {
+        val providerNames = q.providers.mapNotNull { id -> opts.providers.firstOrNull { it.id == id }?.name }
+        BrowseFilterMenu(icon = Icons.Rounded.LiveTv, label = browseFilterSummary("Streaming", providerNames), on = q.providers.isNotEmpty(), onOpenChange = onMenuOpenChange) {
+            BrowseMenuNote(stringResource(Res.string.browse_filter_subscription_services_in, opts.region))
+            opts.providers.forEach { provider ->
+                BrowseMenuCheck(on = provider.id in q.providers, onClick = { update { it.copy(providers = it.providers.toggle(provider.id)) } }) {
+                    provider.logoUrl?.let { url ->
+                        NuvioAsyncImage(
+                            model = url,
+                            contentDescription = null,
+                            modifier = Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)),
+                        )
+                    }
+                    Text(provider.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+
+    if (!movies && opts.networks.isNotEmpty()) {
+        val networkNames = q.networks.mapNotNull { id -> opts.networks.firstOrNull { it.id == id }?.name }
+        BrowseFilterMenu(icon = Icons.Rounded.Tv, label = browseFilterSummary("Network", networkNames), on = q.networks.isNotEmpty(), onOpenChange = onMenuOpenChange) {
+            BrowseMenuCheckColumns(
+                items = opts.networks,
+                isOn = { it.id in q.networks },
+                onToggle = { n -> update { it.copy(networks = it.networks.toggle(n.id)) } },
+                label = { it.name },
+            )
+        }
+    }
+
+    BrowseFilterMenu(icon = Icons.Rounded.Business, label = browseFilterSummary("Studio", q.companies.map { it.name }), on = q.companies.isNotEmpty(), onOpenChange = onMenuOpenChange) {
+        q.companies.forEach { company ->
+            BrowseMenuCheck(on = true, onClick = { update { it.copy(companies = it.companies.filterNot { c -> c.id == company.id }) } }) {
+                Text(company.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        BrowseStudioPicker(onPick = { studio ->
+            update { it.copy(companies = (it.companies + TmdbBrowseCompany(studio.id, studio.name)).distinctBy { c -> c.id }.take(12)) }
+        })
+    }
+
+    BrowseFilterMenu(icon = Icons.Rounded.Sell, label = browseFilterSummary("Tags", q.keywords.map { it.name }), on = q.keywords.isNotEmpty(), onOpenChange = onMenuOpenChange) {
+        if (q.anime == TmdbBrowseAnime.Only) {
+            BrowseMenuNote(stringResource(Res.string.browse_filter_tags_anime_note))
+        } else {
+            BrowseMenuCheck(on = q.allKeywords, onClick = { update { it.copy(allKeywords = !it.allKeywords) } }) {
+                Text(stringResource(Res.string.browse_filter_must_match_every_tag))
+            }
+        }
+        q.keywords.forEach { keyword ->
+            BrowseMenuCheck(on = true, onClick = { update { it.copy(keywords = it.keywords.filterNot { k -> k.id == keyword.id }) } }) {
+                Text(keyword.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        BrowseKeywordPicker(onPick = { keyword ->
+            update { it.copy(keywords = (it.keywords + keyword).distinctBy { k -> k.id }.take(12)) }
+        })
+    }
+
+    BrowseFilterMenu(icon = Icons.Rounded.Event, label = browseYearLabel(q.yearFrom, q.yearTo), on = q.yearFrom != null || q.yearTo != null, onOpenChange = onMenuOpenChange) {
+        BrowseYearsEditor(yearFrom = q.yearFrom, yearTo = q.yearTo, onChange = { from, to ->
+            update { it.copy(yearFrom = from, yearTo = to) }
+        })
+    }
+
+    BrowseFilterMenu(icon = Icons.Rounded.Star, label = browseRatingLabel(q.minRating, q.minVotes), on = q.minRating != null || q.minVotes != null, onOpenChange = onMenuOpenChange) {
+        BrowseMenuNote("Rating")
+        BrowseMenuChoices(options = BrowseRatings, value = q.minRating?.formatRating().orEmpty(), onPick = { picked ->
+            update { it.copy(minRating = picked.toDoubleOrNull()) }
+        })
+        BrowseMenuNote("Votes")
+        BrowseMenuChoices(options = BrowseVotes, value = q.minVotes?.toString().orEmpty(), onPick = { picked ->
+            update { it.copy(minVotes = picked.toIntOrNull()) }
+        })
+    }
+
+    BrowseFilterMenu(icon = Icons.Rounded.Schedule, label = browseRuntimeLabel(q.runtimeMin, q.runtimeMax), on = q.runtimeMin != null || q.runtimeMax != null, onOpenChange = onMenuOpenChange) { close ->
+        BrowseMenuChoices(
+            options = BrowseRuntimes.map { (min, max, label) -> "${min ?: ""}-${max ?: ""}" to label },
+            value = "${q.runtimeMin ?: ""}-${q.runtimeMax ?: ""}",
+            onPick = { picked ->
+                val (min, max) = picked.split("-").map { it.toIntOrNull() }
+                update { it.copy(runtimeMin = min, runtimeMax = max) }
+                close()
+            },
+        )
+    }
+
+    BrowseFilterMenu(
+        icon = Icons.Rounded.Language,
+        label = BrowseLanguages.firstOrNull { it.first == q.language }?.second?.let { "Language: $it" } ?: "Language",
+        on = q.language != null,
+        onOpenChange = onMenuOpenChange,
+    ) { close ->
+        BrowseMenuChoices(options = listOf("" to stringResource(Res.string.browse_filter_any_language)) + BrowseLanguages, value = q.language.orEmpty(), onPick = { picked ->
+            update { it.copy(language = picked.ifBlank { null }) }
+            close()
+        })
+    }
+
+    val statusOptions = buildList {
+        add(TmdbBrowseStatus.Any to stringResource(Res.string.browse_filter_any_status))
+        if (!movies) {
+            add(TmdbBrowseStatus.Returning to stringResource(Res.string.browse_filter_still_running))
+            add(TmdbBrowseStatus.Ended to stringResource(Res.string.browse_filter_ended))
+        }
+        if (!tv) {
+            add(TmdbBrowseStatus.InCinemas to stringResource(Res.string.browse_filter_in_cinemas))
+            add(TmdbBrowseStatus.HomeRelease to stringResource(Res.string.browse_filter_out_at_home))
+        }
+        add(TmdbBrowseStatus.Upcoming to stringResource(Res.string.browse_filter_coming_soon))
+    }
+    BrowseFilterMenu(
+        icon = Icons.Rounded.Update,
+        label = statusOptions.firstOrNull { it.first == q.status && it.first != TmdbBrowseStatus.Any }?.second?.let { "Status: $it" } ?: "Status",
+        on = q.status != TmdbBrowseStatus.Any,
+        onOpenChange = onMenuOpenChange,
+    ) { close ->
+        BrowseMenuChoices(options = statusOptions.map { it.first.name to it.second }, value = q.status.name, onPick = { picked ->
+            update { it.copy(status = TmdbBrowseStatus.valueOf(picked)) }
+            close()
+        })
+    }
+
+    if (!tv) {
+        BrowseFilterMenu(
+            icon = Icons.Rounded.Shield,
+            label = q.certification?.let { stringResource(Res.string.browse_filter_rated, it) } ?: stringResource(Res.string.browse_filter_us_film_rating),
+            on = q.certification != null,
+            onOpenChange = onMenuOpenChange,
+        ) { close ->
+            BrowseMenuNote("US film rating")
+            BrowseMenuChoices(
+                options = listOf("" to "Any") + UsCertifications.map { it to it },
+                value = q.certification.orEmpty(),
+                onPick = { picked ->
+                    update { it.copy(certification = picked.ifBlank { null }) }
+                    close()
+                },
+            )
+        }
+    }
+
+    if (q.hasFilters) {
+        BrowseFilterIconAction(Icons.Rounded.FilterAltOff, stringResource(Res.string.browse_filter_clear_filters), removesItself = true) { update { it.clearedFilters() } }
+    }
+    val count = when {
+        state.isLoading && state.items.isEmpty() -> "Loading…"
+        state.tmdbTotal >= 10_000 -> "10,000+ titles"
+        state.tmdbTotal > 0 -> "%,d titles".format(state.tmdbTotal)
+        else -> ""
+    }
+    if (count.isNotEmpty()) BrowseFilterCaption(count)
+}
+
+private fun List<Int>.toggle(id: Int): List<Int> = if (id in this) this - id else this + id
+
+/**
+ * Stand-in for the poster strip when the row returns nothing (or is still loading). Occupies real
+ * height so the row cannot collapse to a bare header — the header is the only way back to a
+ * different catalog, so it must always be visible and clickable.
  */
 @Composable
 fun BoxScope.DiscoverRowBodyMessage(
@@ -323,96 +460,21 @@ fun BoxScope.DiscoverRowBodyMessage(
     )
 }
 
-/**
- * Everything that can occupy the Discover row's body instead of posters: the open picker, or the
- * empty/loading message. Both the plain list and the TV-mode immersive shelf render the row through
- * `HomeCatalogRowSection`, so both call this — keeping one behaviour rather than two that drift.
- */
+/** The row body's loading / empty message; nothing once there are posters to show. */
 @Composable
 fun BoxScope.DiscoverRowBody(
     state: DiscoverUiState,
     itemsEmpty: Boolean,
-    segment: DiscoverPickerSegment?,
-    pickerMaxHeight: Dp,
-    pickerMaxWidth: Dp,
     horizontalPadding: Dp,
-    anchorX: Dp,
-    onSegmentChange: (DiscoverPickerSegment?) -> Unit,
-    onPanelBoundsChanged: (Rect) -> Unit,
     emptyText: String,
     loadingText: String,
 ) {
-    if (segment == null) {
-        if (itemsEmpty) {
-            DiscoverRowBodyMessage(
-                text = if (state.isLoading) loadingText else emptyText,
-                horizontalPadding = horizontalPadding,
-            )
-        }
-        return
+    if (itemsEmpty) {
+        DiscoverRowBodyMessage(
+            text = if (state.isLoading) loadingText else emptyText,
+            horizontalPadding = horizontalPadding,
+        )
     }
-    val entries = when (segment) {
-        DiscoverPickerSegment.Type -> state.typePickerEntries()
-        DiscoverPickerSegment.Catalog -> state.catalogPickerEntries()
-        DiscoverPickerSegment.Filter -> state.filterPickerEntries()
-    }
-    DiscoverPickerPanel(
-        entries = entries,
-        maxHeight = pickerMaxHeight,
-        maxWidth = pickerMaxWidth,
-        horizontalPadding = horizontalPadding,
-        anchorX = anchorX,
-        onEntryClick = { entry ->
-            // Every pick closes the panel. Choosing a type or catalog resets the filter to "All"
-            // (or the first value where the catalog demands one) and shows the row straight
-            // away; the filter segment stays a click away for anyone who wants to narrow it.
-            when (segment) {
-                DiscoverPickerSegment.Type -> SearchRepository.selectDiscoverType(entry.key)
-                DiscoverPickerSegment.Catalog -> SearchRepository.selectDiscoverCatalog(entry.key)
-                DiscoverPickerSegment.Filter -> SearchRepository.selectDiscoverGenre(entry.key.ifBlank { null })
-            }
-            onSegmentChange(null)
-        },
-        onPanelBoundsChanged = onPanelBoundsChanged,
-    )
-}
-
-/**
- * Whether a press at [position] (root coordinates) should close an open picker instead of
- * reaching whatever is under it.
- *
- * The panel and the header keep their own behaviour — an entry picks, a segment toggles. Anything
- * else is a miss: the posters are still there at [DiscoverPostersDimmedAlpha] and would otherwise
- * open a title the user was only trying to click past the panel to dismiss.
- */
-fun discoverPickerPressDismisses(position: Offset, panelBounds: Rect?, headerBounds: Rect?): Boolean =
-    panelBounds?.contains(position) != true && headerBounds?.contains(position) != true
-
-/** Alpha the posters fade to while a picker owns the row body. Not 0 — the row stays legible as context. */
-const val DiscoverPostersDimmedAlpha = 0.12f
-
-/** Horizontal inset on a picker row; counted twice when sizing the panel to its widest label. */
-private val DiscoverPickerRowPadding = 14.dp
-
-/**
- * Breathing room past the measured text: covers the selected row's SemiBold weight (measured at
- * Normal) and keeps labels off the panel edge.
- */
-private val DiscoverPickerWidthSlack = 24.dp
-
-/** Floor so a list of very short values ("War", "2026") still reads as a panel rather than a chip. */
-private val DiscoverPickerMinWidth = 180.dp
-
-/** Fade duration for the poster dim / picker cross-fade. */
-private const val DiscoverPickerFadeMs = 180
-
-@Composable
-fun rememberDiscoverPostersAlpha(pickerOpen: Boolean): Float {
-    val alpha by animateFloatAsState(
-        targetValue = if (pickerOpen) DiscoverPostersDimmedAlpha else 1f,
-        animationSpec = tween(durationMillis = DiscoverPickerFadeMs),
-    )
-    return alpha
 }
 
 /** Header label for the currently selected catalog, or a prompt when nothing is selected yet. */

@@ -28,6 +28,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -65,6 +67,10 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.runBlocking
+import kotlin.time.Clock
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Instant
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.stringResource
@@ -121,6 +127,8 @@ data class AppUpdaterUiState(
     val showDialog: Boolean = false,
     val showUnknownSourcesDialog: Boolean = false,
     val errorMessage: String? = null,
+    /** What the offered update will really download (just the changed files), when that is less than the whole archive. */
+    val downloadEstimateBytes: Long? = null,
 )
 
 @Serializable
@@ -358,6 +366,12 @@ internal object UpdateAvailability {
      * for and when it was packaged. Applied only to the unmarked case — an install the updater
      * performed has its own settled rules, and nothing here should be able to talk it out of an
      * update.
+     *
+     * The published asset's timestamp is its upload time, which always trails its own build stamp
+     * by the smoke run and the upload, so a user who downloaded the nightly and unpacked it by hand
+     * runs a build "older" than the release it came from. [selfBuiltUploadGrace] absorbs that lag.
+     * The cost is that a nightly uploaded within that window of the running build is missed until
+     * the next one, which is rare and self-correcting.
      */
     private fun isSelfBuiltNightlyAtLeastAsNew(
         update: AppUpdate,
@@ -366,11 +380,14 @@ internal object UpdateAvailability {
     ): Boolean {
         if (installedNightlyId != null) return false
         if (runningBuild?.isNightly != true) return false
-        val builtAt = utcInstantOrNull(runningBuild.buildTime) ?: return false
-        val publishedAt = utcInstantOrNull(update.publishedAt) ?: return false
-        return builtAt >= publishedAt
+        val builtAt = utcInstantOrNull(runningBuild.buildTime)?.let { Instant.parse("${it}Z") } ?: return false
+        val publishedAt = utcInstantOrNull(update.publishedAt)?.let { Instant.parse("${it}Z") } ?: return false
+        return builtAt + selfBuiltUploadGrace >= publishedAt
     }
 }
+
+/** How long after a nightly is packaged its upload may land and still count as that same build. */
+internal val selfBuiltUploadGrace = 45.minutes
 
 private val utcInstantPattern = Regex("""^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$""")
 
@@ -418,6 +435,10 @@ class AppUpdaterController internal constructor(
         if (autoCheckStarted || !AppFeaturePolicy.inAppUpdaterEnabled || !AppUpdaterPlatform.isSupported) {
             return
         }
+        // A `gradlew run` launch carries no build stamp, so on the nightly channel it always read
+        // as a stable install and was offered the switch to nightly on every start. There is
+        // nothing to update in place there anyway; "Check for updates" still works by hand.
+        if (AppVersionPolicy.isDevelopmentRun) return
         autoCheckStarted = true
         checkForUpdates(force = false, showNoUpdateFeedback = false)
     }
@@ -454,12 +475,15 @@ class AppUpdaterController internal constructor(
                     runningBuild = runningBuild,
                 )
                 val ignored = ignoredTag != null && ignoredTag == update.ignoreKey()
-                val shouldShowDialog = force || (remoteNewer && !ignored)
+                val snoozed = AppUpdaterPlatform.getSnoozedUntilMs()
+                    ?.let { until -> Clock.System.now().toEpochMilliseconds() < until } == true
+                val shouldShowDialog = force || (remoteNewer && !ignored && !snoozed)
 
                 _uiState.update { state ->
                     state.copy(
                         isChecking = false,
                         update = update.takeIf { remoteNewer },
+                        downloadEstimateBytes = null,
                         isUpdateAvailable = remoteNewer,
                         isChannelSwitch = remoteNewer &&
                             UpdateAvailability.isChannelSwitch(update, installedNightlyId, runningBuild),
@@ -470,6 +494,15 @@ class AppUpdaterController internal constructor(
                         showUnknownSourcesDialog = false,
                         errorMessage = null,
                     )
+                }
+
+                if (remoteNewer) {
+                    scope.launch {
+                        val estimate = AppUpdaterPlatform.estimateDownloadBytes(update.assetUrl)
+                        _uiState.update { state ->
+                            if (state.update?.assetUrl == update.assetUrl) state.copy(downloadEstimateBytes = estimate) else state
+                        }
+                    }
                 }
 
                 if (showNoUpdateFeedback && !remoteNewer) {
@@ -576,6 +609,19 @@ class AppUpdaterController internal constructor(
         val update = _uiState.value.update ?: return
         AppUpdaterPlatform.setIgnoredTag(update.ignoreKey())
         dismissDialog()
+    }
+
+    /**
+     * Keeps the automatic check quiet for [days], whatever version is out by then. A manual
+     * "Check for updates" still shows the dialog (it passes force).
+     */
+    fun snoozeFor(days: Int) {
+        val until = Clock.System.now() + days.days
+        AppUpdaterPlatform.setSnoozedUntilMs(until.toEpochMilliseconds())
+        dismissDialog()
+        scope.launch {
+            NuvioToastController.show(getString(Res.string.updates_snoozed_until, until.toString().take(10)))
+        }
     }
 
     fun downloadUpdate() {
@@ -688,6 +734,7 @@ class AppUpdaterController internal constructor(
             ?.let { InstalledNightlyBuild(id = it, publishedAt = update.publishedAt) }
         AppUpdaterPlatform.setInstalledNightlyBuild(nightly)
         AppUpdaterPlatform.setIgnoredTag(null)
+        AppUpdaterPlatform.setSnoozedUntilMs(null)
     }
 
     companion object {
@@ -740,6 +787,7 @@ fun AppUpdaterHost(
     if (visibleOverlay != StartupOverlayCoordinator.Overlay.Updater) return
 
     val tokens = MaterialTheme.nuvio
+    var snoozeOptionsOpen by remember { mutableStateOf(false) }
     val showPrimaryAction =
         state.showUnknownSourcesDialog || state.isDownloading || state.downloadedApkPath != null || state.isUpdateAvailable
 
@@ -760,7 +808,7 @@ fun AppUpdaterHost(
             modifier = modifier
                 // Padding first so it still shrinks on a small window, then the cap, then fill -
                 // resolving to min(760dp, available) rather than the whole screen.
-                .padding(horizontal = 24.dp)
+                .padding(horizontal = 24.dp, vertical = 24.dp)
                 .widthIn(max = 760.dp)
                 .fillMaxWidth(),
         ) {
@@ -821,9 +869,14 @@ fun AppUpdaterHost(
 
                 UpdaterHairline()
 
+                // Takes only the height left after the header and action strip, and scrolls within
+                // it: unbounded, a short window pushed the action strip - and the Update button -
+                // off the bottom of the dialog.
                 Column(
                     modifier = Modifier
+                        .weight(1f, fill = false)
                         .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
                         .padding(horizontal = 24.dp, vertical = 18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
@@ -838,6 +891,7 @@ fun AppUpdaterHost(
                     UpdateTargetCard(
                         update = state.update?.takeIf { state.isUpdateAvailable },
                         isChecking = state.isChecking,
+                        downloadEstimateBytes = state.downloadEstimateBytes,
                     )
 
                     state.update?.let { update ->
@@ -895,6 +949,29 @@ fun AppUpdaterHost(
 
                 UpdaterHairline()
 
+                if (snoozeOptionsOpen && state.isUpdateAvailable && !state.isDownloading) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        listOf(
+                            1 to Res.string.updates_snooze_one_day,
+                            3 to Res.string.updates_snooze_three_days,
+                            7 to Res.string.updates_snooze_one_week,
+                            14 to Res.string.updates_snooze_two_weeks,
+                        ).forEach { (days, label) ->
+                            TextButton(onClick = { controller.snoozeFor(days) }) {
+                                Text(stringResource(label))
+                            }
+                        }
+                        TextButton(onClick = controller::ignoreThisVersion) {
+                            Text(stringResource(Res.string.updates_skip_version))
+                        }
+                    }
+                    UpdaterHairline()
+                }
+
                 // The action strip doubles as the app's footer: the project link and the logs
                 // folder used to sit under the settings sidebar, and this dialog — reached from
                 // the same top bar — is where the build being run is already the subject.
@@ -903,11 +980,13 @@ fun AppUpdaterHost(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    UpdaterFooterLinks(modifier = Modifier.padding(start = 6.dp))
-                    Spacer(Modifier.weight(1f))
+                    // Weighted rather than followed by a weighted Spacer: a Row measures weighted
+                    // children last, so on a narrow window the links shrink and the buttons keep
+                    // their width instead of the last one (Update) being squeezed to nothing.
+                    UpdaterFooterLinks(modifier = Modifier.weight(1f).padding(start = 6.dp))
                     if (state.isUpdateAvailable && !state.isDownloading && !state.showUnknownSourcesDialog) {
-                        TextButton(onClick = controller::ignoreThisVersion) {
-                            Text(stringResource(Res.string.action_ignore))
+                        TextButton(onClick = { snoozeOptionsOpen = !snoozeOptionsOpen }) {
+                            Text(stringResource(Res.string.updates_remind_me))
                         }
                     }
                     TextButton(
@@ -968,6 +1047,7 @@ fun AppUpdaterHost(
 private fun UpdateTargetCard(
     update: AppUpdate?,
     isChecking: Boolean,
+    downloadEstimateBytes: Long? = null,
 ) {
     val tokens = MaterialTheme.nuvio
     Row(
@@ -992,7 +1072,13 @@ private fun UpdateTargetCard(
             return@Row
         }
         val published = utcInstantOrNull(update.publishedAt)?.let(::shortUtcLabel)
-        val size = update.assetSizeBytes?.let(::formatFileSize)
+        val size = update.assetSizeBytes?.let { full ->
+            if (downloadEstimateBytes != null && downloadEstimateBytes < full) {
+                stringResource(Res.string.updates_download_size_delta, formatFileSize(downloadEstimateBytes), formatFileSize(full))
+            } else {
+                formatFileSize(full)
+            }
+        }
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = when (update.channel) {
@@ -1104,6 +1190,8 @@ private fun UpdaterFooterLinks(modifier: Modifier = Modifier) {
             color = tokens.colors.textMuted,
             fontWeight = FontWeight.Medium,
             textDecoration = TextDecoration.Underline,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.clickable { runCatching { uriHandler.openUri(NuvioHtpcRepoUrl) } },
         )
         Text(
@@ -1112,6 +1200,8 @@ private fun UpdaterFooterLinks(modifier: Modifier = Modifier) {
             color = tokens.colors.textMuted,
             fontWeight = FontWeight.Medium,
             textDecoration = TextDecoration.Underline,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.clickable { platformOpenLogsDirectory() },
         )
     }

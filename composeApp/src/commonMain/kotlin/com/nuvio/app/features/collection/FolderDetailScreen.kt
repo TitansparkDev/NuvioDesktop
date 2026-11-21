@@ -1,5 +1,6 @@
 package com.nuvio.app.features.collection
 
+import com.nuvio.app.core.ui.requestFocusLogged
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.ScrollableState
@@ -14,11 +15,13 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -26,6 +29,13 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.animation.AnimatedContent
+import com.nuvio.app.features.home.HomeTvRowTransition
+import com.nuvio.app.features.home.components.ImmersiveRowDirection
+import com.nuvio.app.features.home.components.immersiveRowBodyEnter
+import com.nuvio.app.features.home.components.immersiveRowBodyExit
+import com.nuvio.app.features.home.components.immersiveRowFadeBounds
+import com.nuvio.app.features.home.components.immersiveRowTransition
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.material3.LocalRippleConfiguration
@@ -41,6 +51,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,11 +64,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import com.nuvio.app.core.ui.nuvioDitheredVerticalGradient
+import com.nuvio.app.core.ui.LocalHdrFadeCorrected
+import com.nuvio.app.core.ui.nuvioHdrFadeCorrection
 import com.nuvio.app.core.ui.navigationKey
+import com.nuvio.app.core.ui.rememberHoldToSelectState
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -77,32 +93,45 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.isDesktop
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioBackButton
+import com.nuvio.app.core.ui.KeepListAtTopWhileItemsArrive
 import com.nuvio.app.core.ui.NuvioPosterCard
 import com.nuvio.app.core.ui.HeroAmbientBackdrop
 import com.nuvio.app.core.ui.LocalCollectionsPosterSurface
 import com.nuvio.app.core.ui.NuvioPosterShape
 import com.nuvio.app.core.ui.rememberHomePosterCardStyleUiState
 import com.nuvio.app.core.ui.NuvioScreenHeader
-import com.nuvio.app.core.ui.MouseActivityState
+import com.nuvio.app.core.ui.rememberMouseActivityState
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.withDuplicateSafeLazyKeys
 import com.nuvio.app.features.home.HomeCatalogSection
+import com.nuvio.app.features.home.HomeRowShuffleOrder
+import com.nuvio.app.features.home.canShuffleRow
+import com.nuvio.app.features.home.shuffled
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
+import com.nuvio.app.features.home.adaptiveAmbientActive
 import com.nuvio.app.features.home.HeroCastMember
 import com.nuvio.app.features.home.HeroDiscoveryFact
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
 import com.nuvio.app.features.home.canOpenCatalog
 import com.nuvio.app.features.home.usesInfiniteHomeRow
+import com.nuvio.app.features.home.heroNeedsMetadataFetch
+import com.nuvio.app.features.home.resolveFocusedHeroItem
 import com.nuvio.app.features.home.stableKey
+import com.nuvio.app.features.home.withNormalizedHeroBackdrop
+import com.nuvio.app.features.tmdb.HeroImageSource
+import com.nuvio.app.features.tmdb.TmdbBackgroundLane
+import com.nuvio.app.features.tmdb.TmdbSettingsRepository
 import com.nuvio.app.features.home.components.immersiveShelfScrimStops
 import com.nuvio.app.features.home.components.PAGE_ITEM_STEP
 import com.nuvio.app.features.home.components.PAGE_SECTION_STEP
 import com.nuvio.app.features.home.components.HomeCatalogRowSection
+import com.nuvio.app.features.home.components.homeHeroLayout
 import com.nuvio.app.features.home.components.homeSectionHorizontalPaddingForWidth
 import com.nuvio.app.features.home.immersiveCatalogPosterBaseWidthDp
 import com.nuvio.app.features.home.immersiveShelfHeightDp
 import com.nuvio.app.features.home.components.HomeHeroSection
+import com.nuvio.app.features.home.rememberSettledHeroFocus
 import com.nuvio.app.features.home.components.HomeHeroTrailerManualTrigger
 import com.nuvio.app.features.home.components.HomeTvKey
 import com.nuvio.app.features.home.components.HomeTvKeyboardBridge
@@ -114,17 +143,26 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.collections_folder_empty_items
 import nuvio.composeapp.generated.resources.collections_folder_not_found
+import nuvio.composeapp.generated.resources.collections_folder_sources_failed
+import nuvio.composeapp.generated.resources.collections_folder_sources_failed_more
 import nuvio.composeapp.generated.resources.collections_tab_all
 import org.jetbrains.compose.resources.stringResource
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.math.abs
 
 private val FolderCoverHeight = 176.dp
-private val FolderAdaptiveHeroHeightFallback = 440.dp
+private const val FolderBackdropBannerWidthFraction = 0.22f
+private val FolderBackdropBannerMaxHeight = 320.dp
 private const val FolderAdaptiveHeroItemLimit = 8
 private const val FolderCatalogPreviewLimit = 18
 
@@ -185,13 +223,13 @@ private fun rememberFolderPageScrollKeys(
     val coroutineScope = rememberCoroutineScope()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) {
-        runCatching { focusRequester.requestFocus() }
+        focusRequester.requestFocusLogged()
     }
     return Modifier
         .focusRequester(focusRequester)
         .focusable()
         .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { _ ->
-            runCatching { focusRequester.requestFocus() }
+            focusRequester.requestFocusLogged()
         }
         .onPreviewKeyEvent { event ->
             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
@@ -255,8 +293,28 @@ private fun FolderDetailScreenContent(
         WatchedRepository.uiState
     }.collectAsState()
     val folder = uiState.folder
-    val collectionSections = remember(uiState.tabs) {
+    val publishedSections = remember(uiState.tabs, uiState.rowOrderHoldExpired) {
         FolderDetailRepository.getCatalogSectionsForRows()
+    }
+    // Row shuffle, behind the same setting as Home's. Applied to the sections themselves rather
+    // than only to what a row draws: the immersive and adaptive heroes and their key handlers index
+    // into section.items, and they have to agree with the order on screen.
+    val rowShuffleOrders by FolderRowShuffleState.orders.collectAsStateWithLifecycle()
+    val rowShufflingKeys by FolderRowShuffleState.shuffling.collectAsStateWithLifecycle()
+    val rowShuffle = FolderRowShuffleUi(
+        enabled = homeSettings.catalogRowShuffleEnabled,
+        orders = rowShuffleOrders,
+        shufflingKeys = rowShufflingKeys,
+    )
+    val collectionSections = remember(publishedSections, rowShuffleOrders, rowShuffle.enabled) {
+        if (!rowShuffle.enabled || rowShuffleOrders.isEmpty()) {
+            publishedSections
+        } else {
+            publishedSections.map { section ->
+                val order = rowShuffleOrders[section.key] ?: return@map section
+                section.copy(items = section.shuffled(order))
+            }
+        }
     }
     val showImmersiveCollection = isDesktop &&
         homeSettings.heroEnabled &&
@@ -275,11 +333,16 @@ private fun FolderDetailScreenContent(
     // in that case; real Default mode (hero/adaptive/TV all off) is unaffected.
     val suppressFallbackCoverBanner = homeSettings.heroEnabled &&
         (homeSettings.adaptiveHeroEnabled || homeSettings.tvModeEnabled)
+    // The folder's hero backdrop when it has one: the cover is a small tile with its title baked
+    // in, which a full-width crop slices through. The backdrop is made for this shape and comes
+    // with a separate title logo to lay over it.
+    val bannerBackdropUrl = folder?.heroBackdropUrl?.takeIf { it.isNotBlank() }
     val coverImageUrl = if (suppressFallbackCoverBanner) {
         null
     } else {
-        folder?.coverImageUrl?.takeIf { it.isNotBlank() }
+        bannerBackdropUrl ?: folder?.coverImageUrl?.takeIf { it.isNotBlank() }
     }
+    val bannerLogoUrl = folder?.titleLogoUrl?.takeIf { it.isNotBlank() && bannerBackdropUrl != null }
 
     val isFreshEntry = remember(entryKey) { FolderScrollMemory.markComposed(entryKey) }
 
@@ -287,6 +350,7 @@ private fun FolderDetailScreenContent(
         ImmersiveCollectionContent(
             sessionKey = entryKey,
             sections = collectionSections,
+            rowShuffle = rowShuffle,
             watchedKeys = watchedUiState.watchedKeys,
             onBack = onBack,
             onCatalogClick = onCatalogClick,
@@ -302,6 +366,8 @@ private fun FolderDetailScreenContent(
         AdaptiveCollectionContent(
             sessionKey = entryKey,
             sections = collectionSections,
+            rowShuffle = rowShuffle,
+            failedSources = uiState.failedSources,
             watchedKeys = watchedUiState.watchedKeys,
             onBack = onBack,
             onCatalogClick = onCatalogClick,
@@ -313,125 +379,175 @@ private fun FolderDetailScreenContent(
         return
     }
 
-    val density = LocalDensity.current
-    val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val maxHeroHeightPx = with(density) { FolderCoverHeight.toPx() }
-    var heroHeightPx by remember(coverImageUrl, maxHeroHeightPx) {
-        mutableFloatStateOf(if (coverImageUrl != null) maxHeroHeightPx else 0f)
-    }
-
-    val heroScrollConnection = remember(coverImageUrl, maxHeroHeightPx) {
-        object : NestedScrollConnection {
-            fun consumeHeroDelta(deltaY: Float): Float {
-                if (coverImageUrl == null || deltaY == 0f) return 0f
-                val previousHeight = heroHeightPx
-                val nextHeight = (previousHeight + deltaY).coerceIn(0f, maxHeroHeightPx)
-                heroHeightPx = nextHeight
-                return nextHeight - previousHeight
-            }
-
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (available.y >= 0f) return Offset.Zero
-                return Offset(x = 0f, y = consumeHeroDelta(available.y))
-            }
-
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (available.y <= 0f) return Offset.Zero
-                return Offset(x = 0f, y = consumeHeroDelta(available.y))
-            }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val density = LocalDensity.current
+        val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+        // A backdrop is a wide image meant to be seen, so it gets a banner that grows with the
+        // window; the cover-tile fallback keeps the thin strip it always had.
+        val bannerHeight = if (bannerBackdropUrl != null) {
+            (maxWidth * FolderBackdropBannerWidthFraction).coerceIn(FolderCoverHeight, FolderBackdropBannerMaxHeight)
+        } else {
+            FolderCoverHeight
         }
-    }
-
-    val heroHeight = with(density) { heroHeightPx.toDp() }
-    val heroCollapseFraction = if (coverImageUrl == null || maxHeroHeightPx == 0f) {
-        1f
-    } else {
-        1f - (heroHeightPx / maxHeroHeightPx)
-    }
-    val contentModifier = if (coverImageUrl != null) {
-        Modifier.nestedScroll(heroScrollConnection)
-    } else {
-        Modifier
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
-    ) {
-        if (coverImageUrl != null && heroHeight > 0.dp) {
-            FolderCoverImage(
-                imageUrl = coverImageUrl,
-                title = folder?.title.orEmpty(),
-                modifier = Modifier.height(heroHeight),
-            )
+        val maxHeroHeightPx = with(density) { bannerHeight.toPx() }
+        var heroHeightPx by remember(coverImageUrl, maxHeroHeightPx) {
+            mutableFloatStateOf(if (coverImageUrl != null) maxHeroHeightPx else 0f)
         }
 
-        NuvioScreenHeader(
-            title = folder?.title ?: uiState.collectionTitle,
-            modifier = Modifier.padding(horizontal = 16.dp),
-            includeStatusBarPadding = coverImageUrl == null,
-            topPadding = if (coverImageUrl != null) {
-                statusBarTop * heroCollapseFraction
-            } else {
-                null
-            },
-            onBack = onBack,
-        )
+        val heroScrollConnection = remember(coverImageUrl, maxHeroHeightPx) {
+            object : NestedScrollConnection {
+                fun consumeHeroDelta(deltaY: Float): Float {
+                    if (coverImageUrl == null || deltaY == 0f) return 0f
+                    val previousHeight = heroHeightPx
+                    val nextHeight = (previousHeight + deltaY).coerceIn(0f, maxHeroHeightPx)
+                    heroHeightPx = nextHeight
+                    return nextHeight - previousHeight
+                }
 
-        if (folder == null && !uiState.isLoading) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = stringResource(Res.string.collections_folder_not_found),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                    if (available.y >= 0f) return Offset.Zero
+                    return Offset(x = 0f, y = consumeHeroDelta(available.y))
+                }
+
+                override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                    if (available.y <= 0f) return Offset.Zero
+                    return Offset(x = 0f, y = consumeHeroDelta(available.y))
+                }
+            }
+        }
+
+        val heroHeight = with(density) { heroHeightPx.toDp() }
+        val heroCollapseFraction = if (coverImageUrl == null || maxHeroHeightPx == 0f) {
+            1f
+        } else {
+            1f - (heroHeightPx / maxHeroHeightPx)
+        }
+        val contentModifier = if (coverImageUrl != null) {
+            Modifier.nestedScroll(heroScrollConnection)
+        } else {
+            Modifier
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+        ) {
+            if (coverImageUrl != null && heroHeight > 0.dp) {
+                FolderCoverImage(
+                    imageUrl = coverImageUrl,
+                    logoUrl = bannerLogoUrl,
+                    title = folder?.title.orEmpty(),
+                    fullHeight = bannerHeight,
+                    fadeIntoBackground = bannerBackdropUrl != null,
+                    modifier = Modifier.height(heroHeight),
                 )
             }
-            return@Column
-        }
 
-        when (uiState.viewMode) {
-            FolderViewMode.TABBED_GRID -> TabbedGridContent(
-                sessionKey = entryKey,
-                resetToTop = isFreshEntry,
-                uiState = uiState,
-                watchedKeys = watchedUiState.watchedKeys,
-                modifier = Modifier.weight(1f).then(contentModifier),
-                onTabSelected = { FolderDetailRepository.selectTab(it) },
-                onPosterClick = onPosterClick,
-                onPosterLongClick = onPosterLongClick,
+            NuvioScreenHeader(
+                title = folder?.title ?: uiState.collectionTitle,
+                modifier = Modifier.padding(horizontal = 16.dp),
+                includeStatusBarPadding = coverImageUrl == null,
+                topPadding = if (coverImageUrl != null) {
+                    statusBarTop * heroCollapseFraction
+                } else {
+                    null
+                },
+                onBack = onBack,
             )
-            FolderViewMode.ROWS -> RowsContent(
-                sessionKey = entryKey,
-                resetToTop = isFreshEntry,
-                uiState = uiState,
-                watchedKeys = watchedUiState.watchedKeys,
-                modifier = Modifier.weight(1f).then(contentModifier),
-                onCatalogClick = onCatalogClick,
-                onPosterClick = onPosterClick,
-                onPosterLongClick = onPosterLongClick,
-            )
-            FolderViewMode.FOLLOW_LAYOUT -> RowsContent(
-                sessionKey = entryKey,
-                resetToTop = isFreshEntry,
-                uiState = uiState,
-                watchedKeys = watchedUiState.watchedKeys,
-                modifier = Modifier.weight(1f).then(contentModifier),
-                onCatalogClick = onCatalogClick,
-                onPosterClick = onPosterClick,
-                onPosterLongClick = onPosterLongClick,
-            )
+
+            if (folder == null && !uiState.isLoading) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = stringResource(Res.string.collections_folder_not_found),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                return@Column
+            }
+
+            // The grid shows a failed source's error in its own tab already; the notice is for the
+            // views that drop failed sources (the rows, and the grid's All tab).
+            if (uiState.viewMode != FolderViewMode.TABBED_GRID || uiState.selectedTab?.isAllTab == true) {
+                FolderSourceFailuresNotice(
+                    failedSources = uiState.failedSources,
+                    modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 8.dp),
+                )
+            }
+
+            when (uiState.viewMode) {
+                FolderViewMode.TABBED_GRID -> TabbedGridContent(
+                    sessionKey = entryKey,
+                    resetToTop = isFreshEntry,
+                    uiState = uiState,
+                    watchedKeys = watchedUiState.watchedKeys,
+                    modifier = Modifier.weight(1f).then(contentModifier),
+                    onTabSelected = { FolderDetailRepository.selectTab(it) },
+                    onPosterClick = onPosterClick,
+                    onPosterLongClick = onPosterLongClick,
+                )
+                FolderViewMode.ROWS -> RowsContent(
+                    sessionKey = entryKey,
+                    resetToTop = isFreshEntry,
+                    uiState = uiState,
+                    sections = collectionSections,
+                    rowShuffle = rowShuffle,
+                    watchedKeys = watchedUiState.watchedKeys,
+                    modifier = Modifier.weight(1f).then(contentModifier),
+                    onCatalogClick = onCatalogClick,
+                    onPosterClick = onPosterClick,
+                    onPosterLongClick = onPosterLongClick,
+                )
+                FolderViewMode.FOLLOW_LAYOUT -> RowsContent(
+                    sessionKey = entryKey,
+                    resetToTop = isFreshEntry,
+                    uiState = uiState,
+                    sections = collectionSections,
+                    rowShuffle = rowShuffle,
+                    watchedKeys = watchedUiState.watchedKeys,
+                    modifier = Modifier.weight(1f).then(contentModifier),
+                    onCatalogClick = onCatalogClick,
+                    onPosterClick = onPosterClick,
+                    onPosterLongClick = onPosterLongClick,
+                )
+            }
         }
     }
 }
 
 
+private fun HomeTvKey.movesTvFocus(): Boolean = when (this) {
+    HomeTvKey.Down, HomeTvKey.Up, HomeTvKey.Left, HomeTvKey.Right,
+    HomeTvKey.PageDown, HomeTvKey.PageUp, HomeTvKey.Home, HomeTvKey.End -> true
+    else -> false
+}
+
 // 1-based position of each rendered collection row, mirroring Home's optional "Trending • 3"
 // header suffix (HomeCatalogSettings.catalogRowNumbersEnabled). Rows that render nothing take no
 // number, so the sequence matches what the user actually sees.
+/** One frame's view of [FolderRowShuffleState], so the three row layouts wire shuffle the same way. */
+private class FolderRowShuffleUi(
+    val enabled: Boolean,
+    private val orders: Map<String, HomeRowShuffleOrder>,
+    private val shufflingKeys: Set<String>,
+) {
+    fun clickFor(section: HomeCatalogSection): (() -> Unit)? =
+        if (enabled && section.canShuffleRow()) {
+            { FolderRowShuffleState.shuffle(section.key) }
+        } else {
+            null
+        }
+
+    fun isShuffling(section: HomeCatalogSection): Boolean = enabled && section.key in shufflingKeys
+
+    fun generation(section: HomeCatalogSection): Int =
+        if (enabled) orders[section.key]?.generation ?: 0 else 0
+}
+
 private fun collectionRowNumbers(sections: List<HomeCatalogSection>): Map<String, Int> =
     buildMap {
         var nextRowNumber = 1
@@ -445,6 +561,7 @@ private fun collectionRowNumbers(sections: List<HomeCatalogSection>): Map<String
 private fun ImmersiveCollectionContent(
     sessionKey: String,
     sections: List<HomeCatalogSection>,
+    rowShuffle: FolderRowShuffleUi,
     watchedKeys: Set<String>,
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
@@ -459,12 +576,22 @@ private fun ImmersiveCollectionContent(
     val restoredPosition = remember(sessionKey) { FolderScrollMemory.position(sessionKey) }
     var activeRowIndex by remember(sessionKey) { mutableIntStateOf(restoredPosition.rowIndex) }
     var activeItemIndex by remember(sessionKey) { mutableIntStateOf(restoredPosition.itemIndex) }
+    // The cursor is still wherever the user clicked to get here. Coming from TV Mode Home that is
+    // the collection tile in Home's bottom shelf, which is exactly where this screen's shelf draws,
+    // so the synthetic hover Enter for the poster now under it moved focus off the first item (or
+    // off the restored one on return from details). Same guard as AdaptiveCollectionContent: hover
+    // only counts once the mouse genuinely moves.
+    val mouseActivity = rememberMouseActivityState(startInactive = true)
+    val rowStates = remember(sessionKey) { mutableMapOf<String, LazyListState>() }
+    val rowDirection = remember { ImmersiveRowDirection() }
     var wheelLocked by remember { mutableStateOf(false) }
     var backButtonHovered by remember { mutableStateOf(false) }
     var activeHeroBackdrop by remember { mutableStateOf<String?>(null) }
     var activeHeroAccent by remember { mutableStateOf<Color?>(null) }
     val homeSettings by HomeCatalogSettingsRepository.uiState.collectAsStateWithLifecycle()
-    val ambientBackgroundEnabled = homeSettings.heroAmbientBackgroundEnabled
+    // Each mode's own ambient toggle, read only while that mode is active.
+    val tvAmbientBackgroundEnabled = homeSettings.tvModeEnabled && homeSettings.tvAmbientBackgroundEnabled
+    val ambientBackgroundEnabled = homeSettings.adaptiveAmbientActive || tvAmbientBackgroundEnabled
     val catalogSeeMoreEnabled = homeSettings.catalogSeeMoreEnabled
     val heroTrailerShowing by HomeHeroTrailerManualTrigger.active.collectAsStateWithLifecycle()
     val backButtonAlpha by animateFloatAsState(
@@ -537,228 +664,317 @@ private fun ImmersiveCollectionContent(
     // must still resolve to a real item instead of going null and freezing the hero on
     // whatever the pager last showed.
     val focusedItem = activeRowEntries.getOrNull(activeItemIndex)
+    // The hero and its enrichment follow focus once it stops moving (rememberSettledHeroFocus):
+    // with a key held, the enrichment window was rebuilt per step and restarted the lookups of
+    // titles still in it (2026-10-19: one title's external_ids started and cancelled 26 times in
+    // a second). Select still acts on the live focusedItem.
+    val heroFocus = rememberSettledHeroFocus(activeItemIndex to focusedItem)
+    val heroEnrichment = rememberFolderHeroEnrichment(sessionKey, activeRowEntries, heroFocus.first)
+    val heroFocusedItem = heroFocus.second?.withFolderHeroEnrichment(heroEnrichment)
+    val selectHold = rememberHoldToSelectState()
 
     // Mirrors HomeScreen's handleHomeTvKey: a shared handler so the same navigation works
     // whether Compose still owns keyboard focus or the native hero-trailer surface has
     // grabbed it (in which case keys arrive via HomeTvKeyboardBridge instead).
-    fun handleTvKey(key: HomeTvKey): Boolean = when (key) {
-        HomeTvKey.Down -> {
-            activeRowIndex = (activeRowIndex + 1).coerceAtMost(sections.lastIndex)
-            activeItemIndex = activeItemIndex.coerceIn(
-                0,
-                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
-            )
-            true
-        }
-        HomeTvKey.Up -> {
-            activeRowIndex = (activeRowIndex - 1).coerceAtLeast(0)
-            activeItemIndex = activeItemIndex.coerceIn(
-                0,
-                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
-            )
-            true
-        }
-        HomeTvKey.Right -> {
-            activeItemIndex = (activeItemIndex + 1).coerceAtMost((activeRowEntries.size - 1).coerceAtLeast(0))
-            true
-        }
-        HomeTvKey.Left -> {
-            activeItemIndex = (activeItemIndex - 1).coerceAtLeast(0)
-            true
-        }
-        // TV mode shows one row at a time, so a page is a run of posters along it.
-        HomeTvKey.PageDown, HomeTvKey.PageUp -> {
-            val delta = if (key == HomeTvKey.PageDown) PAGE_ITEM_STEP else -PAGE_ITEM_STEP
-            activeItemIndex = (activeItemIndex + delta)
-                .coerceIn(0, (activeRowEntries.size - 1).coerceAtLeast(0))
-            true
-        }
-        HomeTvKey.Home, HomeTvKey.End -> {
-            activeRowIndex = if (key == HomeTvKey.Home) 0 else sections.lastIndex.coerceAtLeast(0)
-            activeItemIndex = 0
-            true
-        }
-        HomeTvKey.Select -> {
-            focusedItem?.let(onPosterClick)
-            true
-        }
-        HomeTvKey.ToggleTrailer -> {
-            HomeHeroTrailerManualTrigger.trigger()
-            true
-        }
-        HomeTvKey.Dismiss -> {
-            if (heroTrailerShowing) {
+    fun handleTvKey(key: HomeTvKey): Boolean {
+        // A stationary cursor must not pull focus back from where the keys just moved it.
+        if (key.movesTvFocus()) mouseActivity.onKeyboardNavigation()
+        return when (key) {
+            HomeTvKey.Down -> {
+                activeRowIndex = (activeRowIndex + 1).coerceAtMost(sections.lastIndex)
+                activeItemIndex = activeItemIndex.coerceIn(
+                    0,
+                    (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                )
+                true
+            }
+            HomeTvKey.Up -> {
+                activeRowIndex = (activeRowIndex - 1).coerceAtLeast(0)
+                activeItemIndex = activeItemIndex.coerceIn(
+                    0,
+                    (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                )
+                true
+            }
+            HomeTvKey.Right -> {
+                activeItemIndex = (activeItemIndex + 1).coerceAtMost((activeRowEntries.size - 1).coerceAtLeast(0))
+                true
+            }
+            HomeTvKey.Left -> {
+                activeItemIndex = (activeItemIndex - 1).coerceAtLeast(0)
+                true
+            }
+            // TV mode shows one row at a time, so a page is a run of posters along it.
+            HomeTvKey.PageDown, HomeTvKey.PageUp -> {
+                val delta = if (key == HomeTvKey.PageDown) PAGE_ITEM_STEP else -PAGE_ITEM_STEP
+                activeItemIndex = (activeItemIndex + delta)
+                    .coerceIn(0, (activeRowEntries.size - 1).coerceAtLeast(0))
+                true
+            }
+            HomeTvKey.Home, HomeTvKey.End -> {
+                activeRowIndex = if (key == HomeTvKey.Home) 0 else sections.lastIndex.coerceAtLeast(0)
+                activeItemIndex = 0
+                true
+            }
+            HomeTvKey.Select -> {
+                focusedItem?.let(onPosterClick)
+                true
+            }
+            HomeTvKey.ToggleTrailer -> {
                 HomeHeroTrailerManualTrigger.trigger()
                 true
-            } else {
-                false
             }
+            HomeTvKey.Dismiss -> {
+                if (heroTrailerShowing) {
+                    HomeHeroTrailerManualTrigger.trigger()
+                    true
+                } else {
+                    false
+                }
+            }
+            HomeTvKey.ToggleMute, HomeTvKey.VolumeDown, HomeTvKey.VolumeUp,
+            HomeTvKey.TogglePeoplePanel, HomeTvKey.Search, HomeTvKey.Library -> false
         }
-        HomeTvKey.ToggleMute, HomeTvKey.VolumeDown, HomeTvKey.VolumeUp,
-        HomeTvKey.TogglePeoplePanel, HomeTvKey.Search, HomeTvKey.Library -> false
     }
     val latestTvKeyHandler = rememberUpdatedState<(HomeTvKey) -> Boolean>(::handleTvKey)
     LaunchedEffect(Unit) {
         HomeTvKeyboardBridge.keys.collect { key -> latestTvKeyHandler.value(key) }
     }
 
-    BoxWithConstraints(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(if (ambientBackgroundEnabled) Color.Transparent else MaterialTheme.colorScheme.background)
-            .focusRequester(focusRequester)
-            .focusable()
-            .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { _ ->
-                try { focusRequester.requestFocus() } catch (_: Exception) {}
-            }
-            .onPointerEvent(PointerEventType.Scroll) { event ->
-                val change = event.changes.firstOrNull() ?: return@onPointerEvent
-                val direction = change.scrollDelta.y.compareTo(0f)
-                if (direction != 0) {
-                    change.consume()
-                    if (!wheelLocked) {
-                        wheelLocked = true
-                        activeRowIndex = (activeRowIndex + direction).coerceIn(0, sections.lastIndex)
-                        activeItemIndex = activeItemIndex.coerceIn(
-                            0,
-                            (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+    // Tells the hero inside that this view already corrects it; see HdrFadeCorrected.
+    CompositionLocalProvider(LocalHdrFadeCorrected provides true) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                // The TV-style view as one picture for Windows HDR; see HomeScreen's TV shelf.
+                .nuvioHdrFadeCorrection(Color.Black)
+                .background(if (ambientBackgroundEnabled) Color.Transparent else MaterialTheme.colorScheme.background)
+                .focusRequester(focusRequester)
+                .focusable()
+                .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { _ ->
+                    focusRequester.requestFocusLogged()
+                }
+                .onPointerEvent(PointerEventType.Move, PointerEventPass.Initial) { event ->
+                    mouseActivity.onMouseMoved(event.changes.first().position)
+                }
+                // Initial pass so isMouseActive is settled before the poster's own Enter handler runs.
+                .onPointerEvent(PointerEventType.Enter, PointerEventPass.Initial) { event ->
+                    mouseActivity.onMouseMoved(event.changes.first().position)
+                }
+                .onPointerEvent(PointerEventType.Scroll) { event ->
+                    val change = event.changes.firstOrNull() ?: return@onPointerEvent
+                    val direction = change.scrollDelta.y.compareTo(0f)
+                    if (direction != 0) {
+                        change.consume()
+                        if (!wheelLocked) {
+                            wheelLocked = true
+                            activeRowIndex = (activeRowIndex + direction).coerceIn(0, sections.lastIndex)
+                            activeItemIndex = activeItemIndex.coerceIn(
+                                0,
+                                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                            )
+                            coroutineScope.launch {
+                                delay(220)
+                                wheelLocked = false
+                            }
+                        }
+                    }
+                }
+                .onPreviewKeyEvent { event ->
+                    val selectKey = event.navigationKey()
+                    if (selectKey == Key.Enter || selectKey == Key.NumPadEnter) {
+                        val item = focusedItem
+                        return@onPreviewKeyEvent selectHold.handle(
+                            event = event,
+                            onSelect = { handleTvKey(HomeTvKey.Select) },
+                            onHold = item?.let { focused ->
+                                onPosterLongClick?.let { longPress -> { longPress(focused) } }
+                            },
                         )
-                        coroutineScope.launch {
-                            delay(220)
-                            wheelLocked = false
+                    }
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.navigationKey()) {
+                        Key.Backspace -> {
+                            // Dismiss first, navigate second — see HomeScreen. A controller has one B
+                            // button where the keyboard has Escape and Backspace.
+                            if (!handleTvKey(HomeTvKey.Dismiss)) onBack()
+                            true
+                        }
+                        Key.DirectionDown -> handleTvKey(HomeTvKey.Down)
+                        Key.DirectionUp -> handleTvKey(HomeTvKey.Up)
+                        Key.DirectionRight -> handleTvKey(HomeTvKey.Right)
+                        Key.DirectionLeft -> handleTvKey(HomeTvKey.Left)
+                        Key.PageDown -> handleTvKey(HomeTvKey.PageDown)
+                        Key.PageUp -> handleTvKey(HomeTvKey.PageUp)
+                        Key.MoveHome -> handleTvKey(HomeTvKey.Home)
+                        Key.MoveEnd -> handleTvKey(HomeTvKey.End)
+                        Key.T -> handleTvKey(HomeTvKey.ToggleTrailer)
+                        Key.Escape -> handleTvKey(HomeTvKey.Dismiss)
+                        else -> false
+                    }
+                },
+        ) {
+            if (ambientBackgroundEnabled) {
+                HeroAmbientBackdrop(
+                    backdrop = activeHeroBackdrop,
+                    accent = activeHeroAccent,
+                    onAccentChanged = { activeHeroAccent = it },
+                    label = "collection_hero_ambient_background",
+                )
+            }
+
+            val posterCardStyle = rememberHomePosterCardStyleUiState()
+            val landscapeMode = posterCardStyle.catalogLandscapeModeEnabled
+            val shelfHeight = immersiveShelfHeightDp(
+                viewportHeightDp = maxHeight.value,
+                landscapeMode = landscapeMode,
+            ).dp
+            val shelfPosterBaseWidthDp = remember(maxWidth, shelfHeight, landscapeMode) {
+                immersiveCatalogPosterBaseWidthDp(
+                    maxWidthDp = maxWidth.value,
+                    shelfHeightDp = shelfHeight.value,
+                    sectionPaddingDp = homeSectionHorizontalPaddingForWidth(maxWidth.value).value,
+                    hideLabels = true,
+                    landscapeMode = landscapeMode,
+                )
+            }
+            HomeHeroSection(
+                items = activeEntries.take(FolderAdaptiveHeroItemLimit).map { it.withFolderHeroEnrichment(heroEnrichment) },
+                focusedItem = heroFocusedItem,
+                metadataPrefetchItems = metadataPrefetchItems,
+                heightOverride = maxHeight,
+                roundedBottomCorners = false,
+                immersiveMode = true,
+                // This folder view is the TV-style immersive layout wherever it is opened from, so it
+                // follows the same backdrop choice. The toggle only appears while the home display mode
+                // is TV Mode, so nobody who has not deliberately chosen this look ever sees it here.
+                immersiveFullBackdrop = homeSettings.tvFullBackdropEnabled,
+                // Dissolve into the ambient wash rather than fading to black, as TV Home does.
+                ambientBackground = tvAmbientBackgroundEnabled,
+                heroInfoLines = homeSettings.heroInfoLines,
+                heroInfoPriority = homeSettings.heroInfoPriority,
+                heroBadgePlacement = homeSettings.heroBadgePlacement,
+                heroReleaseStatusUnavailableOnly = homeSettings.heroReleaseStatusUnavailableOnly,
+                immersiveContentBottomPadding = shelfHeight - 20.dp,
+                onActiveItemChanged = { item ->
+                    activeHeroBackdrop = item.banner ?: item.poster
+                },
+                onCastClick = onCastClick,
+                onBadgeClick = onBadgeClick,
+                onItemClick = onPosterClick,
+            )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(shelfHeight)
+                    .align(Alignment.BottomStart)
+                    .background(
+                        nuvioDitheredVerticalGradient(
+                            immersiveShelfScrimStops(
+                                // Black to match the hero's fade, as on Home's TV shelf; the
+                                // ambient background keeps the theme colour it was tuned against.
+                                backgroundColor = if (ambientBackgroundEnabled) {
+                                    MaterialTheme.colorScheme.background
+                                } else {
+                                    Color.Black
+                                },
+                                fullBackdrop = homeSettings.tvFullBackdropEnabled,
+                                ambientBackgroundEnabled = ambientBackgroundEnabled,
+                            ),
+                        ),
+                    )
+                    // Bottom padding lives inside each row; see immersiveRowFadeBounds.
+                    .padding(top = 68.dp),
+                contentAlignment = if (landscapeMode) Alignment.BottomStart else Alignment.TopStart,
+            ) {
+                // One composition per row, keyed by the row, as Home's TV shelf does. A single shared
+                // LazyRow fed each row in turn diffed the new row's posters against the old one's:
+                // animateItem slid and cross-faded them across each other on every row change, and
+                // the focused slot's per-item state (the depth border, the sweep) carried over from
+                // whatever poster last sat in it until it caught up a few frames later.
+                rowDirection.observe(activeRowIndex)
+                AnimatedContent(
+                    targetState = activeRowIndex,
+                    transitionSpec = { immersiveRowTransition(homeSettings.tvRowTransition) },
+                    contentAlignment = if (landscapeMode) Alignment.BottomStart else Alignment.TopStart,
+                    label = "collection_immersive_row",
+                ) { rowIndex ->
+                    val section = sections.getOrNull(rowIndex) ?: return@AnimatedContent
+                    val isActiveRow = rowIndex == activeRowIndex
+                    val usesInfiniteScroll = section.usesInfiniteHomeRow(catalogSeeMoreEnabled)
+                    val rowEntries = if (usesInfiniteScroll) {
+                        section.items
+                    } else {
+                        section.items.take(FolderCatalogPreviewLimit)
+                    }
+                    val rowBodyModifier = if (homeSettings.tvRowTransition == HomeTvRowTransition.FadeNudge) {
+                        Modifier.animateEnterExit(
+                            enter = immersiveRowBodyEnter(rowDirection.forward),
+                            exit = immersiveRowBodyExit(rowDirection.forward),
+                            label = "collection_immersive_row_body",
+                        )
+                    } else {
+                        Modifier
+                    }
+                    Box(modifier = Modifier.immersiveRowFadeBounds()) {
+                        androidx.compose.runtime.key(section.key) {
+                            HomeCatalogRowSection(
+                                section = section,
+                                entries = rowEntries,
+                                watchedKeys = watchedKeys,
+                                basePosterWidthDpOverride = shelfPosterBaseWidthDp,
+                                focusedItemIndex = activeItemIndex,
+                                // Each row keeps its own horizontal position for this visit.
+                                rowState = remember { rowStates.getOrPut(section.key) { LazyListState() } },
+                                // Also stops the row's edge auto-scroll, which otherwise runs under a cursor
+                                // that happens to rest near the shelf's side and drags posters (and focus).
+                                isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                onHoverItem = { itemIndex ->
+                                    // The outgoing row is still hoverable while it fades out.
+                                    if (isActiveRow && mouseActivity.isMouseActive) activeItemIndex = itemIndex
+                                },
+                                onViewAllClick = if (
+                                    !usesInfiniteScroll &&
+                                    section.canOpenCatalog(FolderCatalogPreviewLimit)
+                                ) {
+                                    { onCatalogClick(section) }
+                                } else {
+                                    null
+                                },
+                                onLoadMore = if (usesInfiniteScroll) {
+                                    { FolderDetailRepository.loadMoreCatalogRow(section) }
+                                } else {
+                                    null
+                                },
+                                isLoadingMore = section.isLoadingMore,
+                                onShuffleClick = rowShuffle.clickFor(section),
+                                isShuffling = rowShuffle.isShuffling(section),
+                                shuffleGeneration = rowShuffle.generation(section),
+                                rowNumber = rowNumbers[section.key],
+                                headerTrailingContent = rowDotsContent,
+                                bodyModifier = rowBodyModifier,
+                                onPosterClick = onPosterClick,
+                                onPosterLongClick = onPosterLongClick,
+                            )
                         }
                     }
                 }
             }
-            .onPreviewKeyEvent { event ->
-                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                when (event.navigationKey()) {
-                    Key.Backspace -> {
-                        // Dismiss first, navigate second — see HomeScreen. A controller has one B
-                        // button where the keyboard has Escape and Backspace.
-                        if (!handleTvKey(HomeTvKey.Dismiss)) onBack()
-                        true
-                    }
-                    Key.DirectionDown -> handleTvKey(HomeTvKey.Down)
-                    Key.DirectionUp -> handleTvKey(HomeTvKey.Up)
-                    Key.DirectionRight -> handleTvKey(HomeTvKey.Right)
-                    Key.DirectionLeft -> handleTvKey(HomeTvKey.Left)
-                    Key.PageDown -> handleTvKey(HomeTvKey.PageDown)
-                    Key.PageUp -> handleTvKey(HomeTvKey.PageUp)
-                    Key.MoveHome -> handleTvKey(HomeTvKey.Home)
-                    Key.MoveEnd -> handleTvKey(HomeTvKey.End)
-                    Key.Enter, Key.NumPadEnter -> handleTvKey(HomeTvKey.Select)
-                    Key.T -> handleTvKey(HomeTvKey.ToggleTrailer)
-                    Key.Escape -> handleTvKey(HomeTvKey.Dismiss)
-                    else -> false
-                }
-            },
-    ) {
-        if (ambientBackgroundEnabled) {
-            HeroAmbientBackdrop(
-                backdrop = activeHeroBackdrop,
-                accent = activeHeroAccent,
-                onAccentChanged = { activeHeroAccent = it },
-                label = "collection_hero_ambient_background",
+
+            NuvioBackButton(
+                onClick = onBack,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 20.dp, top = 20.dp)
+                    .size(40.dp)
+                    .onPointerEvent(PointerEventType.Enter) { backButtonHovered = true }
+                    .onPointerEvent(PointerEventType.Exit) { backButtonHovered = false },
+                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backButtonAlpha),
+                contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = backButtonAlpha),
+                iconSize = 24.dp,
             )
         }
-
-        val posterCardStyle = rememberHomePosterCardStyleUiState()
-        val landscapeMode = posterCardStyle.catalogLandscapeModeEnabled
-        val shelfHeight = immersiveShelfHeightDp(
-            viewportHeightDp = maxHeight.value,
-            landscapeMode = landscapeMode,
-        ).dp
-        val shelfPosterBaseWidthDp = remember(maxWidth, shelfHeight, landscapeMode) {
-            immersiveCatalogPosterBaseWidthDp(
-                maxWidthDp = maxWidth.value,
-                shelfHeightDp = shelfHeight.value,
-                sectionPaddingDp = homeSectionHorizontalPaddingForWidth(maxWidth.value).value,
-                hideLabels = true,
-                landscapeMode = landscapeMode,
-            )
-        }
-        HomeHeroSection(
-            items = activeEntries.take(FolderAdaptiveHeroItemLimit),
-            focusedItem = focusedItem,
-            metadataPrefetchItems = metadataPrefetchItems,
-            heightOverride = maxHeight,
-            roundedBottomCorners = false,
-            immersiveMode = true,
-            // This folder view is the TV-style immersive layout wherever it is opened from, so it
-            // follows the same backdrop choice. The toggle only appears while the home display mode
-            // is TV Mode, so nobody who has not deliberately chosen this look ever sees it here.
-            immersiveFullBackdrop = homeSettings.tvFullBackdropEnabled,
-            heroInfoLines = homeSettings.heroInfoLines,
-            heroInfoPriority = homeSettings.heroInfoPriority,
-            heroBadgePlacement = homeSettings.heroBadgePlacement,
-            heroReleaseStatusUnavailableOnly = homeSettings.heroReleaseStatusUnavailableOnly,
-            immersiveContentBottomPadding = shelfHeight - 20.dp,
-            onActiveItemChanged = { item ->
-                activeHeroBackdrop = item.banner ?: item.poster
-            },
-            onCastClick = onCastClick,
-            onBadgeClick = onBadgeClick,
-            onItemClick = onPosterClick,
-        )
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(shelfHeight)
-                .align(Alignment.BottomStart)
-                .background(
-                    Brush.verticalGradient(
-                        colorStops = immersiveShelfScrimStops(
-                            backgroundColor = MaterialTheme.colorScheme.background,
-                            fullBackdrop = homeSettings.tvFullBackdropEnabled,
-                            ambientBackgroundEnabled = ambientBackgroundEnabled,
-                        ),
-                    ),
-                )
-                .padding(top = 68.dp, bottom = 12.dp),
-            contentAlignment = if (landscapeMode) Alignment.BottomStart else Alignment.TopStart,
-        ) {
-            HomeCatalogRowSection(
-                section = activeSection,
-                entries = activeRowEntries,
-                watchedKeys = watchedKeys,
-                basePosterWidthDpOverride = shelfPosterBaseWidthDp,
-                focusedItemIndex = activeItemIndex,
-                onHoverItem = { itemIndex -> activeItemIndex = itemIndex },
-                onViewAllClick = if (
-                    !activeUsesInfiniteScroll &&
-                    activeSection.canOpenCatalog(FolderCatalogPreviewLimit)
-                ) {
-                    { onCatalogClick(activeSection) }
-                } else {
-                    null
-                },
-                onLoadMore = if (activeUsesInfiniteScroll) {
-                    { FolderDetailRepository.loadMoreCatalogRow(activeSection) }
-                } else {
-                    null
-                },
-                isLoadingMore = activeSection.isLoadingMore,
-                rowNumber = rowNumbers[activeSection.key],
-                headerTrailingContent = rowDotsContent,
-                onPosterClick = onPosterClick,
-                onPosterLongClick = onPosterLongClick,
-            )
-        }
-
-        NuvioBackButton(
-            onClick = onBack,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 20.dp, top = 20.dp)
-                .size(40.dp)
-                .onPointerEvent(PointerEventType.Enter) { backButtonHovered = true }
-                .onPointerEvent(PointerEventType.Exit) { backButtonHovered = false },
-            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backButtonAlpha),
-            contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = backButtonAlpha),
-            iconSize = 24.dp,
-        )
     }
 }
 
@@ -767,6 +983,8 @@ private fun ImmersiveCollectionContent(
 private fun AdaptiveCollectionContent(
     sessionKey: String,
     sections: List<HomeCatalogSection>,
+    rowShuffle: FolderRowShuffleUi,
+    failedSources: List<FolderTab>,
     watchedKeys: Set<String>,
     onBack: () -> Unit,
     onCatalogClick: (HomeCatalogSection) -> Unit,
@@ -793,12 +1011,12 @@ private fun AdaptiveCollectionContent(
     // screen look like it didn't open at the start. Arm ignoreNextMouseMove synchronously
     // (mirrors HomeScreen's native-surface-disposal guard) so that first synthetic event is
     // swallowed; a genuine mouse move afterwards re-activates hover normally.
-    val mouseActivity = remember { MouseActivityState().apply { onKeyboardNavigation(ignoreNextMouseMove = true) } }
+    val mouseActivity = rememberMouseActivityState(startInactive = true)
     var backButtonHovered by remember { mutableStateOf(false) }
     var activeHeroBackdrop by remember { mutableStateOf<String?>(null) }
     var activeHeroAccent by remember { mutableStateOf<Color?>(null) }
     val homeSettings by HomeCatalogSettingsRepository.uiState.collectAsStateWithLifecycle()
-    val ambientBackgroundEnabled = homeSettings.heroAmbientBackgroundEnabled
+    val ambientBackgroundEnabled = homeSettings.adaptiveAmbientActive
     val catalogSeeMoreEnabled = homeSettings.catalogSeeMoreEnabled
     val heroTrailerShowing by HomeHeroTrailerManualTrigger.active.collectAsStateWithLifecycle()
     val backButtonAlpha by animateFloatAsState(
@@ -857,72 +1075,84 @@ private fun AdaptiveCollectionContent(
     // must still resolve to a real item instead of going null and freezing the hero on
     // whatever the pager last showed.
     val focusedItem = activeRowEntries.getOrNull(activeItemIndex)
+    // The hero and its enrichment follow focus once it stops moving (rememberSettledHeroFocus):
+    // with a key held, the enrichment window was rebuilt per step and restarted the lookups of
+    // titles still in it (2026-10-19: one title's external_ids started and cancelled 26 times in
+    // a second). Select still acts on the live focusedItem.
+    val heroFocus = rememberSettledHeroFocus(activeItemIndex to focusedItem)
+    val heroEnrichment = rememberFolderHeroEnrichment(sessionKey, activeRowEntries, heroFocus.first)
+    val heroFocusedItem = heroFocus.second?.withFolderHeroEnrichment(heroEnrichment)
+    val selectHold = rememberHoldToSelectState()
 
     // Mirrors HomeScreen's handleHomeTvKey: a shared handler so the same navigation works
     // whether Compose still owns keyboard focus or the native hero-trailer surface has
     // grabbed it (in which case keys arrive via HomeTvKeyboardBridge instead).
-    fun handleTvKey(key: HomeTvKey): Boolean = when (key) {
-        HomeTvKey.Down -> {
-            activeRowIndex = (activeRowIndex + 1).coerceAtMost(sections.lastIndex)
-            activeItemIndex = activeItemIndex.coerceIn(
-                0,
-                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
-            )
-            coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
-            true
-        }
-        HomeTvKey.Up -> {
-            activeRowIndex = (activeRowIndex - 1).coerceAtLeast(0)
-            activeItemIndex = activeItemIndex.coerceIn(
-                0,
-                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
-            )
-            coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
-            true
-        }
-        HomeTvKey.Right -> {
-            activeItemIndex = (activeItemIndex + 1).coerceAtMost((activeRowEntries.size - 1).coerceAtLeast(0))
-            true
-        }
-        HomeTvKey.Left -> {
-            activeItemIndex = (activeItemIndex - 1).coerceAtLeast(0)
-            true
-        }
-        // Everywhere else the folder is a vertical list of rows, so a page is a run of rows.
-        HomeTvKey.PageDown, HomeTvKey.PageUp -> {
-            val delta = if (key == HomeTvKey.PageDown) PAGE_SECTION_STEP else -PAGE_SECTION_STEP
-            activeRowIndex = (activeRowIndex + delta).coerceIn(0, sections.lastIndex.coerceAtLeast(0))
-            activeItemIndex = activeItemIndex.coerceIn(
-                0,
-                (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
-            )
-            coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
-            true
-        }
-        HomeTvKey.Home, HomeTvKey.End -> {
-            activeRowIndex = if (key == HomeTvKey.Home) 0 else sections.lastIndex.coerceAtLeast(0)
-            activeItemIndex = 0
-            coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
-            true
-        }
-        HomeTvKey.Select -> {
-            focusedItem?.let(onPosterClick)
-            true
-        }
-        HomeTvKey.ToggleTrailer -> {
-            HomeHeroTrailerManualTrigger.trigger()
-            true
-        }
-        HomeTvKey.Dismiss -> {
-            if (heroTrailerShowing) {
+    fun handleTvKey(key: HomeTvKey): Boolean {
+        // A stationary cursor must not pull focus back from where the keys just moved it.
+        if (key.movesTvFocus()) mouseActivity.onKeyboardNavigation()
+        return when (key) {
+            HomeTvKey.Down -> {
+                activeRowIndex = (activeRowIndex + 1).coerceAtMost(sections.lastIndex)
+                activeItemIndex = activeItemIndex.coerceIn(
+                    0,
+                    (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                )
+                coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
+                true
+            }
+            HomeTvKey.Up -> {
+                activeRowIndex = (activeRowIndex - 1).coerceAtLeast(0)
+                activeItemIndex = activeItemIndex.coerceIn(
+                    0,
+                    (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                )
+                coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
+                true
+            }
+            HomeTvKey.Right -> {
+                activeItemIndex = (activeItemIndex + 1).coerceAtMost((activeRowEntries.size - 1).coerceAtLeast(0))
+                true
+            }
+            HomeTvKey.Left -> {
+                activeItemIndex = (activeItemIndex - 1).coerceAtLeast(0)
+                true
+            }
+            // Everywhere else the folder is a vertical list of rows, so a page is a run of rows.
+            HomeTvKey.PageDown, HomeTvKey.PageUp -> {
+                val delta = if (key == HomeTvKey.PageDown) PAGE_SECTION_STEP else -PAGE_SECTION_STEP
+                activeRowIndex = (activeRowIndex + delta).coerceIn(0, sections.lastIndex.coerceAtLeast(0))
+                activeItemIndex = activeItemIndex.coerceIn(
+                    0,
+                    (sections[activeRowIndex].items.size - 1).coerceAtLeast(0),
+                )
+                coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
+                true
+            }
+            HomeTvKey.Home, HomeTvKey.End -> {
+                activeRowIndex = if (key == HomeTvKey.Home) 0 else sections.lastIndex.coerceAtLeast(0)
+                activeItemIndex = 0
+                coroutineScope.launch { lazyListState.animateScrollToItem(activeRowIndex) }
+                true
+            }
+            HomeTvKey.Select -> {
+                focusedItem?.let(onPosterClick)
+                true
+            }
+            HomeTvKey.ToggleTrailer -> {
                 HomeHeroTrailerManualTrigger.trigger()
                 true
-            } else {
-                false
             }
+            HomeTvKey.Dismiss -> {
+                if (heroTrailerShowing) {
+                    HomeHeroTrailerManualTrigger.trigger()
+                    true
+                } else {
+                    false
+                }
+            }
+            HomeTvKey.ToggleMute, HomeTvKey.VolumeDown, HomeTvKey.VolumeUp,
+            HomeTvKey.TogglePeoplePanel, HomeTvKey.Search, HomeTvKey.Library -> false
         }
-        HomeTvKey.ToggleMute, HomeTvKey.VolumeDown, HomeTvKey.VolumeUp,
-        HomeTvKey.TogglePeoplePanel, HomeTvKey.Search, HomeTvKey.Library -> false
     }
     val latestTvKeyHandler = rememberUpdatedState<(HomeTvKey) -> Boolean>(::handleTvKey)
     LaunchedEffect(Unit) {
@@ -936,7 +1166,7 @@ private fun AdaptiveCollectionContent(
             .focusRequester(focusRequester)
             .focusable()
             .onPointerEvent(PointerEventType.Press, PointerEventPass.Initial) { _ ->
-                try { focusRequester.requestFocus() } catch (_: Exception) {}
+                focusRequester.requestFocusLogged()
             }
             .onPointerEvent(PointerEventType.Move, PointerEventPass.Initial) { event ->
                 mouseActivity.onMouseMoved(event.changes.first().position)
@@ -947,6 +1177,17 @@ private fun AdaptiveCollectionContent(
                 mouseActivity.onMouseMoved(event.changes.first().position)
             }
             .onPreviewKeyEvent { event ->
+                val selectKey = event.navigationKey()
+                if (selectKey == Key.Enter || selectKey == Key.NumPadEnter) {
+                    val item = focusedItem
+                    return@onPreviewKeyEvent selectHold.handle(
+                        event = event,
+                        onSelect = { handleTvKey(HomeTvKey.Select) },
+                        onHold = item?.let { focused ->
+                            onPosterLongClick?.let { longPress -> { longPress(focused) } }
+                        },
+                    )
+                }
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.navigationKey()) {
                     Key.Backspace -> {
@@ -961,7 +1202,6 @@ private fun AdaptiveCollectionContent(
                     Key.PageUp -> handleTvKey(HomeTvKey.PageUp)
                     Key.MoveHome -> handleTvKey(HomeTvKey.Home)
                     Key.MoveEnd -> handleTvKey(HomeTvKey.End)
-                    Key.Enter, Key.NumPadEnter -> handleTvKey(HomeTvKey.Select)
                     Key.T -> handleTvKey(HomeTvKey.ToggleTrailer)
                     Key.Escape -> handleTvKey(HomeTvKey.Dismiss)
                     else -> false
@@ -977,79 +1217,107 @@ private fun AdaptiveCollectionContent(
             )
         }
 
-        Column(modifier = Modifier.fillMaxSize()) {
-            Box {
-                HomeHeroSection(
-                    items = activeEntries.take(FolderAdaptiveHeroItemLimit),
-                    focusedItem = focusedItem,
-                    metadataPrefetchItems = metadataPrefetchItems,
-                    viewportHeight = FolderAdaptiveHeroHeightFallback,
-                    roundedBottomCorners = false,
-                    adaptiveHeroMode = true,
-                    heroInfoLines = homeSettings.heroInfoLines,
-                    heroInfoPriority = homeSettings.heroInfoPriority,
-                    heroBadgePlacement = homeSettings.heroBadgePlacement,
-                    heroReleaseStatusUnavailableOnly = homeSettings.heroReleaseStatusUnavailableOnly,
-                    onActiveItemChanged = { item ->
-                        activeHeroBackdrop = item.banner ?: item.poster
-                    },
-                    onCastClick = onCastClick,
-                    onBadgeClick = onBadgeClick,
-                    onItemClick = onPosterClick,
-                )
-                NuvioBackButton(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(start = 20.dp, top = 20.dp)
-                        .size(40.dp)
-                        .onPointerEvent(PointerEventType.Enter) { backButtonHovered = true }
-                        .onPointerEvent(PointerEventType.Exit) { backButtonHovered = false },
-                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backButtonAlpha),
-                    contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = backButtonAlpha),
-                    iconSize = 24.dp,
-                )
-            }
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            // Sized, padded and faded exactly as Home's Adaptive hero, so opening a collection keeps
+            // the hero the user set up there: same height slider, same row-aligned text, and with the
+            // ambient background on it fades into the wash instead of ending on a hard black edge.
+            val heroLayout = homeHeroLayout(
+                maxWidthDp = maxWidth.value,
+                viewportHeightDp = maxHeight.value,
+                preferDesktopLayout = true,
+                heightMultiplier = homeSettings.adaptiveHeroHeightMultiplier,
+            )
+            val sectionPadding = homeSectionHorizontalPaddingForWidth(maxWidth.value)
+            val viewportHeight = maxHeight
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box {
+                    HomeHeroSection(
+                        items = activeEntries.take(FolderAdaptiveHeroItemLimit).map { it.withFolderHeroEnrichment(heroEnrichment) },
+                        focusedItem = heroFocusedItem,
+                        metadataPrefetchItems = metadataPrefetchItems,
+                        viewportHeight = viewportHeight,
+                        sectionPadding = sectionPadding,
+                        heightOverride = heroLayout.heroHeight,
+                        roundedBottomCorners = !ambientBackgroundEnabled,
+                        adaptiveHeroMode = true,
+                        ambientBackground = ambientBackgroundEnabled,
+                        heroInfoLines = homeSettings.heroInfoLines,
+                        heroInfoPriority = homeSettings.heroInfoPriority,
+                        heroBadgePlacement = homeSettings.heroBadgePlacement,
+                        heroReleaseStatusUnavailableOnly = homeSettings.heroReleaseStatusUnavailableOnly,
+                        onActiveItemChanged = { item ->
+                            activeHeroBackdrop = item.banner ?: item.poster
+                        },
+                        onCastClick = onCastClick,
+                        onBadgeClick = onBadgeClick,
+                        onItemClick = onPosterClick,
+                    )
+                    NuvioBackButton(
+                        onClick = onBack,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(start = 20.dp, top = 20.dp)
+                            .size(40.dp)
+                            .onPointerEvent(PointerEventType.Enter) { backButtonHovered = true }
+                            .onPointerEvent(PointerEventType.Exit) { backButtonHovered = false },
+                        containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backButtonAlpha),
+                        contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = backButtonAlpha),
+                        iconSize = 24.dp,
+                    )
+                }
 
-            LazyColumn(state = lazyListState, modifier = Modifier.weight(1f)) {
-                sections.forEachIndexed { rowIndex, section ->
-                    val previewEntries = section.items.take(FolderCatalogPreviewLimit)
-                    val usesInfiniteScroll = section.usesInfiniteHomeRow(catalogSeeMoreEnabled)
-                    val entries = if (usesInfiniteScroll) {
-                        section.items
-                    } else {
-                        previewEntries
-                    }
-                    item(key = section.key) {
-                        HomeCatalogRowSection(
-                            section = section,
-                            entries = entries,
-                            watchedKeys = watchedKeys,
-                            focusedItemIndex = if (rowIndex == activeRowIndex) activeItemIndex else null,
-                            onHoverItem = { itemIndex ->
-                                if (mouseActivity.isMouseActive) {
-                                    activeRowIndex = rowIndex
-                                    activeItemIndex = itemIndex
-                                }
-                            },
-                            onViewAllClick = if (
-                                !usesInfiniteScroll &&
-                                section.canOpenCatalog(FolderCatalogPreviewLimit)
-                            ) {
-                                { onCatalogClick(section) }
-                            } else {
-                                null
-                            },
-                            onLoadMore = if (usesInfiniteScroll) {
-                                { FolderDetailRepository.loadMoreCatalogRow(section) }
-                            } else {
-                                null
-                            },
-                            isLoadingMore = section.isLoadingMore,
-                            rowNumber = rowNumbers[section.key],
-                            onPosterClick = onPosterClick,
-                            onPosterLongClick = onPosterLongClick,
-                        )
+                FolderSourceFailuresNotice(
+                    failedSources = failedSources,
+                    modifier = Modifier.padding(horizontal = sectionPadding).padding(bottom = 8.dp),
+                )
+                KeepListAtTopWhileItemsArrive(lazyListState, sections.map { it.key })
+                LazyColumn(state = lazyListState, modifier = Modifier.weight(1f)) {
+                    sections.forEachIndexed { rowIndex, section ->
+                        val previewEntries = section.items.take(FolderCatalogPreviewLimit)
+                        val usesInfiniteScroll = section.usesInfiniteHomeRow(catalogSeeMoreEnabled)
+                        val entries = if (usesInfiniteScroll) {
+                            section.items
+                        } else {
+                            previewEntries
+                        }
+                        item(key = section.key) {
+                            HomeCatalogRowSection(
+                                section = section,
+                                entries = entries,
+                                watchedKeys = watchedKeys,
+                                // Home's row spacing and edge padding, so a collection reads like Home.
+                                modifier = Modifier.padding(bottom = 12.dp),
+                                sectionPadding = sectionPadding,
+                                focusedItemIndex = if (rowIndex == activeRowIndex) activeItemIndex else null,
+                                isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                onHoverItem = { itemIndex ->
+                                    if (mouseActivity.isMouseActive) {
+                                        activeRowIndex = rowIndex
+                                        activeItemIndex = itemIndex
+                                    }
+                                },
+                                onViewAllClick = if (
+                                    !usesInfiniteScroll &&
+                                    section.canOpenCatalog(FolderCatalogPreviewLimit)
+                                ) {
+                                    { onCatalogClick(section) }
+                                } else {
+                                    null
+                                },
+                                onLoadMore = if (usesInfiniteScroll) {
+                                    { FolderDetailRepository.loadMoreCatalogRow(section) }
+                                } else {
+                                    null
+                                },
+                                isLoadingMore = section.isLoadingMore,
+                                onShuffleClick = rowShuffle.clickFor(section),
+                                isShuffling = rowShuffle.isShuffling(section),
+                                shuffleGeneration = rowShuffle.generation(section),
+                                rowNumber = rowNumbers[section.key],
+                                onPosterClick = onPosterClick,
+                                onPosterLongClick = onPosterLongClick,
+                            )
+                        }
                     }
                 }
             }
@@ -1057,20 +1325,128 @@ private fun AdaptiveCollectionContent(
     }
 }
 
+/**
+ * The hero copies of [rowItems] around the focused card, enriched the way Home enriches its own
+ * focused rows (logo, genres, runtime, age rating, TMDB backdrop), keyed by `type:id`.
+ *
+ * Home runs every focused item through [resolveFocusedHeroItem] before the hero sees it; the
+ * collection screens handed the hero the raw row item. That is invisible for an addon catalogue,
+ * whose items arrive complete, but a TMDB or Trakt source yields only a title, poster, backdrop,
+ * synopsis and year, so its hero showed a plain text title and no metadata row.
+ *
+ * The focused card goes first, then its neighbours, so moving along the row finds them resolved.
+ * Results are kept for the screen's lifetime; the lookups themselves are cached app-wide.
+ */
+@Composable
+private fun rememberFolderHeroEnrichment(
+    sessionKey: String,
+    rowItems: List<MetaPreview>,
+    focusedIndex: Int,
+): Map<String, MetaPreview> {
+    val enriched = remember(sessionKey) { mutableStateMapOf<String, MetaPreview>() }
+    val window = remember(rowItems, focusedIndex) {
+        val focus = focusedIndex.coerceIn(0, (rowItems.size - 1).coerceAtLeast(0))
+        rowItems.indices
+            .filter { it in (focus - FolderHeroEnrichBehind)..(focus + FolderHeroEnrichAhead) }
+            .sortedBy { abs(it - focus) }
+            .map(rowItems::get)
+    }
+    LaunchedEffect(window) {
+        val tvdbForShows = TmdbSettingsRepository.snapshot().heroImageSource == HeroImageSource.TmdbMoviesTvdbShows
+        val permits = Semaphore(FolderHeroEnrichConcurrency)
+        // Only the focused title is something the user is waiting on. Its neighbours are read-ahead,
+        // and in TMDB's interactive lane they queued it behind them (2026-10-19 19:26: 124 of 178
+        // queued requests on a folder were neighbour lookups, median wait 1 s).
+        val focusedKey = window.firstOrNull()?.let(::folderHeroKey)
+        coroutineScope {
+            window
+                .map { it.withNormalizedHeroBackdrop() }
+                .filter { raw ->
+                    folderHeroKey(raw) !in enriched &&
+                        raw.heroNeedsMetadataFetch(
+                            normalHomeMode = true,
+                            searchLibraryBackdropEnrichmentEnabled = false,
+                        )
+                }
+                .forEach { raw ->
+                    launch(if (folderHeroKey(raw) == focusedKey) EmptyCoroutineContext else TmdbBackgroundLane) {
+                        val resolved = permits.withPermit {
+                            try {
+                                resolveFocusedHeroItem(raw, normalHomeMode = true, tvdbForShows = tvdbForShows).first
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                null
+                            }
+                        }
+                        if (resolved != null) enriched[folderHeroKey(raw)] = resolved
+                    }
+                }
+        }
+    }
+    return enriched
+}
+
+private fun folderHeroKey(item: MetaPreview): String = "${item.type}:${item.id}"
+
+private fun MetaPreview.withFolderHeroEnrichment(enriched: Map<String, MetaPreview>): MetaPreview =
+    enriched[folderHeroKey(this)] ?: this
+
+private const val FolderHeroEnrichBehind = 1
+private const val FolderHeroEnrichAhead = 3
+private const val FolderHeroEnrichConcurrency = 4
+
 @Composable
 private fun FolderCoverImage(
     imageUrl: String,
+    logoUrl: String?,
     title: String,
+    fullHeight: Dp,
+    fadeIntoBackground: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    AsyncImage(
-        model = imageUrl,
-        contentDescription = title,
-        modifier = modifier
-            .fillMaxWidth()
-            .height(FolderCoverHeight),
-        contentScale = ContentScale.Crop,
-    )
+    val background = MaterialTheme.colorScheme.background
+    // Laid out at full height and clipped as the banner collapses, so the image doesn't rescale
+    // while the user scrolls.
+    Box(modifier = modifier.fillMaxWidth().clipToBounds()) {
+        AsyncImage(
+            model = imageUrl,
+            contentDescription = title,
+            modifier = Modifier
+                .fillMaxWidth()
+                .requiredHeight(fullHeight)
+                .align(Alignment.TopCenter),
+            contentScale = ContentScale.Crop,
+        )
+        if (fadeIntoBackground) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .requiredHeight(fullHeight)
+                    .align(Alignment.TopCenter)
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.Transparent,
+                            0.55f to Color.Transparent,
+                            1f to background,
+                        ),
+                    ),
+            )
+        }
+        if (logoUrl != null) {
+            AsyncImage(
+                model = logoUrl,
+                contentDescription = title,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 32.dp, top = fullHeight * 0.3f)
+                    .fillMaxWidth(0.32f)
+                    .height(fullHeight * 0.4f),
+                contentScale = ContentScale.Fit,
+                alignment = Alignment.CenterStart,
+            )
+        }
+    }
 }
 
 @Composable
@@ -1211,6 +1587,8 @@ private fun RowsContent(
     sessionKey: String,
     resetToTop: Boolean,
     uiState: FolderDetailUiState,
+    sections: List<HomeCatalogSection>,
+    rowShuffle: FolderRowShuffleUi,
     watchedKeys: Set<String>,
     modifier: Modifier = Modifier,
     onCatalogClick: (HomeCatalogSection) -> Unit,
@@ -1229,7 +1607,6 @@ private fun RowsContent(
         }
     }
 
-    val sections = FolderDetailRepository.getCatalogSectionsForRows()
     val rowNumbers = remember(sections) { collectionRowNumbers(sections) }
 
     if (uiState.isLoading && sections.isEmpty()) {
@@ -1250,6 +1627,7 @@ private fun RowsContent(
         },
     )
 
+    KeepListAtTopWhileItemsArrive(listState, sections.map { it.key })
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize().then(pageScrollKeys),
@@ -1286,6 +1664,9 @@ private fun RowsContent(
                     null
                 },
                 isLoadingMore = section.isLoadingMore,
+                                onShuffleClick = rowShuffle.clickFor(section),
+                                isShuffling = rowShuffle.isShuffling(section),
+                                shuffleGeneration = rowShuffle.generation(section),
                 watchedKeys = watchedKeys,
                 rowNumber = rowNumbers[section.key],
                 onPosterClick = { onPosterClick(it) },
@@ -1333,6 +1714,39 @@ private fun LoadingIndicator() {
         )
     }
 }
+
+/**
+ * One line per distinct reason, naming the sources it affected, e.g. "Top 10 Series, Awards and 3
+ * more couldn't load: Missing Trakt credentials. Configure a client ID in Settings." Nothing when
+ * every source loaded. Each reason already says what to do about it.
+ */
+@Composable
+private fun FolderSourceFailuresNotice(
+    failedSources: List<FolderTab>,
+    modifier: Modifier = Modifier,
+) {
+    if (failedSources.isEmpty()) return
+    val byReason = failedSources.groupBy { it.error.orEmpty() }
+    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        byReason.forEach { (reason, tabs) ->
+            val shown = tabs.take(FolderFailureNamesShown).joinToString(", ") { it.label }
+            val names = if (tabs.size > FolderFailureNamesShown) {
+                stringResource(Res.string.collections_folder_sources_failed_more, shown, tabs.size - FolderFailureNamesShown)
+            } else {
+                shown
+            }
+            Text(
+                text = stringResource(Res.string.collections_folder_sources_failed, names, reason),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private const val FolderFailureNamesShown = 3
 
 @Composable
 private fun ErrorMessage(error: String) {

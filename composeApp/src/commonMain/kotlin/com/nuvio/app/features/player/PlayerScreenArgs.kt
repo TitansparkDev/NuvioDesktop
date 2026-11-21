@@ -12,6 +12,7 @@ internal data class PlayerScreenArgs(
     val sourceAffinity: PlayerSourceAffinity,
     val providerName: String,
     val streamTitle: String,
+    val streamFilename: String?,
     val streamSubtitle: String?,
     val sourceIdentityKey: String?,
     val initialBingeGroup: String?,
@@ -44,4 +45,13 @@ internal data class PlayerScreenArgs(
     // no watch-progress persistence and no Trakt/Simkl scrobbling.
     val disableProgressTracking: Boolean = false,
     val autoPlayMode: PlayerAutoPlayMode = PlayerAutoPlayMode.NextEpisode,
+    // Playlist mode: opens the next entry's resolved source in a fresh player.
+    val onPlaylistHandoff: ((com.nuvio.app.features.playlist.PlaylistHandoff) -> Unit)? = null,
+    /** Playlist mode: the viewer picked another entry from the HUD's playlist peek. */
+    val onPlaylistJump: ((entryId: String) -> Unit)? = null,
+    /** Watch party: the party moved to another title; open it the way the app launches playback. */
+    val onOpenPartyMedia: (com.nuvio.app.features.party.PartyMedia) -> Unit = {},
+    val stream: com.nuvio.app.features.streams.StreamItem? = null,
+    /** The source was taken from the reuse-last-link cache; see `linkCacheSourceUrl`. */
+    val sourceFromLinkCache: Boolean = false,
 )

@@ -7,8 +7,14 @@ object StreamAutoPlaySelector {
     fun orderAddonStreams(
         groups: List<AddonStreamGroup>,
         installedOrder: List<String>,
+        /** Groups listed first whatever the addon order says (a media server set to come first). */
+        preferredGroupIds: Set<String> = emptySet(),
     ): List<AddonStreamGroup> {
         if (groups.isEmpty()) return groups
+        if (preferredGroupIds.isNotEmpty()) {
+            val (preferred, rest) = groups.partition { it.addonId in preferredGroupIds }
+            return preferred + orderAddonStreams(rest, installedOrder)
+        }
 
         val addonRankByName = HashMap<String, Int>(installedOrder.size)
         installedOrder.forEachIndexed { index, addonName ->
@@ -47,6 +53,8 @@ object StreamAutoPlaySelector {
         activeResolverProviderId: String? = null,
         scoreProfile: StreamScoreProfile = StreamScoreProfile(),
         scoreContext: StreamScoreContext = StreamScoreContext.MOVIE,
+        /** Within the binge group, the same release as last time goes first. */
+        preferredRelease: BingeReleaseHint? = null,
     ): StreamItem? =
         evaluateAutoPlayStream(
             streams = streams,
@@ -63,6 +71,7 @@ object StreamAutoPlaySelector {
             activeResolverProviderId = activeResolverProviderId,
             scoreProfile = scoreProfile,
             scoreContext = scoreContext,
+            preferredRelease = preferredRelease,
         ).stream
 
     fun evaluateAutoPlayStream(
@@ -80,17 +89,21 @@ object StreamAutoPlaySelector {
         activeResolverProviderId: String? = null,
         scoreProfile: StreamScoreProfile = StreamScoreProfile(),
         scoreContext: StreamScoreContext = StreamScoreContext.MOVIE,
+        /** Within the binge group, the same release as last time goes first. */
+        preferredRelease: BingeReleaseHint? = null,
     ): StreamAutoPlayEvaluation {
         if (streams.isEmpty()) return StreamAutoPlayEvaluation()
 
         val sourceScopedStreams = when (source) {
             StreamAutoPlaySource.ALL_SOURCES -> streams
-            StreamAutoPlaySource.INSTALLED_ADDONS_ONLY -> streams.filter { it.addonName in installedAddonNames }
+            StreamAutoPlaySource.INSTALLED_ADDONS_ONLY -> streams.filter { it.serverTarget != null || it.addonName in installedAddonNames }
             StreamAutoPlaySource.ENABLED_PLUGINS_ONLY -> streams.filter { it.addonName !in installedAddonNames }
         }
         val candidateStreams = sourceScopedStreams.filter { stream ->
             val isAddonStream = stream.addonName in installedAddonNames
-            if (isAddonStream) {
+            if (stream.serverTarget != null) {
+                true // A media-server file is the user's own library, never filtered out by addon picks.
+            } else if (isAddonStream) {
                 selectedAddons.isEmpty() || stream.addonName in selectedAddons
             } else {
                 selectedPlugins.isEmpty() || stream.addonName in selectedPlugins
@@ -103,7 +116,10 @@ object StreamAutoPlaySelector {
 
         val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
         val bingeGroupCandidates = if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
-            candidateStreams.filter { stream -> stream.behaviorHints.bingeGroup == targetBingeGroup }
+            candidateStreams
+                .filter { stream -> stream.behaviorHints.bingeGroup == targetBingeGroup }
+                // Stable: rows matching neither keep their order.
+                .let { matches -> if (preferredRelease == null) matches else matches.sortedBy(preferredRelease::rank) }
         } else {
             emptyList()
         }
@@ -124,14 +140,7 @@ object StreamAutoPlaySelector {
         if (mode == StreamAutoPlayMode.MANUAL) {
             return StreamAutoPlayEvaluation()
         }
-        val preferredStream = if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
-            candidateStreams.firstOrNull { stream ->
-                stream.behaviorHints.bingeGroup == targetBingeGroup &&
-                    stream.isAutoPlayable(debridEnabled, activeResolverProviderId)
-            }
-        } else {
-            null
-        }
+        val preferredStream = preferredReadyStream
         val matchingStreams = when (mode) {
             StreamAutoPlayMode.MANUAL -> emptyList()
             StreamAutoPlayMode.FIRST_STREAM -> candidateStreams
@@ -212,6 +221,8 @@ object StreamAutoPlaySelector {
         activeResolverProviderId: String?,
     ): Boolean =
         playableDirectUrl != null ||
+            serverTarget != null ||
+            nzbUrl != null ||
             (
                 AppFeaturePolicy.p2pEnabled &&
                     needsLocalDebridResolve &&

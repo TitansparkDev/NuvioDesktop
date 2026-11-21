@@ -3,12 +3,15 @@ package com.nuvio.app.features.settings
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CloudQueue
 import androidx.compose.material.icons.rounded.HighQuality
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Lightbulb
+import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.layout.Column
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.features.library.LibrarySourceMode
@@ -16,8 +19,15 @@ import com.nuvio.app.features.tracking.CalendarSource
 import com.nuvio.app.features.tracking.CalendarSourceRepository
 import com.nuvio.app.features.tracking.LibrarySourceRepository
 import com.nuvio.app.features.tracking.RatingPromptRepository
+import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.tracking.TrackingProviderRegistry
+import com.nuvio.app.features.tmdb.TmdbSettingsRepository
+import com.nuvio.app.features.trakt.MoreLikeThisSourcePreference
+import com.nuvio.app.features.trakt.TraktSettingsRepository
 import com.nuvio.app.features.tracking.trackingProvider
+import com.nuvio.app.features.tracking.TrackingRatingSource
+import com.nuvio.app.features.tracking.TrackingRatingSourceRepository
+import com.nuvio.app.features.tracking.trackingRatingProviderDisplayName
 import com.nuvio.app.features.tracking.trackingRatingProviderFor
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.compose_settings_page_debrid
@@ -44,45 +54,46 @@ internal fun LazyListScope.integrationsContent(
     onTmdbClick: () -> Unit,
     onMdbListClick: () -> Unit,
     onQualiCacheClick: () -> Unit,
+    onPosterServiceClick: () -> Unit,
     onDebridClick: () -> Unit,
     onTraktClick: () -> Unit,
     onSimklClick: () -> Unit,
     onYamtrackClick: () -> Unit,
+    onYouTubeAccountClick: () -> Unit,
+    onSeekrClick: () -> Unit,
     onLightsClick: () -> Unit,
     onDiscordClick: () -> Unit,
 ) {
+    // One panel for the four "which service feeds this" choices; as three headings over four rows
+    // the headings outweighed the settings.
     item {
         SettingsSection(
-            title = stringResource(Res.string.settings_library_source_section),
+            title = stringResource(Res.string.settings_integrations_sources_section),
             isTablet = isTablet,
         ) {
-            SettingsGroup(
-                isTablet = isTablet,
-                modifier = Modifier.settingsScrollAnchor(
-                    SettingsScrollAnchor.searchKey("library-source"),
-                ),
-            ) {
-                LibrarySourceRow(isTablet = isTablet)
+            SettingsGroup(isTablet = isTablet) {
+                Column(
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("library-source")),
+                ) {
+                    LibrarySourceRow(isTablet = isTablet)
+                    SettingsGroupDivider(isTablet = isTablet)
+                    // Under the Library source because "Same as Library" (the default) follows it.
+                    RatingSourceRow(isTablet = isTablet)
+                    SettingsGroupDivider(isTablet = isTablet)
+                    RatingPromptRow(isTablet = isTablet)
+                }
                 SettingsGroupDivider(isTablet = isTablet)
-                // Sits with the Library source because that selection is what decides where a
-                // rating is written, and whether it can be written at all.
-                RatingPromptRow(isTablet = isTablet)
-            }
-        }
-    }
-
-    item {
-        SettingsSection(
-            title = stringResource(Res.string.settings_calendar_source_section),
-            isTablet = isTablet,
-        ) {
-            SettingsGroup(
-                isTablet = isTablet,
-                modifier = Modifier.settingsScrollAnchor(
-                    SettingsScrollAnchor.searchKey("calendar-source"),
-                ),
-            ) {
-                CalendarSourceRow(isTablet = isTablet)
+                Column(
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("calendar-source")),
+                ) {
+                    CalendarSourceRow(isTablet = isTablet)
+                }
+                SettingsGroupDivider(isTablet = isTablet)
+                Column(
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("more-like-this-source")),
+                ) {
+                    MoreLikeThisSourceRow(isTablet = isTablet)
+                }
             }
         }
     }
@@ -118,6 +129,14 @@ internal fun LazyListScope.integrationsContent(
                 )
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsNavigationRow(
+                    title = stringResource(Res.string.compose_settings_page_poster_service),
+                    description = stringResource(Res.string.settings_integrations_poster_service_description),
+                    icon = Icons.Rounded.Image,
+                    isTablet = isTablet,
+                    onClick = onPosterServiceClick,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsNavigationRow(
                     title = stringResource(Res.string.compose_settings_page_debrid),
                     description = stringResource(Res.string.settings_integrations_debrid_description),
                     icon = Icons.Rounded.CloudQueue,
@@ -148,6 +167,26 @@ internal fun LazyListScope.integrationsContent(
                     isTablet = isTablet,
                     onClick = onYamtrackClick,
                 )
+                if (isDesktop) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.compose_settings_page_youtube),
+                        description = stringResource(Res.string.settings_youtube_description),
+                        icon = Icons.Rounded.Link,
+                        isTablet = isTablet,
+                        onClick = onYouTubeAccountClick,
+                    )
+                }
+                if (isDesktop) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsNavigationRow(
+                        title = stringResource(Res.string.compose_settings_page_seekr),
+                        description = stringResource(Res.string.settings_integrations_seekr_description),
+                        icon = Icons.Rounded.Image,
+                        isTablet = isTablet,
+                        onClick = onSeekrClick,
+                    )
+                }
                 if (isDesktop) {
                     SettingsGroupDivider(isTablet = isTablet)
                     SettingsNavigationRow(
@@ -213,10 +252,55 @@ private fun LibrarySourceRow(isTablet: Boolean) {
 }
 
 /**
+ * Where ratings from Details and the finale prompt are saved. "Same as Library" follows the Library
+ * source; naming a service lets a Trakt or local Library still rate on SIMKL, MDBList or Floppy.
+ * The description says when the choice leaves ratings off, so the row explains a missing button.
+ */
+@Composable
+private fun RatingSourceRow(isTablet: Boolean) {
+    val selected by remember {
+        TrackingRatingSourceRepository.ensureLoaded()
+        TrackingRatingSourceRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val librarySource by LibrarySourceRepository.uiState.collectAsStateWithLifecycle()
+    val connected by TrackingProviderRegistry.connectedProviderIds.collectAsStateWithLifecycle()
+
+    val providerId = trackingRatingProviderFor(selected, librarySource)
+    val labels = linkedMapOf(
+        TrackingRatingSource.LIBRARY to stringResource(Res.string.settings_rating_source_library),
+        TrackingRatingSource.SIMKL to trackingRatingProviderDisplayName(TrackingProviderId.SIMKL),
+        TrackingRatingSource.MDBLIST to trackingRatingProviderDisplayName(TrackingProviderId.MDBLIST),
+        TrackingRatingSource.YAMTRACK to trackingRatingProviderDisplayName(TrackingProviderId.YAMTRACK),
+        TrackingRatingSource.OFF to stringResource(Res.string.settings_more_like_this_off),
+    )
+    val description = when {
+        selected == TrackingRatingSource.OFF -> stringResource(Res.string.settings_rating_source_description)
+        providerId == null -> stringResource(Res.string.settings_rating_source_library_unavailable)
+        providerId !in connected -> stringResource(
+            Res.string.settings_rating_source_not_connected,
+            trackingRatingProviderDisplayName(providerId),
+        )
+        selected == TrackingRatingSource.LIBRARY -> stringResource(
+            Res.string.settings_rating_source_library_active,
+            trackingRatingProviderDisplayName(providerId),
+        )
+        else -> stringResource(Res.string.settings_rating_source_description)
+    }
+    SettingsChoiceRow(
+        title = stringResource(Res.string.settings_rating_source_title),
+        description = description,
+        options = labels.map { (value, label) -> SettingsChoiceOption(value, label) },
+        selectedValue = selected,
+        isTablet = isTablet,
+        onSelected = TrackingRatingSourceRepository::setSource,
+    )
+}
+
+/**
  * Offers a rating after a movie, season finale or series finale.
  *
- * Shown as disabled — rather than hidden — when the Library source cannot take a rating, so the
- * setting does not silently vanish depending on an unrelated choice made elsewhere on this page.
+ * Shown as disabled — rather than hidden — when Ratings go to leads nowhere connected, so the
+ * setting does not silently vanish depending on another choice made on this page.
  */
 @Composable
 private fun RatingPromptRow(isTablet: Boolean) {
@@ -225,22 +309,76 @@ private fun RatingPromptRow(isTablet: Boolean) {
         RatingPromptRepository.isEnabled
     }.collectAsStateWithLifecycle()
     val librarySource by LibrarySourceRepository.uiState.collectAsStateWithLifecycle()
+    val ratingSource by remember {
+        TrackingRatingSourceRepository.ensureLoaded()
+        TrackingRatingSourceRepository.uiState
+    }.collectAsStateWithLifecycle()
     val connected by TrackingProviderRegistry.connectedProviderIds.collectAsStateWithLifecycle()
 
-    val ratingProviderId = trackingRatingProviderFor(librarySource)
+    val ratingProviderId = trackingRatingProviderFor(ratingSource, librarySource)
     val canRate = ratingProviderId != null && ratingProviderId in connected
 
     SettingsSwitchRow(
         title = stringResource(Res.string.settings_rating_prompt_title),
         description = if (canRate) {
-            stringResource(Res.string.settings_rating_prompt_description)
+            stringResource(Res.string.settings_rating_prompt_description_source)
         } else {
-            stringResource(Res.string.settings_rating_prompt_unavailable)
+            stringResource(Res.string.settings_rating_prompt_no_source)
         },
         checked = isEnabled && canRate,
         enabled = canRate,
         isTablet = isTablet,
         onCheckedChange = RatingPromptRepository::setEnabled,
+    )
+}
+
+/**
+ * The single place the detail page's More Like This rail is configured. It is not a Trakt or TMDB
+ * setting: the source can be any of the three, and "Off" is TMDB's own module switch (with TMDB as
+ * the source, that switch off leaves the rail empty, which is how it always behaved).
+ *
+ * A source that is not connected falls back to TMDB, so the row says so rather than pretending.
+ */
+@Composable
+private fun MoreLikeThisSourceRow(isTablet: Boolean) {
+    val traktSettings by remember {
+        TraktSettingsRepository.ensureLoaded()
+        TraktSettingsRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val tmdbSettings by remember {
+        TmdbSettingsRepository.ensureLoaded()
+        TmdbSettingsRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val connected by TrackingProviderRegistry.connectedProviderIds.collectAsStateWithLifecycle()
+
+    val source = traktSettings.moreLikeThisSource
+    val selected: MoreLikeThisSourcePreference? =
+        if (source == MoreLikeThisSourcePreference.TMDB && !tmdbSettings.useMoreLikeThis) null else source
+    val labels = linkedMapOf<MoreLikeThisSourcePreference?, String>(
+        MoreLikeThisSourcePreference.TRAKT to stringResource(Res.string.trakt_more_like_this_source_trakt),
+        MoreLikeThisSourcePreference.SIMKL to stringResource(Res.string.trakt_more_like_this_source_simkl),
+        MoreLikeThisSourcePreference.TMDB to stringResource(Res.string.trakt_more_like_this_source_tmdb),
+        null to stringResource(Res.string.settings_more_like_this_off),
+    )
+    val requiredProvider = when (selected) {
+        MoreLikeThisSourcePreference.TRAKT -> TrackingProviderId.TRAKT
+        MoreLikeThisSourcePreference.SIMKL -> TrackingProviderId.SIMKL
+        else -> null
+    }
+    SettingsChoiceRow(
+        title = stringResource(Res.string.trakt_more_like_this_source_title),
+        description = if (requiredProvider == null || requiredProvider in connected) {
+            labels.getValue(selected)
+        } else {
+            stringResource(Res.string.settings_more_like_this_not_connected)
+        },
+        options = labels.map { (value, label) -> SettingsChoiceOption(value, label) },
+        selectedValue = selected,
+        isTablet = isTablet,
+        onSelected = { choice ->
+            TmdbSettingsRepository.setUseMoreLikeThis(choice != null)
+            TraktSettingsRepository.setMoreLikeThisSource(choice ?: MoreLikeThisSourcePreference.TMDB)
+        },
     )
 }
 
@@ -254,20 +392,20 @@ private fun CalendarSourceRow(isTablet: Boolean) {
     val connected by TrackingProviderRegistry.connectedProviderIds.collectAsStateWithLifecycle()
 
     val labels = CalendarSource.entries.associateWith { source ->
-        stringResource(
-            when (source) {
-                CalendarSource.TRAKT -> Res.string.settings_calendar_source_trakt
-                CalendarSource.SIMKL -> Res.string.settings_calendar_source_simkl
-                CalendarSource.MDBLIST -> Res.string.settings_calendar_source_mdblist
-            },
-        )
+        when (source) {
+            CalendarSource.TRAKT -> stringResource(Res.string.settings_calendar_source_trakt)
+            CalendarSource.SIMKL -> stringResource(Res.string.settings_calendar_source_simkl)
+            CalendarSource.MDBLIST -> stringResource(Res.string.settings_calendar_source_mdblist)
+            // Short enough for the dropdown; the row description says what it draws from.
+            CalendarSource.NUVIO -> "Nuvio"
+        }
     }
 
-    val isSelectionConnected = selected.providerId in connected
+    val isSelectionConnected = selected.providerId?.let { it in connected } ?: true
     SettingsChoiceRow(
         title = stringResource(Res.string.settings_calendar_source_title),
         description = if (isSelectionConnected) {
-            labels.getValue(selected)
+            if (selected == CalendarSource.NUVIO) "Your Nuvio library and watch history" else labels.getValue(selected)
         } else {
             stringResource(Res.string.settings_calendar_source_not_connected)
         },

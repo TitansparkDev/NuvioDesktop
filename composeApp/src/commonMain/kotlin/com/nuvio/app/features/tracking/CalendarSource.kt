@@ -4,17 +4,24 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** The one tracking service whose schedule populates the Calendar screen. */
+/**
+ * What populates the Calendar screen: one tracking service's schedule, or [NUVIO] — the shows in
+ * the profile's own Nuvio library and watch history, dated from the meta addons, which needs no
+ * account anywhere.
+ */
 enum class CalendarSource(val storageId: String) {
     TRAKT("trakt"),
     SIMKL("simkl"),
-    MDBLIST("mdblist");
+    MDBLIST("mdblist"),
+    NUVIO("nuvio");
 
-    val providerId: TrackingProviderId
+    /** The service this source needs connected; null for [NUVIO], which reads local data. */
+    val providerId: TrackingProviderId?
         get() = when (this) {
             TRAKT -> TrackingProviderId.TRAKT
             SIMKL -> TrackingProviderId.SIMKL
             MDBLIST -> TrackingProviderId.MDBLIST
+            NUVIO -> null
         }
 
     companion object {
@@ -24,32 +31,35 @@ enum class CalendarSource(val storageId: String) {
 }
 
 /**
- * Falls back to a connected provider when the selected one is not.
+ * Falls back to a connected provider when the selected one is not, and to [CalendarSource.NUVIO]
+ * when none is.
  *
  * Continue Watching and Library both resolve their selection against what is actually connected and
- * fall back to local state; the Calendar had no equivalent, and its default is Trakt — which no
+ * fall back to local state; the Calendar had no equivalent, and its default was Trakt — which no
  * longer issues API keys. A profile that has never touched the setting therefore opened on "connect
  * your Trakt account" with SIMKL sitting connected right next to it. Declaration order decides the
  * fallback, matching how the provider registry orders every other fan-out.
  *
- * With nothing connected the selection is returned unchanged, so the screen still names the service
- * the user actually chose in its connect prompt.
+ * With nothing connected the local calendar is used rather than a connect prompt, since it needs
+ * no account.
  */
 internal fun resolveCalendarSource(
     selected: CalendarSource,
     isProviderAuthenticated: (TrackingProviderId) -> Boolean,
 ): CalendarSource {
-    if (isProviderAuthenticated(selected.providerId)) return selected
+    val selectedProvider = selected.providerId ?: return selected
+    if (isProviderAuthenticated(selectedProvider)) return selected
     return CalendarSource.entries.firstOrNull { candidate ->
-        isProviderAuthenticated(candidate.providerId)
-    } ?: selected
+        candidate.providerId?.let(isProviderAuthenticated) == true
+    } ?: CalendarSource.NUVIO
 }
 
 /**
  * One-time migration from the old independent MDBList and SIMKL switches.
  *
  * This deliberately preserves the old Calendar precedence: MDBList won when both switches were
- * enabled, SIMKL won when only its switch was enabled, and Trakt was the implicit default.
+ * enabled and SIMKL won when only its switch was enabled. With neither, the local Nuvio calendar
+ * is used: it is the default, and works without an account.
  */
 internal fun migratedCalendarSource(
     mdbListWasCalendarSource: Boolean,
@@ -57,15 +67,15 @@ internal fun migratedCalendarSource(
 ): CalendarSource = when {
     mdbListWasCalendarSource -> CalendarSource.MDBLIST
     simklWasCalendarSource -> CalendarSource.SIMKL
-    else -> CalendarSource.TRAKT
+    else -> CalendarSource.NUVIO
 }
 
 object CalendarSourceRepository {
-    private val _uiState = MutableStateFlow(CalendarSource.TRAKT)
+    private val _uiState = MutableStateFlow(CalendarSource.NUVIO)
     val uiState: StateFlow<CalendarSource> = _uiState.asStateFlow()
 
     private var hasLoaded = false
-    private var selected = CalendarSource.TRAKT
+    private var selected = CalendarSource.NUVIO
 
     /** Supplies the legacy flags for migration; set once at startup to avoid a package cycle. */
     internal var legacyMigrationProbe: (() -> CalendarSource)? = null
@@ -91,9 +101,9 @@ object CalendarSourceRepository {
     }
 
     fun clearLocalState() {
-        selected = CalendarSource.TRAKT
-        _uiState.value = CalendarSource.TRAKT
-        ContinueWatchingSourceStorage.saveCalendarSelection(CalendarSource.TRAKT.storageId)
+        selected = CalendarSource.NUVIO
+        _uiState.value = CalendarSource.NUVIO
+        ContinueWatchingSourceStorage.saveCalendarSelection(CalendarSource.NUVIO.storageId)
     }
 
     private fun loadFromDisk() {
@@ -101,7 +111,7 @@ object CalendarSourceRepository {
         val stored = CalendarSource.fromStorage(
             ContinueWatchingSourceStorage.loadCalendarSelection(),
         )
-        selected = stored ?: (legacyMigrationProbe?.invoke() ?: CalendarSource.TRAKT).also {
+        selected = stored ?: (legacyMigrationProbe?.invoke() ?: CalendarSource.NUVIO).also {
             // Persist immediately so legacy provider flags are only consulted once per profile.
             ContinueWatchingSourceStorage.saveCalendarSelection(it.storageId)
         }

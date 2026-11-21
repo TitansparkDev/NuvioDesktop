@@ -18,6 +18,7 @@ import com.nuvio.app.core.ui.PosterHighlightMode
 import com.nuvio.app.core.ui.PosterRatingBadgeScale
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.settings_poster_card_radius
+import nuvio.composeapp.generated.resources.settings_poster_highlight_glow
 import nuvio.composeapp.generated.resources.settings_poster_card_width
 import nuvio.composeapp.generated.resources.settings_poster_description
 import nuvio.composeapp.generated.resources.settings_poster_hide_labels
@@ -36,6 +37,8 @@ import nuvio.composeapp.generated.resources.settings_poster_landscape_rating_bad
 import nuvio.composeapp.generated.resources.settings_poster_landscape_rating_badge_off
 import nuvio.composeapp.generated.resources.settings_poster_landscape_rating_badge_out_of_hundred
 import nuvio.composeapp.generated.resources.settings_poster_landscape_rating_badge_out_of_ten
+import nuvio.composeapp.generated.resources.settings_poster_portrait_rating_badge
+import nuvio.composeapp.generated.resources.settings_poster_portrait_rating_badge_description
 import nuvio.composeapp.generated.resources.settings_poster_landscape_text_titles
 import nuvio.composeapp.generated.resources.settings_poster_landscape_text_titles_description
 import nuvio.composeapp.generated.resources.settings_poster_radius_classic
@@ -52,6 +55,8 @@ import nuvio.composeapp.generated.resources.settings_poster_width_large
 import nuvio.composeapp.generated.resources.settings_poster_width_standard
 import nuvio.composeapp.generated.resources.settings_poster_action_preview
 import nuvio.composeapp.generated.resources.settings_poster_action_preview_description
+import nuvio.composeapp.generated.resources.settings_poster_watchlist_badge
+import nuvio.composeapp.generated.resources.settings_poster_watchlist_badge_description
 import nuvio.composeapp.generated.resources.settings_poster_card_depth
 import nuvio.composeapp.generated.resources.settings_poster_card_depth_apply_to
 import nuvio.composeapp.generated.resources.settings_poster_card_depth_cast
@@ -74,15 +79,18 @@ internal fun PosterCardStyleControls(
     collectionsPortraitPostersEnabled: Boolean,
     landscapeTextTitlesEnabled: Boolean,
     landscapeRatingBadgeScale: PosterRatingBadgeScale,
+    portraitRatingBadgeScale: PosterRatingBadgeScale,
     posterHighlightMode: PosterHighlightMode,
     hideLabelsEnabled: Boolean,
     zoomActionPreviewEnabled: Boolean,
+    watchlistBadgeEnabled: Boolean,
     onWidthSelected: (Int) -> Unit,
     onCornerRadiusSelected: (Int) -> Unit,
     onCatalogLandscapeModeChange: (Boolean) -> Unit,
     onCollectionsPortraitPostersChange: (Boolean) -> Unit,
     onLandscapeTextTitlesChange: (Boolean) -> Unit,
     onLandscapeRatingBadgeScaleChange: (PosterRatingBadgeScale) -> Unit,
+    onPortraitRatingBadgeScaleChange: (PosterRatingBadgeScale) -> Unit,
     onHideLabelsChange: (Boolean) -> Unit,
 ) {
     val widthOptions = listOf(
@@ -189,6 +197,19 @@ internal fun PosterCardStyleControls(
             onSelected = onLandscapeRatingBadgeScaleChange,
         )
         SettingsGroupDivider(isTablet = isTablet)
+        SettingsChoiceRow(
+            title = stringResource(Res.string.settings_poster_portrait_rating_badge),
+            description = stringResource(Res.string.settings_poster_portrait_rating_badge_description),
+            options = ratingBadgeScaleOptions(),
+            selectedValue = portraitRatingBadgeScale,
+            enabled = !catalogLandscapeModeEnabled,
+            isTablet = isTablet,
+            modifier = Modifier.settingsScrollAnchor(
+                SettingsScrollAnchor.searchKey("poster-portrait-rating-badge"),
+            ),
+            onSelected = onPortraitRatingBadgeScaleChange,
+        )
+        SettingsGroupDivider(isTablet = isTablet)
         SettingsSwitchRow(
             title = stringResource(Res.string.settings_poster_hide_labels),
             description = null,
@@ -204,6 +225,15 @@ internal fun PosterCardStyleControls(
             checked = zoomActionPreviewEnabled,
             isTablet = isTablet,
             onCheckedChange = PosterCardStyleRepository::setZoomActionPreviewEnabled,
+        )
+        SettingsGroupDivider(isTablet = isTablet)
+        SettingsSwitchRow(
+            title = stringResource(Res.string.settings_poster_watchlist_badge),
+            description = stringResource(Res.string.settings_poster_watchlist_badge_description),
+            checked = watchlistBadgeEnabled,
+            isTablet = isTablet,
+            modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("poster-watchlist-badge")),
+            onCheckedChange = PosterCardStyleRepository::setWatchlistBadgeEnabled,
         )
     }
 }
@@ -245,6 +275,10 @@ private fun posterHighlightModeOptions(): List<SettingsChoiceOption<PosterHighli
     SettingsChoiceOption(
         PosterHighlightMode.Sweep,
         stringResource(Res.string.settings_poster_highlight_sweep),
+    ),
+    SettingsChoiceOption(
+        PosterHighlightMode.Glow,
+        stringResource(Res.string.settings_poster_highlight_glow),
     ),
 )
 

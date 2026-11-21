@@ -29,7 +29,14 @@ internal object NativePlayerBridge {
 
     init {
         loadNativeLibrary()
+        // Before any other call, so the player logs and shader cache land in the same data folder as
+        // nuvio.log (beside the app when portable) rather than the bridge's %LOCALAPPDATA% default.
+        runCatching { setDataDirectory(DesktopStorage.rootDir.toAbsolutePath().toString()) }
+            .onFailure { log.w { "Native bridge data folder not set: ${it.message}" } }
     }
+
+    /** Where the bridge keeps `logs\` and `shader-cache\`: [DesktopStorage.rootDir]. */
+    private external fun setDataDirectory(directory: String)
 
     external fun create(
         hostViewPtr: Long,
@@ -49,9 +56,36 @@ internal object NativePlayerBridge {
     ): Long
 
     external fun dispose(handle: Long)
+
+    /**
+     * Loads [sourceUrl] into the live player [handle] instead of disposing it and creating a new
+     * one; from then on the player's events go to [eventSink]. False when the player cannot be
+     * reused (failed playback, separate audio, a local/remote change), and the caller then
+     * recreates it as before. See NativePlayerController.attachPending.
+     */
+    external fun replaceSource(
+        handle: Long,
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        initialProgressFraction: Double,
+        animeSvpFilter: String?,
+        mediaTitle: String?,
+        traceId: String?,
+        eventSink: NativePlayerEventSink,
+    ): Boolean
+
     external fun updateControls(handle: Long, controlsJson: String)
     external fun runJavaScript(handle: Long, script: String)
     external fun requestSeekThumbnail(handle: Long, positionMs: Long)
+
+    /**
+     * fork:usenet - while [forSourceUrl] plays, seek thumbnails and the other side decoders open
+     * [auxiliaryUrl] instead (null: the source itself). Applies to the source playing now and to
+     * a create or replace with that source that follows.
+     */
+    external fun setAuxiliarySource(handle: Long, forSourceUrl: String, auxiliaryUrl: String?)
     external fun setCursorHidden(handle: Long, hidden: Boolean)
     external fun setPaused(handle: Long, paused: Boolean)
 
@@ -74,6 +108,11 @@ internal object NativePlayerBridge {
     external fun completeSvpStartupProfile(handle: Long)
     external fun seekTo(handle: Long, positionMs: Long)
     external fun seekBy(handle: Long, offsetMs: Long)
+    /** Live TV's Go live: [cushionMs] short of the received end, within the cache's seekable range. */
+    external fun seekToCachedLiveEdge(handle: Long, cushionMs: Long)
+    /** Live TV: seeks kept inside the demuxer cache's seekable ranges (a live .ts cannot seek beyond). */
+    external fun seekWithinCacheTo(handle: Long, positionMs: Long)
+    external fun seekWithinCacheBy(handle: Long, offsetMs: Long)
     external fun setSpeed(handle: Long, speed: Float)
     external fun setResizeMode(handle: Long, mode: Int)
     external fun durationMs(handle: Long): Long
@@ -89,6 +128,7 @@ internal object NativePlayerBridge {
     external fun isMuted(handle: Long): Boolean
     external fun audioTracksJson(handle: Long): String
     external fun subtitleTracksJson(handle: Long): String
+    external fun videoTracksJson(handle: Long): String
     external fun chaptersJson(handle: Long): String
     external fun selectAudioTrack(handle: Long, trackId: Int): Boolean
     external fun selectSubtitleTrack(handle: Long, trackId: Int): Boolean
@@ -114,6 +154,64 @@ internal object NativePlayerBridge {
     external fun setSubtitleDelayMs(handle: Long, delayMs: Int)
 
     /**
+     * Decodes [durationSeconds] of the playing audio from [startSeconds] to raw 16 kHz mono float32
+     * PCM in [outputPath], with a throwaway headless mpv on its own connection. Blocks; 0 = written.
+     */
+    external fun decodeSpeechSpot(handle: Long, startSeconds: Double, durationSeconds: Double, outputPath: String): Int
+
+    /**
+     * [decodeSpeechSpot] with a chosen format: raw float32 PCM at [sampleRate] Hz, interleaved, [channelCount] 1 or 2.
+     * Not present in the macOS bridge: calling it there throws UnsatisfiedLinkError (the loudness measurement catches it).
+     */
+    external fun decodeAudioSpot(
+        handle: Long,
+        startSeconds: Double,
+        durationSeconds: Double,
+        sampleRate: Int,
+        channelCount: Int,
+        outputPath: String,
+    ): Int
+
+    /**
+     * fork:gapless - queues [url] to play straight after the current file in the same mpv (any earlier queued file is
+     * dropped; an empty url only drops it). [options] are "name=value" per-file options. Windows bridge only.
+     */
+    external fun queueNext(handle: Long, url: String, headerLines: Array<String>, options: Array<String>)
+
+    /** fork:gapless - the stream [decodeAudioSpot] reads after the player moved on to a queued file; null goes back. */
+    external fun setSpotSource(handle: Long, url: String?, headerLines: Array<String>)
+
+    /** fork:gapless - the playlist entry playing (0 the file opened, 1 a queued one once it starts), or -1. */
+    external fun playlistPos(handle: Long): Long
+
+    /**
+     * fork:loudness - [decodeAudioSpot] for a stream no player has open yet ([url], sent with [headerLines] as "Name: value"),
+     * so the next track can be measured before it starts. Needs no player handle. Windows bridge only: elsewhere it throws
+     * UnsatisfiedLinkError.
+     */
+    external fun decodeAudioUrl(
+        url: String,
+        headerLines: Array<String>,
+        startSeconds: Double,
+        durationSeconds: Double,
+        sampleRate: Int,
+        channelCount: Int,
+        outputPath: String,
+    ): Int
+
+    /** fork:visualiser - makes [decodeAudioSpot] read the local file at [path] instead of the stream; null goes back to the stream. Windows bridge only. */
+    external fun setAudioSpotFile(handle: Long, path: String?)
+
+    /**
+     * fork:live-tv-subtitles - runs one mpv command ([args], e.g. "dump-cache", start, end, file) synchronously and returns
+     * mpv's result (negative = error). Windows bridge only: elsewhere it throws UnsatisfiedLinkError.
+     */
+    external fun mpvCommand(handle: Long, args: Array<String>): Int
+
+    /** The playing source's size over its duration; negative when unknown. */
+    external fun speechSourceBytesPerSecond(handle: Long): Double
+
+    /**
      * mpv's `sub-ass-override` level for ASS/SSA tracks ("no", "yes", "scale" or "force") plus the
      * `sub-scale` factor that goes with it.
      *
@@ -136,8 +234,25 @@ internal object NativePlayerBridge {
         fontName: String,
     )
     external fun setMpvProperty(handle: Long, key: String, value: String)
+
+    /** fork:music-stage - cut the video window to rounded corners of [radiusPx] pixels; 0 makes it square again. */
+    external fun setCornerRadius(handle: Long, radiusPx: Int)
+
+    /**
+     * fork:music-stage - the glass bezel over the Now Playing video: a click-through window of [width] x [height] pixels showing
+     * [argb] (premultiplied ARGB) with the video host's rectangle [marginPx] in from each edge. Process-wide, and every call
+     * is made on the AWT event thread. A library without these leaves the video as it was.
+     */
+    external fun bezelShow(hostViewPtr: Long, argb: IntArray, width: Int, height: Int, marginPx: Int)
+
+    /** Moves the bezel to follow the host window (the app window moved). */
+    external fun bezelMove(hostViewPtr: Long)
+    external fun bezelHide()
     external fun toggleStatsOverlay(handle: Long)
     external fun forceVideoRedraw(handle: Long)
+
+    /** Fits the video and the HUD to the host window now, after the host was resized (not on the bridge's next timer tick). */
+    external fun layoutToHost(handle: Long)
 
     /**
      * Polls the XInput controller slots selected by [slotMask] (bit N = slot N) and returns a
@@ -152,6 +267,14 @@ internal object NativePlayerBridge {
     external fun pollGamepads(slotMask: Int, out: IntArray): Int
 
     /**
+     * What the PlayStation pads read over raw HID should do themselves, applied on the next
+     * [pollGamepads]: [fullReports] asks a Bluetooth DualSense for its full report (the mic button
+     * is only in that one); [lightMode] 0 leaves the lights alone, 1 turns the light bar off, 2 sets
+     * it to [rgb] (0xRRGGBB); [playerLight] lights the player-1 light while lightMode is not 0.
+     */
+    external fun configureGamepads(fullReports: Boolean, lightMode: Int, rgb: Int, playerLight: Boolean)
+
+    /**
      * Milliseconds since the last keyboard or mouse input anywhere on the desktop (Windows'
      * `GetLastInputInfo`), or -1 if that could not be read. Controllers are not included; see
      * `DesktopScreensaver` for how they are folded in. Same reason for living here as
@@ -160,10 +283,52 @@ internal object NativePlayerBridge {
     external fun systemIdleMs(): Long
 
     /**
+     * This process's memory, for the memory diagnostics ([com.nuvio.app.core.diagnostics.MemoryBreakdownSampler]).
+     * Fills [out] (9 longs, bytes, -1 = unknown): private commit, working set, private working set,
+     * committed write-combined (graphics-driver) memory, other private, images, mapped files,
+     * dedicated video memory, shared video memory. Same reason for living here as [pollGamepads].
+     */
+    external fun processMemoryBreakdown(out: LongArray): Boolean
+
+    /** [handle]'s demuxer cache: [out][0] bytes held, [out][1] the part ahead of the playhead; -1 = unknown. */
+    external fun demuxerCacheBytes(handle: Long, out: LongArray): Boolean
+
+    /** Another process's private working set in bytes (for child processes); -1 = unknown. */
+    external fun processPrivateWorkingSet(pid: Long): Long
+
+    /** File names of the DLLs loaded in this process, ';'-separated. */
+    external fun loadedModuleNames(): String
+
+    /**
+     * Holds (or releases) a keep-awake request for the display and system while a video plays.
+     * Leaves [systemIdleMs] alone, so the screensaver's idle clock is unaffected.
+     */
+    external fun setWindowsDisplaySleepInhibited(inhibited: Boolean): Boolean
+
+    /**
      * Whether the foreground window belongs to this process. AWT's `Window.isActive` cannot be
      * trusted for this while focus sits in the WebView2 HUD (a non-AWT child of the frame).
      */
     external fun isForegroundProcess(): Boolean
+
+    /**
+     * Whether Windows HDR is on for the monitor [windowHwnd] sits on. False when that monitor
+     * cannot be matched, never a guess from another display. See `DesktopHdrUiCompensation`.
+     */
+    external fun isWindowDisplayHdr(windowHwnd: Long): Boolean
+
+    /**
+     * Refresh rates the monitor [windowHwnd] sits on offers at its current resolution: element 0
+     * is the current rate, the rest are the choices. Empty when it cannot be read. See
+     * `DisplayRefreshMatch`.
+     */
+    external fun displayRefreshRates(windowHwnd: Long): IntArray
+
+    /**
+     * Temporarily switches that monitor to [hz] (never saved; Windows undoes it if the app ends).
+     * [hz] 0 puts back the user's own mode on whichever monitor was switched.
+     */
+    external fun setDisplayRefreshRate(windowHwnd: Long, hz: Int): Boolean
 
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
@@ -350,6 +515,7 @@ internal object NativePlayerBridge {
     }
 
     private fun findLocalBuildLibrary(platformDir: String, libraryName: String): File? {
+        if (!com.nuvio.app.core.build.DesktopDevRun.allowsLocalNativeBuilds) return null
         val candidates = listOf(
             File("composeApp/build/native/$platformDir/$libraryName"),
             File("build/native/$platformDir/$libraryName"),
@@ -393,19 +559,27 @@ internal object NativePlayerBridge {
         val root = File(System.getProperty("java.io.tmpdir"), "nuvio-player-ui").apply { mkdirs() }
         val fontsDir = root.resolve("fonts").apply { mkdirs() }
         val htmlFile = root.resolve("controls.html")
+        val cssText = readTextResource("/player-ui/controls.css")
+            .replace("/* __NUVIO_PLAYER_FONT_FACES__ */", nativePlayerFontFaces())
+        val jsText = readTextResource("/player-ui/controls.js")
+        // The page names its stylesheet and script with a hand-maintained `?v=` key. WebView2 keeps
+        // a disk cache across launches and treats an unchanged URL as unchanged content, so when a
+        // release edited controls.css/js without remembering to bump that key, the old files kept
+        // being served from cache (a stale pre-show HUD showed the mute icon again). The key is now
+        // taken from the content itself, so the URL changes exactly when the files do.
+        val assetVersion = java.security.MessageDigest.getInstance("SHA-256")
+            .digest((cssText + "\u0000" + jsText).toByteArray(Charsets.UTF_8))
+            .take(6)
+            .joinToString("") { "%02x".format(it) }
         writeTextIfChanged(
             target = htmlFile,
-            text = readTextResource("/player-ui/controls.html"),
+            text = readTextResource("/player-ui/controls.html")
+                .replace(Regex("""(controls\.(?:css|js))\?v=[^"'\s>]*""")) { match ->
+                    "${match.groupValues[1]}?v=$assetVersion"
+                },
         )
-        writeTextIfChanged(
-            target = root.resolve("controls.css"),
-            text = readTextResource("/player-ui/controls.css")
-                .replace("/* __NUVIO_PLAYER_FONT_FACES__ */", nativePlayerFontFaces()),
-        )
-        copyResourceIfChanged(
-            resource = "/player-ui/controls.js",
-            target = root.resolve("controls.js"),
-        )
+        writeTextIfChanged(target = root.resolve("controls.css"), text = cssText)
+        writeTextIfChanged(target = root.resolve("controls.js"), text = jsText)
         copyResourceIfChanged(
             resource = "/composeResources/nuvio.composeapp.generated.resources/font/jetbrains_sans_regular.ttf",
             target = fontsDir.resolve("jetbrains_sans_regular.ttf"),

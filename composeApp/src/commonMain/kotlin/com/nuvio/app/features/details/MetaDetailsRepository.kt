@@ -1,15 +1,24 @@
 package com.nuvio.app.features.details
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.addons.AddonManifest
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.enabledAddons
-import com.nuvio.app.features.addons.httpGetText
+import com.nuvio.app.features.addons.httpRequestRaw
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
+import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.home.WatchedContentFilter
 import com.nuvio.app.features.home.filterReleasedItems
+import com.nuvio.app.features.home.filterUnwatchedItems
 import com.nuvio.app.features.mdblist.MdbListMetadataService
 import com.nuvio.app.features.mdblist.MdbListSettingsRepository
+import com.nuvio.app.features.posterservice.CustomPosterKeys
+import com.nuvio.app.features.posterservice.CustomPosterScreen
+import com.nuvio.app.features.posterservice.CustomPosterSettingsRepository
+import com.nuvio.app.features.posterservice.cacheToken
+import com.nuvio.app.features.posterservice.withResolvedCustomPosters
 import com.nuvio.app.features.metadata.AnimeArtworkService
 import com.nuvio.app.features.metadata.animeMovieTmdbFallbackId
 import com.nuvio.app.features.metadata.hasAnimeNamespacePrefix
@@ -19,6 +28,8 @@ import com.nuvio.app.features.tmdb.HeroImageSource
 import com.nuvio.app.features.tmdb.TmdbService
 import com.nuvio.app.features.tmdb.TmdbSettingsRepository
 import com.nuvio.app.features.tvdb.TvdbImageService
+import com.nuvio.app.features.watchprogress.isPlaceholderAirTime
+import com.nuvio.app.features.watchprogress.repairPlaceholderAirTime
 import com.nuvio.app.features.tvdb.TvdbSettingsRepository
 import com.nuvio.app.features.trakt.TraktAuthRepository
 import com.nuvio.app.features.trakt.TraktConnectionMode
@@ -33,16 +44,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.features.servers.message
+import com.nuvio.app.features.servers.serverFailure
 import org.jetbrains.compose.resources.getString
 
 object MetaDetailsRepository {
@@ -75,8 +92,15 @@ object MetaDetailsRepository {
     }
 
     fun load(type: String, id: String) {
+        PerfTelemetry.count("MetaDetailsRepository.load")
         log.d { "load() called — type=$type id=$id" }
         val requestKey = "$type:$id"
+
+        // A media server's own title (a server: id): its details come from the server itself.
+        com.nuvio.app.features.servers.ServerItemRef.parse(id)?.let { ref ->
+            loadServerMeta(requestKey, ref)
+            return
+        }
 
         // Unmatched local-library items have no addon meta; serve a synthesized one so the details
         // page still opens and plays the local file(s). (Matched items use their real tt/tmdb meta.)
@@ -178,25 +202,27 @@ object MetaDetailsRepository {
 
             var supplementalMeta: MetaDetails? = null
             for (manifest in manifests) {
-                val result = withContext(Dispatchers.Default) {
-                    tryFetchMeta(
-                        manifest,
-                        type,
-                        metaLookupId,
-                        includeMdbList = false,
+                // Bare addon records first: whether a series record has episodes decides whether it
+                // is the page or only a supplement, and that needs no decoration.
+                val raw = withContext(Dispatchers.Default) {
+                    fetchAddonMetaCatching(
+                        manifest = manifest,
+                        type = type,
+                        id = metaLookupId,
                         origin = "supplemental:$type:$metaLookupId",
-                    )
+                    ) { it }
                 }
-                if (result != null) {
-                    if (type.isSeriesMetaType() && result.videos.isEmpty()) {
-                        supplementalMeta = supplementalMeta?.mergeSupplementalMeta(result) ?: result
+                if (raw != null) {
+                    if (type.isSeriesMetaType() && raw.videos.isEmpty()) {
+                        supplementalMeta = supplementalMeta?.mergeSupplementalMeta(raw) ?: raw
                         continue
                     }
-                    publishLoadedMeta(
+                    publishProgressively(
                         requestKey = requestKey,
-                        meta = result.mergeSupplementalMeta(supplementalMeta),
-                        fallbackItemId = metaLookupId,
-                        fallbackItemType = type,
+                        raw = raw,
+                        supplementalMeta = supplementalMeta,
+                        metaLookupId = metaLookupId,
+                        type = type,
                         mdbListSettings = mdbListSettings,
                         metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
                     )
@@ -211,6 +237,22 @@ object MetaDetailsRepository {
                     meta = tmdbMeta.mergeSupplementalMeta(supplementalMeta),
                     fallbackItemId = id,
                     fallbackItemType = type,
+                    mdbListSettings = mdbListSettings,
+                    metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
+                )
+                return@launch
+            }
+
+            // Nothing better turned up, so the episode-less record is the page. `tv` counts as a
+            // series type, but live-TV addons (Nuvio Live Sports) use it for channels and events,
+            // which never have episodes and have no TMDB id to fall back on.
+            supplementalMeta?.let { meta ->
+                publishProgressively(
+                    requestKey = requestKey,
+                    raw = meta,
+                    supplementalMeta = null,
+                    metaLookupId = metaLookupId,
+                    type = type,
                     mdbListSettings = mdbListSettings,
                     metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
                 )
@@ -294,19 +336,72 @@ object MetaDetailsRepository {
     private val inFlightFullMeta = mutableMapOf<String, kotlinx.coroutines.Deferred<MetaDetails?>>()
     private val fullMetaMutex = kotlinx.coroutines.sync.Mutex()
 
-    suspend fun fetch(type: String, id: String, enrichTmdb: Boolean = true, forceRefresh: Boolean = false): MetaDetails? {
+    /**
+     * Uncached full fetches from bulk background callers (watch-progress resolution, Next Up) at
+     * once. Each caller limited itself, if at all, but not each other: ~40 full records
+     * were decorated together right after a details visit (2026-10-19), each with every season's
+     * TMDB episodes held in memory, and the live heap went 206 -> 549 MB with back-to-back 350-560 ms
+     * full GCs. Foreground callers do not take a permit, and neither does Trakt's hydration: it
+     * times each fetch at 3.5 s, and a wait for a permit would count against that.
+     */
+    private val backgroundFetchPermits = kotlinx.coroutines.sync.Semaphore(3)
+
+    suspend fun fetch(
+        type: String,
+        id: String,
+        enrichTmdb: Boolean = true,
+        forceRefresh: Boolean = false,
+        /** A bulk sweep rather than something the user is waiting on; see [backgroundFetchPermits]. */
+        background: Boolean = false,
+        /**
+         * Only these seasons' episodes are decorated from TMDB; null for every season. For callers that show one
+         * episode (Up Next and Continue Watching cards): decorating every season of every watched series was most of
+         * the 120 TMDB season requests left at launch (optimization audit, 2026-11-13). Kept under its own key, so a
+         * partly decorated record never reaches a caller that wants them all; a full record already held is used.
+         */
+        episodeSeasons: Set<Int>? = null,
+    ): MetaDetails? {
+        com.nuvio.app.features.servers.ServerItemRef.parse(id)?.let { ref ->
+            val serverKey = "$type:$id"
+            if (!forceRefresh) cachedMetaByRequestKey[serverKey]?.let { return it.baseMeta }
+            return runCatching { com.nuvio.app.features.servers.ServerCatalog.details(ref).meta }
+                .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
+                .getOrNull()
+                ?.also { cachedMetaByRequestKey[serverKey] = CachedMetaEntry(baseMeta = it) }
+        }
         // Keyed on the **resolved** lookup id, not the id the caller happened to hold — plan §23.3.
         // `tt11561116` and `tmdb:860508` are the same title and produce the identical addon URL, so
         // keying on the requested id made each alias pay for its own fetch. Resolving first is
         // effectively free now: it goes through `TmdbService.tmdbToImdb`, which is disk-cached.
         val metaLookupId = resolveMetaLookupId(itemId = id, itemType = type)
-        val requestKey = "$type:$metaLookupId:enrich=$enrichTmdb"
+        val fullRequestKey = "$type:$metaLookupId:enrich=$enrichTmdb"
+        val seasonScope = episodeSeasons?.takeIf { enrichTmdb && it.isNotEmpty() }
+        val requestKey = seasonScope?.let { "$fullRequestKey:seasons=${it.sorted().joinToString(",")}" } ?: fullRequestKey
         if (!forceRefresh) {
+            if (seasonScope != null) {
+                cachedMetaByRequestKey[fullRequestKey]?.let { return it.baseMeta }
+                // A record already decorated for more seasons than asked (Up Next's seed and next season, after
+                // Continue Watching asked for one of them, or the other way round) answers this one too.
+                val prefix = "$fullRequestKey:seasons="
+                // Written from other dispatchers too: a walk that races a write is just a miss.
+                runCatching {
+                    cachedMetaByRequestKey.entries.firstOrNull { (key, _) ->
+                        key.startsWith(prefix) &&
+                            key.removePrefix(prefix).split(',').mapNotNull { it.toIntOrNull() }.toSet().containsAll(seasonScope)
+                    }?.value?.baseMeta
+                }.getOrNull()?.let { return it }
+            }
             cachedMetaByRequestKey[requestKey]?.let { return it.baseMeta }
             val shared = fullMetaMutex.withLock {
                 inFlightFullMeta[requestKey] ?: scope.async {
                     try {
-                        fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId)
+                        if (background) {
+                            backgroundFetchPermits.withPermit {
+                                fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId, seasonScope)
+                            }
+                        } else {
+                            fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId, seasonScope)
+                        }
                     } finally {
                         fullMetaMutex.withLock { inFlightFullMeta.remove(requestKey) }
                     }
@@ -314,7 +409,10 @@ object MetaDetailsRepository {
             }
             return shared.await()
         }
-        return fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId)
+        if (background) {
+            return backgroundFetchPermits.withPermit { fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId, seasonScope) }
+        }
+        return fetchUncached(type, id, enrichTmdb, requestKey, metaLookupId, seasonScope)
     }
 
     private suspend fun fetchUncached(
@@ -323,16 +421,21 @@ object MetaDetailsRepository {
         enrichTmdb: Boolean,
         requestKey: String,
         metaLookupId: String,
+        episodeSeasons: Set<Int>? = null,
     ): MetaDetails? = runMetaFetch(
         type = type,
         id = id,
         metaLookupId = metaLookupId,
         requestKey = requestKey,
         enrichTmdb = enrichTmdb,
-        // The details screen is the one consumer that genuinely wants all of this.
-        trailerScope = TmdbMetadataService.TrailerScope.AllSeasons,
+        // Episodes yes (Next Up cards and the player need stills and titles), every season's
+        // trailers no: nothing reads trailers off this record (the details screen loads its own
+        // through load()), and the per-season lists were half of a sweep's TMDB calls. The same
+        // scope as the details screen's first pass, so the two share TMDB's enrichment cache.
+        trailerScope = TmdbMetadataService.TrailerScope.SingleSeason(preferredTrailerSeason(metaLookupId)),
         includeEpisodes = true,
         origin = "full",
+        episodeSeasons = episodeSeasons,
     )
 
     /**
@@ -351,6 +454,10 @@ object MetaDetailsRepository {
         trailerScope: TmdbMetadataService.TrailerScope,
         includeEpisodes: Boolean,
         origin: String,
+        /** False for a background sweep that keeps its own cache — see [fetchForSchedule]. */
+        cacheResult: Boolean = true,
+        /** Seasons TMDB decorates; null for all. See [fetch]. */
+        episodeSeasons: Set<Int>? = null,
     ): MetaDetails? {
         // forceRefresh bypasses the LRU so a background sweep (library auto-download) sees newly
         // aired episodes instead of a stale cached video list. The non-forced read happens in
@@ -370,6 +477,7 @@ object MetaDetailsRepository {
                     trailerScope = trailerScope,
                     includeEpisodes = includeEpisodes,
                     origin = "$origin:$requestKey",
+                    episodeSeasons = episodeSeasons,
                 )
             }
             if (result != null) {
@@ -378,16 +486,45 @@ object MetaDetailsRepository {
                     continue
                 }
                 val merged = result.mergeSupplementalMeta(supplementalMeta)
-                cachedMetaByRequestKey[requestKey] = CachedMetaEntry(baseMeta = merged)
+                if (cacheResult) cachedMetaByRequestKey[requestKey] = CachedMetaEntry(baseMeta = merged)
                 return merged
             }
         }
 
-        return tryFetchTmdbFallbackMeta(type = type, id = id)?.also { result ->
-            cachedMetaByRequestKey[requestKey] = CachedMetaEntry(
-                baseMeta = result.mergeSupplementalMeta(supplementalMeta),
-            )
-        }?.mergeSupplementalMeta(supplementalMeta)
+        // Without a TMDB record the episode-less addon record is still the title (see load()).
+        val fallback = tryFetchTmdbFallbackMeta(type = type, id = id)?.mergeSupplementalMeta(supplementalMeta)
+            ?: supplementalMeta
+        if (fallback != null && cacheResult) {
+            cachedMetaByRequestKey[requestKey] = CachedMetaEntry(baseMeta = fallback)
+        }
+        return fallback
+    }
+
+    /**
+     * A title's episode list and air dates for a background sweep that keeps its own cache — the
+     * local calendar, which walks every followed show.
+     *
+     * A full record already held is reused, but the answer is never stored: a sweep over a few
+     * hundred shows would otherwise push out of the 300-entry LRU everything the details screens
+     * and Home just loaded. No TMDB decoration either; only the addon's dates are wanted, and the
+     * placeholder air-time repair still runs inside the addon fetch.
+     */
+    suspend fun fetchForSchedule(type: String, id: String): MetaDetails? {
+        val metaLookupId = resolveMetaLookupId(itemId = id, itemType = type)
+        listOf("$type:$metaLookupId:enrich=true", "$type:$metaLookupId:enrich=false")
+            .firstNotNullOfOrNull { key -> cachedMetaByRequestKey[key]?.baseMeta }
+            ?.let { return it }
+        return runMetaFetch(
+            type = type,
+            id = id,
+            metaLookupId = metaLookupId,
+            requestKey = "$type:$metaLookupId:schedule",
+            enrichTmdb = false,
+            trailerScope = TmdbMetadataService.TrailerScope.SingleSeason(HERO_TRAILER_SEASON),
+            includeEpisodes = false,
+            origin = "schedule",
+            cacheResult = false,
+        )
     }
 
     /**
@@ -416,6 +553,7 @@ object MetaDetailsRepository {
      * performs the full fetch with its episodes.
      */
     suspend fun fetchHeroSummary(type: String, id: String): MetaDetails? {
+        PerfTelemetry.count("MetaDetailsRepository.fetchHeroSummary")
         // A record already in hand beats a summary and costs nothing - but only a *complete* one.
         // Deliberately not peekAny(): that also answers from the lightweight artwork cache, whose
         // records can be a name, a backdrop and a logo with no cast at all. Handing one of those to
@@ -451,6 +589,9 @@ object MetaDetailsRepository {
 
     // Separate lightweight cache: survives LaunchedEffect restarts without polluting the
     // main detail-page cache (which the full fetch() path writes to).
+    /** Addon meta URLs that answered 404 this session; see [tryFetchMeta]. */
+    private val metaNotFoundUrls = mutableSetOf<String>()
+    private val metaNotFoundMutex = Mutex()
     private val lightweightMetaCache = mutableMapOf<String, MetaDetails>()
 
     // Guards lightweightMetaCache and inFlightLightweightMeta. Unlike cachedMetaByRequestKey,
@@ -506,12 +647,28 @@ object MetaDetailsRepository {
             inFlightLightweightMeta.getOrPut(requestKey) {
                 scope.async {
                     try {
+                        // Kept across launches (LightweightMetaDiskCache): the artwork prewarm asks
+                        // for the same ~1,100 titles every launch. Fingerprinted at the start so
+                        // the result is filed under the settings it was actually fetched with.
+                        val diskContext = lightweightDiskContext()
+                        LightweightMetaDiskCache.get(requestKey, diskContext)?.let { hit ->
+                            cacheLightweightMeta(requestKey, hit.meta)
+                            if (hit.stale) {
+                                scheduleStaleLightweightRefresh(type, id, preferTmdbImages, requestKey, diskContext, hit.meta)
+                            }
+                            return@async hit.meta
+                        }
                         runLightweightMetaFetch(
                             type = type,
                             id = id,
                             preferTmdbImages = preferTmdbImages,
                             requestKey = requestKey,
-                        )
+                        ).also {
+                            // Only what the fetch chose to cache - an incomplete answer it declined
+                            // to keep for the session must not be kept for a day either.
+                            val cached = lightweightMetaMutex.withLock { lightweightMetaCache[requestKey] }
+                            if (cached != null) LightweightMetaDiskCache.put(requestKey, diskContext, cached)
+                        }
                     } finally {
                         // A failed fetch must not leave its Deferred behind for later callers to
                         // await forever, so the removal has to survive cancellation too.
@@ -524,6 +681,44 @@ object MetaDetailsRepository {
         }
         return request.await()
     }
+
+    /**
+     * Refreshes a disk entry that outlived the Metadata Cache setting, one title at a time with a
+     * pause between, while the stale copy keeps serving. After a long break nearly every entry is
+     * stale at once, so this is what turns a ~3,300-request burst into a background trickle.
+     */
+    private fun scheduleStaleLightweightRefresh(
+        type: String,
+        id: String,
+        preferTmdbImages: Boolean,
+        requestKey: String,
+        diskContext: String,
+        stale: MetaDetails,
+    ) {
+        if (!staleLightweightRefreshes.add(requestKey)) return
+        scope.launch {
+            try {
+                staleLightweightRefreshGate.withPermit {
+                    delay(STALE_LIGHTWEIGHT_REFRESH_SPACING_MS)
+                    runLightweightMetaFetch(type = type, id = id, preferTmdbImages = preferTmdbImages, requestKey = requestKey)
+                    // A failed refresh leaves the stale copy in the session cache; it must not be
+                    // saved again as if it were new.
+                    val cached = lightweightMetaMutex.withLock { lightweightMetaCache[requestKey] }
+                    if (cached != null && cached !== stale) LightweightMetaDiskCache.put(requestKey, diskContext, cached)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.d { "Stale lightweight meta refresh failed for $requestKey: ${e.message}" }
+            } finally {
+                staleLightweightRefreshes.remove(requestKey)
+            }
+        }
+    }
+
+    private val staleLightweightRefreshGate = Semaphore(1)
+    private val staleLightweightRefreshes: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private const val STALE_LIGHTWEIGHT_REFRESH_SPACING_MS = 1_000L
 
     private suspend fun runLightweightMetaFetch(
         type: String,
@@ -568,6 +763,9 @@ object MetaDetailsRepository {
                     // block of TMDB traffic left: 474 season requests across 69 shows in one
                     // browsing session, none of them redundant, none of them used.
                     includeEpisodes = false,
+                    // Every consumer of the lightweight cache reads artwork, text, rating and
+                    // runtime only - see TmdbMetadataService.EnrichmentDepth.Card.
+                    tmdbDepth = TmdbMetadataService.EnrichmentDepth.Card,
                     origin = "lightweight:$requestKey",
                 )
             }
@@ -605,7 +803,10 @@ object MetaDetailsRepository {
                 val addonBg = addonResult?.background
                 val addonLogo = addonResult?.logo
                 val addonHasTvdbBackdrop = addonBg?.contains("artworks.thetvdb.com") == true || addonBg?.contains("metahub.space") == true
-                val addonHasTvdbLogo = addonLogo?.contains("artworks.thetvdb.com") == true || addonLogo?.contains("metahub.space") == true
+                // metahub logos are fanart.tv's, picked with no regard to language (a Polish show
+                // got its Polish logo over TMDB's English one), so they don't count as TVDB here;
+                // they rank below TMDB in the merge further down.
+                val addonHasTvdbLogo = addonLogo?.contains("artworks.thetvdb.com") == true
 
                 if (addonHasTvdbBackdrop) {
                     // Addon (e.g. AIOMetadata) already ran the TVDB selection and embedded the
@@ -657,7 +858,11 @@ object MetaDetailsRepository {
         } else null
         val tmdbFallbackId = if (resolvedTmdbNumericId != null) "tmdb:$resolvedTmdbNumericId" else id
         val rawTmdbResult = if (needsTmdb && resolvedTmdbNumericId != null) {
-            tryFetchTmdbFallbackMeta(type = type, id = tmdbFallbackId)
+            tryFetchTmdbFallbackMeta(
+                type = type,
+                id = tmdbFallbackId,
+                depth = TmdbMetadataService.EnrichmentDepth.Card,
+            )
         } else null
         // resolvedTmdbNumericId can come from a bare-numeric addon id trusted without
         // verification (TmdbService.ensureTmdbId's "all digits" branch) — if that number
@@ -697,12 +902,16 @@ object MetaDetailsRepository {
 
         // Merge independently per field so TMDB fills in when TVDB has no backdrop/logo.
         // e.g. a series not yet on TVDB gets TVDB logo (if present) + TMDB backdrop.
-        // Priority order: TVDB -> Explicit Metahub -> Addon -> TMDB
+        // Priority order: TVDB -> Addon -> TMDB -> Metahub. Logos differ from backdrops: metahub
+        // (fanart.tv) has no language selection, while TVDB/TMDB are filtered to the user's
+        // language, English or neutral - so metahub only fills a logo nobody else had.
         val textSource = tmdbResult ?: tvdbResult  // TMDB has richer text metadata
+        val addonLanguageAwareLogo = addonResult?.logo?.takeUnless(::isMetahubUrl)
         val merged = when {
             addonResult != null -> addonResult.copy(
                 background = tvdbResult?.background ?: explicitMetahubBackground ?: addonResult.background ?: tmdbResult?.background,
-                logo = tvdbResult?.logo ?: explicitMetahubLogo ?: addonResult.logo ?: tmdbResult?.logo,
+                logo = tvdbResult?.logo ?: addonLanguageAwareLogo ?: tmdbResult?.logo
+                    ?: explicitMetahubLogo ?: addonResult.logo,
                 genres = addonResult.genres.ifEmpty { textSource?.genres ?: emptyList() },
                 description = addonResult.description ?: textSource?.description,
                 releaseInfo = addonResult.releaseInfo ?: textSource?.releaseInfo,
@@ -719,12 +928,41 @@ object MetaDetailsRepository {
                     // than answering with a nameless title.
                     name = img.name.takeIf { it.isNotBlank() } ?: tmdbResult?.name.orEmpty(),
                     background = tvdbResult?.background ?: explicitMetahubBackground ?: tmdbResult?.background,
-                    logo = tvdbResult?.logo ?: explicitMetahubLogo ?: tmdbResult?.logo
+                    logo = tvdbResult?.logo ?: tmdbResult?.logo ?: explicitMetahubLogo
                 )
             }
         }
         merged?.let { cacheLightweightMeta(requestKey, it) }
         return merged
+    }
+
+    /**
+     * What a lightweight result depends on besides the title: TMDB's settings, the hero image
+     * source, whether TVDB can answer, and which addons are enabled. A disk entry made under any
+     * other combination is a miss. Hashed - the addon URLs carry user configs and keys.
+     */
+    private fun lightweightDiskContext(): String {
+        val tmdb = TmdbSettingsRepository.snapshot()
+        val addons = AddonRepository.uiState.value.addons
+            .enabledAddons()
+            .mapNotNull { it.manifest?.transportUrl }
+            .sorted()
+        return listOf(
+            // Bump when the merge rules change so stale disk entries miss.
+            // 2: metahub logos rank below TMDB (language-blind fanart.tv logos).
+            // 3: TVDB/Kitsu show records keep their own text under TmdbShowEnrichment.SourceAware.
+            LIGHTWEIGHT_MERGE_VERSION,
+            tmdb.enabled,
+            tmdb.hasApiKey,
+            tmdb.language,
+            tmdb.useArtwork,
+            tmdb.useBasicInfo,
+            tmdb.useDetails,
+            tmdb.heroImageSource.name,
+            tmdb.showEnrichment.name,
+            TvdbSettingsRepository.snapshot().hasApiKey,
+            addons.joinToString(","),
+        ).joinToString("|").hashCode().toUInt().toString(16)
     }
 
     private suspend fun cacheLightweightMeta(requestKey: String, meta: MetaDetails) {
@@ -760,9 +998,74 @@ object MetaDetailsRepository {
      */
     private const val HERO_TRAILER_SEASON = 1
 
+    /** A media server's title: details, watched state and resume points read from the server. */
+    private fun loadServerMeta(requestKey: String, ref: com.nuvio.app.features.servers.ServerItemRef) {
+        if (_uiState.value.isLoading && activeRequestKey == requestKey) return
+        activeRequestKey = requestKey
+        _uiState.value = MetaDetailsUiState(
+            isLoading = true,
+            meta = cachedMetaByRequestKey[requestKey]?.baseMeta,
+        )
+        scope.launch {
+            val result = runCatching { com.nuvio.app.features.servers.ServerCatalog.details(ref) }
+            if (activeRequestKey != requestKey) return@launch
+            result.fold(
+                onSuccess = { details ->
+                    val meta = details.meta
+                    com.nuvio.app.features.servers.ServerUserStateProjection.apply(details)
+                    cachedMetaByRequestKey[requestKey] = CachedMetaEntry(baseMeta = meta)
+                    _uiState.value = MetaDetailsUiState(meta = meta)
+                },
+                onFailure = { error ->
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    log.w { "Server details failed: ${error.serverFailure()}" }
+                    val cached = cachedMetaByRequestKey[requestKey]?.baseMeta
+                    _uiState.value = MetaDetailsUiState(
+                        meta = cached,
+                        errorMessage = if (cached == null) getString(error.serverFailure().message()) else null,
+                    )
+                    if (cached == null) activeRequestKey = null
+                },
+            )
+        }
+    }
+
     private const val FETCH_TIMEOUT_MS = 12_000L
+    private const val HTTP_NOT_FOUND = 404
+    private const val HTTP_TOO_MANY_REQUESTS = 429
+    private const val META_NOT_FOUND_CACHE_LIMIT = 5_000
     private const val TMDB_ENRICH_TIMEOUT_MS = 5_000L
+    private const val TVDB_AIR_TIME_TIMEOUT_MS = 4_000L
+
+    /**
+     * AIOMetadata dates an episode at noon UTC when it cannot work out the series' air time — every
+     * UK show, since TVDB says `gbr` and the addon's timezone table only knows `gb`. Ask TVDB for
+     * the schedule ourselves and rebuild the instant; one `/extended` call per series per run,
+     * and none at all for a meta with no placeholder or no TVDB id.
+     */
+    private suspend fun repairPlaceholderAirTimes(meta: MetaDetails): MetaDetails {
+        if (meta.videos.none { isPlaceholderAirTime(it.released) }) return meta
+        val tvdbId = meta.tvdbId?.trim()?.takeIf(String::isNotBlank) ?: return meta
+        val schedule = TvdbImageService.fetchAirSchedule(tvdbId) ?: return meta
+        var repaired = 0
+        val videos = meta.videos.map { video ->
+            val fixed = repairPlaceholderAirTime(video.released, schedule.airsTime, schedule.originalCountry)
+                ?: return@map video
+            repaired++
+            video.copy(released = fixed)
+        }
+        if (repaired == 0) {
+            log.d { "Placeholder air times left as-is for ${meta.id}: tvdb airsTime=${schedule.airsTime} country=${schedule.originalCountry}" }
+            return meta
+        }
+        log.d { "Repaired $repaired placeholder air times for ${meta.id} from tvdb airsTime=${schedule.airsTime} country=${schedule.originalCountry}" }
+        return meta.copy(videos = videos)
+    }
     private const val MDBLIST_ENRICH_TIMEOUT_MS = 5_000L
+    private const val FIRST_PASS_HOLD_MS = 300L
+    // Up to this many seasons are all decorated before the page completes; more and the page waits
+    // only for the season it opens on (prioritySeasonsFor).
+    private const val ALL_SEASONS_AT_ONCE_MAX = 4
     private const val IMDB_INTERESTS_TIMEOUT_MS = 6_000L
     private const val LOGO_FALLBACK_TIMEOUT_MS = 5_000L
 
@@ -773,13 +1076,29 @@ object MetaDetailsRepository {
      * started it, which the trailer scope reads as "the first". Local data only — this must not add
      * a request to a path whose whole purpose is to avoid them.
      */
-    private fun preferredTrailerSeason(id: String): Int? =
-        WatchedRepository.uiState.value.items
-            .asSequence()
-            .filter { it.id == id }
-            .mapNotNull { it.season }
-            .filter { it > 0 }
-            .maxOrNull()
+    private fun preferredTrailerSeason(id: String): Int? = highestWatchedSeasons()[id]
+
+    /**
+     * Highest watched season per title, rebuilt only when the watched list changes. Scanning the
+     * whole history per call (~13.6k items) ran on the UI thread for every hero summary — dozens per
+     * second while browsing Home — and showed up as an 80 ms `(UiStall)` on its own (2026-10-19).
+     */
+    @Volatile
+    private var watchedSeasonIndex: Pair<List<Any>, Map<String, Int>>? = null
+
+    private fun highestWatchedSeasons(): Map<String, Int> {
+        val items = WatchedRepository.uiState.value.items
+        watchedSeasonIndex?.let { (source, index) -> if (source === items) return index }
+        val index = HashMap<String, Int>()
+        for (item in items) {
+            val season = item.season ?: continue
+            if (season <= 0) continue
+            val current = index[item.id]
+            if (current == null || season > current) index[item.id] = season
+        }
+        watchedSeasonIndex = items to index
+        return index
+    }
 
     private suspend fun tryFetchMeta(
         manifest: AddonManifest,
@@ -789,6 +1108,7 @@ object MetaDetailsRepository {
         enrichTmdb: Boolean = true,
         trailerScope: TmdbMetadataService.TrailerScope = TmdbMetadataService.TrailerScope.AllSeasons,
         includeEpisodes: Boolean = true,
+        tmdbDepth: TmdbMetadataService.EnrichmentDepth = TmdbMetadataService.EnrichmentDepth.Full,
         /**
          * Which cache namespace asked for this — diagnostic only, plan §21.3.
          *
@@ -799,6 +1119,33 @@ object MetaDetailsRepository {
          * lightweight, full, supplemental) or one namespace failing to cache at all.
          */
         origin: String = "unknown",
+        /** Seasons TMDB decorates; null for all. See [fetch]. */
+        episodeSeasons: Set<Int>? = null,
+    ): MetaDetails? = fetchAddonMetaCatching(manifest, type, id, origin) { parsed ->
+        decorateAddonMeta(
+            parsed = parsed,
+            id = id,
+            includeMdbList = includeMdbList,
+            enrichTmdb = enrichTmdb,
+            trailerScope = trailerScope,
+            includeEpisodes = includeEpisodes,
+            tmdbDepth = tmdbDepth,
+            episodeSeasons = episodeSeasons,
+        )
+    }
+
+    /**
+     * The addon request and parse that every meta path starts with, plus [then] on the parsed record,
+     * inside one error boundary: a 404 is remembered and answers null, any other failure is logged
+     * and answers null, cancellation propagates. Split out of [tryFetchMeta] so the details screen
+     * can show the bare addon record (via its own decoration) before the slow decoration finishes.
+     */
+    private suspend fun fetchAddonMetaCatching(
+        manifest: AddonManifest,
+        type: String,
+        id: String,
+        origin: String,
+        then: suspend (MetaDetails) -> MetaDetails,
     ): MetaDetails? {
         val url = buildAddonResourceUrl(
             manifestUrl = manifest.transportUrl,
@@ -806,55 +1153,142 @@ object MetaDetailsRepository {
             type = type,
             id = id,
         )
+        if (metaNotFoundMutex.withLock { url in metaNotFoundUrls }) return null
 
-        return try {
+        // Off the caller's thread. `fetch()` and the hero/lightweight paths run in this object's
+        // Main-dispatcher scope, so the parse and every decoration after it ran on the UI thread:
+        // stall samples caught `runMetaFetch`/`tryFetchMeta` there, and a Next Up or Trakt sweep
+        // parses dozens of records at once (One Piece, 1,242 episodes). Only `load()` wrapped it.
+        // The caller's cache writes still happen back on its own dispatcher.
+        return withContext(Dispatchers.Default) { try {
             TmdbSettingsRepository.ensureLoaded()
-            log.d { "Fetching meta from: $url [origin=$origin]" }
-            val payload = httpGetText(url)
-            log.d { "Raw payload length=${payload.length}, first 500 chars: ${payload.take(500)}" }
-            val result = MetaDetailsParser.parse(payload)
-            val tmdbEnriched = if (enrichTmdb) {
-                withTimeoutOrNull(TMDB_ENRICH_TIMEOUT_MS) {
-                    TmdbMetadataService.enrichMeta(
-                        meta = result,
-                        fallbackItemId = id,
-                        settings = TmdbSettingsRepository.snapshot(),
-                        trailerScope = trailerScope,
-                        includeEpisodes = includeEpisodes,
-                    )
-                } ?: result
-            } else {
-                result
+            log.d { "Fetching meta from: ${com.nuvio.app.core.network.redactAddonUrl(url)} [origin=$origin]" }
+            // A host that says 429 is waited out and asked again (RateLimitGate) instead of being sent the rest of the burst.
+            val response = com.nuvio.app.core.network.RateLimitGate.shared.run(url) {
+                httpRequestRaw(
+                    method = "GET",
+                    url = url,
+                    headers = mapOf("Accept" to "application/json"),
+                    body = "",
+                    allowLargeResponse = true,
+                ).also { raw ->
+                    if (raw.status == HTTP_TOO_MANY_REQUESTS) {
+                        throw com.nuvio.app.core.network.HttpStatusException(
+                            status = raw.status,
+                            retryAfterSeconds = com.nuvio.app.core.network.parseRetryAfterSeconds(
+                                raw.headers.entries.firstOrNull { it.key.equals("Retry-After", ignoreCase = true) }?.value,
+                            ),
+                            message = getString(Res.string.network_request_failed_http, raw.status),
+                        )
+                    }
+                }
             }
-            val enriched = if (includeMdbList) {
-                MdbListSettingsRepository.ensureLoaded()
-                withTimeoutOrNull(MDBLIST_ENRICH_TIMEOUT_MS) {
-                    MdbListMetadataService.enrichMeta(
-                        meta = tmdbEnriched,
-                        fallbackItemId = id,
-                        settings = MdbListSettingsRepository.snapshot(),
-                    )
-                } ?: tmdbEnriched
-            } else {
-                tmdbEnriched
+            if (response.status == HTTP_NOT_FOUND) {
+                // The addon declares meta for this id prefix but doesn't have this title: an
+                // answer, not a failure. Addons such as provider catalogues claim every `tt` id,
+                // so one user's log held 1,626 of these as stack-traced errors, from 378 URLs each
+                // requested about four times. One line, and the URL is not asked again this session.
+                metaNotFoundMutex.withLock {
+                    if (metaNotFoundUrls.size >= META_NOT_FOUND_CACHE_LIMIT) metaNotFoundUrls.clear()
+                    metaNotFoundUrls += url
+                }
+                log.i { "No meta for $type/$id at ${com.nuvio.app.core.network.redactAddonUrl(manifest.transportUrl)} (HTTP 404)" }
+                return@withContext null
             }
-            log.d { "Parsed meta: type=${enriched.type}, name=${enriched.name}, videos=${enriched.videos.size}" }
-            if (enriched.videos.isNotEmpty()) {
-                val first = enriched.videos.first()
-                log.d { "First video: id=${first.id} title=${first.title} s=${first.season} e=${first.episode} embeddedStreams=${first.streams.size}" }
+            if (response.status !in 200..299) {
+                error(getString(Res.string.network_request_failed_http, response.status))
             }
-            enriched
+            val payload = response.body.takeIf { it.isNotBlank() }
+                ?: throw IllegalStateException(getString(Res.string.network_empty_response_body))
+            log.d { "Raw payload length=${payload.length}" }
+            val parsed = try {
+                MetaDetailsParser.parse(payload)
+            } catch (missing: MetaMissingException) {
+                // Remembered like a 404 (optimization audit B4: `series/anilist:219714` was asked 43 times in a day and
+                // came back empty 41 times).
+                metaNotFoundMutex.withLock {
+                    if (metaNotFoundUrls.size >= META_NOT_FOUND_CACHE_LIMIT) metaNotFoundUrls.clear()
+                    metaNotFoundUrls += url
+                }
+                log.i { "No meta for $type/$id at ${com.nuvio.app.core.network.redactAddonUrl(manifest.transportUrl)} (empty answer)" }
+                return@withContext null
+            }
+            then(parsed)
         } catch (e: Throwable) {
             if (e is CancellationException) {
                 // Logged before rethrowing: cancellation after the payload arrived means a request
                 // was paid for and discarded, and the silence is what made that invisible for so
                 // long. Still rethrown — cancellation must propagate.
-                log.d { "Meta fetch cancelled after payload for $url [origin=$origin]" }
+                log.d { "Meta fetch cancelled after payload for ${com.nuvio.app.core.network.redactAddonUrl(url)} [origin=$origin]" }
                 throw e
             }
-            log.e(e) { "Failed to fetch/parse meta from $url (manifest=${manifest.transportUrl})" }
+            if (e is com.nuvio.app.core.network.HttpStatusException && e.status == HTTP_TOO_MANY_REQUESTS) {
+                // One line, no stack: a rate-limited sweep used to write thousands of these.
+                log.w { "Meta for $type/$id rate limited (HTTP 429) by ${com.nuvio.app.core.network.redactAddonUrl(manifest.transportUrl)}; skipped for now" }
+                return@withContext null
+            }
+            log.e(e) { "Failed to fetch/parse meta from ${com.nuvio.app.core.network.redactAddonUrl(url)} (manifest=${com.nuvio.app.core.network.redactAddonUrl(manifest.transportUrl)})" }
             null
+        } }
+    }
+
+    /**
+     * Everything [tryFetchMeta] layers onto a parsed addon record: the TVDB air-time repair, TMDB
+     * enrichment (artwork, text, cast, episodes and trailers to the requested depth) and MDBList.
+     */
+    private suspend fun decorateAddonMeta(
+        parsed: MetaDetails,
+        id: String,
+        includeMdbList: Boolean,
+        enrichTmdb: Boolean = true,
+        trailerScope: TmdbMetadataService.TrailerScope = TmdbMetadataService.TrailerScope.AllSeasons,
+        includeEpisodes: Boolean = true,
+        tmdbDepth: TmdbMetadataService.EnrichmentDepth = TmdbMetadataService.EnrichmentDepth.Full,
+        /** False for the details screen's first pass; the repair only refines episode air times. */
+        repairAirTimes: Boolean = true,
+        /** Seasons whose episodes TMDB decorates; null for all (see TmdbMetadataService.enrichMeta). */
+        episodeSeasons: Set<Int>? = null,
+    ): MetaDetails {
+        // Before TMDB enrichment: preferPreciseReleaseDate keeps a timestamped addon value
+        // over TMDB's bare date, so the placeholder has to become a real instant first.
+        val result = if (repairAirTimes) {
+            withTimeoutOrNull(TVDB_AIR_TIME_TIMEOUT_MS) { repairPlaceholderAirTimes(parsed) } ?: parsed
+        } else {
+            parsed
         }
+        val tmdbEnriched = if (enrichTmdb) {
+            withTimeoutOrNull(TMDB_ENRICH_TIMEOUT_MS) {
+                TmdbMetadataService.enrichMeta(
+                    meta = result,
+                    fallbackItemId = id,
+                    settings = TmdbSettingsRepository.snapshot(),
+                    trailerScope = trailerScope,
+                    includeEpisodes = includeEpisodes,
+                    depth = tmdbDepth,
+                    episodeSeasons = episodeSeasons,
+                )
+            } ?: result
+        } else {
+            result
+        }
+        val enriched = if (includeMdbList) {
+            MdbListSettingsRepository.ensureLoaded()
+            withTimeoutOrNull(MDBLIST_ENRICH_TIMEOUT_MS) {
+                MdbListMetadataService.enrichMeta(
+                    meta = tmdbEnriched,
+                    fallbackItemId = id,
+                    settings = MdbListSettingsRepository.snapshot(),
+                )
+            } ?: tmdbEnriched
+        } else {
+            tmdbEnriched
+        }
+        log.d { "Parsed meta: type=${enriched.type}, name=${enriched.name}, videos=${enriched.videos.size}" }
+        if (enriched.videos.isNotEmpty()) {
+            val first = enriched.videos.first()
+            log.d { "First video: id=${first.id} title=${first.title} s=${first.season} e=${first.episode} embeddedStreams=${first.streams.size}" }
+        }
+        return enriched
     }
 
     private fun findMetaManifests(type: String, id: String): List<AddonManifest> =
@@ -884,7 +1318,11 @@ object MetaDetailsRepository {
             ?: itemId
     }
 
-    private suspend fun tryFetchTmdbFallbackMeta(type: String, id: String): MetaDetails? {
+    private suspend fun tryFetchTmdbFallbackMeta(
+        type: String,
+        id: String,
+        depth: TmdbMetadataService.EnrichmentDepth = TmdbMetadataService.EnrichmentDepth.Full,
+    ): MetaDetails? {
         // TmdbMetadataService only understands `tmdb:` ids. A native anime movie id
         // (`kitsu:`/`mal:`/`simkl:`, which is what SIMKL Continue Watching produces) can be
         // translated through the anime-list mapping, so a setup whose anime metadata comes from
@@ -899,11 +1337,233 @@ object MetaDetailsRepository {
                 type = type,
                 id = lookupId,
                 settings = TmdbSettingsRepository.snapshot(),
+                depth = depth,
             )
         } ?: return null
         // The caller asked about the native id and everything downstream is keyed on it; only the
         // lookup borrowed the TMDB id.
         return if (lookupId == id) meta else meta.copy(id = id)
+    }
+
+    /**
+     * The details screen's addon load in two passes, so a long-running show opens as fast as a film.
+     *
+     * Everything used to be decorated before the page showed anything: TMDB episode decoration and
+     * trailers for **every** season, the TVDB air-time repair, then MDBList, IMDb interests and More
+     * Like This. Family Guy (25 seasons) took 3.6 s from click to backdrop, 2.7 s of it in that chain,
+     * with up to ~14 s of timeouts behind it (2026-10-19 log).
+     *
+     * First pass: the TMDB details call (artwork, text, cast, recommendations, the show-level videos
+     * plus one season's trailers) and the screen's own backdrop/logo resolution — the same inputs the
+     * final pass uses, so the artwork shown now is the artwork kept. Published with `isLoading` still
+     * set, which holds off a reload and tells nothing to show a spinner over a page it already has.
+     *
+     * Second pass: the full decoration ([publishLoadedMeta]) — episode stills and titles, trailers for
+     * every season, air-time repair, MDBList, IMDb interests, More Like This — published over the
+     * first when it lands, and cached as the record for this title.
+     */
+    private suspend fun publishProgressively(
+        requestKey: String,
+        raw: MetaDetails,
+        supplementalMeta: MetaDetails?,
+        metaLookupId: String,
+        type: String,
+        mdbListSettings: com.nuvio.app.features.mdblist.MdbListSettings,
+        metaScreenSettingsFingerprint: String,
+    ) {
+        val firstPass = withContext(Dispatchers.Default) {
+            val quick = decorateAddonMeta(
+                parsed = raw,
+                id = metaLookupId,
+                includeMdbList = false,
+                trailerScope = TmdbMetadataService.TrailerScope.SingleSeason(preferredTrailerSeason(metaLookupId)),
+                includeEpisodes = false,
+                repairAirTimes = false,
+            ).mergeSupplementalMeta(supplementalMeta)
+            enrichForMetaScreen(
+                requestKey = requestKey,
+                meta = quick,
+                fallbackItemId = metaLookupId,
+                fallbackItemType = type,
+                settings = mdbListSettings,
+                settingsFingerprint = metaScreenSettingsFingerprint,
+                artworkOnly = true,
+            )
+        }
+        // A long show decorates the season the page opens on now and the rest after it is shown:
+        // every season is two TMDB requests (episodes, trailers), and waiting for all of them held a
+        // 20-season page for ~2.5 s (2026-10-19, Law & Order).
+        val prioritySeasons = prioritySeasonsFor(raw, metaLookupId)
+        val full = coroutineScope {
+            val fullDecoration = async(Dispatchers.Default) {
+                decorateAddonMeta(
+                    parsed = raw,
+                    id = metaLookupId,
+                    includeMdbList = false,
+                    trailerScope = if (prioritySeasons != null) {
+                        TmdbMetadataService.TrailerScope.SingleSeason(preferredTrailerSeason(metaLookupId))
+                    } else {
+                        TmdbMetadataService.TrailerScope.AllSeasons
+                    },
+                    episodeSeasons = prioritySeasons,
+                ).mergeSupplementalMeta(supplementalMeta)
+            }
+            // Most titles finish the full decoration in well under this (a 20-episode show: 166 ms,
+            // 2026-10-19), and showing the first pass for that long only bought a swap: its addon
+            // episode list (titles, TVDB screencaps fetched from the network) was replaced by TMDB's
+            // a fraction of a second later - a second page build and a second set of images for
+            // nothing. So the first pass waits this long; only shows whose decoration is still
+            // running after it (the long ones the two passes were for) open on it.
+            val inTime = withTimeoutOrNull(FIRST_PASS_HOLD_MS) { fullDecoration.await() }
+            if (activeRequestKey == requestKey) {
+                val shown = if (inTime != null) {
+                    // Artwork resolved from the same inputs as the first pass, so from its caches.
+                    withContext(Dispatchers.Default) {
+                        enrichForMetaScreen(
+                            requestKey = requestKey,
+                            meta = inTime,
+                            fallbackItemId = metaLookupId,
+                            fallbackItemType = type,
+                            settings = mdbListSettings,
+                            settingsFingerprint = metaScreenSettingsFingerprint,
+                            artworkOnly = true,
+                        )
+                    }
+                } else {
+                    firstPass
+                }
+                log.d {
+                    if (inTime != null) {
+                        "Decorated page shown for $requestKey; ratings and rows continue"
+                    } else {
+                        "First pass shown for $requestKey; full decoration continues"
+                    }
+                }
+                _uiState.value = MetaDetailsUiState(isLoading = true, meta = shown.withUnreleasedFilter())
+            }
+            inTime ?: fullDecoration.await()
+        }
+        publishLoadedMeta(
+            requestKey = requestKey,
+            meta = full,
+            fallbackItemId = metaLookupId,
+            fallbackItemType = type,
+            mdbListSettings = mdbListSettings,
+            metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
+        )
+        if (prioritySeasons != null) {
+            seasonCompletions[requestKey] = SeasonCompletion(
+                raw = raw,
+                supplementalMeta = supplementalMeta,
+                metaLookupId = metaLookupId,
+                decorated = prioritySeasons.toMutableSet(),
+            )
+            scope.launch { completeRemainingSeasons(requestKey, raw, supplementalMeta, metaLookupId) }
+        }
+    }
+
+    /** What a long show's page needs to decorate one more season before the background pass lands. */
+    private class SeasonCompletion(
+        val raw: MetaDetails,
+        val supplementalMeta: MetaDetails?,
+        val metaLookupId: String,
+        val decorated: MutableSet<Int>,
+    )
+
+    // Main-thread only (the repository scope and the screen's effects).
+    private val seasonCompletions = HashMap<String, SeasonCompletion>()
+
+    /**
+     * The user picked [season] on a long show's page before the background pass decorated it: fetch
+     * that season alone, at the user's priority, and patch its episodes in. A no-op once the season
+     * is decorated, for short shows, or for any page but the open one.
+     */
+    fun prioritizeSeason(season: Int) {
+        val requestKey = activeRequestKey ?: return
+        val completion = seasonCompletions[requestKey] ?: return
+        if (!completion.decorated.add(season)) return
+        scope.launch {
+            val decorated = runCatching {
+                withContext(Dispatchers.Default) {
+                    decorateAddonMeta(
+                        parsed = completion.raw,
+                        id = completion.metaLookupId,
+                        includeMdbList = false,
+                        trailerScope = TmdbMetadataService.TrailerScope.SingleSeason(season),
+                        episodeSeasons = setOf(season),
+                    ).mergeSupplementalMeta(completion.supplementalMeta)
+                }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                completion.decorated.remove(season)
+            }.getOrNull() ?: return@launch
+            val seasonVideos = decorated.videos.filter { it.season == season }.associateBy { it.id }
+            if (seasonVideos.isEmpty()) return@launch
+            patchShownMeta(requestKey) { meta ->
+                meta.copy(videos = meta.videos.map { video -> seasonVideos[video.id] ?: video })
+            }
+            log.d { "Season $season decorated on demand for $requestKey" }
+        }
+    }
+
+    /** Applies [transform] to the cached record and, if [requestKey] is still on screen, to the page. */
+    private fun patchShownMeta(requestKey: String, transform: (MetaDetails) -> MetaDetails) {
+        cachedMetaByRequestKey[requestKey]?.let { entry ->
+            cachedMetaByRequestKey[requestKey] = entry.copy(
+                baseMeta = transform(entry.baseMeta),
+                metaScreenMeta = entry.metaScreenMeta?.let(transform),
+            )
+        }
+        if (activeRequestKey != requestKey) return
+        val shown = _uiState.value.meta ?: return
+        _uiState.value = _uiState.value.copy(meta = transform(shown).withUnreleasedFilter())
+    }
+
+    /**
+     * The seasons a long show's page decorates before it is shown: the highest watched season and
+     * the one after it (where the page opens), or the first regular season of an unwatched show.
+     * Null when the show is short enough that every season costs no more than waiting.
+     */
+    private fun prioritySeasonsFor(raw: MetaDetails, id: String): Set<Int>? {
+        val seasons = raw.videos.mapNotNull { it.season }.distinct()
+        if (seasons.size <= ALL_SEASONS_AT_ONCE_MAX) return null
+        val watched = preferredTrailerSeason(id)
+        return if (watched != null) {
+            setOf(watched, watched + 1).filterTo(mutableSetOf()) { it in seasons }
+                .ifEmpty { null }
+        } else {
+            setOf(seasons.filter { it > 0 }.minOrNull() ?: seasons.min())
+        }
+    }
+
+    /**
+     * Second half of a long show's decoration: every season's episodes and trailers, in TMDB's
+     * background lane, patched into the page and the cache when it lands. Only the episode list and
+     * trailers are replaced; everything else on the page stays as published. The seasons already
+     * decorated come from TMDB's per-season cache.
+     */
+    private suspend fun completeRemainingSeasons(
+        requestKey: String,
+        raw: MetaDetails,
+        supplementalMeta: MetaDetails?,
+        metaLookupId: String,
+    ) {
+        val complete = runCatching {
+            withContext(Dispatchers.Default + com.nuvio.app.features.tmdb.TmdbBackgroundLane) {
+                decorateAddonMeta(
+                    parsed = raw,
+                    id = metaLookupId,
+                    includeMdbList = false,
+                ).mergeSupplementalMeta(supplementalMeta)
+            }
+        }.onFailure { error ->
+            if (error is CancellationException) throw error
+            log.w { "Remaining seasons for $requestKey not decorated: ${error.message}" }
+        }.getOrNull()
+        seasonCompletions.remove(requestKey)
+        complete ?: return
+        patchShownMeta(requestKey) { meta -> meta.copy(videos = complete.videos, trailers = complete.trailers) }
+        log.d { "Remaining seasons decorated for $requestKey" }
     }
 
     private suspend fun publishLoadedMeta(
@@ -916,16 +1576,18 @@ object MetaDetailsRepository {
     ) {
         val cachedEntry = CachedMetaEntry(baseMeta = meta)
         cachedMetaByRequestKey[requestKey] = cachedEntry
+        // The user may have opened another title while this one loaded (a progressive load's
+        // second pass runs for seconds): the cache still takes the result, the screen does not.
+        val stillActive = { activeRequestKey == requestKey }
 
         if (!shouldEnrichForMetaScreen(meta, fallbackItemId, mdbListSettings)) {
-            _uiState.value = MetaDetailsUiState(meta = meta.withUnreleasedFilter())
-            activeRequestKey = requestKey
+            if (stillActive()) _uiState.value = MetaDetailsUiState(meta = meta.withUnreleasedFilter())
             return
         }
 
-        _uiState.value = MetaDetailsUiState(
-            isLoading = true,
-        )
+        // Keep a first-pass page on screen while this refines it; only a page with nothing to show
+        // goes back to the spinner.
+        if (stillActive()) _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
         val enrichedMeta = withContext(Dispatchers.Default) {
             enrichForMetaScreen(
                 requestKey = requestKey,
@@ -940,8 +1602,7 @@ object MetaDetailsRepository {
             metaScreenMeta = enrichedMeta,
             metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
         )
-        _uiState.value = MetaDetailsUiState(meta = enrichedMeta.withUnreleasedFilter())
-        activeRequestKey = requestKey
+        if (stillActive()) _uiState.value = MetaDetailsUiState(meta = enrichedMeta.withUnreleasedFilter())
     }
 
     /**
@@ -965,8 +1626,14 @@ object MetaDetailsRepository {
         fallbackItemType: String,
         settings: com.nuvio.app.features.mdblist.MdbListSettings,
         settingsFingerprint: String,
+        /**
+         * The details screen's first pass: resolve the backdrop and logo exactly as the final pass
+         * will (so the page never swaps artwork when the rest lands), skip the hover/rail extras,
+         * and leave the cache to the final pass.
+         */
+        artworkOnly: Boolean = false,
     ): MetaDetails {
-        val mdbListEnrichedMeta = coroutineScope {
+        val mdbListEnrichedMeta = if (artworkOnly) meta else coroutineScope {
             // The IMDb sub-genre lookup rides alongside MDBList rather than after it: both are
             // hover-only data the page can open without, and neither waits on the other.
             val interests = async { fetchImdbInterests(meta, fallbackItemId) }
@@ -979,11 +1646,15 @@ object MetaDetailsRepository {
             } ?: meta
             mdbEnriched.copy(imdbInterests = interests.await().ifEmpty { mdbEnriched.imdbInterests })
         }
-        val moreLikeThisEnrichedMeta = applyMoreLikeThisSource(
-            meta = mdbListEnrichedMeta,
-            fallbackItemId = fallbackItemId,
-            fallbackItemType = fallbackItemType,
-        )
+        val moreLikeThisEnrichedMeta = if (artworkOnly) {
+            mdbListEnrichedMeta
+        } else {
+            applyMoreLikeThisSource(
+                meta = mdbListEnrichedMeta,
+                fallbackItemId = fallbackItemId,
+                fallbackItemType = fallbackItemType,
+            )
+        }
 
         // Apply TVDB and explicit Metahub fallbacks directly so that the Details screen
         // prioritizes them over TMDB images in exactly the same way fetchLightweightMeta does.
@@ -1026,8 +1697,15 @@ object MetaDetailsRepository {
             }
         }
 
-        val resolvedLogo = (tvdbResult?.logo ?: explicitMetahubLogo ?: moreLikeThisEnrichedMeta.logo)
-            ?.takeIf { it.isNotBlank() }
+        // TMDB/addon (already merged into the enriched meta) before metahub, whose logos ignore
+        // language; see the lightweight path.
+        val enrichedLogo = moreLikeThisEnrichedMeta.logo?.takeIf { it.isNotBlank() }
+        val resolvedLogo = (
+            tvdbResult?.logo
+                ?: enrichedLogo?.takeUnless(::isMetahubUrl)
+                ?: explicitMetahubLogo
+                ?: enrichedLogo
+            )?.takeIf { it.isNotBlank() }
 
         // Every source above can come up empty for reasons unrelated to the title actually lacking
         // artwork: TMDB enrichment dropped by its 5s timeout or by the artwork toggle, or an addon
@@ -1055,7 +1733,7 @@ object MetaDetailsRepository {
         log.d {
             val source = when {
                 tvdbResult?.logo != null -> "tvdb"
-                explicitMetahubLogo != null -> "metahub"
+                resolvedLogo != null && resolvedLogo == explicitMetahubLogo -> "metahub"
                 resolvedLogo != null -> "addon/tmdb"
                 fallbackLogo != null -> "lightweight-fallback"
                 else -> "none"
@@ -1067,6 +1745,8 @@ object MetaDetailsRepository {
             background = meta.background ?: tvdbResult?.background ?: explicitMetahubBackground ?: moreLikeThisEnrichedMeta.background,
             logo = finalLogo,
         )
+
+        if (artworkOnly) return enrichedMeta
 
         cachedMetaByRequestKey[requestKey] = cachedMetaByRequestKey[requestKey]
             ?.copy(
@@ -1087,6 +1767,32 @@ object MetaDetailsRepository {
         fallbackItemId: String,
         fallbackItemType: String,
     ): MetaDetails {
+        val sourced = selectMoreLikeThisSource(meta, fallbackItemId, fallbackItemType)
+        if (sourced.moreLikeThis.isEmpty()) return sourced
+        return sourced.copy(moreLikeThis = sourced.moreLikeThis.withCustomPosterService())
+    }
+
+    /**
+     * Runs the More Like This rail through the user's poster service, the way every Library and
+     * Discover row already is. The rail's cards are landscape, so this is where the landscape
+     * template shows up on the details page; the portrait template rides along for the poster-shaped
+     * layouts. Ids are resolved per item from the cached TMDB `/find` lookups, in parallel — a dozen
+     * cards, one request each at most, and only when a template names an id the item lacks.
+     */
+    private suspend fun List<MetaPreview>.withCustomPosterService(): List<MetaPreview> {
+        val settings = CustomPosterSettingsRepository.snapshot(CustomPosterScreen.Details)
+        if (!settings.isActive) return this
+        val keys = CustomPosterKeys.snapshot()
+        return coroutineScope {
+            map { item -> async { item.withResolvedCustomPosters(settings, keys) } }.awaitAll()
+        }
+    }
+
+    private suspend fun selectMoreLikeThisSource(
+        meta: MetaDetails,
+        fallbackItemId: String,
+        fallbackItemType: String,
+    ): MetaDetails {
         if (!meta.imdbTmdbIdentityTrusted) {
             return meta.copy(moreLikeThis = emptyList(), moreLikeThisSource = null)
         }
@@ -1095,6 +1801,23 @@ object MetaDetailsRepository {
         TmdbSettingsRepository.ensureLoaded()
 
         val traktSettings = TraktSettingsRepository.uiState.value
+
+        if (shouldUseSimklMoreLikeThis(traktSettings.moreLikeThisSource) && supportsMoreLikeThis(meta, fallbackItemType)) {
+            val items = runCatching {
+                com.nuvio.app.features.simkl.SimklRelatedRepository.getRelated(
+                    meta = meta,
+                    fallbackItemId = fallbackItemId,
+                    fallbackItemType = fallbackItemType,
+                )
+            }.onFailure { error ->
+                log.w { "Failed to load SIMKL related titles for ${meta.id}: ${error.message}" }
+            }.getOrDefault(emptyList())
+            return meta.copy(
+                moreLikeThis = items,
+                moreLikeThisSource = MoreLikeThisSource.SIMKL.takeIf { items.isNotEmpty() },
+            )
+        }
+
         val isTraktAuthenticated = TraktAuthRepository.uiState.value.mode == TraktConnectionMode.CONNECTED
         val shouldUseTrakt = shouldUseTraktMoreLikeThis(
             isAuthenticated = isTraktAuthenticated,
@@ -1159,7 +1882,9 @@ object MetaDetailsRepository {
         return shouldUseTraktMoreLikeThis(
             isAuthenticated = isTraktAuthenticated,
             source = traktSettings.moreLikeThisSource,
-        ) || !tmdbSettings.enabled || !tmdbSettings.useMoreLikeThis || meta.moreLikeThisSource == null && meta.moreLikeThis.isNotEmpty()
+        ) || shouldUseSimklMoreLikeThis(traktSettings.moreLikeThisSource) || !tmdbSettings.enabled || !tmdbSettings.useMoreLikeThis || meta.moreLikeThisSource == null && meta.moreLikeThis.isNotEmpty() ||
+            // TMDB attached the rail already, but the poster service still has to run over it.
+            meta.moreLikeThis.isNotEmpty() && CustomPosterSettingsRepository.snapshot(CustomPosterScreen.Details).isActive
     }
 
     private fun buildMetaScreenSettingsFingerprint(
@@ -1176,7 +1901,15 @@ object MetaDetailsRepository {
             append("${settings.enabled}:${settings.apiKey.trim()}:$providers")
             append("|more_like=${traktSettings.moreLikeThisSource}:$traktAuthMode")
             append("|tmdb=${tmdbSettings.enabled}:${tmdbSettings.useMoreLikeThis}:${tmdbSettings.hasApiKey}:${tmdbSettings.language}")
+            append("|${CustomPosterSettingsRepository.snapshot(CustomPosterScreen.Details).cacheToken()}")
         }
+    }
+
+    /** SIMKL as the More Like This source (upstream af1298eb4); needs a connected SIMKL account. */
+    private fun shouldUseSimklMoreLikeThis(source: com.nuvio.app.features.trakt.MoreLikeThisSourcePreference): Boolean {
+        if (source != com.nuvio.app.features.trakt.MoreLikeThisSourcePreference.SIMKL) return false
+        com.nuvio.app.features.simkl.SimklAuthRepository.ensureLoaded()
+        return com.nuvio.app.features.simkl.SimklAuthRepository.isAuthenticated.value
     }
 
     private fun supportsMoreLikeThis(meta: MetaDetails, fallbackItemType: String): Boolean =
@@ -1202,14 +1935,20 @@ object MetaDetailsRepository {
         )
     }
 
+    /** Both browsing filters on the recommendation rails; the title itself is never filtered. */
     private fun MetaDetails.withUnreleasedFilter(): MetaDetails {
-        if (!HomeCatalogSettingsRepository.snapshot().hideUnreleasedContent) return this
-        val todayIsoDate = CurrentDateProvider.todayIsoDate()
-        val releasedMoreLikeThis = moreLikeThis.filterReleasedItems(todayIsoDate)
+        val snapshot = HomeCatalogSettingsRepository.snapshot()
+        val todayIsoDate = if (snapshot.hideUnreleasedContent) CurrentDateProvider.todayIsoDate() else null
+        val watchedFilter = WatchedContentFilter.current()
+        if (todayIsoDate == null && watchedFilter == null) return this
+        fun List<MetaPreview>.filtered(): List<MetaPreview> =
+            (if (todayIsoDate == null) this else filterReleasedItems(todayIsoDate))
+                .filterUnwatchedItems(watchedFilter)
+        val filteredMoreLikeThis = moreLikeThis.filtered()
         return copy(
-            moreLikeThis = releasedMoreLikeThis,
-            moreLikeThisSource = moreLikeThisSource.takeIf { releasedMoreLikeThis.isNotEmpty() },
-            collectionItems = collectionItems.filterReleasedItems(todayIsoDate),
+            moreLikeThis = filteredMoreLikeThis,
+            moreLikeThisSource = moreLikeThisSource.takeIf { filteredMoreLikeThis.isNotEmpty() },
+            collectionItems = collectionItems.filtered(),
         )
     }
 
@@ -1271,3 +2010,7 @@ object MetaDetailsRepository {
         return emptyList()
     }
 }
+
+private fun isMetahubUrl(url: String): Boolean = url.contains("metahub.space")
+
+private const val LIGHTWEIGHT_MERGE_VERSION = 3

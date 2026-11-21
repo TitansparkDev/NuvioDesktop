@@ -2,6 +2,7 @@ package com.nuvio.app.features.addons
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.profiles.ProfileRepository
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Order
@@ -53,7 +54,8 @@ object AddonRepository {
     private var initialized = false
     private var pulledFromServer = false
     private var currentProfileId: Int = 1
-    private val activeRefreshJobs = mutableMapOf<String, Job>()
+    // Written on the caller's thread and removed from the job's finally on a worker thread.
+    private val activeRefreshJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     fun initialize() {
         val effectiveProfileId = resolveEffectiveProfileId(ProfileRepository.activeProfileId)
@@ -105,6 +107,7 @@ object AddonRepository {
     }
 
     suspend fun pullFromServer(profileId: Int) {
+        PerfTelemetry.count("AddonRepository.pullFromServer")
         currentProfileId = resolveEffectiveProfileId(profileId)
         log.i { "pullFromServer() — profileId=$profileId, initialized=$initialized, pulledFromServer=$pulledFromServer" }
         runCatching {
@@ -187,16 +190,21 @@ object AddonRepository {
             }
 
             val existingByUrl = _uiState.value.addons.associateBy(ManagedAddon::manifestUrl)
-            _uiState.value = AddonsUiState(
-                addons = urls.map { url ->
-                    val row = rowsByUrl[url]
-                    existingByUrl[url].toPendingAddon(
-                        manifestUrl = url,
-                        userSetName = row?.name?.takeIf { it.isNotBlank() },
-                        enabled = row?.enabled,
-                    )
-                },
-            )
+            val pulledAddons = urls.map { url ->
+                val row = rowsByUrl[url]
+                existingByUrl[url].toPendingAddon(
+                    manifestUrl = url,
+                    userSetName = row?.name?.takeIf { it.isNotBlank() },
+                    enabled = row?.enabled,
+                )
+            }
+            // The foreground pull runs this on window focus; when nothing changed on the server,
+            // leave the state and the stored list alone.
+            if (initialized && pulledFromServer && pulledAddons == _uiState.value.addons) {
+                log.d { "pullFromServer() — remote matches local, no update needed" }
+                return
+            }
+            _uiState.value = AddonsUiState(addons = pulledAddons)
             persist()
             urls.forEach { url ->
                 val existing = existingByUrl[url]
@@ -220,6 +228,28 @@ object AddonRepository {
                 state.addons.any { it.manifest != null } ||
                 state.addons.none { it.isRefreshing }
         }
+    }
+
+    private val _pendingTrackingConsent = MutableStateFlow<AddonManifest?>(null)
+    val pendingTrackingConsent: StateFlow<AddonManifest?> = _pendingTrackingConsent.asStateFlow()
+
+    fun requestTrackingConsent(manifest: AddonManifest) {
+        _pendingTrackingConsent.value = manifest
+    }
+
+    fun dismissTrackingConsent() {
+        _pendingTrackingConsent.value = null
+    }
+
+    suspend fun installWithTrackingConsent(manifest: AddonManifest): AddAddonResult {
+        _pendingTrackingConsent.value = null
+        if (isUsingPrimaryAddonsFromSecondaryProfile()) {
+            return AddAddonResult.Error(getString(Res.string.profile_primary_addons_required))
+        }
+        if (_uiState.value.addons.any { it.manifestUrl == manifest.transportUrl }) {
+            return AddAddonResult.Error(getString(Res.string.addon_already_installed))
+        }
+        return installManifest(manifest.transportUrl, manifest)
     }
 
     suspend fun addAddon(rawUrl: String): AddAddonResult {
@@ -249,6 +279,13 @@ object AddonRepository {
             return AddAddonResult.Error(error.message ?: getString(Res.string.addon_load_manifest_failed))
         }
 
+        if (manifest.isTrackingAddon) {
+            return AddAddonResult.TrackingConsentRequired(manifest)
+        }
+        return installManifest(manifestUrl, manifest)
+    }
+
+    private fun installManifest(manifestUrl: String, manifest: AddonManifest): AddAddonResult {
         _uiState.update { current ->
             current.copy(
                 addons = current.addons + ManagedAddon(
@@ -266,7 +303,7 @@ object AddonRepository {
 
     fun removeAddon(manifestUrl: String) {
         if (isUsingPrimaryAddonsFromSecondaryProfile()) return
-        log.i { "removeAddon() — $manifestUrl" }
+        log.i { "removeAddon() — ${com.nuvio.app.core.network.redactAddonUrl(manifestUrl)}" }
         _uiState.update { current ->
             current.copy(
                 addons = current.addons.filterNot { it.manifestUrl == manifestUrl },
@@ -320,12 +357,14 @@ object AddonRepository {
     }
 
     fun refreshAll() {
+        PerfTelemetry.count("AddonRepository.refreshAll")
         _uiState.value.addons.filter { it.enabled }.distinctBy { it.manifestUrl }.forEach { addon ->
             refreshAddon(addon.manifestUrl)
         }
     }
 
     fun refreshAddon(manifestUrl: String) {
+        PerfTelemetry.count("AddonRepository.refreshAddon")
         val existingJob = activeRefreshJobs[manifestUrl]
         if (existingJob?.isActive == true) return
 
@@ -367,9 +406,7 @@ object AddonRepository {
                     )
                 }
             } finally {
-                if (activeRefreshJobs[manifestUrl] === refreshJob) {
-                    activeRefreshJobs.remove(manifestUrl)
-                }
+                activeRefreshJobs.remove(manifestUrl, refreshJob)
             }
         }
         activeRefreshJobs[manifestUrl] = refreshJob

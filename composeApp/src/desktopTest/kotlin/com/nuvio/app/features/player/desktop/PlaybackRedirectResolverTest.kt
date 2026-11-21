@@ -1,5 +1,7 @@
 package com.nuvio.app.features.player.desktop
 
+import com.nuvio.app.features.player.isPlaybackPlaceholderUrl
+import com.nuvio.app.features.player.isProviderStatusClipUrl
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import kotlin.test.Test
@@ -72,6 +74,7 @@ class PlaybackRedirectResolverTest {
     @Test
     fun directMediaHostsAreSkipped() {
         assertTrue(PlaybackRedirectResolver.isDirectMediaHost("https://nexus-179.neur.tb-cdn.st/dld/abc?token=x"))
+        assertTrue(PlaybackRedirectResolver.isDirectMediaHost("https://store-046.wnam.tb-cdn.io/dld/abc?token=x"))
         assertTrue(PlaybackRedirectResolver.isDirectMediaHost("https://sgp1-4.download.real-debrid.com/d/ABC/file.mkv"))
         assertFalse(PlaybackRedirectResolver.isDirectMediaHost("https://addon.debridio.com/play/series/torbox/a/b/c/d"))
         assertFalse(PlaybackRedirectResolver.isDirectMediaHost("https://aio.example.xyz/api/v1/debrid/playback/a/b/c"))
@@ -86,13 +89,20 @@ class PlaybackRedirectResolverTest {
         assertEquals("", PlaybackRedirectResolver.hostOf("magnet:?xt=urn:btih:abc"))
     }
 
-    /** AIOStreams' usenet failure clip must be classified, not pinned. */
+    /** AIOStreams' status clips (usenet failure, and every `/static/` StaticFiles clip) must be classified, not pinned. */
     @Test
     fun providerStatusClipsAreRecognised() {
-        assertTrue(PlaybackRedirectResolver.isProviderStatusClipUrl("https://aio.example/api/v1/usenet/abc/download_failed.mp4"))
-        assertTrue(PlaybackRedirectResolver.isProviderStatusClipUrl("https://aio.example/static/error.mp4?x=1"))
-        assertFalse(PlaybackRedirectResolver.isProviderStatusClipUrl("https://aio.example/api/v1/usenet/abc/Friends.S01E03.mkv"))
-        assertFalse(PlaybackRedirectResolver.isProviderStatusClipUrl("https://cdn.example/dld/abc?token=failed"))
+        assertTrue(isProviderStatusClipUrl("https://aio.example/api/v1/usenet/abc/download_failed.mp4"))
+        assertTrue(isProviderStatusClipUrl("https://aio.example/static/error.mp4?x=1"))
+        assertTrue(isProviderStatusClipUrl("https://aio.example/static/429.mp4"))
+        assertTrue(isProviderStatusClipUrl("https://aio.example/static/content_proxy_limit_reached.mp4"))
+        assertTrue(isProviderStatusClipUrl("https://aio.example/static/downloading.mp4"))
+        assertTrue(isPlaybackPlaceholderUrl("https://aio.example/static/500.mp4"))
+        assertFalse(isProviderStatusClipUrl("https://aio.example/api/v1/usenet/abc/Friends.S01E03.mkv"))
+        assertFalse(isProviderStatusClipUrl("https://cdn.example/dld/abc?token=failed"))
+        // A numeric name is only a status clip in AIOStreams' own /static/ directory.
+        assertFalse(isProviderStatusClipUrl("https://cdn.example/files/500.mp4"))
+        assertFalse(isPlaybackPlaceholderUrl("https://aio.example/api/v1/debrid/playback/a/b/c/d/Show.S01E01.mkv"))
     }
 
     /** Verdicts are remembered per resolver endpoint, never per link. */

@@ -1,5 +1,10 @@
 package com.nuvio.app.features.settings
 
+import nuvio.composeapp.generated.resources.settings_tmdb_key_badge_checking
+import nuvio.composeapp.generated.resources.settings_tmdb_key_badge_valid
+import nuvio.composeapp.generated.resources.settings_tmdb_key_badge_rejected
+import nuvio.composeapp.generated.resources.settings_tmdb_key_badge_wrong_type
+import nuvio.composeapp.generated.resources.settings_tmdb_key_badge_unreachable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -26,7 +31,17 @@ import nuvio.composeapp.generated.resources.api_keys_onboarding_tmdb_label
 import nuvio.composeapp.generated.resources.setup_wizard_keys_mdblist_benefit
 import nuvio.composeapp.generated.resources.setup_wizard_keys_tmdb_benefit
 import nuvio.composeapp.generated.resources.setup_wizard_keys_where
+import nuvio.composeapp.generated.resources.settings_tmdb_key_check_checking
+import nuvio.composeapp.generated.resources.settings_tmdb_key_check_rejected
+import nuvio.composeapp.generated.resources.settings_tmdb_key_check_unreachable
+import nuvio.composeapp.generated.resources.settings_tmdb_key_check_valid
+import nuvio.composeapp.generated.resources.settings_tmdb_key_check_wrong_type
 import org.jetbrains.compose.resources.stringResource
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import com.nuvio.app.features.tmdb.TmdbApiKeyCheck
+import com.nuvio.app.features.tmdb.TmdbApiKeyStatus
+import kotlinx.coroutines.delay
 import com.nuvio.app.core.ui.accentBrush
 
 private const val TMDB_API_KEY_URL = "https://www.themoviedb.org/settings/api"
@@ -69,6 +84,7 @@ internal fun ApiKeySetupContent(
             helpUrl = TMDB_API_KEY_URL,
             style = style,
             onChange = onTmdbApiKeyChange,
+            checksTmdbKey = true,
         )
         ApiKeyField(
             value = mdbListApiKey,
@@ -89,6 +105,7 @@ private fun ApiKeyField(
     helpUrl: String,
     style: ApiKeySetupStyle,
     onChange: (String) -> Unit,
+    checksTmdbKey: Boolean = false,
 ) {
     val tokens = MaterialTheme.nuvio
     val uriHandler = LocalUriHandler.current
@@ -130,9 +147,14 @@ private fun ApiKeyField(
                 ) {
                     Text(stringResource(Res.string.action_save))
                 }
+                if (checksTmdbKey) TmdbApiKeyStatusLine(apiKey = value)
             }
 
             ApiKeySetupStyle.Staged -> {
+                if (checksTmdbKey) {
+                    // Staged fields change on every keystroke, so wait for the typing to stop.
+                    TmdbApiKeyStatusLine(apiKey = normalizedDraft, debounceMs = STAGED_KEY_CHECK_DEBOUNCE_MS)
+                }
                 Text(
                     text = stringResource(Res.string.setup_wizard_keys_where),
                     style = MaterialTheme.typography.bodySmall.accentBrush(),
@@ -143,4 +165,83 @@ private fun ApiKeyField(
             }
         }
     }
+}
+
+/**
+ * One line under a TMDB key field saying whether TMDB accepts the key, so a wrong one is caught
+ * where it is typed rather than later as empty TMDB collections and a log full of 401s.
+ */
+@Composable
+internal fun TmdbApiKeyStatusLine(
+    apiKey: String,
+    modifier: Modifier = Modifier,
+    debounceMs: Long = 0L,
+) {
+    val tokens = MaterialTheme.nuvio
+    val current = rememberTmdbApiKeyStatus(apiKey, debounceMs) ?: return
+    val text = when (current) {
+        TmdbApiKeyStatus.Checking -> stringResource(Res.string.settings_tmdb_key_check_checking)
+        TmdbApiKeyStatus.Valid -> stringResource(Res.string.settings_tmdb_key_check_valid)
+        TmdbApiKeyStatus.Rejected -> stringResource(Res.string.settings_tmdb_key_check_rejected)
+        TmdbApiKeyStatus.WrongKeyType -> stringResource(Res.string.settings_tmdb_key_check_wrong_type)
+        TmdbApiKeyStatus.Unreachable -> stringResource(Res.string.settings_tmdb_key_check_unreachable)
+    }
+    val isProblem = current == TmdbApiKeyStatus.Rejected || current == TmdbApiKeyStatus.WrongKeyType
+    Text(
+        text = text,
+        modifier = modifier,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (isProblem) MaterialTheme.colorScheme.error else tokens.colors.textSecondary,
+        fontWeight = if (isProblem) FontWeight.SemiBold else null,
+    )
+}
+
+private const val STAGED_KEY_CHECK_DEBOUNCE_MS = 700L
+
+/** Whether TMDB accepts [apiKey], checked once per key; null until a check has started. */
+@Composable
+internal fun rememberTmdbApiKeyStatus(apiKey: String, debounceMs: Long = 0L): TmdbApiKeyStatus? {
+    var status by remember(apiKey) { mutableStateOf<TmdbApiKeyStatus?>(null) }
+    LaunchedEffect(apiKey) {
+        if (apiKey.isBlank()) return@LaunchedEffect
+        if (debounceMs > 0) delay(debounceMs)
+        status = TmdbApiKeyStatus.Checking
+        status = TmdbApiKeyCheck.check(apiKey)
+    }
+    return status
+}
+
+/** The full explanation for a key TMDB would not take, or null when there is nothing wrong. */
+@Composable
+internal fun tmdbApiKeyProblemText(status: TmdbApiKeyStatus?): String? = when (status) {
+    TmdbApiKeyStatus.Rejected -> stringResource(Res.string.settings_tmdb_key_check_rejected)
+    TmdbApiKeyStatus.WrongKeyType -> stringResource(Res.string.settings_tmdb_key_check_wrong_type)
+    TmdbApiKeyStatus.Unreachable -> stringResource(Res.string.settings_tmdb_key_check_unreachable)
+    else -> null
+}
+
+/** The key check in a word or two, for a settings row's control column. */
+@Composable
+internal fun TmdbApiKeyStatusBadge(status: TmdbApiKeyStatus?) {
+    val tokens = MaterialTheme.nuvio
+    val current = status ?: return
+    val text = when (current) {
+        TmdbApiKeyStatus.Checking -> stringResource(Res.string.settings_tmdb_key_badge_checking)
+        TmdbApiKeyStatus.Valid -> stringResource(Res.string.settings_tmdb_key_badge_valid)
+        TmdbApiKeyStatus.Rejected -> stringResource(Res.string.settings_tmdb_key_badge_rejected)
+        TmdbApiKeyStatus.WrongKeyType -> stringResource(Res.string.settings_tmdb_key_badge_wrong_type)
+        TmdbApiKeyStatus.Unreachable -> stringResource(Res.string.settings_tmdb_key_badge_unreachable)
+    }
+    val isProblem = current == TmdbApiKeyStatus.Rejected || current == TmdbApiKeyStatus.WrongKeyType
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodyMedium,
+        color = when {
+            isProblem -> MaterialTheme.colorScheme.error
+            current == TmdbApiKeyStatus.Valid -> tokens.colors.textPrimary
+            else -> tokens.colors.textMuted
+        },
+        fontWeight = FontWeight.SemiBold,
+        maxLines = 1,
+    )
 }

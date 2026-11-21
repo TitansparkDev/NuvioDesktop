@@ -24,10 +24,9 @@ object TmdbSettingsRepository {
     private var useSeasonPosters = true
     private var useMoreLikeThis = true
     private var useCollections = true
-    private var libraryPosterEnabled = false
-    private var libraryPosterUrlTemplate = ""
     private var resolveFilenameCatalogs = true
     private var heroImageSource = HeroImageSource.Addon
+    private var showEnrichment = TmdbShowEnrichment.SourceAware
 
     fun ensureLoaded() {
         if (hasLoaded) return
@@ -166,14 +165,6 @@ object TmdbSettingsRepository {
         persist = TmdbSettingsStorage::saveUseCollections,
     )
 
-    fun setLibraryPosterEnabled(value: Boolean) {
-        ensureLoaded()
-        if (libraryPosterEnabled == value) return
-        libraryPosterEnabled = value
-        publish()
-        TmdbSettingsStorage.saveLibraryPosterEnabled(value)
-    }
-
     fun setResolveFilenameCatalogs(value: Boolean) = setBoolean(
         current = resolveFilenameCatalogs,
         next = value,
@@ -190,13 +181,12 @@ object TmdbSettingsRepository {
         TmdbHeroImageService.clearCache()
     }
 
-    fun setLibraryPosterUrlTemplate(value: String) {
+    fun setShowEnrichment(value: TmdbShowEnrichment) {
         ensureLoaded()
-        val normalized = value.trim()
-        if (libraryPosterUrlTemplate == normalized) return
-        libraryPosterUrlTemplate = normalized
+        if (showEnrichment == value) return
+        showEnrichment = value
         publish()
-        TmdbSettingsStorage.saveLibraryPosterUrlTemplate(normalized)
+        TmdbSettingsStorage.saveShowEnrichment(value.name)
     }
 
     private fun setBoolean(
@@ -229,13 +219,13 @@ object TmdbSettingsRepository {
         useSeasonPosters = TmdbSettingsStorage.loadUseSeasonPosters() ?: true
         useMoreLikeThis = TmdbSettingsStorage.loadUseMoreLikeThis() ?: true
         useCollections = TmdbSettingsStorage.loadUseCollections() ?: true
-        libraryPosterUrlTemplate = TmdbSettingsStorage.loadLibraryPosterUrlTemplate()?.trim().orEmpty()
-        libraryPosterEnabled = (TmdbSettingsStorage.loadLibraryPosterEnabled() ?: false) &&
-            libraryPosterUrlTemplate.isNotBlank()
         resolveFilenameCatalogs = TmdbSettingsStorage.loadResolveFilenameCatalogs() ?: true
         heroImageSource = TmdbSettingsStorage.loadHeroImageSource()
             ?.let { name -> HeroImageSource.entries.firstOrNull { it.name == name } }
             ?: HeroImageSource.Addon
+        showEnrichment = TmdbSettingsStorage.loadShowEnrichment()
+            ?.let { name -> TmdbShowEnrichment.entries.firstOrNull { it.name == name } }
+            ?: TmdbShowEnrichment.SourceAware
         publish()
     }
 
@@ -255,10 +245,9 @@ object TmdbSettingsRepository {
             useSeasonPosters = useSeasonPosters,
             useMoreLikeThis = useMoreLikeThis,
             useCollections = useCollections,
-            libraryPosterEnabled = libraryPosterEnabled,
-            libraryPosterUrlTemplate = libraryPosterUrlTemplate,
             resolveFilenameCatalogs = resolveFilenameCatalogs,
             heroImageSource = heroImageSource,
+            showEnrichment = showEnrichment,
         )
     }
 }

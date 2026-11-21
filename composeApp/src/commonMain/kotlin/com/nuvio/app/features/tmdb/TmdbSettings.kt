@@ -9,6 +9,17 @@ enum class HeroImageSource {
     TmdbMoviesTvdbShows,
 }
 
+/** How TMDB's text and episode data treat a show or anime the addon already describes. */
+enum class TmdbShowEnrichment {
+    /** TMDB's title, synopsis, details, credits and episodes replace the addon's for every title. */
+    Always,
+    /**
+     * A show or anime whose addon record comes from TheTVDB or Kitsu keeps it; TMDB only fills what
+     * the record leaves blank. Cinemeta / IMDb-style records and films are upgraded as before.
+     */
+    SourceAware,
+}
+
 data class TmdbSettings(
     val enabled: Boolean = false,
     val apiKey: String = "",
@@ -24,15 +35,11 @@ data class TmdbSettings(
     val useSeasonPosters: Boolean = true,
     val useMoreLikeThis: Boolean = true,
     val useCollections: Boolean = true,
-    // Custom poster service for library items (which aren't catalog-backed and otherwise
-    // show plain TMDB posters). The template is a full URL with {imdb_id}/{tmdb_id}/{type}
-    // placeholders, e.g. a PostersPlus/RPDB/etc. endpoint. Applied only to the library.
-    val libraryPosterEnabled: Boolean = false,
-    val libraryPosterUrlTemplate: String = "",
     // Cloud-library catalogs (TorBox, the AIOStreams library addon) list release filenames with no
     // metadata; when set, those rows are looked up on TMDB by parsed name + year. Needs an API key.
     val resolveFilenameCatalogs: Boolean = true,
     val heroImageSource: HeroImageSource = HeroImageSource.Addon,
+    val showEnrichment: TmdbShowEnrichment = TmdbShowEnrichment.SourceAware,
 ) {
     val hasApiKey: Boolean
         get() = apiKey.isNotBlank()

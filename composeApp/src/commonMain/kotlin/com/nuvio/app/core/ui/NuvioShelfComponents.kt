@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.animateScrollBy
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -52,6 +53,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
@@ -66,16 +68,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,6 +96,7 @@ import nuvio.composeapp.generated.resources.home_view_all
 import nuvio.composeapp.generated.resources.poster_logo_content_description
 import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 enum class NuvioPosterShape {
@@ -121,6 +127,9 @@ fun <T> NuvioShelfSection(
     // Replaces the header's title text with caller-drawn content (Discover's clickable
     // catalog/genre segments). [title] is still required and still carries the accessibility name.
     titleContent: (@Composable () -> Unit)? = null,
+    // Small muted chip drawn right after the title (Home's optional "catalog provider" tag).
+    // Ignored when [titleContent] replaces the title.
+    titleTag: String? = null,
     // Body fade + overlay, used by Discover to swap the posters for a picker without tearing down
     // the LazyRow (which would lose its scroll position). The row keeps composing at reduced alpha
     // underneath; the overlay draws on top.
@@ -142,6 +151,9 @@ fun <T> NuvioShelfSection(
     // Bumped once per completed shuffle. Any change replays the deal animation; the value itself
     // carries no meaning, and 0 means "never shuffled" so a first composition sits still.
     shuffleGeneration: Int = 0,
+    // A change sends the row back to its start: the caller re-sorted it. Without this a keyed row
+    // follows whichever title was first on screen to its new place, which can be mid-row.
+    resetScrollKey: Any? = null,
     key: ((T) -> Any)? = null,
     rowState: LazyListState = rememberLazyListState(),
     itemContent: @Composable (T) -> Unit,
@@ -168,6 +180,38 @@ fun <T> NuvioShelfSection(
             animationSpec = tween(durationMillis = ShuffleDealDurationMs, easing = LinearEasing),
         )
     }
+    // Seeded like lastDealtGeneration, so a row scrolled back into view keeps its place.
+    var lastResetScrollKey by remember { mutableStateOf(resetScrollKey) }
+    // After a reset the row stays at its start until the user scrolls it: a sort that needs TMDB
+    // details (Popular, Top rated...) re-sorts again once they arrive, and the keyed row would
+    // follow its first title off to wherever that lands.
+    var pinnedToStart by remember { mutableStateOf(false) }
+    val selfScrolling = remember { booleanArrayOf(false) }
+    suspend fun scrollToStart() {
+        selfScrolling[0] = true
+        try {
+            rowState.scrollToItem(0)
+        } finally {
+            selfScrolling[0] = false
+        }
+    }
+    LaunchedEffect(resetScrollKey) {
+        if (resetScrollKey == lastResetScrollKey) return@LaunchedEffect
+        lastResetScrollKey = resetScrollKey
+        pinnedToStart = true
+        scrollToStart()
+    }
+    LaunchedEffect(entries) {
+        if (pinnedToStart) scrollToStart()
+    }
+    // Unpinned once a scroll other than ours ends away from the start. Bringing item 0 into view
+    // for focus is a scroll too, but leaves the row where the pin wants it.
+    LaunchedEffect(rowState) {
+        snapshotFlow { rowState.isScrollInProgress }.collect { scrolling ->
+            val atStart = rowState.firstVisibleItemIndex == 0 && rowState.firstVisibleItemScrollOffset == 0
+            if (!scrolling && !selfScrolling[0] && !atStart) pinnedToStart = false
+        }
+    }
     // Horizontal infinite scroll: request the next page when the row is scrolled within a few items
     // of the end. onLoadMore is idempotent, so repeated triggers while a page loads are harmless.
     if (onLoadMore != null) {
@@ -184,40 +228,24 @@ fun <T> NuvioShelfSection(
     LaunchedEffect(focusedItemIndex, entries) {
         val target = focusedItemIndex
         if (target == null || target !in entries.indices) return@LaunchedEffect
-        // Item 0 must always snap to scroll offset 0 — after scrolling right and back,
-        // item 0 can be partially clipped on the left while still counting as "visible",
-        // so the normal off-screen check would leave it cut off.
-        if (target == 0) {
-            rowState.animateScrollToItem(0, scrollOffset = 0)
-            return@LaunchedEffect
-        }
-        
         // Wait for the LazyRow to lay out the new items if they were just added via pagination
         if (target >= rowState.layoutInfo.totalItemsCount) {
             androidx.compose.runtime.snapshotFlow { rowState.layoutInfo.totalItemsCount }
                 .first { it > target }
         }
 
-        val layoutInfo = rowState.layoutInfo
         // For mouse hover, only scroll when the item is completely off-screen to prevent
         // hover cascade loops. For keyboard navigation, scroll if the item is even partially clipped.
-        val isVisible = if (isKeyboardNavigation) {
-            layoutInfo.visibleItemsInfo.any { item -> 
-                item.index == target && 
-                item.offset >= layoutInfo.viewportStartOffset && 
-                item.offset + item.size <= layoutInfo.viewportEndOffset 
-            }
-        } else {
-            layoutInfo.visibleItemsInfo.any { item -> item.index == target }
-        }
-        if (!isVisible) {
-            // When navigating with keyboard, scrolling an item into view perfectly from the right edge
-            // by just using animateScrollToItem(target) snaps it to the far LEFT of the screen, which is
-            // visually jarring. We use an offset scroll if possible to bring it into view gently.
-            // Wait, animateScrollToItem(target) natively snaps to the start, but we can't easily calculate
-            // the offset without knowing the item widths. For now, snapping to start is acceptable and ensures visibility.
-            rowState.animateScrollToItem(target)
-        }
+        // Item 0 always counts as needing it: after scrolling right and back it can sit partially
+        // clipped on the left while still "visible", and the row should rest flush at its start.
+        // A mouse focus only scrolls when the mouse actually moved: returning to Home puts the page
+        // back under a still cursor, Compose reports that as hover, and the row under it slid to
+        // rest flush (2026-10-19, "CW slides a few pixels on leaving").
+        val mouseMoved = !isDesktop || PointerMotionClock.movedWithin(MouseFocusScrollWindowMs)
+        val needsScroll = isKeyboardNavigation || (
+            mouseMoved && (target == 0 || rowState.layoutInfo.visibleItemsInfo.none { item -> item.index == target })
+        )
+        if (needsScroll) rowState.scrollShelfItemIntoView(target)
     }
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -234,6 +262,7 @@ fun <T> NuvioShelfSection(
                 isShuffling = isShuffling,
                 trailingContent = headerTrailingContent,
                 titleContent = titleContent,
+                titleTag = titleTag,
             )
         }
         Box(modifier = bodyModifier.fillMaxWidth()) {
@@ -242,7 +271,11 @@ fun <T> NuvioShelfSection(
             modifier = Modifier
                 .alpha(bodyAlpha)
                 .desktopShelfDragScroll(rowState)
-                .desktopShelfEdgeScroll(rowState, isMouseActive = !isKeyboardNavigation),
+                .desktopShelfEdgeScroll(
+                    rowState,
+                    isMouseActive = !isKeyboardNavigation,
+                    covered = LocalScreenCovered.current,
+                ),
             contentPadding = rowContentPadding,
             horizontalArrangement = Arrangement.spacedBy(itemSpacing),
         ) {
@@ -296,6 +329,40 @@ fun <T> NuvioShelfSection(
 
 private const val ShelfLoadMoreThreshold = 6
 
+/**
+ * Scrolls the row just far enough that [target] sits wholly inside the content padding: its
+ * trailing edge at the right edge when it is clipped on the right, its leading edge at the left
+ * edge otherwise — one card's step per key press, as on a TV, rather than a page.
+ *
+ * Only ever by scroll distance. `animateScrollToItem` ends in `snapToItem`, which the item animator
+ * reads as the cards having moved rather than the row having scrolled, so each card's placement
+ * spring (the shuffle deal) slid it across from its old spot and the cards overlapped mid-flight.
+ * A target that is not laid out at all (a Page or End jump) is reached by an estimate from the
+ * visible cards' stride, then corrected once it is on screen.
+ */
+private suspend fun LazyListState.scrollShelfItemIntoView(target: Int) {
+    fun distanceTo(offset: Int, size: Int): Int {
+        val info = layoutInfo
+        val start = info.viewportStartOffset + info.beforeContentPadding
+        val end = info.viewportEndOffset - info.afterContentPadding
+        return when {
+            offset < start -> offset - start
+            offset + size > end -> offset + size - end
+            else -> 0
+        }
+    }
+    val placed = layoutInfo.visibleItemsInfo.firstOrNull { it.index == target }
+    if (placed == null) {
+        val reference = layoutInfo.visibleItemsInfo.firstOrNull() ?: return scrollToItem(target)
+        val stride = reference.size + layoutInfo.mainAxisItemSpacing
+        val estimate = reference.offset + (target - reference.index) * stride
+        animateScrollBy(distanceTo(estimate, reference.size).toFloat())
+    }
+    val item = layoutInfo.visibleItemsInfo.firstOrNull { it.index == target } ?: return
+    val distance = distanceTo(item.offset, item.size)
+    if (distance != 0) animateScrollBy(distance.toFloat())
+}
+
 // --- Shuffle deal animation -------------------------------------------------------------------
 //
 // The driver runs 0 -> ShuffleDealSettled over ShuffleDealDurationMs. Each card maps that to its
@@ -343,6 +410,14 @@ internal fun shuffleDealProgressFor(driver: Float, index: Int): Float {
 private const val HeaderTitleMaxWidthFraction = 0.26f
 
 /**
+ * Lets a header drawn through `titleContent` reach further than [HeaderTitleMaxWidthFraction] when
+ * trailing content shares its line: given the header's width, how wide the title content may be.
+ * TV Mode provides the room left of its row-jump dots, so Discover's filter bar runs up to the
+ * dots and scrolls beyond that. Null keeps the fixed fraction.
+ */
+val LocalNuvioShelfTitleContentMaxWidth = androidx.compose.runtime.staticCompositionLocalOf<((Dp) -> Dp)?> { null }
+
+/**
  * The share of the header row kept clear on *each* side of centred trailing content.
  *
  * Trailing content is centred on the row, so one margin governs both edges: it must clear the
@@ -367,7 +442,24 @@ internal fun NuvioShelfItemSlot(
     dealProgress: (() -> Float)? = null,
     content: @Composable () -> Unit,
 ) {
-    val scale by animateFloatAsState(targetValue = if (focused) 1.04f else 1f)
+    // Glow marks the highlighted card with its glow alone (enlarged as well, the glow ran over the next poster), but
+    // only on a card that draws the glow; any other keeps the enlarge so the row never loses its place.
+    val report = remember { NuvioShelfHighlightReport() }
+    val enlarge = rememberPosterCardStyleUiState().posterHighlightMode != PosterHighlightMode.Glow || !report.drawsGlow
+    var pressed by remember { mutableStateOf(false) }
+    val targetScale = when {
+        pressed -> if (focused && enlarge) 0.99f else 0.975f
+        focused && enlarge -> 1.04f
+        else -> 1f
+    }
+    val scale by animateFloatAsState(
+        targetValue = targetScale,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = if (pressed) Spring.StiffnessHigh else Spring.StiffnessMedium,
+        ),
+        label = "shelf_item_scale",
+    )
     Box(
         modifier = modifier
             .zIndex(if (focused) 1f else 0f)
@@ -391,6 +483,9 @@ internal fun NuvioShelfItemSlot(
                     alpha = lerp(ShuffleDealStartAlpha, 1f, eased)
                 }
             }
+            .onPointerEvent(PointerEventType.Press) { pressed = true }
+            .onPointerEvent(PointerEventType.Release) { pressed = false }
+            .onPointerEvent(PointerEventType.Exit) { pressed = false }
             .then(
                 if (onHover != null) {
                     Modifier.onPointerEvent(PointerEventType.Enter) { onHover() }
@@ -400,7 +495,10 @@ internal fun NuvioShelfItemSlot(
             ),
     ) {
         // Poster cards read this to draw their highlight ring — see nuvioPosterHighlight.
-        CompositionLocalProvider(LocalNuvioShelfItemHighlighted provides focused) {
+        CompositionLocalProvider(
+            LocalNuvioShelfItemHighlighted provides focused,
+            LocalNuvioShelfHighlightReport provides report,
+        ) {
             content()
         }
     }
@@ -447,8 +545,12 @@ private fun Modifier.desktopShelfDragScroll(
     }
 }
 
-private fun Modifier.desktopShelfEdgeScroll(state: LazyListState, isMouseActive: Boolean): Modifier {
+private fun Modifier.desktopShelfEdgeScroll(state: LazyListState, isMouseActive: Boolean, covered: Boolean): Modifier {
     if (!isDesktop) return this
+    // Restarted (and its scroll stopped) when the screen is covered: Home now stays composed under
+    // Details, and a scroll started by clicking a poster near the row's edge kept running there and
+    // after Back until the mouse moved over the row again (2026-10-19, Next Up).
+    if (covered) return this
     return this.pointerInput(state) {
         // PointerInputScope (Compose 1.7+) no longer extends CoroutineScope, so we
         // need coroutineScope { } to get a scope for launching child coroutines.
@@ -487,9 +589,12 @@ private fun Modifier.desktopShelfEdgeScroll(state: LazyListState, isMouseActive:
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                     when (event.type) {
-                        PointerEventType.Exit -> positionChannel.trySend(null)
-                        PointerEventType.Move ->
+                        PointerEventType.Exit, PointerEventType.Press -> positionChannel.trySend(null)
+                        // Only real mouse motion: a move Compose reports because the row scrolled
+                        // or the page came back under a still cursor neither starts nor stops it.
+                        PointerEventType.Move -> if (PointerMotionClock.movedWithin(MouseFocusScrollWindowMs)) {
                             positionChannel.trySend(event.changes.firstOrNull()?.position?.x)
+                        }
                         else -> Unit
                     }
                 }
@@ -518,6 +623,7 @@ fun NuvioPosterCard(
     ratingBadgeText: String? = null,
     artworkContent: (@Composable BoxScope.() -> Unit)? = null,
     isWatched: Boolean = false,
+    isInWatchlist: Boolean = false,
     onClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
 ) {
@@ -534,9 +640,11 @@ fun NuvioPosterCard(
         shape = shape,
     )
     val ratingBadgeMetrics = posterRatingBadgeMetrics(basePosterWidthDp = basePosterWidthDp)
-    val hasArtwork = imageUrl != null || artworkContent != null
+    // A blank URL is no artwork: it can never load, and would leave an empty card with no title.
+    val artworkUrl = imageUrl?.takeIf { it.isNotBlank() }
+    val hasArtwork = artworkUrl != null || artworkContent != null
     // Hoisted above the card Box so the long-press anchor can read it — see posterCardClickable.
-    var currentUrl by remember(imageUrl, fallbackImageUrl) { mutableStateOf(imageUrl) }
+    var currentUrl by remember(artworkUrl, fallbackImageUrl) { mutableStateOf(artworkUrl) }
     val shouldShowTitleBelow = showTitleBelow && !posterCardStyle.hideLabelsEnabled
     // Upstream's 14sp label is balanced around its 126dp poster. This fork supports much larger
     // posters, so scale gently by the square root of the size ratio. The tight clamp preserves
@@ -558,8 +666,9 @@ fun NuvioPosterCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(shape.aspectRatio)
-                // Ahead of the clip on purpose — see nuvioPosterHighlight.
-                .nuvioPosterHighlight(posterCardStyle.cornerRadiusDp.dp)
+                // Ahead of the clip on purpose — see nuvioPosterHighlight and nuvioCardDepth.
+                .nuvioPosterHighlight(posterCardStyle.cornerRadiusDp.dp, artworkUrl = currentUrl)
+                .nuvioPosterDepth(cardShape)
                 .clip(cardShape)
                 .background(
                     if (!hasArtwork) {
@@ -570,7 +679,7 @@ fun NuvioPosterCard(
                 )
                 .then(
                     if (!hasArtwork) {
-                        Modifier.border(
+                        Modifier.smoothBorder(
                             width = 1.dp,
                             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.42f),
                             shape = cardShape,
@@ -579,7 +688,6 @@ fun NuvioPosterCard(
                         Modifier
                     },
                 )
-                .nuvioPosterDepth(cardShape)
                 .posterCardClickable(
                     onClick = onClick,
                     onLongClick = onLongClick,
@@ -690,7 +798,7 @@ fun NuvioPosterCard(
                 )
             }
 
-            NuvioPosterWatchedOverlay(isWatched = isWatched)
+            NuvioPosterWatchedOverlay(isWatched = isWatched, isInWatchlist = isInWatchlist)
         }
         if (shouldShowTitleBelow) {
             // Label is centered and capped at 65% of the poster width; truncated names are
@@ -740,6 +848,7 @@ private fun NuvioShelfSectionHeader(
     isShuffling: Boolean = false,
     trailingContent: (@Composable () -> Unit)? = null,
     titleContent: (@Composable () -> Unit)? = null,
+    titleTag: String? = null,
 ) {
     val tokens = MaterialTheme.nuvio
     val viewAllPlaceholderModifier = if (onViewAllClick == null) {
@@ -778,15 +887,11 @@ private fun NuvioShelfSectionHeader(
                 if (titleContent != null) {
                     Box(modifier = Modifier.weight(1f)) { titleContent() }
                 } else {
-                    Text(
-                        text = title,
-                        modifier = Modifier
-                            .weight(1f)
-                            .then(titleShuffleModifier),
-                        style = MaterialTheme.typography.titleLarge,
-                        color = tokens.colors.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    NuvioShelfTitleWithTag(
+                        title = title,
+                        tag = titleTag,
+                        modifier = Modifier.weight(1f),
+                        titleModifier = titleShuffleModifier,
                     )
                 }
                 NuvioViewAllPill(
@@ -807,24 +912,26 @@ private fun NuvioShelfSectionHeader(
                 contentAlignment = Alignment.Center,
             ) {
                 if (titleContent != null) {
+                    // A caller-drawn header (Discover's filter bar) may be told how far it can reach
+                    // before the trailing content instead — see LocalNuvioShelfTitleContentMaxWidth.
+                    val titleCap = LocalNuvioShelfTitleContentMaxWidth.current?.invoke(maxWidth)
+                        ?.coerceAtLeast(maxWidth * HeaderTitleMaxWidthFraction)
+                        ?: (maxWidth * HeaderTitleMaxWidthFraction)
                     Box(
                         modifier = Modifier
                             .align(Alignment.CenterStart)
-                            .widthIn(max = maxWidth * HeaderTitleMaxWidthFraction),
+                            .widthIn(max = titleCap),
                     ) {
                         titleContent()
                     }
                 } else {
-                    Text(
-                        text = title,
+                    NuvioShelfTitleWithTag(
+                        title = title,
+                        tag = titleTag,
                         modifier = Modifier
                             .align(Alignment.CenterStart)
-                            .widthIn(max = maxWidth * HeaderTitleMaxWidthFraction)
-                            .then(titleShuffleModifier),
-                        style = MaterialTheme.typography.titleLarge,
-                        color = tokens.colors.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                            .widthIn(max = maxWidth * HeaderTitleMaxWidthFraction),
+                        titleModifier = titleShuffleModifier,
                     )
                 }
                 trailingContent()
@@ -845,6 +952,52 @@ private fun NuvioShelfSectionHeader(
                         brush = tokens.colors.accentFill,
                         shape = tokens.shapes.chip,
                     ),
+            )
+        }
+    }
+}
+
+/**
+ * The header title with the optional provider tag hanging off its right edge. The title keeps its
+ * ellipsis behaviour and yields width to the tag, which never wraps.
+ */
+@Composable
+private fun NuvioShelfTitleWithTag(
+    title: String,
+    tag: String?,
+    modifier: Modifier = Modifier,
+    titleModifier: Modifier = Modifier,
+) {
+    val tokens = MaterialTheme.nuvio
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s10),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            modifier = Modifier
+                .weight(1f, fill = false)
+                .then(titleModifier),
+            style = MaterialTheme.typography.titleLarge,
+            color = tokens.colors.textPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (!tag.isNullOrBlank()) {
+            Text(
+                text = tag,
+                modifier = Modifier
+                    .background(
+                        color = tokens.colors.textPrimary.copy(alpha = 0.10f),
+                        shape = tokens.shapes.chip,
+                    )
+                    .padding(horizontal = NuvioTokens.Space.s8, vertical = NuvioTokens.Space.s2),
+                style = MaterialTheme.typography.labelMedium,
+                color = tokens.colors.textMuted,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -1031,19 +1184,48 @@ internal fun Modifier.posterCardClickable(
 ): Modifier {
     if (onClick == null && onLongClick == null) return this
     val bounds = remember { mutableStateOf<Rect?>(null) }
+    val windowOrigin = remember { mutableStateOf<Offset?>(null) }
+    fun stashZoomAnchor() {
+        bounds.value?.takeIf { zoomImageUrl != null }?.let { cardBounds ->
+            PosterZoomAnchorHolder.stash(
+                PosterZoomAnchor(
+                    boundsInRoot = cardBounds,
+                    imageUrl = zoomImageUrl,
+                    fallbackImageUrl = zoomFallbackImageUrl,
+                    cornerRadius = zoomCornerRadius,
+                ),
+            )
+        }
+    }
     val handleLongClick = onLongClick?.let { longClick ->
         {
-            bounds.value?.takeIf { zoomImageUrl != null }?.let { cardBounds ->
-                PosterZoomAnchorHolder.stash(
-                    PosterZoomAnchor(
-                        boundsInRoot = cardBounds,
-                        imageUrl = zoomImageUrl,
-                        fallbackImageUrl = zoomFallbackImageUrl,
-                        cornerRadius = zoomCornerRadius,
-                    ),
-                )
-            }
+            stashZoomAnchor()
             longClick()
+        }
+    }
+    // While keyboard focus highlights this card, a held select key opens its actions here, beside
+    // the card, as a right-click would at the cursor. The screen's key handler decides what the
+    // hold does; the card only says where it is.
+    // Read through the updated state so a card whose artwork changes while it stays highlighted
+    // stashes the current art, not what it showed when it was first highlighted.
+    val currentStashZoomAnchor = rememberUpdatedState<() -> Unit>({ stashZoomAnchor() })
+    if (onLongClick != null && LocalNuvioShelfItemHighlighted.current) {
+        DisposableEffect(Unit) {
+            val prepare: () -> Unit = {
+                currentStashZoomAnchor.value()
+                val origin = windowOrigin.value
+                val cardBounds = bounds.value
+                if (origin != null && cardBounds != null) {
+                    ContextMenuInvocation.recordKeyboardInvocation(
+                        IntOffset(
+                            (origin.x + cardBounds.width / 2f).roundToInt(),
+                            (origin.y + cardBounds.height / 2f).roundToInt(),
+                        ),
+                    )
+                }
+            }
+            HighlightedCardAnchor.register(prepare)
+            onDispose { HighlightedCardAnchor.unregister(prepare) }
         }
     }
     // Material's hover state layer is black app-wide (see NuvioRippleConfiguration) and measures
@@ -1057,6 +1239,7 @@ internal fun Modifier.posterCardClickable(
     val positioned = onGloballyPositioned { coordinates ->
         val position = coordinates.positionInRoot()
         bounds.value = Rect(position.x, position.y, position.x + coordinates.size.width, position.y + coordinates.size.height)
+        windowOrigin.value = coordinates.positionInWindow()
     }
     val clickable = if (shineHighlighted) {
         positioned.combinedClickable(
@@ -1073,3 +1256,17 @@ internal fun Modifier.posterCardClickable(
     }
     return clickable.secondaryClick(handleLongClick)
 }
+
+/**
+ * When the mouse last really moved. Compose also reports hover moves when content moves under a
+ * still cursor (a row scrolling, a page returning); those must not drive anything meant to follow
+ * the user's hand. Stamped by the desktop input listener from the OS's own mouse-move events.
+ */
+object PointerMotionClock {
+    @kotlin.concurrent.Volatile
+    var lastRealMoveAtMs: Long = 0L
+
+    fun movedWithin(windowMs: Long): Boolean = System.currentTimeMillis() - lastRealMoveAtMs <= windowMs
+}
+
+private const val MouseFocusScrollWindowMs = 150L

@@ -11,6 +11,8 @@ internal fun buildAddonSubtitleFetchKey(
 ): String? {
     val normalizedType = type?.takeIf { it.isNotBlank() } ?: return null
     val normalizedVideoId = videoId?.takeIf { it.isNotBlank() } ?: return null
+    // fork:youtube-mode - YouTube tab videos bring their own subtitles (SubtitleRepository), no addon needed.
+    if (normalizedType == com.nuvio.app.features.youtube.YOUTUBE_META_TYPE) return "$normalizedType|$normalizedVideoId|youtube"
     val compatibleSubtitleAddons = addons.enabledAddons().mapNotNull { addon ->
         val manifest = addon.manifest ?: return@mapNotNull null
         val supportsSubtitles = manifest.resources.any { resource ->
@@ -364,15 +366,22 @@ internal fun filterBuiltInSubtitlesForSettings(
         track.index == selectedIndex ||
             (
                 !rejected.rejectsSubtitleTrack(track) &&
-                    targets.any { target ->
+                    // A track with no language tag could be any language, so it is not filtered on
+                    // one. Closed captions carried in the video (mpv's EIA-608 track, common on live
+                    // TV) never have one, and hiding them left the right-click menu as the only way in.
+                    (isUntaggedTrackLanguage(track.language) || targets.any { target ->
                         languageMatchesPreference(
                             trackLanguage = track.language,
                             targetLanguage = target,
                         )
-                    }
+                    })
                 )
     }
 }
+
+/** No language tag, or ISO 639's "undetermined" (`und`), which says the same. */
+internal fun isUntaggedTrackLanguage(language: String?): Boolean =
+    normalizeLanguageCode(language).let { it == null || it == "und" }
 
 /**
  * [originalLanguage] defaults to whatever is playing now ([OriginalLanguageCache.current]) because

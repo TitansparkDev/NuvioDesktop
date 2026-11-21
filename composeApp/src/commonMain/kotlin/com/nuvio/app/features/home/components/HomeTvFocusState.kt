@@ -17,12 +17,18 @@ internal class HomeTvRow(
     val itemCount: Int,
     val metaItems: List<MetaPreview>?,
     val onEnter: (index: Int) -> Unit,
+    // Holding select on an item: the same actions a right-click opens. Null for rows whose cards
+    // have none (collection folders), where select keeps firing on the press.
+    val onHold: ((index: Int) -> Unit)? = null,
     // For horizontally infinite-scrolling catalog rows: request the next page (called as focus nears
     // the end). Null for non-paginating rows.
     val onLoadMore: (() -> Unit)? = null,
     // For non-paginating catalog rows: pressing Right on the last item opens the full grid. Null when
     // the row paginates (it just keeps loading more) or can't be opened.
     val onRightAtEnd: (() -> Unit)? = null,
+    // The row's header is a filter bar (Discover's browser row, Library's first row): Up from its
+    // cards goes into the bar.
+    val hasFilterStrip: Boolean = false,
 )
 
 /**
@@ -65,13 +71,29 @@ internal fun homeTvLazyScrollTarget(
  * (continue watching, then catalog/collection shelves, in emission order).
  * [itemIndex] is the focused position within the focused row's shelf.
  */
+private val focusTraceLog = co.touchlab.kermit.Logger.withTag("HomeTvFocus")
+private var nextFocusStateId = 1
+
 internal class HomeTvFocusState(
     private val onPositionChanged: ((sectionIndex: Int, itemIndex: Int) -> Unit)? = null,
 ) {
+    // Perf logging only: which code moves TV focus (2026-10-19: after Details, focus jumped back to
+    // the card just left and the next click opened it again; nothing logged who moved it).
+    private val instance = nextFocusStateId++
+    private fun trace(what: String) {
+        if (!com.nuvio.app.core.perf.PerfTelemetry.enabled) return
+        val callers = Throwable().stackTrace.asSequence()
+            .filter { it.className.startsWith("com.nuvio.") && !it.className.endsWith("HomeTvFocusState") }
+            .take(4)
+            .joinToString(" < ") { it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber }
+        focusTraceLog.d { "#$instance $what | $callers" }
+    }
+
     private var currentSectionIndex by mutableStateOf(0)
     var sectionIndex: Int
         get() = currentSectionIndex
         set(value) {
+            if (value != currentSectionIndex) trace("section ${currentSectionIndex} -> $value (item ${itemIndices[value] ?: 0})")
             currentSectionIndex = value
             onPositionChanged?.invoke(value, itemIndices[value] ?: 0)
         }
@@ -82,6 +104,7 @@ internal class HomeTvFocusState(
     var itemIndex: Int
         get() = itemIndices[sectionIndex] ?: 0
         set(value) {
+            if ((itemIndices[sectionIndex] ?: 0) != value) trace("item ${itemIndices[sectionIndex] ?: 0} -> $value in section $sectionIndex")
             itemIndices[sectionIndex] = value
             onPositionChanged?.invoke(sectionIndex, value)
         }
@@ -95,6 +118,7 @@ internal class HomeTvFocusState(
      * section focus (e.g. the hero on a fresh launch) untouched.
      */
     fun restoreItemIndex(section: Int, index: Int) {
+        trace("restore item $index in section $section")
         itemIndices[section] = index
     }
 

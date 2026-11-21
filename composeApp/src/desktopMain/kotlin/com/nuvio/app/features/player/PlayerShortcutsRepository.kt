@@ -29,10 +29,13 @@ object PlayerShortcutsRepository {
         PlayerShortcutAction.SpeedUp to KeyEvent.VK_CLOSE_BRACKET,
         PlayerShortcutAction.SpeedDown to KeyEvent.VK_OPEN_BRACKET,
         PlayerShortcutAction.ToggleSpeed to KeyEvent.VK_R,
+        PlayerShortcutAction.ChannelUp to KeyEvent.VK_PAGE_UP,
+        PlayerShortcutAction.ChannelDown to KeyEvent.VK_PAGE_DOWN,
         PlayerShortcutAction.NextSubtitle to KeyEvent.VK_S,
         PlayerShortcutAction.NextAudio to KeyEvent.VK_A,
         PlayerShortcutAction.OpenSources to KeyEvent.VK_O,
         PlayerShortcutAction.OpenEpisodes to KeyEvent.VK_E,
+        PlayerShortcutAction.OpenPlayerMenu to KeyEvent.VK_P,
         PlayerShortcutAction.CycleZoom to KeyEvent.VK_C,
         PlayerShortcutAction.SkipInterval to KeyEvent.VK_TAB,
         PlayerShortcutAction.CycleSvp to KeyEvent.VK_F7,
@@ -57,9 +60,29 @@ object PlayerShortcutsRepository {
     private val _keyLabels = MutableStateFlow(defaults.mapValues { playerShortcutKeyCodeLabel(it.value) })
     val keyLabels: StateFlow<Map<PlayerShortcutAction, String>> = _keyLabels.asStateFlow()
 
+    // Escape in fullscreen playback drops to windowed first instead of leaving the player (Stremio
+    // Kai's behaviour); a second Escape, already windowed, leaves as usual. Off by default.
+    @Volatile
+    private var escWindowedFirst = false
+    private val _escWindowedFirstState = MutableStateFlow(false)
+    val escWindowedFirstState: StateFlow<Boolean> = _escWindowedFirstState.asStateFlow()
+
     fun ensureLoaded() {
         if (hasLoaded) return
         loadFromDisk()
+    }
+
+    /** Read on the AWT event-dispatch thread and from the HUD bridge on every Escape. */
+    fun escWindowedFirst(): Boolean {
+        ensureLoaded()
+        return escWindowedFirst
+    }
+
+    fun setEscWindowedFirst(enabled: Boolean) {
+        ensureLoaded()
+        escWindowedFirst = enabled
+        if (enabled) store.putBoolean(scoped(ESC_WINDOWED_FIRST_KEY), true) else store.remove(scoped(ESC_WINDOWED_FIRST_KEY))
+        _escWindowedFirstState.value = enabled
     }
 
     /** Must be called on profile switch once this repo is reachable from the profile plumbing. */
@@ -70,6 +93,8 @@ object PlayerShortcutsRepository {
         bindings = PlayerShortcutAction.entries.associateWith { action ->
             store.getInt(scoped(action.id)) ?: defaults.getValue(action)
         }
+        escWindowedFirst = store.getBoolean(scoped(ESC_WINDOWED_FIRST_KEY)) ?: false
+        _escWindowedFirstState.value = escWindowedFirst
         publish()
     }
 
@@ -127,6 +152,8 @@ object PlayerShortcutsRepository {
     }
 
     private fun scoped(key: String): String = ProfileScopedKey.of(key)
+
+    private const val ESC_WINDOWED_FIRST_KEY = "esc_windowed_first"
 }
 
 object AppShortcutsRepository {
@@ -136,6 +163,12 @@ object AppShortcutsRepository {
         AppShortcutAction.OpenLibrary to KeyEvent.VK_L,
         AppShortcutAction.OpenDiscover to KeyEvent.VK_D,
         AppShortcutAction.OpenCalendar to KeyEvent.VK_C,
+        AppShortcutAction.OpenLiveTv to KeyEvent.VK_V,
+        AppShortcutAction.OpenMusic to KeyEvent.VK_U,
+        AppShortcutAction.OpenYouTube to KeyEvent.VK_Y,
+        // O for Options: S is Search. The player's O (Sources) is a separate set of keys.
+        AppShortcutAction.OpenSettings to KeyEvent.VK_O,
+        AppShortcutAction.FocusMusicPlayer to KeyEvent.VK_B,
         AppShortcutAction.ToggleTrailer to KeyEvent.VK_T,
         AppShortcutAction.ToggleTrailerMute to KeyEvent.VK_M,
         AppShortcutAction.TogglePeoplePanel to KeyEvent.VK_P,
@@ -144,6 +177,10 @@ object AppShortcutsRepository {
         AppShortcutAction.SelectFocused to KeyEvent.VK_ENTER,
         AppShortcutAction.GoBack to KeyEvent.VK_BACK_SPACE,
         AppShortcutAction.DismissOverlay to KeyEvent.VK_ESCAPE,
+        // fork:voice-control - free in the app and in the player (K is the player's alternate play/pause).
+        AppShortcutAction.VoiceCommand to KeyEvent.VK_N,
+        // R for Ring: the panel ring (features/panelring). The player's R (speed toggle) is a separate set of keys.
+        AppShortcutAction.OpenPanelRing to KeyEvent.VK_R,
     )
     private val store = DesktopStorage.store("nuvio_app_shortcuts")
     @Volatile private var bindings: Map<AppShortcutAction, Int> = defaults

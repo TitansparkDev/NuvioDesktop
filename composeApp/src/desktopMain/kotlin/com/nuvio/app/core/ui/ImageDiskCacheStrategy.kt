@@ -6,6 +6,7 @@ import coil3.network.NetworkHeaders
 import coil3.network.NetworkRequest
 import coil3.network.NetworkResponse
 import coil3.request.Options
+import kotlinx.coroutines.currentCoroutineContext
 
 /**
  * What Nuvio's image disk cache is allowed to keep, and for how long.
@@ -55,6 +56,14 @@ internal object ImageDiskCacheStrategy : CacheStrategy {
             return CacheStrategy.ReadResult(cacheResponse)
         }
 
+        // A fetch that waited behind an identical one (see CoalescingRequestStrategy): the entry
+        // was written by that request moments ago, so it is the answer the network just gave.
+        // Serving it is what makes the wait worth anything for a `no-store` poster, which would
+        // otherwise be downloaded once per waiter anyway.
+        if (cacheResponse.isSuccessful && currentCoroutineContext()[CoalescedFollower] != null) {
+            return CacheStrategy.ReadResult(cacheResponse)
+        }
+
         // Never serve a cached failure. Entries like this exist only on installs that ran the
         // previous strategy; going to the network is what should have happened all along.
         if (!cacheResponse.isSuccessful) {
@@ -75,7 +84,20 @@ internal object ImageDiskCacheStrategy : CacheStrategy {
             return CacheStrategy.ReadResult(cacheResponse)
         }
 
-        // Stale. A validator turns the refetch into a 304 that costs no body, so prefer it. With
+        // Stale. Show it now and refresh it in the background, so a slow or hung origin costs one
+        // view of yesterday's poster rather than a blank card (see ImageBackgroundRevalidation).
+        // Not for `no-cache`, which asks for every use to be checked first, nor for the refresh
+        // itself, which is the request that has to go to the network.
+        val fetch = currentCoroutineContext()[ImageFetchScope]
+        if (fetch != null && !options.isBackgroundRevalidation() && !directives.contains(NO_CACHE)) {
+            ImageBackgroundRevalidation.schedule(fetch, options.diskCacheKey ?: networkRequest.url)
+            // Booked for the memory cache's one-minute floor: long enough that the cards showing
+            // it do not each come back here, short enough to pick up what the refresh brings.
+            recordFreshness(networkRequest, options, now, remainingMillis = 0L, bodyChanged = false)
+            return CacheStrategy.ReadResult(cacheResponse)
+        }
+
+        // A validator turns the refetch into a 304 that costs no body, so prefer it. With
         // nothing to validate against the entry is simply re-downloaded: the origin said how long
         // its answer held, and that time is up.
         val conditionalRequest = conditionalRequestOrNull(networkRequest, cacheResponse)
@@ -128,6 +150,17 @@ internal object ImageDiskCacheStrategy : CacheStrategy {
 
         // Everything else — 404 for a still that has not been published yet above all — is a
         // moment-in-time answer, not a fact about the URL. Ask again next time.
+        //
+        // With a copy already on disk, that copy is stored back unchanged instead of answering
+        // DISABLED. Coil 3.5's NetworkFetcher.writeToDiskCache returns null on DISABLED without
+        // closing the snapshot it was handed, and its caller then drops its own reference, so the
+        // entry stayed locked for the rest of the session: after one failed refresh (a 503 while a
+        // poster service restarts) nothing could write that poster again until a restart. Storing
+        // the cached response goes through `closeAndOpenEditor`, which closes it; a null body leaves
+        // the data file as it is, and the original `responseMillis` keeps its age where it was.
+        if (cacheResponse != null) {
+            return CacheStrategy.WriteResult(cacheResponse.copy(body = null))
+        }
         return CacheStrategy.WriteResult.DISABLED
     }
 
@@ -143,14 +176,25 @@ internal object ImageDiskCacheStrategy : CacheStrategy {
      * response that says nothing at all gets the [DEFAULT_FRESHNESS_SECONDS] backstop — long,
      * because artwork under a stable URL rarely changes and this cache exists to avoid
      * re-fetching it; finite, because "never" is the bug this whole file is about.
+     *
+     * The backstop counts only the time *we* have held the entry. `Age` is the origin's statement
+     * of how much of its own lifetime a CDN has used up, so it belongs against a declared `max-age`
+     * and nothing else: `artworks.thetvdb.com` declares nothing and arrives through CloudFront with
+     * an `Age` of months, and measuring the backstop from that made half the TVDB artwork on disk
+     * stale the instant it was written — and stale again after every 304, because the 304 carried
+     * the same `Age` — so each disk lookup cost a revalidation round trip.
      */
     private fun NetworkResponse.remainingFreshnessMillis(directives: List<String>, now: Long): Long {
         if (directives.contains(IMMUTABLE)) return Long.MAX_VALUE - now
-        val lifetimeSeconds = when {
+        val declaredSeconds = when {
             directives.contains(NO_STORE) || directives.contains(NO_CACHE) -> 0L
-            else -> directives.directiveSeconds(MAX_AGE) ?: DEFAULT_FRESHNESS_SECONDS
+            else -> directives.directiveSeconds(MAX_AGE)
         }
-        return (lifetimeSeconds - ageSeconds(now)) * 1000L
+        val remainingSeconds = when (declaredSeconds) {
+            null -> DEFAULT_FRESHNESS_SECONDS - heldSeconds(now)
+            else -> declaredSeconds - storedAgeSeconds() - heldSeconds(now)
+        }
+        return remainingSeconds * 1000L
     }
 
     /**
@@ -176,16 +220,16 @@ internal object ImageDiskCacheStrategy : CacheStrategy {
         )
     }
 
+    /** The age the origin reported when we stored the entry. */
+    private fun NetworkResponse.storedAgeSeconds(): Long =
+        headers[AGE]?.trim()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+
     /**
-     * How stale the cached entry is now: the age the origin reported when we stored it, plus the
-     * time we have been holding it. `responseMillis` is stamped by [write] from the same clock
-     * [now] comes from, so the two are never compared across clocks.
+     * How long we have been holding the entry. `responseMillis` is stamped by [write] from the same
+     * clock [now] comes from, so the two are never compared across clocks.
      */
-    private fun NetworkResponse.ageSeconds(now: Long): Long {
-        val storedAgeSeconds = headers[AGE]?.trim()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
-        val heldMillis = (now - responseMillis).coerceAtLeast(0L)
-        return storedAgeSeconds + heldMillis / 1000L
-    }
+    private fun NetworkResponse.heldSeconds(now: Long): Long =
+        (now - responseMillis).coerceAtLeast(0L) / 1000L
 
     private fun conditionalRequestOrNull(
         request: NetworkRequest,

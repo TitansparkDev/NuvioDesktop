@@ -25,16 +25,55 @@ enum class ContinueWatchingSectionStyle {
 enum class ContinueWatchingSortMode {
     DEFAULT,
     STREAMING_STYLE,
+
+    /**
+     * Partly watched and newly aired cards stay in front as in [DEFAULT]; the rest of Up Next is
+     * ordered least recently watched first, so shows not touched in a while come back around.
+     */
+    ROTATION,
+    ;
+
+    /**
+     * The value written to the `sort_mode` key every build reads. Builds that predate a mode fail to
+     * decode the whole preferences blob on an enum value they don't know, so newer modes are saved
+     * there as their nearest older equivalent and in full under `sort_mode_v2`.
+     */
+    internal val legacyValue: ContinueWatchingSortMode
+        get() = if (this == ROTATION) DEFAULT else this
 }
 
 @Serializable
 enum class ContinueWatchingClickAction {
     PLAY,
     DETAILS,
+    /** Details for a Next Up episode that has not aired yet, play for the rest (upstream 37e8a5c0e). */
+    DETAILS_FOR_UPCOMING,
 }
 
-internal fun ContinueWatchingClickAction.opensDetails(canOpenDetails: Boolean): Boolean =
-    this == ContinueWatchingClickAction.DETAILS && canOpenDetails
+/**
+ * Where a Continue Watching card shows its source shortcut: the opposite of what a plain click
+ * does with streams. With Reuse Last Link on it opens the source picker; otherwise it replays the
+ * last link. [CENTER] is a large Stremio-style button over the artwork.
+ */
+@Serializable
+enum class ContinueWatchingSourceShortcut {
+    OFF,
+    CORNER,
+    CENTER,
+}
+
+internal fun ContinueWatchingClickAction.opensDetails(
+    canOpenDetails: Boolean,
+    isUpcoming: Boolean = false,
+): Boolean = canOpenDetails && when (this) {
+    ContinueWatchingClickAction.PLAY -> false
+    ContinueWatchingClickAction.DETAILS -> true
+    ContinueWatchingClickAction.DETAILS_FOR_UPCOMING -> isUpcoming
+}
+
+/** A Next Up episode whose air date is still ahead. */
+internal fun ContinueWatchingItem.isUpcoming(nowEpochMs: Long = WatchProgressClock.nowEpochMs()): Boolean =
+    isNextUp && parseReleaseDateToEpochMs(released)?.let { releaseEpochMs -> releaseEpochMs > nowEpochMs } == true
 
 /** Whether a playback source URL is a local file (local-library / download) rather than a remote stream. */
 fun isLocalFileSourceUrl(url: String?): Boolean =
@@ -186,6 +225,15 @@ data class ContinueWatchingItem(
     val logo: String? = null,
     val poster: String? = null,
     val background: String? = null,
+    /**
+     * Poster-service art, applied on Home only (see `withCachedCustomPosters`). Kept beside
+     * [poster]/[background] rather than replacing them, so the card's artwork chain still falls
+     * back to the original art when the service has none.
+     */
+    val customPoster: String? = null,
+    val customLandscape: String? = null,
+    /** Custom art outranks the episode still too (the poster service's Continue Watching "All"). */
+    val customArtFirst: Boolean = false,
     val seasonNumber: Int? = null,
     val episodeNumber: Int? = null,
     val episodeTitle: String? = null,
@@ -207,10 +255,12 @@ data class ContinueWatchingPreferencesUiState(
     val isVisible: Boolean = true,
     val style: ContinueWatchingSectionStyle = ContinueWatchingSectionStyle.Card,
     val clickAction: ContinueWatchingClickAction = ContinueWatchingClickAction.PLAY,
+    val sourceShortcut: ContinueWatchingSourceShortcut = ContinueWatchingSourceShortcut.CENTER,
     val upNextFromFurthestEpisode: Boolean = true,
     val useEpisodeThumbnails: Boolean = true,
     val showUnairedNextUp: Boolean = true,
-    val separateNextUpRow: Boolean = false,
+    val separateNextUpRow: Boolean = true,
+    val separateUpcomingRow: Boolean = true,
     /**
      * Whether Up Next may also be seeded from the Nuvio Sync watched history when a *remote*
      * Continue Watching source is selected.
@@ -224,19 +274,19 @@ data class ContinueWatchingPreferencesUiState(
     val dismissedNextUpKeys: Set<String> = emptySet(),
     val showResumePromptOnLaunch: Boolean = true,
     val sortMode: ContinueWatchingSortMode = ContinueWatchingSortMode.DEFAULT,
+    /**
+     * Upcoming episodes count down in plain elapsed time: hours under a day, then whole days with no
+     * cut-over to a date ("In 1 day" from 24 hours, "In 2 days" from 48). Off keeps Today / Tomorrow
+     * and the date past a week.
+     */
+    val relativeAirCountdown: Boolean = false,
 )
 
 internal fun nextUpDismissKey(
     contentId: String,
     seasonNumber: Int?,
     episodeNumber: Int?,
-): String = buildString {
-    append(contentId.trim())
-    append("|")
-    append(seasonNumber ?: -1)
-    append("|")
-    append(episodeNumber ?: -1)
-}
+): String = contentId.trim() // Upstream 9da04b944: the show alone, as NuvioTV stores it.
 
 internal fun WatchProgressEntry.toContinueWatchingItem(): ContinueWatchingItem {
     val normalizedEntry = normalizedCompletion()

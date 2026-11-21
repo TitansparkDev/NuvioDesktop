@@ -55,6 +55,8 @@ data class StreamTraits(
     val isFullDisc: Boolean = false,
     /** A whole-season release rather than a single episode. Only meaningful for episodes. */
     val isSeasonPack: Boolean = false,
+    /** A Usenet release known to be a compressed 7z (set by the scorer from UsenetCompressedReleases). */
+    val isCompressedArchive: Boolean = false,
     /**
      * Size of the whole torrent/folder behind this row, as opposed to [size] which is the one file
      * it resolved to. Null when nothing published it — plenty of rows carry only a file size, and
@@ -135,10 +137,27 @@ object StreamTraitDetector {
 
     private val traitLog = Logger.withTag("StreamTraits")
 
+    // Streams are re-scored every time an addon answers: the list sort, the source merge, the HTPC
+    // tab and every card's badge each ran this text scan again for every stream on screen, on the UI
+    // thread (2026-10-19 soak: an 841 ms stall and several of ~220 ms around the source picker). The
+    // result depends on the stream alone, so it is kept for as long as the stream object lives.
+    private val detected = java.util.WeakHashMap<StreamItem, StreamTraits>()
+
     fun detect(stream: StreamItem): StreamTraits {
+        synchronized(detected) { detected[stream] }?.let { return it }
+        val traits = detectUncached(stream)
+        synchronized(detected) { detected[stream] = traits }
+        return traits
+    }
+
+    private fun detectUncached(stream: StreamItem): StreamTraits {
         val parsed = stream.clientResolve?.stream?.raw?.parsed
         val searchText = streamSearchText(stream)
-        val group = parsed?.group?.takeIf { it.isNotBlank() } ?: releaseGroupFromText(searchText)
+        // An addon's own parse first, then the release name as the row shows it (ReleaseGroupName knows
+        // Sonarr renames, "x264 NTb NL sub", "-Ben.The.Men" and the rest), then the old suffix rule.
+        val group = parsed?.group?.takeIf { it.isNotBlank() }
+            ?: releaseNameText(stream)?.let(ReleaseGroupName::of)
+            ?: releaseGroupFromText(searchText)
         // The parsed group is the high-confidence signal; the text scan catches groups sitting
         // mid-name where the trailing-token parse cannot see them.
         val tier = StreamReleaseGroups.tierOf(group) ?: StreamReleaseGroups.bestTierInText(searchText)
@@ -146,12 +165,13 @@ object StreamTraitDetector {
         return StreamTraits(
             resolution = streamResolution(parsed?.resolution, parsed?.quality, searchText),
             quality = streamQuality(parsed?.quality, searchText),
-            visualTags = streamVisualTags(parsed?.hdr.orEmpty(), searchText),
+            visualTags = streamVisualTags(parsed?.hdr.orEmpty(), searchText, releaseNameText(stream) ?: searchText),
             audioTags = streamAudioTags(parsed?.audio.orEmpty(), searchText),
             audioChannels = streamAudioChannels(parsed?.channels.orEmpty(), searchText),
             encode = streamEncode(parsed?.codec, searchText),
             languages = parsed?.languages.orEmpty().mapNotNull { languageFor(it) }.ifEmpty {
-                DebridStreamLanguage.entries.filter { searchText.hasToken(it.code) }
+                val languageText = languageSearchText(stream)
+                LANGUAGE_REGEXES.filter { (_, regex) -> regex.containsMatchIn(languageText) }.map { it.first }
             },
             releaseGroup = group,
             size = streamSize(stream),
@@ -549,25 +569,96 @@ object StreamTraitDetector {
 
     private fun resolutionValue(value: String?): DebridStreamResolution? {
         val normalized = value?.lowercase().orEmpty()
-        return when {
-            normalized.hasResolutionToken("2160p?", "4k", "uhd") -> DebridStreamResolution.P2160
-            normalized.hasResolutionToken("1440p?", "2k") -> DebridStreamResolution.P1440
-            normalized.hasResolutionToken("1080p?", "fhd") -> DebridStreamResolution.P1080
-            normalized.hasResolutionToken("720p?", "hd") -> DebridStreamResolution.P720
-            normalized.hasResolutionToken("576p?") -> DebridStreamResolution.P576
-            normalized.hasResolutionToken("480p?", "sd") -> DebridStreamResolution.P480
-            normalized.hasResolutionToken("360p?") -> DebridStreamResolution.P360
-            else -> null
-        }
+        return RESOLUTION_TOKENS.firstOrNull { (regex, _) -> regex.containsMatchIn(normalized) }?.second
+            ?: RESOLUTION_ALIASES.firstOrNull { (regex, _) -> regex.containsMatchIn(normalized) }?.second
     }
+
+    // Compiled once rather than per check (upstream def203a96): trait detection runs for every row
+    // of every list on a cache miss, and each of these used to build a new Regex each time.
+    private fun resolutionRegex(vararg tokens: String): Regex =
+        Regex("(^|[^a-z0-9])(${tokens.joinToString("|")})([^a-z0-9]|\$)")
+
+    // A pixel count always beats a word: "1080p.UHD.BluRay" is a 1080p encode of a UHD disc and
+    // "1080p.4K.Remaster" a 1080p release, so the aliases are only read when no number is present.
+    private val RESOLUTION_TOKENS = listOf(
+        resolutionRegex("2160p?") to DebridStreamResolution.P2160,
+        resolutionRegex("1440p?") to DebridStreamResolution.P1440,
+        resolutionRegex("1080p?") to DebridStreamResolution.P1080,
+        resolutionRegex("720p?") to DebridStreamResolution.P720,
+        resolutionRegex("576p?") to DebridStreamResolution.P576,
+        resolutionRegex("480p?") to DebridStreamResolution.P480,
+        resolutionRegex("360p?") to DebridStreamResolution.P360,
+    )
+
+    // "HD" is also half of "DTS-HD" and "True HD", which say nothing about the picture.
+    private val RESOLUTION_ALIASES = listOf(
+        resolutionRegex("4k", "uhd") to DebridStreamResolution.P2160,
+        resolutionRegex("2k") to DebridStreamResolution.P1440,
+        resolutionRegex("fhd") to DebridStreamResolution.P1080,
+        Regex("(^|[^a-z0-9])(?<!dts[-_. ])(?<!true[-_. ])hd([^a-z0-9]|\$)") to DebridStreamResolution.P720,
+        resolutionRegex("sd") to DebridStreamResolution.P480,
+    )
+    private val DOLBY_VISION_TEXT = Regex("(^|[^a-z0-9])(dv|dovi|dolby[ ._-]?vision)([^a-z0-9]|\$)")
+    private val HDR_TEXT = Regex("(^|[^a-z0-9])(hdr|hdr10|hdr10p|hdr10plus|hdr10\\+|hlg)([^a-z0-9]|\$)")
+    private val RELEASE_GROUP_SUFFIX = Regex("-([a-z0-9][a-z0-9._]{1,24})($|\\.)", RegexOption.IGNORE_CASE)
+    /**
+     * A bare "WEB" where a source tag sits: after a resolution or streaming-service tag
+     * ("1080p.WEB", "AMZN.WEB"), before a codec/audio/HDR tag ("WEB.H264", "WEB.DDP5.1"), right
+     * before the group ("WEB-NTb"), or in anime brackets ("[WEB]", "(WEB 1080p)").
+     */
+    private val BARE_WEB_SOURCE = Regex(
+        "(^|[^a-z0-9])(\\d{3,4}p|4k|uhd|amzn|nf|dsnp|dsny|atvp|hmax|max|hulu|pcok|pmtp|itunes|stan|cr|vudu|roku|crav|sho)[ ._-]+web([^a-z0-9]|\$)" +
+            "|(^|[^a-z0-9])web[ ._-]+([xh][ ._-]?26[456]|avc|hevc|av1|e?ac-?3|ddp?|dd\\+|aac|opus|flac|atmos|truehd|dts|hdr|dv|dovi|sdr|10bit|\\d{3,4}p)([^a-z]|\$)" +
+            "|[ ._]web-[a-z0-9]+(\\.[a-z0-9]{2,4})?(\\s|\$)" +
+            "|[\\[(]web[\\]) .]",
+    )
+
+    // Spelled-out pre-release sources. The bare cam/ts/tc/scr tokens stay last in streamQuality,
+    // as before, because they are short enough to turn up elsewhere.
+    private val JUNK_CAM = Regex("(^|[^a-z0-9])(hd[ ._-]?cam|cam[ ._-]?rip)([^a-z0-9]|\$)")
+    private val JUNK_TS = Regex("(^|[^a-z0-9])(telesync|hd[ ._-]?ts|ts[ ._-]?rip|hdtsrip|pdvd)([^a-z0-9]|\$)")
+    private val JUNK_TC = Regex("(^|[^a-z0-9])(telecine|hd[ ._-]?tc)([^a-z0-9]|\$)")
+    private val JUNK_SCR = Regex("(^|[^a-z0-9])(screener|dvd[ ._-]?scr(eener)?|bd[ ._-]?scr)([^a-z0-9]|\$)")
+
+    // Audio and codec tokens, after TRaSH's custom-format regexes. Codec names are commonly glued
+    // to the channel layout ("DDP5.1", "AAC2.0", "DTS5.1"), so a digit may follow the name.
+    private val DD_PLUS = Regex("(^|[^a-z0-9])(dd[p+]|e[-_. ]?ac-?3)|dolby digital plus")
+    private val DD = Regex("(^|[^a-z0-9])dd([^a-z+]|\$)|(^|[^a-z0-9e-])ac-?3([^a-z0-9]|\$)|dolby digital(?! plus)")
+    private val DTS_X = Regex("(^|[^a-z0-9])dts[-_.: ]?x7?([^a-z0-9]|\$)(?![-_. ]?26[456])")
+    private val DTS_HD_MA = Regex("(^|[^a-z0-9])dts[-_. ]?(ma|hd(?![-_. ]?(hra?|hi)([^a-z]|\$))([-_. ]?ma)?|xll)([^a-z]|\$)")
+    private val DTS_HD = Regex("(^|[^a-z0-9])dts[-_. ]?hd")
+    private val DTS_ES = Regex("(^|[^a-z0-9])dts[-_. ]?es([^a-z]|\$)")
+    private val DTS = Regex("(^|[^a-z0-9])dts([^a-z]|\$)")
+    private val TRUEHD = Regex("true[ ._-]?hd")
+    private fun codecRegex(name: String) = Regex("(^|[^a-z0-9])$name([^a-z]|\$)")
+    private val ATMOS = Regex("(^|[^a-z0-9])(atmos|ddpa)([^a-z]|\$)")
+    private val AAC = codecRegex("aac")
+    private val FLAC = codecRegex("flac")
+    private val OPUS = codecRegex("opus")
+    private val HEVC_CODEC = Regex("(^|[^a-z0-9])([xh][ ._-]?265|hevc)([^a-z]|\$)")
+    private val AVC_CODEC = Regex("(^|[^a-z0-9])([xh][ ._-]?264|avc)([^a-z]|\$)")
+
+    private val NON_ALPHANUMERIC = Regex("[^a-z0-9]")
+    private val NON_ALPHANUMERIC_OR_PLUS = Regex("[^a-z0-9+]")
+    private val tokenRegexCache = java.util.concurrent.ConcurrentHashMap<String, Regex>()
 
     private fun streamQuality(parsedQuality: String?, searchText: String): DebridStreamQuality {
         val text = listOfNotNull(parsedQuality, searchText).joinToString(" ").lowercase()
         return when {
             text.contains("remux") -> DebridStreamQuality.BLURAY_REMUX
-            text.contains("blu-ray") || text.contains("bluray") || text.contains("bdrip") || text.contains("brrip") -> DebridStreamQuality.BLURAY
+            text.contains("blu-ray") || text.contains("bluray") || text.contains("bdrip") || text.contains("brrip") ||
+                text.hasToken("bd") -> DebridStreamQuality.BLURAY
             text.contains("web-dl") || text.contains("webdl") -> DebridStreamQuality.WEB_DL
             text.contains("webrip") || text.contains("web-rip") -> DebridStreamQuality.WEBRIP
+            // Scene rules since 2020 tag an untouched stream capture plain "WEB" (a re-encode is
+            // "WEBRip"); Sonarr/Radarr parse it as WEB-DL and TRaSH's formats rely on that. Only a
+            // WEB in source position counts, so a title word ("Charlotte's Web") does not.
+            parsedQuality?.trim()?.equals("web", ignoreCase = true) == true ||
+                BARE_WEB_SOURCE.containsMatchIn(text) -> DebridStreamQuality.WEB_DL
+            JUNK_CAM.containsMatchIn(text) -> DebridStreamQuality.CAM
+            JUNK_TS.containsMatchIn(text) -> DebridStreamQuality.TS
+            JUNK_TC.containsMatchIn(text) -> DebridStreamQuality.TC
+            JUNK_SCR.containsMatchIn(text) -> DebridStreamQuality.SCR
             text.contains("hdrip") -> DebridStreamQuality.HDRIP
             text.contains("hd-rip") || text.contains("hcrip") -> DebridStreamQuality.HD_RIP
             text.contains("dvdrip") -> DebridStreamQuality.DVDRIP
@@ -580,46 +671,60 @@ object StreamTraitDetector {
         }
     }
 
-    private fun streamVisualTags(parsedHdr: List<String>, searchText: String): List<DebridStreamVisualTag> {
+    /**
+     * [releaseNameText] carries the 3D markers: formatter names and descriptions print a release's
+     * age as "3d" (three days old), which a whole-text scan read as a 3D release.
+     */
+    private fun streamVisualTags(
+        parsedHdr: List<String>,
+        searchText: String,
+        releaseNameText: String,
+    ): List<DebridStreamVisualTag> {
         val text = (parsedHdr + searchText).joinToString(" ").lowercase()
         val tags = mutableListOf<DebridStreamVisualTag>()
         val hasDv = parsedHdr.any { it.isDolbyVisionToken() } ||
-            Regex("(^|[^a-z0-9])(dv|dovi|dolby[ ._-]?vision)([^a-z0-9]|\$)").containsMatchIn(searchText)
+            DOLBY_VISION_TEXT.containsMatchIn(searchText)
         val hasHdr = parsedHdr.any { it.isHdrToken() } ||
-            Regex("(^|[^a-z0-9])(hdr|hdr10|hdr10plus|hdr10\\+|hlg)([^a-z0-9]|\$)").containsMatchIn(searchText)
+            HDR_TEXT.containsMatchIn(searchText)
         if (hasDv && hasHdr) tags += DebridStreamVisualTag.HDR_DV
         if (hasDv && !hasHdr) tags += DebridStreamVisualTag.DV_ONLY
         if (hasHdr && !hasDv) tags += DebridStreamVisualTag.HDR_ONLY
-        if (text.contains("hdr10+") || text.contains("hdr10plus")) tags += DebridStreamVisualTag.HDR10_PLUS
+        if (text.contains("hdr10+") || text.contains("hdr10plus") || text.hasToken("hdr10p")) tags += DebridStreamVisualTag.HDR10_PLUS
         if (text.contains("hdr10")) tags += DebridStreamVisualTag.HDR10
         if (hasDv) tags += DebridStreamVisualTag.DV
         if (hasHdr) tags += DebridStreamVisualTag.HDR
         if (text.hasToken("hlg")) tags += DebridStreamVisualTag.HLG
         if (text.contains("10bit") || text.contains("10 bit")) tags += DebridStreamVisualTag.TEN_BIT
-        if (text.hasToken("3d")) tags += DebridStreamVisualTag.THREE_D
+        if (releaseNameText.hasToken("3d")) tags += DebridStreamVisualTag.THREE_D
         if (text.hasToken("imax")) tags += DebridStreamVisualTag.IMAX
-        if (text.hasToken("ai")) tags += DebridStreamVisualTag.AI
+        // The scorer penalises this tag as an AI upscale, so bare "AI" in the text (an anime title,
+        // "A.I." in a film name) must not set it; only a parser's tag or a real upscale marker does.
+        if (parsedHdr.any { it.trim().equals("ai", ignoreCase = true) } || AI_ENHANCED.containsMatchIn(searchText)) {
+            tags += DebridStreamVisualTag.AI
+        }
         if (text.hasToken("sdr")) tags += DebridStreamVisualTag.SDR
-        if (text.contains("h-ou")) tags += DebridStreamVisualTag.H_OU
-        if (text.contains("h-sbs")) tags += DebridStreamVisualTag.H_SBS
+        if (releaseNameText.contains("h-ou")) tags += DebridStreamVisualTag.H_OU
+        if (releaseNameText.contains("h-sbs")) tags += DebridStreamVisualTag.H_SBS
         return tags.distinct().ifEmpty { listOf(DebridStreamVisualTag.UNKNOWN) }
     }
 
     private fun streamAudioTags(parsedAudio: List<String>, searchText: String): List<DebridStreamAudioTag> {
         val text = (parsedAudio + searchText).joinToString(" ").lowercase()
         val tags = mutableListOf<DebridStreamAudioTag>()
-        if (text.hasToken("atmos")) tags += DebridStreamAudioTag.ATMOS
-        if (text.contains("dd+") || text.contains("ddp") || text.contains("dolby digital plus")) tags += DebridStreamAudioTag.DD_PLUS
-        if (text.hasToken("dd") || text.contains("ac3") || text.contains("dolby digital")) tags += DebridStreamAudioTag.DD
-        if (text.contains("dts:x") || text.contains("dtsx")) tags += DebridStreamAudioTag.DTS_X
-        if (text.contains("dts-hd ma") || text.contains("dtshd ma")) tags += DebridStreamAudioTag.DTS_HD_MA
-        if (text.contains("dts-hd") || text.contains("dtshd")) tags += DebridStreamAudioTag.DTS_HD
-        if (text.contains("dts-es") || text.contains("dtses")) tags += DebridStreamAudioTag.DTS_ES
-        if (text.hasToken("dts")) tags += DebridStreamAudioTag.DTS
-        if (text.contains("truehd") || text.contains("true hd")) tags += DebridStreamAudioTag.TRUEHD
-        if (text.hasToken("opus")) tags += DebridStreamAudioTag.OPUS
-        if (text.hasToken("flac")) tags += DebridStreamAudioTag.FLAC
-        if (text.hasToken("aac")) tags += DebridStreamAudioTag.AAC
+        if (ATMOS.containsMatchIn(text)) tags += DebridStreamAudioTag.ATMOS
+        if (DD_PLUS.containsMatchIn(text)) tags += DebridStreamAudioTag.DD_PLUS
+        if (DD.containsMatchIn(text)) tags += DebridStreamAudioTag.DD
+        if (DTS_X.containsMatchIn(text)) tags += DebridStreamAudioTag.DTS_X
+        // As TRaSH does, a bare "DTS-HD" counts as MA: the lossy High Resolution variant is
+        // always spelled out (HRA/HR/HI), and an unqualified DTS-HD track is in practice MA.
+        if (DTS_HD_MA.containsMatchIn(text)) tags += DebridStreamAudioTag.DTS_HD_MA
+        if (DTS_HD.containsMatchIn(text)) tags += DebridStreamAudioTag.DTS_HD
+        if (DTS_ES.containsMatchIn(text)) tags += DebridStreamAudioTag.DTS_ES
+        if (DTS.containsMatchIn(text)) tags += DebridStreamAudioTag.DTS
+        if (TRUEHD.containsMatchIn(text)) tags += DebridStreamAudioTag.TRUEHD
+        if (OPUS.containsMatchIn(text)) tags += DebridStreamAudioTag.OPUS
+        if (FLAC.containsMatchIn(text)) tags += DebridStreamAudioTag.FLAC
+        if (AAC.containsMatchIn(text)) tags += DebridStreamAudioTag.AAC
         return tags.distinct().ifEmpty { listOf(DebridStreamAudioTag.UNKNOWN) }
     }
 
@@ -655,8 +760,8 @@ object StreamTraitDetector {
         val text = listOfNotNull(parsedCodec, searchText).joinToString(" ").lowercase()
         return when {
             text.hasToken("av1") -> DebridStreamEncode.AV1
-            text.hasToken("hevc") || text.hasToken("h265") || text.hasToken("x265") -> DebridStreamEncode.HEVC
-            text.hasToken("avc") || text.hasToken("h264") || text.hasToken("x264") -> DebridStreamEncode.AVC
+            HEVC_CODEC.containsMatchIn(text) -> DebridStreamEncode.HEVC
+            AVC_CODEC.containsMatchIn(text) -> DebridStreamEncode.AVC
             text.hasToken("xvid") -> DebridStreamEncode.XVID
             text.hasToken("divx") -> DebridStreamEncode.DIVX
             else -> DebridStreamEncode.UNKNOWN
@@ -664,24 +769,48 @@ object StreamTraitDetector {
     }
 
     private fun languageFor(value: String): DebridStreamLanguage? {
-        val normalized = value.lowercase()
+        val normalized = value.trim().lowercase()
         return DebridStreamLanguage.entries.firstOrNull {
-            normalized == it.code || normalized == it.label.lowercase()
+            normalized == it.code ||
+                normalized == it.label.lowercase() ||
+                normalized in LANGUAGE_ALIASES[it].orEmpty()
         }
     }
 
+    // Words release names use for each language besides its code. Short words common in titles
+    // ("por", "chi", "fra") are left out so a title is not read as a language. Upstream 6eb35df05.
+    private val LANGUAGE_ALIASES = mapOf(
+        DebridStreamLanguage.EN to listOf("eng", "english"),
+        DebridStreamLanguage.HI to listOf("hin", "hindi"),
+        DebridStreamLanguage.IT to listOf("ita", "italian", "italiano"),
+        DebridStreamLanguage.ES to listOf("spa", "esp", "spanish", "espanol", "castellano"),
+        DebridStreamLanguage.FR to listOf("fre", "french", "truefrench"),
+        DebridStreamLanguage.DE to listOf("ger", "deu", "german", "deutsch"),
+        DebridStreamLanguage.PT to listOf("portuguese", "portugues"),
+        DebridStreamLanguage.PL to listOf("pol", "polish"),
+        DebridStreamLanguage.CS to listOf("cze", "czech"),
+        DebridStreamLanguage.LA to listOf("latino"),
+        DebridStreamLanguage.JA to listOf("jpn", "japanese"),
+        DebridStreamLanguage.KO to listOf("kor", "korean"),
+        DebridStreamLanguage.ZH to listOf("chinese"),
+    )
+    private val LANGUAGE_REGEXES = DebridStreamLanguage.entries.map { language ->
+        val tokens = listOf(language.code) + LANGUAGE_ALIASES[language].orEmpty()
+        language to Regex("(^|[^a-z0-9])(${tokens.joinToString("|") { Regex.escape(it) }})([^a-z0-9]|\$)")
+    }
+    private val NON_ALPHANUMERIC_RUN = Regex("[^a-z0-9]+")
+
     private fun releaseGroupFromText(text: String): String =
-        Regex("-([a-z0-9][a-z0-9._]{1,24})($|\\.)", RegexOption.IGNORE_CASE)
+        RELEASE_GROUP_SUFFIX
             .find(text)
             ?.groupValues
             ?.getOrNull(1)
             .orEmpty()
 
-    private fun String.hasResolutionToken(vararg tokens: String): Boolean =
-        Regex("(^|[^a-z0-9])(${tokens.joinToString("|")})([^a-z0-9]|\$)").containsMatchIn(this)
-
     private fun String.hasToken(token: String): Boolean =
-        Regex("(^|[^a-z0-9])${Regex.escape(token.lowercase())}([^a-z0-9]|\$)").containsMatchIn(lowercase())
+        tokenRegexCache
+            .getOrPut(token) { Regex("(^|[^a-z0-9])${Regex.escape(token.lowercase())}([^a-z0-9]|\$)") }
+            .containsMatchIn(lowercase())
 
     /**
      * The gap between a number and its unit. Kotlin's `\s` is ASCII-only on the JVM, so the
@@ -707,11 +836,17 @@ object StreamTraitDetector {
      * which custom addon formatters routinely do — reads "5.1 Mbps" or "7.1 GB" as surround sound.
      * Occurrences followed by a measurement unit are rejected; the scan continues, so a release that
      * genuinely carries both ("… DTS 5.1 … 5.1 Mbps") is still detected from its real channel token.
+     *
+     * Scene names glue the layout to the codec ("DDP5.1", "AAC2.0", "DTS5.1"), so a layout straight
+     * after an audio codec name counts too; any other letter or digit before it still blocks it.
      */
     private val CHANNEL_TOKEN_REGEX: Map<String, Regex> =
         listOf("7.1", "6.1", "5.1", "2.0").associateWith { token ->
-            Regex("(^|[^a-z0-9])${Regex.escape(token)}(?!$MEASUREMENT_UNIT)([^a-z0-9]|\$)")
+            Regex("(^|[^a-z0-9]|$GLUED_AUDIO_CODEC)${Regex.escape(token)}(?!$MEASUREMENT_UNIT)([^a-z0-9]|\$)")
         }
+
+    private const val GLUED_AUDIO_CODEC =
+        "(?<=(?:^|[^a-z0-9])(?:dd|ddp|dd\\+|ddpa|aac|dts|truehd|flac|opus|l?pcm|atmos|ma))"
 
     private fun String.hasChannelToken(token: String): Boolean =
         channelTokenMatch(token) != null
@@ -720,12 +855,12 @@ object StreamTraitDetector {
         CHANNEL_TOKEN_REGEX.getValue(token).find(lowercase())
 
     private fun String.isDolbyVisionToken(): Boolean {
-        val normalized = lowercase().replace(Regex("[^a-z0-9]"), "")
+        val normalized = lowercase().replace(NON_ALPHANUMERIC, "")
         return normalized == "dv" || normalized == "dovi" || normalized == "dolbyvision"
     }
 
     private fun String.isHdrToken(): Boolean {
-        val normalized = lowercase().replace(Regex("[^a-z0-9+]"), "")
+        val normalized = lowercase().replace(NON_ALPHANUMERIC_OR_PLUS, "")
         return normalized == "hdr" ||
             normalized == "hdr10" ||
             normalized == "hdr10+" ||
@@ -737,6 +872,29 @@ object StreamTraitDetector {
         stream.clientResolve?.stream?.raw?.size
             ?: stream.behaviorHints.videoSize
             ?: stream.debridCacheStatus?.cachedSize
+
+    /**
+     * File size for ordering the source list: the structured size, else the first size the addon
+     * printed in its name/description.
+     *
+     * Deliberately separate from [StreamTraits.size], which scoring reads: plenty of addons publish
+     * the size only as text ("💾 4.2 GB"), and a size sort that parked every one of those rows at the
+     * bottom would look broken — but scoring's size rules must keep skipping when nothing structured
+     * exists. The first token is the file on rows that print both ("💾 12 GB 📦 158 GB"); anything
+     * under a megabyte is noise, not a video.
+     */
+    fun listSortSizeBytes(stream: StreamItem): Long? {
+        streamSize(stream)?.takeIf { it > 0L }?.let { return it }
+        return listOfNotNull(stream.name, stream.title, stream.description)
+            .asSequence()
+            .flatMap { SIZE_TOKEN.findAll(it) }
+            .mapNotNull { match ->
+                val value = match.groupValues[1].replace(',', '.').toDoubleOrNull()
+                val unit = SIZE_UNIT_BYTES[match.groupValues[2].lowercase()]
+                if (value == null || unit == null) null else (value * unit).toLong()
+            }
+            .firstOrNull { it >= SIZE_UNIT_BYTES.getValue("mb") }
+    }
 
     /**
      * Resolves the instant-playback trait using the strongest available signal.
@@ -812,10 +970,38 @@ object StreamTraitDetector {
         RegexOption.IGNORE_CASE,
     )
 
-    private fun streamSearchText(stream: StreamItem): String {
+    /** The file and torrent names alone, without formatter text; null when the addon sent none. */
+    private fun releaseNameText(stream: StreamItem): String? {
         val resolve = stream.clientResolve
         val raw = resolve?.stream?.raw
-        val parsed = raw?.parsed
+        return listOfNotNull(
+            stream.behaviorHints.filename,
+            stream.debridCacheStatus?.cachedName,
+            resolve?.torrentName,
+            resolve?.filename,
+            raw?.torrentName,
+            raw?.filename,
+        ).filter { it.isNotBlank() }
+            .takeIf { it.isNotEmpty() }
+            ?.joinToString(" ")
+            ?.lowercase()
+    }
+
+    private fun streamSearchText(stream: StreamItem): String {
+        val parsed = stream.clientResolve?.stream?.raw?.parsed
+        val parsedTexts = listOfNotNull(
+            parsed?.resolution,
+            parsed?.quality,
+            parsed?.codec,
+            parsed?.hdr?.joinToString(" "),
+            parsed?.audio?.joinToString(" "),
+        )
+        return (streamTexts(stream) + parsedTexts).joinToString(" ").lowercase()
+    }
+
+    private fun streamTexts(stream: StreamItem): List<String> {
+        val resolve = stream.clientResolve
+        val raw = resolve?.stream?.raw
         return listOfNotNull(
             stream.name,
             stream.title,
@@ -826,11 +1012,29 @@ object StreamTraitDetector {
             resolve?.filename,
             raw?.torrentName,
             raw?.filename,
-            parsed?.resolution,
-            parsed?.quality,
-            parsed?.codec,
-            parsed?.hdr?.joinToString(" "),
-            parsed?.audio?.joinToString(" "),
-        ).joinToString(" ").lowercase()
+        )
+    }
+
+    /**
+     * The stream's texts with the media title taken out, for language matching only, so title
+     * words ("The French Dispatch", "The Italian Job") are not read as the stream's language. Only
+     * the first match per text goes: a release name repeats the title only as a language word.
+     * Upstream 4b79c43cf.
+     */
+    private fun languageSearchText(stream: StreamItem): String {
+        val resolve = stream.clientResolve
+        val titleRegexes = listOfNotNull(resolve?.stream?.raw?.parsed?.parsedTitle, resolve?.title)
+            .mapNotNull(::titleRegex)
+            .distinctBy { it.pattern }
+            .sortedByDescending { it.pattern.length }
+        return streamTexts(stream).joinToString(" ") { text ->
+            titleRegexes.fold(text.lowercase()) { remaining, regex -> regex.replaceFirst(remaining, " ") }
+        }
+    }
+
+    private fun titleRegex(title: String): Regex? {
+        val words = title.lowercase().split(NON_ALPHANUMERIC_RUN).filter { it.isNotEmpty() }
+        if (words.isEmpty()) return null
+        return Regex("(^|[^a-z0-9])${words.joinToString("[^a-z0-9]+") { Regex.escape(it) }}(?=[^a-z0-9]|\$)")
     }
 }

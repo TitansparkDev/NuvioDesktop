@@ -1,11 +1,20 @@
 package com.nuvio.app.features.home
 
+import com.nuvio.app.core.perf.PerfTelemetry
+import com.nuvio.app.features.posterservice.withCachedCustomPosters
+import com.nuvio.app.features.posterservice.withCustomPosterOverlay
+import com.nuvio.app.features.posterservice.CustomPosterScreen
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.ManagedAddon
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.enabledAddons
+import com.nuvio.app.features.catalog.CATALOG_PAGE_SIZE
+import com.nuvio.app.features.catalog.CatalogPage
 import com.nuvio.app.features.catalog.CatalogTarget
+import com.nuvio.app.features.catalog.buildCatalogUrl
+import com.nuvio.app.features.catalog.catalogPageFromPayload
 import com.nuvio.app.features.catalog.fetchCatalogPage
+import com.nuvio.app.features.catalog.fetchCatalogPayload
 import com.nuvio.app.features.catalog.mergeCatalogItems
 import com.nuvio.app.features.catalog.nextCatalogPaginationState
 import com.nuvio.app.features.collection.Collection
@@ -14,8 +23,11 @@ import com.nuvio.app.features.collection.CollectionRepository
 import com.nuvio.app.features.collection.CollectionSource
 import com.nuvio.app.features.collection.TmdbCollectionSourceResolver
 import com.nuvio.app.features.collection.catalogRouteKey
+import com.nuvio.app.features.collection.fallbackCatalogId
+import com.nuvio.app.features.collection.fetchCollectionCatalogPage
 import com.nuvio.app.features.collection.findCollectionCatalog
 import com.nuvio.app.features.trakt.TraktPublicListSourceResolver
+import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,11 +35,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import com.nuvio.app.features.profiles.ProfileRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlin.math.absoluteValue
 import kotlin.random.Random
 
@@ -63,7 +84,14 @@ object HomeRepository {
     private val log = Logger.withTag("HomeRepository")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val _uiState = MutableStateFlow(HomeUiState())
+    // Poster-service art is layered on at read time so cachedSections never hold template URLs.
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+        .withCustomPosterOverlay(CustomPosterScreen.Home) { settings, keys ->
+            copy(sections = sections.map { section ->
+                val items = section.items.withCachedCustomPosters(settings, keys)
+                if (items === section.items) section else section.copy(items = items)
+            })
+        }
 
     private var activeJob: Job? = null
     private var activeRequestKey: String? = null
@@ -78,13 +106,49 @@ object HomeRepository {
     private var collectionHeroRequestKey: String? = null
     private var lastPublishedCatalogHeroEmpty: Boolean = true
     private var lastErrorMessage: String? = null
+    // Disk restore (HomeCatalogDiskCache) runs once per profile session, on the first refresh.
+    // Rows it restored are shown at once but are refetched by that refresh regardless of `force`;
+    // a key leaves this set when its refetch has finished, whichever way.
+    private var diskRestoreDone = false
+    private val revalidateKeys = mutableSetOf<String>()
+    private var diskRestoreJob: Job? = null
+    // The row list the restore worked from, for rows whose addon is still loading (see refresh).
+    private var restoredDefinitions: List<HomeCatalogDefinition> = emptyList()
+
+    init {
+        // "Hide watched content" is applied at publish time from the cached rows, so a title that
+        // was just finished (playback completion) or marked watched from a details page would sit
+        // on Home until the next refresh. Republish from the cache whenever the history changes
+        // while the filter is on; the seeded hero shuffle keeps the same order minus the title.
+        scope.launch {
+            WatchedRepository.uiState
+                .map { it.items }
+                .distinctUntilChanged { old, new -> old === new }
+                .drop(1)
+                .collect {
+                    if (!HomeCatalogSettingsRepository.snapshot().hideWatchedContent) return@collect
+                    if (currentDefinitions.isEmpty()) return@collect
+                    applyCurrentSettings()
+                }
+        }
+    }
 
     fun refresh(addons: List<ManagedAddon>, force: Boolean = false) {
+        PerfTelemetry.count("HomeRepository.refresh")
         val activeAddons = addons.enabledAddons()
         val requests = buildHomeCatalogDefinitions(activeAddons)
-        currentDefinitions = requests
+        // Rows restored from disk whose addon has not answered with its manifest yet: kept on Home
+        // until it does, instead of vanishing on every early refresh and returning a second later.
+        // Once the manifest is in they are ordinary requests again, or gone if the addon dropped them.
+        val awaitingManifest = restoredDefinitions.filter { definition ->
+            definition.key in revalidateKeys &&
+                requests.none { it.key == definition.key } &&
+                activeAddons.any { it.manifestUrl == definition.manifestUrl && it.manifest == null }
+        }
+        currentDefinitions = requests + awaitingManifest
         val requestKeys = requests.mapTo(mutableSetOf(), HomeCatalogDefinition::key)
-        cachedSections = cachedSections.filterKeys(requestKeys::contains)
+        val keptKeys = requestKeys + awaitingManifest.map(HomeCatalogDefinition::key)
+        cachedSections = cachedSections.filterKeys(keptKeys::contains)
         // Drop infinite-scroll state for catalogs that are no longer present.
         (loadMoreJobs.keys - requestKeys).toList().forEach { key ->
             val job = loadMoreJobs.remove(key)
@@ -96,23 +160,20 @@ object HomeRepository {
         }
         // Shuffled orders are pruned on the same boundary as paging state: a row that has left the
         // active set must not come back still holding a permutation from an earlier session.
-        HomeRowShuffleState.retain(requestKeys)
+        HomeRowShuffleState.retain(keptKeys)
         if (force) sectionDuplicatePageCounts.clear()
-        val requestKey = requests.joinToString(separator = "|") { request ->
-            "${request.manifestUrl}:${request.type}:${request.catalogId}:${request.genre.orEmpty()}"
-        }
+        val requestKey = homeRequestKey(requests)
 
         if (!force && activeRequestKey == requestKey && _uiState.value.isLoading) return
 
         val snapshot = HomeCatalogSettingsRepository.snapshot()
-        fun HomeCatalogDefinition.isActiveInHome(): Boolean {
-            val preference = snapshot.preferences[key] ?: return true
-            return preference.enabled || (snapshot.heroEnabled && preference.heroSourceEnabled)
-        }
+        fun HomeCatalogDefinition.isActiveInHome(): Boolean = isActiveInHome(snapshot)
         val activeRequestKeys = requests
             .filter(HomeCatalogDefinition::isActiveInHome)
             .mapTo(mutableSetOf(), HomeCatalogDefinition::key)
-        val allActiveCatalogsFetched = activeRequestKeys.all(cachedSections::containsKey)
+        // A row restored from disk is cached but not yet fetched this session.
+        val allActiveCatalogsFetched = activeRequestKeys.all(cachedSections::containsKey) &&
+            activeRequestKeys.none(revalidateKeys::contains)
         if (!force && requestKey == lastRequestKey && allActiveCatalogsFetched) {
             if (_uiState.value.sections.isEmpty() || _uiState.value.heroItems.isEmpty()) {
                 applyCurrentSettings()
@@ -122,6 +183,11 @@ object HomeRepository {
         lastRequestKey = requestKey
         activeRequestKey = requestKey
 
+        if (requests.isEmpty() && awaitingManifest.isNotEmpty()) {
+            // Nothing fetchable yet, only restored rows: show them and wait for the manifests.
+            publishCurrentState(isLoading = true, requestKey = requestKey)
+            return
+        }
         if (requests.isEmpty()) {
             activeJob?.cancel()
             activeJob = null
@@ -148,8 +214,16 @@ object HomeRepository {
                 definitions = requests.filter(HomeCatalogDefinition::isActiveInHome),
                 snapshot = snapshot,
             )
+            val profileId = ProfileRepository.activeProfileId
+            // Started at profile warm-up (restoreFromDiskInBackground); usually finished by now.
+            diskRestoreJob?.join()
+            if (!diskRestoreDone) {
+                restoreRowsFromDisk(prioritizedRequests, profileId, requestKey)
+                // Only once it has run to the end: a refresh cancelled mid-restore leaves it to the next.
+                diskRestoreDone = true
+            }
             val pendingRequests = prioritizedRequests.filter { definition ->
-                shouldFetchHomeCatalog(
+                definition.key in revalidateKeys || shouldFetchHomeCatalog(
                     force = force,
                     cachedSection = cachedSections[definition.key],
                 )
@@ -171,45 +245,78 @@ object HomeRepository {
                 putAll(cachedSections)
             }
             var firstErrorMessage: String? = null
-            var batchIndex = 0
 
-            pendingRequests.chunked(HOME_CATALOG_FETCH_BATCH_SIZE).forEach { batch ->
-                if (activeRequestKey != requestKey) return@launch
-                val batchStartedAt = System.currentTimeMillis()
-                val results = batch.map { request ->
-                    async { runCatching { request.toSection() } }
-                }.awaitAll()
-
-                if (activeRequestKey != requestKey) return@launch
-
-                results.mapNotNull { it.getOrNull() }.forEach { section ->
-                    loadedSections[section.key] = section
-                }
-                results.forEachIndexed { i, result ->
-                    result.exceptionOrNull()?.let { error ->
-                        log.w(error) {
-                            "Catalog fetch failed: ${batch.getOrNull(i)?.let { "${it.addonName} / ${it.catalogId}" } ?: "unknown"}"
+            // A pool, not fixed batches: a finished catalog frees its slot for the next one at once.
+            // With batches of four awaited in turn, one slow catalog held up every batch behind it —
+            // an addon retrying a dead upstream for ~12s (AIOMetadata's MAL rows during the Jikan
+            // shutdown, 2026-10) took a 43-row Home from ~2s to ~27s. Requests still *start* in
+            // priority order, so the hero's sources and the top rows go out first.
+            val gate = Semaphore(HOME_CATALOG_FETCH_BATCH_SIZE)
+            val completions = Channel<Pair<Int, Result<HomeCatalogSection>>>(Channel.UNLIMITED)
+            pendingRequests.forEachIndexed { index, request ->
+                launch {
+                    gate.withPermit {
+                        val startedAt = System.currentTimeMillis()
+                        val result = runCatching { request.toSection(profileId) }
+                        val elapsedMs = System.currentTimeMillis() - startedAt
+                        if (elapsedMs >= HOME_CATALOG_SLOW_LOG_MS) {
+                            log.i { "Slow catalog: ${request.addonName} / ${request.catalogId} took ${elapsedMs}ms" }
                         }
+                        completions.send(index to result)
                     }
                 }
-                if (firstErrorMessage == null) {
-                    firstErrorMessage = results.firstNotNullOfOrNull { it.exceptionOrNull()?.message }
+            }
+
+            // "First batch" keeps its old meaning — the first few requests in priority order — so the
+            // first publish still waits for the rows the hero draws from, not for whichever came back first.
+            val firstBatchSize = minOf(HOME_CATALOG_FETCH_BATCH_SIZE, pendingRequests.size)
+            var firstBatchDone = 0
+            var firstBatchLoaded = 0
+            var firstBatchPublished = false
+            var sincePublish = 0
+            repeat(pendingRequests.size) {
+                val (index, result) = completions.receive()
+                if (activeRequestKey != requestKey) {
+                    cancel()
+                    return@launch
+                }
+                // A failed refetch keeps the restored row: last launch's row beats an empty one.
+                revalidateKeys.remove(pendingRequests[index].key)
+                result.getOrNull()?.let { section -> loadedSections[section.key] = section }
+                result.exceptionOrNull()?.let { error ->
+                    val request = pendingRequests[index]
+                    if (error is com.nuvio.app.core.network.HttpStatusException) {
+                        // An answer, not a crash: one line without the stack (a rate-limited Home wrote hundreds of them).
+                        log.w { "Catalog fetch failed: ${request.addonName} / ${request.catalogId} (HTTP ${error.status})" }
+                    } else {
+                        log.w(error) { "Catalog fetch failed: ${request.addonName} / ${request.catalogId}" }
+                    }
+                    if (firstErrorMessage == null) firstErrorMessage = error.message
                 }
                 mergeBatchIntoCache(loadedSections)
                 lastErrorMessage = firstErrorMessage
-                if (batchIndex == 0 || (batchIndex + 1) % HOME_CATALOG_PUBLISH_INTERVAL == 0) {
+                sincePublish++
+                if (index < firstBatchSize) {
+                    firstBatchDone++
+                    if (result.isSuccess) firstBatchLoaded++
+                }
+                val firstBatchJustFinished = !firstBatchPublished && firstBatchDone == firstBatchSize
+                if (firstBatchJustFinished) {
+                    firstBatchPublished = true
+                    log.i {
+                        "Home refresh first batch loaded $firstBatchLoaded / $firstBatchSize in " +
+                            "${System.currentTimeMillis() - refreshStartedAt}ms"
+                    }
+                }
+                if (firstBatchJustFinished ||
+                    (firstBatchPublished && sincePublish >= HOME_CATALOG_FETCH_BATCH_SIZE * HOME_CATALOG_PUBLISH_INTERVAL)
+                ) {
                     publishCurrentState(
                         isLoading = true,
                         requestKey = requestKey,
                     )
+                    sincePublish = 0
                 }
-                val batchElapsedMs = System.currentTimeMillis() - batchStartedAt
-                if (batchIndex == 0) {
-                    log.i { "Home refresh first batch loaded ${results.count { it.isSuccess }} / ${batch.size} in ${batchElapsedMs}ms" }
-                } else {
-                    log.d { "Home refresh batch ${batchIndex + 1} loaded ${results.count { it.isSuccess }} / ${batch.size} in ${batchElapsedMs}ms" }
-                }
-                batchIndex++
             }
 
             if (activeRequestKey != requestKey) return@launch
@@ -223,6 +330,13 @@ object HomeRepository {
             log.i {
                 "Home refresh completed: loaded=${loadedSections.size}, pending=${pendingRequests.size}, " +
                     "elapsed=${System.currentTimeMillis() - refreshStartedAt}ms"
+            }
+            // The row list the next launch restores from. Only once no addon is still loading its
+            // manifest, or a launch would remember a Home missing that addon's rows.
+            if (activeAddons.none { it.isRefreshing }) {
+                restoredDefinitions = requests
+                // The stored row shape has no server fields, so server rows are not remembered.
+                HomeCatalogDiskCache.writeDefinitions(profileId, requests.filter { it.serverConnectionId == null })
             }
             ensureCollectionHeroFallback(
                 addons = activeAddons,
@@ -257,6 +371,12 @@ object HomeRepository {
         collectionHeroRequestKey = null
         lastPublishedCatalogHeroEmpty = true
         lastErrorMessage = null
+        // The next profile restores its own rows.
+        diskRestoreJob?.cancel()
+        diskRestoreJob = null
+        diskRestoreDone = false
+        revalidateKeys.clear()
+        restoredDefinitions = emptyList()
         _uiState.value = HomeUiState()
     }
 
@@ -266,9 +386,8 @@ object HomeRepository {
     ) {
         val snapshot = HomeCatalogSettingsRepository.snapshot()
         val preferences = snapshot.preferences
-        val todayIsoDate = if (snapshot.hideUnreleasedContent) CurrentDateProvider.todayIsoDate() else null
-        fun HomeCatalogSection.withReleaseFilter(): HomeCatalogSection =
-            if (todayIsoDate == null) this else filterReleasedItems(todayIsoDate)
+        val browsingFilters = BrowsingFilters.current(snapshot)
+        fun HomeCatalogSection.withReleaseFilter(): HomeCatalogSection = browsingFilters.apply(this)
 
         val skippedEnabledSections = mutableListOf<String>()
         val sections = currentDefinitions
@@ -341,32 +460,150 @@ object HomeRepository {
         )
     }
 
-    private suspend fun HomeCatalogDefinition.toSection(): HomeCatalogSection {
-        val page = fetchCatalogPage(
+    private fun homeRequestKey(definitions: List<HomeCatalogDefinition>): String =
+        definitions.joinToString(separator = "|") { request ->
+            "${request.manifestUrl}:${request.type}:${request.catalogId}:${request.genre.orEmpty()}" +
+                request.serverConnectionId?.let { ":server=$it" }.orEmpty()
+        }
+
+    private fun HomeCatalogDefinition.isActiveInHome(snapshot: HomeCatalogSettingsSnapshot): Boolean {
+        val preference = snapshot.preferences[key] ?: return true
+        return preference.enabled || (snapshot.heroEnabled && preference.heroSourceEnabled)
+    }
+
+    /**
+     * Restores last launch's rows while the profile is still being warmed, so they are parsed and
+     * published before Home first composes rather than after its first refresh starts. Works from
+     * the stored row list, because the addon manifests that define the rows are still on their way
+     * over the network at this point. Non-blocking; the first refresh joins it.
+     */
+    fun restoreFromDiskInBackground() {
+        if (diskRestoreDone || diskRestoreJob != null) return
+        if (HomeCatalogDiskCache.lifetimeMs() <= 0L) return
+        val profileId = ProfileRepository.activeProfileId
+        diskRestoreJob = scope.launch {
+            val definitions = HomeCatalogDiskCache.readDefinitions(profileId)
+            if (definitions.isNullOrEmpty()) return@launch
+            val snapshot = HomeCatalogSettingsRepository.snapshot()
+            restoredDefinitions = definitions
+            if (currentDefinitions.isEmpty()) currentDefinitions = definitions
+            restoreRowsFromDisk(
+                definitions = prioritizeDefinitions(
+                    definitions = definitions.filter { it.isActiveInHome(snapshot) },
+                    snapshot = snapshot,
+                ),
+                profileId = profileId,
+                requestKey = homeRequestKey(definitions),
+            )
+            diskRestoreDone = true
+        }
+    }
+
+    /**
+     * Seeds the session with the rows a previous launch fetched (see HomeCatalogDiskCache) and
+     * publishes them, so Home opens on last time's rows while this refresh fetches today's.
+     */
+    private suspend fun restoreRowsFromDisk(
+        definitions: List<HomeCatalogDefinition>,
+        profileId: Int,
+        requestKey: String,
+    ) {
+        if (HomeCatalogDiskCache.lifetimeMs() <= 0L) return
+        val startedAt = System.currentTimeMillis()
+        val restored = coroutineScope {
+            definitions
+                .filter { definition -> cachedSections[definition.key] == null }
+                .map { definition -> async { definition.key to definition.restoredSection(profileId) } }
+                .awaitAll()
+        }.mapNotNull { (key, section) -> section?.let { key to it } }.toMap()
+        if (restored.isEmpty()) return
+        cachedSections = restored + cachedSections
+        revalidateKeys += restored.keys
+        publishCurrentState(isLoading = true, requestKey = requestKey)
+        log.i { "Home restored ${restored.size} rows from disk in ${System.currentTimeMillis() - startedAt}ms" }
+    }
+
+    private fun HomeCatalogDefinition.firstPageUrl(): String = buildCatalogUrl(
+        manifestUrl = manifestUrl,
+        type = type,
+        catalogId = catalogId,
+        genre = genre,
+        search = null,
+        skip = null,
+    )
+
+    private suspend fun HomeCatalogDefinition.toSection(profileId: Int): HomeCatalogSection {
+        serverConnectionId?.let { connectionId -> return toServerSection(connectionId) }
+        // The whole first page is parsed even for a catalog the manifest calls non-paginating:
+        // whether it pages is only known once the response is in hand (below), and a row that
+        // turns out to page keeps its full page so the next skip stays page-aligned.
+        val url = firstPageUrl()
+        val payload = fetchCatalogPayload(url)
+        // Off the fetch path: the row is published without waiting on the disk.
+        scope.launch { HomeCatalogDiskCache.write(profileId, key, url, payload) }
+        return sectionFromPage(catalogPageFromPayload(payload))
+    }
+
+    /** The row a previous launch fetched, replayed from disk; null when there is none fit to show. */
+    private suspend fun HomeCatalogDefinition.restoredSection(profileId: Int): HomeCatalogSection? {
+        if (serverConnectionId != null) return null // Server rows are always asked of the server.
+        val url = firstPageUrl()
+        val stored = HomeCatalogDiskCache.read(profileId, key, url) ?: return null
+        return runCatching { sectionFromPage(catalogPageFromPayload(stored.payload)) }.getOrNull()
+    }
+
+    /** A media server's library (or resume) row, read from the server itself. */
+    private suspend fun HomeCatalogDefinition.toServerSection(connectionId: String): HomeCatalogSection {
+        val target = CatalogTarget.Server(connectionId, catalogId, type)
+        val page = com.nuvio.app.features.servers.ServerCatalog.page(
+            target,
+            skip = 0,
+            limit = HOME_CATALOG_PREVIEW_FETCH_LIMIT,
+        )
+        WatchedContentFilter.prepareForLoad(page.items)
+        return HomeCatalogSection(
+            key = key,
+            title = defaultTitle,
+            subtitle = addonName,
+            addonName = addonName,
+            target = target,
+            items = page.items,
+            availableItemCount = page.rawItemCount,
+            hasMore = page.nextSkip != null,
+            paginates = page.nextSkip != null,
+            nextSkip = page.nextSkip,
+        )
+    }
+
+    private suspend fun HomeCatalogDefinition.sectionFromPage(page: CatalogPage): HomeCatalogSection {
+        // Cache load only, no lookups: Home's rows are on the startup path.
+        WatchedContentFilter.prepareForLoad(page.items)
+        // Same rule as the catalog screen and the Discover feed: a catalog that fills a whole page
+        // pages in practice even when its manifest never advertised `skip`. Deciding from the
+        // manifest alone left such rows as a capped preview with an arrow while "See more arrows"
+        // was off — and the arrow's catalog screen then scrolled the entire thing.
+        val paginates = supportsPagination || page.rawItemCount >= CATALOG_PAGE_SIZE
+        // A row that does not page is a preview plus a pill; it never needs more than the preview.
+        val items = if (paginates) page.items else page.items.take(HOME_CATALOG_PREVIEW_FETCH_LIMIT)
+        val nextSkip = if (paginates) page.nextSkip else null
+        log.d {
+            "Catalog fetch: $addonName / $catalogId ($type) — " +
+                if (items.isEmpty()) "empty" else "${items.size} items, paginates=$paginates"
+        }
+        val target = CatalogTarget.Addon(
             manifestUrl = manifestUrl,
-            type = type,
+            contentType = type,
             catalogId = catalogId,
             genre = genre,
-            // Paginating rows are horizontal infinite-scroll, so fetch the full first page (skip stays
-            // page-aligned for subsequent loads). Non-paginating rows only need the preview + pill.
-            maxItems = if (supportsPagination) null else HOME_CATALOG_PREVIEW_FETCH_LIMIT,
+            supportsPagination = paginates,
         )
-        val items = page.items
-        val nextSkip = if (supportsPagination) page.nextSkip else null
-        log.d { "Catalog fetch: $addonName / $catalogId ($type) — ${if (items.isEmpty()) "empty" else "${items.size} items"}" }
         if (items.isEmpty()) {
             return HomeCatalogSection(
                 key = key,
                 title = defaultTitle,
                 subtitle = addonName,
                 addonName = addonName,
-                target = CatalogTarget.Addon(
-                    manifestUrl = manifestUrl,
-                    contentType = type,
-                    catalogId = catalogId,
-                    genre = genre,
-                    supportsPagination = supportsPagination,
-                ),
+                target = target,
                 items = emptyList(),
                 availableItemCount = 0,
                 hasMore = false,
@@ -378,17 +615,11 @@ object HomeRepository {
             title = defaultTitle,
             subtitle = addonName,
             addonName = addonName,
-            target = CatalogTarget.Addon(
-                manifestUrl = manifestUrl,
-                contentType = type,
-                catalogId = catalogId,
-                genre = genre,
-                supportsPagination = supportsPagination,
-            ),
+            target = target,
             items = items,
             availableItemCount = page.rawItemCount,
             hasMore = nextSkip != null,
-            paginates = supportsPagination,
+            paginates = paginates,
             nextSkip = nextSkip,
         )
     }
@@ -404,6 +635,7 @@ object HomeRepository {
      * an infinite-scroll trigger waits for that page instead of concluding the row is exhausted.
      */
     fun loadMoreCatalogRow(sectionKey: String): Job? {
+        PerfTelemetry.count("HomeRepository.loadMoreCatalogRow")
         // Every refusal is named. Horizontal paging is driven by scroll position, so it is called
         // constantly and declines most of the time — and while all four exits were silent there was
         // no way to tell "correctly idle" from "wedged" in a log.
@@ -412,9 +644,9 @@ object HomeRepository {
             log.d { "loadMore skipped ($sectionKey): section is not in the published state" }
             return null
         }
-        val target = section.target as? CatalogTarget.Addon
-        if (target == null) {
-            log.d { "loadMore skipped ($sectionKey): not an addon catalog" }
+        val target = section.target
+        if (target !is CatalogTarget.Addon && target !is CatalogTarget.Server) {
+            log.d { "loadMore skipped ($sectionKey): not an addon or server catalog" }
             return null
         }
         val skip = section.nextSkip
@@ -429,16 +661,22 @@ object HomeRepository {
         }
 
         log.i { "loadMore start ($sectionKey) skip=$skip have=${section.items.size}" }
-        setSection(section.copy(isLoadingMore = true))
+        setLoadingMore(sectionKey, loading = true)
         val job = scope.launch {
             runCatching {
-                fetchCatalogPage(
-                    manifestUrl = target.manifestUrl,
-                    type = target.contentType,
-                    catalogId = target.catalogId,
-                    genre = target.genre,
-                    skip = skip,
-                )
+                when (target) {
+                    is CatalogTarget.Server -> com.nuvio.app.features.servers.ServerCatalog.page(target, skip = skip)
+                    is CatalogTarget.Addon -> fetchCatalogPage(
+                        manifestUrl = target.manifestUrl,
+                        type = target.contentType,
+                        catalogId = target.catalogId,
+                        genre = target.genre,
+                        skip = skip,
+                    )
+                    else -> error("unreachable")
+                }.also { page ->
+                    WatchedContentFilter.prepareForLoad(page.items, resolveBudgetMs = WATCHED_FILTER_RESOLVE_BUDGET_MS)
+                }
             }.fold(
                 onSuccess = { page ->
                     val current = _uiState.value.sections.firstOrNull { it.key == sectionKey }
@@ -448,34 +686,40 @@ object HomeRepository {
                         log.i { "loadMore dropped ($sectionKey): section vanished while paging" }
                         return@launch
                     }
-                    val merged = mergeCatalogItems(current.items, page.items)
+                    // Merged against the *cached* row, not the published one. The published row
+                    // has already had the browsing filters (hide unreleased / hide watched)
+                    // applied, so merging into it and writing that back would bake the filter
+                    // into the cache — and a page of nothing but watched titles would read as
+                    // "row exhausted". The cache stays raw; only what is published is filtered.
+                    val cached = cachedSections[sectionKey] ?: current
+                    val merged = mergeCatalogItems(cached.items, page.items)
                     val pagination = nextCatalogPaginationState(
                         supportsPagination = true,
                         requestedSkip = skip,
                         page = page,
-                        loadedNewItems = merged.size > current.items.size,
+                        loadedNewItems = merged.size > cached.items.size,
                         consecutiveDuplicatePages = sectionDuplicatePageCounts[sectionKey] ?: 0,
                     )
                     sectionDuplicatePageCounts[sectionKey] = pagination.consecutiveDuplicatePages
-                    log.i {
-                        "loadMore done ($sectionKey) ${current.items.size} -> ${merged.size} " +
-                            "(page=${page.items.size}, new=${merged.size - current.items.size}, " +
-                            "nextSkip=${pagination.nextSkip}, dupPages=${pagination.consecutiveDuplicatePages})"
-                    }
-                    setSection(
-                        current.copy(
-                            items = merged,
-                            availableItemCount = maxOf(current.availableItemCount, merged.size),
-                            nextSkip = pagination.nextSkip,
-                            hasMore = pagination.nextSkip != null,
-                            isLoadingMore = false,
-                        ),
+                    val mergedSection = current.copy(
+                        items = merged,
+                        availableItemCount = maxOf(current.availableItemCount, merged.size),
+                        nextSkip = pagination.nextSkip,
+                        hasMore = pagination.nextSkip != null,
+                        isLoadingMore = false,
                     )
+                    val visible = BrowsingFilters.current().apply(mergedSection)
+                    log.i {
+                        "loadMore done ($sectionKey) ${cached.items.size} -> ${merged.size} " +
+                            "(page=${page.items.size}, new=${merged.size - cached.items.size}, " +
+                            "visible=${visible.items.size}, nextSkip=${pagination.nextSkip}, " +
+                            "dupPages=${pagination.consecutiveDuplicatePages})"
+                    }
+                    setSection(published = visible, cached = mergedSection)
                 },
                 onFailure = { error ->
                     log.w(error) { "loadMore failed ($sectionKey) skip=$skip" }
-                    _uiState.value.sections.firstOrNull { it.key == sectionKey }
-                        ?.let { setSection(it.copy(isLoadingMore = false)) }
+                    setLoadingMore(sectionKey, loading = false)
                 },
             )
         }
@@ -553,12 +797,29 @@ object HomeRepository {
         }
     }
 
-    private fun setSection(section: HomeCatalogSection) {
+    /**
+     * Writes a row to the published state and, when the row is cached, to the cache. The two are
+     * allowed to differ: the cache holds every item fetched, the published row only those the
+     * browsing filters let through, and [publishCurrentState] rebuilds the latter from the former.
+     */
+    private fun setSection(published: HomeCatalogSection, cached: HomeCatalogSection = published) {
         _uiState.update { state ->
-            state.copy(sections = state.sections.map { if (it.key == section.key) section else it })
+            state.copy(sections = state.sections.map { if (it.key == published.key) published else it })
         }
-        if (cachedSections.containsKey(section.key)) {
-            cachedSections = cachedSections + (section.key to section)
+        if (cachedSections.containsKey(cached.key)) {
+            cachedSections = cachedSections + (cached.key to cached)
+        }
+    }
+
+    /** Flips the paging flag on both copies without letting the filtered one overwrite the cache. */
+    private fun setLoadingMore(sectionKey: String, loading: Boolean) {
+        _uiState.update { state ->
+            state.copy(
+                sections = state.sections.map { if (it.key == sectionKey) it.copy(isLoadingMore = loading) else it },
+            )
+        }
+        cachedSections[sectionKey]?.let { cached ->
+            cachedSections = cachedSections + (sectionKey to cached.copy(isLoadingMore = loading))
         }
     }
 
@@ -639,16 +900,18 @@ object HomeRepository {
             else -> {
                 val catalogSource = addonCatalogSource() ?: return emptyList()
                 val resolvedCatalog = addons.findCollectionCatalog(catalogSource) ?: return emptyList()
-                fetchCatalogPage(
+                fetchCollectionCatalogPage(
                     manifestUrl = resolvedCatalog.addon.manifestUrl,
                     type = catalogSource.type,
                     catalogId = catalogSource.catalogId,
+                    fallbackCatalogId = resolvedCatalog.fallbackCatalogId(catalogSource),
                     genre = catalogSource.genre,
                     maxItems = HOME_COLLECTION_HERO_SOURCE_ITEM_LIMIT,
-                )
+                ).page
             }
         }
-        val items = page.items
+        WatchedContentFilter.prepareForLoad(page.items)
+        val items = page.items.filterUnwatchedItems(WatchedContentFilter.current())
         return if (HomeCatalogSettingsRepository.snapshot().hideUnreleasedContent) {
             items.filterReleasedItems(CurrentDateProvider.todayIsoDate())
         } else {
@@ -682,6 +945,8 @@ object HomeRepository {
         append(requestKey.orEmpty())
         append("|hideUnreleased=")
         append(snapshot.hideUnreleasedContent)
+        append("|hideWatched=")
+        append(snapshot.hideWatchedContent)
         append("|collections=")
         collections.forEach { collection ->
             val preference = snapshot.preferences["collection_${collection.id}"]
@@ -721,6 +986,8 @@ private const val HOME_COLLECTION_HERO_SOURCE_ITEM_LIMIT = 8
 private const val HOME_CATALOG_FETCH_BATCH_SIZE = 4
 private const val HOME_CATALOG_PREVIEW_FETCH_LIMIT = 18
 private const val HOME_CATALOG_PUBLISH_INTERVAL = 2
+/** A catalog slower than this is named in the log at info level, so a slow addon is easy to find. */
+private const val HOME_CATALOG_SLOW_LOG_MS = 3_000L
 
 private fun prioritizeDefinitions(
     definitions: List<HomeCatalogDefinition>,

@@ -25,7 +25,7 @@ internal object MetaDetailsParser {
         val root = json.parseToJsonElement(payload).asJsonObjectOrNull()
             ?: error("Expected top-level JSON object in response")
         val meta = root.extractMetaObject()
-            ?: error("Response did not contain a valid meta object")
+            ?: throw MetaMissingException()
         val links = meta.links()
 
         return MetaDetails(
@@ -247,7 +247,8 @@ internal object MetaDetailsParser {
             group.forEach { person ->
                 val normalizedName = person.name.trim()
                 if (normalizedName.isBlank()) return@forEach
-                val key = normalizedName.lowercase()
+                // Accent- and punctuation-blind: see personNameKey.
+                val key = personNameKey(normalizedName).ifBlank { normalizedName.lowercase() }
                 val existing = merged[key]
                 merged[key] = if (existing == null) {
                     person.copy(name = normalizedName)
@@ -276,7 +277,8 @@ internal object MetaDetailsParser {
                 season = video.int("season"),
                 episode = video.int("episode"),
                 overview = video.string("overview") ?: video.string("description"),
-                runtime = video.int("runtime"),
+                // Addons send this as a number, a numeric string or text like "45 min" / "1h 30m".
+                runtime = parseRuntimeMinutes((video["runtime"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()),
                 streams = video.embeddedStreams(),
             )
         }
@@ -304,6 +306,8 @@ internal object MetaDetailsParser {
                 publishedAt = trailer.string("published_at") ?: trailer.string("publishedAt"),
                 seasonNumber = trailer.int("seasonNumber") ?: trailer.int("season_number"),
                 displayName = trailer.string("displayName")?.takeIf(String::isNotBlank),
+                language = (trailer.string("iso_639_1") ?: trailer.string("lang") ?: trailer.string("language"))
+                    ?.trim()?.takeIf(String::isNotBlank),
             )
         }
 
@@ -372,3 +376,6 @@ internal object MetaDetailsParser {
 }
 
 private fun JsonElement?.asJsonObjectOrNull(): JsonObject? = this as? JsonObject
+
+/** An addon answered 200 with no meta object in it: as good as a 404 for that title. */
+internal class MetaMissingException : IllegalStateException("Response did not contain a valid meta object")

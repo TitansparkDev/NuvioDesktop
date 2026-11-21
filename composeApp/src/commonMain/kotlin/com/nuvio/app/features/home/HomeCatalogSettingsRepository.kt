@@ -1,5 +1,7 @@
 package com.nuvio.app.features.home
 
+import com.nuvio.app.core.perf.PerfTelemetry
+import com.nuvio.app.features.collection.FolderRowShuffleState
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.ManagedAddon
 import com.nuvio.app.features.addons.enabledAddons
@@ -15,6 +17,8 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.features.profiles.ProfileRepository
+import kotlinx.coroutines.launch
 import com.nuvio.app.features.discover.CUSTOM_DISCOVER_REF_LIMIT
 import com.nuvio.app.features.discover.CUSTOM_DISCOVER_ROW_LIMIT
 import com.nuvio.app.features.discover.CustomDiscoverRow
@@ -201,12 +205,15 @@ data class HomeCatalogSettingsUiState(
     val heroBadgeScale: Float = 1f,
     val heroReleaseStatusUnavailableOnly: Boolean = true,
     val hideUnreleasedContent: Boolean = false,
+    val hideWatchedContent: Boolean = false,
     val discoverHideWatched: Boolean = true,
     val discoverBecauseYouWatchedRows: Int = DISCOVER_BECAUSE_ROWS_DEFAULT,
     val discoverFinishWhatYouStartedEnabled: Boolean = true,
     val discoverFinishIdleDays: Int = DISCOVER_FINISH_IDLE_DAYS_DEFAULT,
     val discoverMoreLikeFavouritesEnabled: Boolean = true,
     val discoverHiddenGemsEnabled: Boolean = true,
+    val discoverTopPicksEnabled: Boolean = true,
+    val discoverPeopleRowsEnabled: Boolean = true,
     val discoverTrendingGenreRows: Int = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT,
     val discoverExcludedGenres: Set<String> = emptySet(),
     /**
@@ -222,18 +229,24 @@ data class HomeCatalogSettingsUiState(
     val catalogRowShuffleEnabled: Boolean = false,
     val adaptiveHeroEnabled: Boolean = false,
     val adaptiveHeroVerticalBias: Float = ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT,
+    val adaptiveHeroAutoFraming: Boolean = true,
     val adaptiveHeroHeightMultiplier: Float = ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT,
     val heroAmbientBackgroundEnabled: Boolean = false,
     val tvModeEnabled: Boolean = false,
     val smoothScrollingEnabled: Boolean = true,
+    /** Basic/Adaptive: one wheel notch steps one row, as Up/Down do (TV Mode always steps). */
+    val snapScrollingEnabled: Boolean = false,
     val hoverPreviewBasicEnabled: Boolean = true,
     val hoverPreviewAdaptiveEnabled: Boolean = false,
     val catalogSeeMoreEnabled: Boolean = false,
     val catalogRowNumbersEnabled: Boolean = false,
+    val collectionGifsOnFocusOnly: Boolean = true,
+    val catalogProviderTagEnabled: Boolean = false,
     val tvRowDotsEnabled: Boolean = false,
-    val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle,
-    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Fade,
+    val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop,
+    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Off,
     val tvFullBackdropEnabled: Boolean = false,
+    val tvAmbientBackgroundEnabled: Boolean = false,
     val randomPlayEnabled: Boolean = false,
     val randomPlayIncludeCollections: Boolean = false,
     val randomPlayCategories: Set<RandomPlayCategory> = RandomPlayCategory.entries.toSet(),
@@ -268,6 +281,8 @@ data class HomeCatalogSettingsUiState(
             append('|')
             append(adaptiveHeroVerticalBias)
             append('|')
+            append(adaptiveHeroAutoFraming)
+            append('|')
             append(adaptiveHeroHeightMultiplier)
             append('|')
             append(heroAmbientBackgroundEnabled)
@@ -275,6 +290,8 @@ data class HomeCatalogSettingsUiState(
             append(tvModeEnabled)
             append('|')
             append(smoothScrollingEnabled)
+            append('|')
+            append(snapScrollingEnabled)
             append('|')
             append(hoverPreviewBasicEnabled)
             append('|')
@@ -284,6 +301,10 @@ data class HomeCatalogSettingsUiState(
             append('|')
             append(catalogRowNumbersEnabled)
             append('|')
+            append(collectionGifsOnFocusOnly)
+            append('|')
+            append(catalogProviderTagEnabled)
+            append('|')
             append(tvRowDotsEnabled)
             append('|')
             append(tvRowDotsAnchor)
@@ -291,6 +312,8 @@ data class HomeCatalogSettingsUiState(
             append(tvRowTransition)
             append('|')
             append(tvFullBackdropEnabled)
+            append('|')
+            append(tvAmbientBackgroundEnabled)
             append('|')
             append(randomPlayEnabled)
             append('|')
@@ -328,12 +351,15 @@ internal data class HomeCatalogSettingsSnapshot(
     val heroBadgeScale: Float,
     val heroReleaseStatusUnavailableOnly: Boolean,
     val hideUnreleasedContent: Boolean,
+    val hideWatchedContent: Boolean,
     val discoverHideWatched: Boolean,
     val discoverBecauseYouWatchedRows: Int,
     val discoverFinishWhatYouStartedEnabled: Boolean,
     val discoverFinishIdleDays: Int,
     val discoverMoreLikeFavouritesEnabled: Boolean,
     val discoverHiddenGemsEnabled: Boolean,
+    val discoverTopPicksEnabled: Boolean,
+    val discoverPeopleRowsEnabled: Boolean,
     val discoverTrendingGenreRows: Int,
     val discoverExcludedGenres: Set<String>,
     /** Already normalised — see [HomeCatalogSettingsUiState.discoverRowOrder]. */
@@ -345,6 +371,7 @@ internal data class HomeCatalogSettingsSnapshot(
     val catalogRowShuffleEnabled: Boolean,
     val adaptiveHeroEnabled: Boolean,
     val adaptiveHeroVerticalBias: Float,
+    val adaptiveHeroAutoFraming: Boolean,
     val adaptiveHeroHeightMultiplier: Float,
     val heroAmbientBackgroundEnabled: Boolean,
     val tvModeEnabled: Boolean,
@@ -386,52 +413,54 @@ enum class HomeTvRowTransition {
 }
 
 /**
- * Single "how the home screen presents itself" choice, consolidating adaptive cropping, ambient
- * background, and TV mode into one control instead of three independent switches.
+ * Single "how the home screen presents itself" choice, consolidating adaptive cropping and TV mode
+ * into one control instead of independent switches.
  *
- * The three backing flags are not free to vary: TV mode excludes both of the others (see
- * [normalizeHeroModes]), and ambient only means anything on top of the adaptive hero. This enum is
- * the only representation the UI should reason about — read it with [homeDisplayModeOf], write it
- * with [HomeCatalogSettingsRepository.setDisplayMode].
+ * The two backing flags are not free to vary: TV mode excludes the adaptive hero (see
+ * [normalizeHeroModes]). This enum is the only representation the UI should reason about — read it
+ * with [homeDisplayModeOf], write it with [HomeCatalogSettingsRepository.setDisplayMode].
+ *
+ * Ambient is not a mode. Adaptive and TV Mode each carry their own ambient toggle
+ * ([HomeCatalogSettingsUiState.heroAmbientBackgroundEnabled] and `tvAmbientBackgroundEnabled`),
+ * kept while another mode is active so switching back restores it; read Adaptive's through
+ * [adaptiveAmbientActive], which is false outside Adaptive.
  */
 enum class HomeDisplayMode {
     Basic,
     Adaptive,
-    AdaptiveAmbient,
     TvMode,
 }
 
 fun homeDisplayModeOf(
     adaptiveHeroEnabled: Boolean,
-    heroAmbientBackgroundEnabled: Boolean,
     tvModeEnabled: Boolean,
 ): HomeDisplayMode = when {
     tvModeEnabled -> HomeDisplayMode.TvMode
-    adaptiveHeroEnabled && heroAmbientBackgroundEnabled -> HomeDisplayMode.AdaptiveAmbient
     adaptiveHeroEnabled -> HomeDisplayMode.Adaptive
     else -> HomeDisplayMode.Basic
 }
 
-/** The three backing flags a [HomeDisplayMode] corresponds to. */
+/** The backing flags a [HomeDisplayMode] corresponds to. */
 data class HomeDisplayModeFlags(
     val adaptiveHeroEnabled: Boolean,
-    val heroAmbientBackgroundEnabled: Boolean,
     val tvModeEnabled: Boolean,
 )
+
+/** Adaptive's ambient wash as drawn: the stored toggle, but only while Adaptive is the mode. */
+val HomeCatalogSettingsUiState.adaptiveAmbientActive: Boolean
+    get() = heroAmbientBackgroundEnabled && adaptiveHeroEnabled && !tvModeEnabled
 
 /**
  * The mode → flags half of the mapping, kept pure so it can be round-tripped against
  * [homeDisplayModeOf] in a test. Everything that writes a display mode goes through this.
  */
 fun HomeDisplayMode.toFlags(): HomeDisplayModeFlags = HomeDisplayModeFlags(
-    adaptiveHeroEnabled = this == HomeDisplayMode.Adaptive || this == HomeDisplayMode.AdaptiveAmbient,
-    heroAmbientBackgroundEnabled = this == HomeDisplayMode.AdaptiveAmbient,
+    adaptiveHeroEnabled = this == HomeDisplayMode.Adaptive,
     tvModeEnabled = this == HomeDisplayMode.TvMode,
 )
 
 fun homeDisplayModeOf(flags: HomeDisplayModeFlags): HomeDisplayMode = homeDisplayModeOf(
     adaptiveHeroEnabled = flags.adaptiveHeroEnabled,
-    heroAmbientBackgroundEnabled = flags.heroAmbientBackgroundEnabled,
     tvModeEnabled = flags.tvModeEnabled,
 )
 
@@ -447,7 +476,7 @@ fun HomeCatalogSettingsUiState.hoverPreviewEnabledFor(
     mode: HomeDisplayMode = homeDisplayModeOf(this),
 ): Boolean = when (mode) {
     HomeDisplayMode.Basic -> hoverPreviewBasicEnabled
-    HomeDisplayMode.Adaptive, HomeDisplayMode.AdaptiveAmbient -> hoverPreviewAdaptiveEnabled
+    HomeDisplayMode.Adaptive -> hoverPreviewAdaptiveEnabled
     HomeDisplayMode.TvMode -> false
 }
 
@@ -469,7 +498,6 @@ fun basicHeroTrailersAllowed(
 
 fun homeDisplayModeOf(state: HomeCatalogSettingsUiState): HomeDisplayMode = homeDisplayModeOf(
     adaptiveHeroEnabled = state.adaptiveHeroEnabled,
-    heroAmbientBackgroundEnabled = state.heroAmbientBackgroundEnabled,
     tvModeEnabled = state.tvModeEnabled,
 )
 
@@ -506,12 +534,15 @@ private data class StoredHomeCatalogSettingsPayload(
     val heroBadgeScale: Float = 1f,
     val heroReleaseStatusUnavailableOnly: Boolean = true,
     val hideUnreleasedContent: Boolean = false,
+    val hideWatchedContent: Boolean = false,
     val discoverHideWatched: Boolean = true,
     val discoverBecauseYouWatchedRows: Int = DISCOVER_BECAUSE_ROWS_DEFAULT,
     val discoverFinishWhatYouStartedEnabled: Boolean = true,
     val discoverFinishIdleDays: Int = DISCOVER_FINISH_IDLE_DAYS_DEFAULT,
     val discoverMoreLikeFavouritesEnabled: Boolean = true,
     val discoverHiddenGemsEnabled: Boolean = true,
+    val discoverTopPicksEnabled: Boolean = true,
+    val discoverPeopleRowsEnabled: Boolean = true,
     val discoverTrendingGenreRows: Int = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT,
     val discoverExcludedGenres: Set<String> = emptySet(),
     /**
@@ -528,19 +559,25 @@ private data class StoredHomeCatalogSettingsPayload(
     @SerialName("tvModeEnabled")
     val adaptiveHeroEnabled: Boolean = false,
     val adaptiveHeroVerticalBias: Float = -0.58f,
+    val adaptiveHeroAutoFraming: Boolean = true,
     val adaptiveHeroHeightMultiplier: Float = 1.25f,
     val heroAmbientBackgroundEnabled: Boolean = false,
     @SerialName("immersiveCatalogModeEnabled")
     val tvModeEnabled: Boolean = false,
     val smoothScrollingEnabled: Boolean = true,
+    /** Basic/Adaptive: one wheel notch steps one row, as Up/Down do (TV Mode always steps). */
+    val snapScrollingEnabled: Boolean = false,
     val hoverPreviewBasicEnabled: Boolean = true,
     val hoverPreviewAdaptiveEnabled: Boolean = false,
     val catalogSeeMoreEnabled: Boolean = false,
     val catalogRowNumbersEnabled: Boolean = false,
+    val collectionGifsOnFocusOnly: Boolean = true,
+    val catalogProviderTagEnabled: Boolean = false,
     val tvRowDotsEnabled: Boolean = false,
-    val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle,
-    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Fade,
+    val tvRowDotsAnchor: HomeTvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop,
+    val tvRowTransition: HomeTvRowTransition = HomeTvRowTransition.Off,
     val tvFullBackdropEnabled: Boolean = false,
+    val tvAmbientBackgroundEnabled: Boolean = false,
     val randomPlayEnabled: Boolean = false,
     val randomPlayIncludeCollections: Boolean = false,
     val randomPlayCategories: Set<RandomPlayCategory> = RandomPlayCategory.entries.toSet(),
@@ -577,12 +614,15 @@ object HomeCatalogSettingsRepository {
     private var heroBadgeScale = 1f
     private var heroReleaseStatusUnavailableOnly = true
     private var hideUnreleasedContent = false
+    private var hideWatchedContent = false
     private var discoverHideWatched = true
     private var discoverBecauseYouWatchedRows = DISCOVER_BECAUSE_ROWS_DEFAULT
     private var discoverFinishWhatYouStartedEnabled = true
     private var discoverFinishIdleDays = DISCOVER_FINISH_IDLE_DAYS_DEFAULT
     private var discoverMoreLikeFavouritesEnabled = true
     private var discoverHiddenGemsEnabled = true
+    private var discoverTopPicksEnabled = true
+    private var discoverPeopleRowsEnabled = true
     private var discoverTrendingGenreRows = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT
     private var discoverExcludedGenres: Set<String> = emptySet()
     private var discoverRowOrder: List<String> = emptyList()
@@ -603,18 +643,23 @@ object HomeCatalogSettingsRepository {
     private var catalogRowShuffleEnabled = false
     private var adaptiveHeroEnabled = false
     private var adaptiveHeroVerticalBias = ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT
+    private var adaptiveHeroAutoFraming = true
     private var adaptiveHeroHeightMultiplier = ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT
     private var heroAmbientBackgroundEnabled = false
     private var tvModeEnabled = false
     private var smoothScrollingEnabled = true
+    private var snapScrollingEnabled = false
     private var hoverPreviewBasicEnabled = true
     private var hoverPreviewAdaptiveEnabled = false
     private var catalogSeeMoreEnabled = false
     private var catalogRowNumbersEnabled = false
+    private var collectionGifsOnFocusOnly = true
+    private var catalogProviderTagEnabled = false
     private var tvRowDotsEnabled = false
-    private var tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
-    private var tvRowTransition = HomeTvRowTransition.Fade
+    private var tvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop
+    private var tvRowTransition = HomeTvRowTransition.Off
     private var tvFullBackdropEnabled = false
+    private var tvAmbientBackgroundEnabled = false
     private var randomPlayEnabled = false
     private var randomPlayIncludeCollections = false
     private var randomPlayCategories = RandomPlayCategory.entries.toSet()
@@ -623,6 +668,8 @@ object HomeCatalogSettingsRepository {
     private var randomPlayAction = RandomPlayAction.Details
 
     fun onProfileChanged() {
+        // The outgoing profile's last change lands before anything reloads from the store.
+        flushPendingPersist()
         hasLoaded = false
         preferences.clear()
         heroEnabled = true
@@ -635,12 +682,15 @@ object HomeCatalogSettingsRepository {
         heroBadgeScale = 1f
         heroReleaseStatusUnavailableOnly = true
         hideUnreleasedContent = false
+        hideWatchedContent = false
         discoverHideWatched = true
         discoverBecauseYouWatchedRows = DISCOVER_BECAUSE_ROWS_DEFAULT
         discoverFinishWhatYouStartedEnabled = true
         discoverFinishIdleDays = DISCOVER_FINISH_IDLE_DAYS_DEFAULT
         discoverMoreLikeFavouritesEnabled = true
         discoverHiddenGemsEnabled = true
+        discoverTopPicksEnabled = true
+        discoverPeopleRowsEnabled = true
         discoverTrendingGenreRows = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT
         discoverExcludedGenres = emptySet()
         discoverRowOrder = emptyList()
@@ -652,22 +702,29 @@ object HomeCatalogSettingsRepository {
         catalogRowShuffleEnabled = false
         adaptiveHeroEnabled = false
         adaptiveHeroVerticalBias = ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT
+        adaptiveHeroAutoFraming = true
         adaptiveHeroHeightMultiplier = ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT
         heroAmbientBackgroundEnabled = false
         tvModeEnabled = false
         smoothScrollingEnabled = true
+        snapScrollingEnabled = false
         hoverPreviewBasicEnabled = true
         hoverPreviewAdaptiveEnabled = false
         catalogSeeMoreEnabled = false
         catalogRowNumbersEnabled = false
+        collectionGifsOnFocusOnly = true
+        catalogProviderTagEnabled = false
         tvRowDotsEnabled = false
-        tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
-        tvRowTransition = HomeTvRowTransition.Fade
+        tvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop
+        tvRowTransition = HomeTvRowTransition.Off
         tvFullBackdropEnabled = false
+        tvAmbientBackgroundEnabled = false
         resetRandomPlaySettings()
         definitions = emptyList()
         collectionDefinitions = emptyList()
         lastSyncedCatalogKeys = null
+        lastCatalogSync = null
+        lastCollectionSync = null
         _uiState.value = HomeCatalogSettingsUiState()
     }
 
@@ -676,6 +733,8 @@ object HomeCatalogSettingsRepository {
         definitions = emptyList()
         collectionDefinitions = emptyList()
         lastSyncedCatalogKeys = null
+        lastCatalogSync = null
+        lastCollectionSync = null
         preferences.clear()
         heroEnabled = true
         heroInfoLines = 2
@@ -687,12 +746,15 @@ object HomeCatalogSettingsRepository {
         heroBadgeScale = 1f
         heroReleaseStatusUnavailableOnly = true
         hideUnreleasedContent = false
+        hideWatchedContent = false
         discoverHideWatched = true
         discoverBecauseYouWatchedRows = DISCOVER_BECAUSE_ROWS_DEFAULT
         discoverFinishWhatYouStartedEnabled = true
         discoverFinishIdleDays = DISCOVER_FINISH_IDLE_DAYS_DEFAULT
         discoverMoreLikeFavouritesEnabled = true
         discoverHiddenGemsEnabled = true
+        discoverTopPicksEnabled = true
+        discoverPeopleRowsEnabled = true
         discoverTrendingGenreRows = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT
         discoverExcludedGenres = emptySet()
         discoverRowOrder = emptyList()
@@ -704,18 +766,23 @@ object HomeCatalogSettingsRepository {
         catalogRowShuffleEnabled = false
         adaptiveHeroEnabled = false
         adaptiveHeroVerticalBias = ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT
+        adaptiveHeroAutoFraming = true
         adaptiveHeroHeightMultiplier = ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT
         heroAmbientBackgroundEnabled = false
         tvModeEnabled = false
         smoothScrollingEnabled = true
+        snapScrollingEnabled = false
         hoverPreviewBasicEnabled = true
         hoverPreviewAdaptiveEnabled = false
         catalogSeeMoreEnabled = false
         catalogRowNumbersEnabled = false
+        collectionGifsOnFocusOnly = true
+        catalogProviderTagEnabled = false
         tvRowDotsEnabled = false
-        tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
-        tvRowTransition = HomeTvRowTransition.Fade
+        tvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop
+        tvRowTransition = HomeTvRowTransition.Off
         tvFullBackdropEnabled = false
+        tvAmbientBackgroundEnabled = false
         resetRandomPlaySettings()
         _uiState.value = HomeCatalogSettingsUiState()
     }
@@ -724,10 +791,26 @@ object HomeCatalogSettingsRepository {
     // set actually changed, not on every home (re)entry.
     private var lastSyncedCatalogKeys: List<String>? = null
 
+    // Inputs of the last sync and the state it published. Home runs both syncs every time it is
+    // built (tab switches, back from the player, startup); when nothing changed and nobody has
+    // published since, normalising, publishing and persisting again would only repeat the last pass.
+    private var lastCatalogSync: Triple<List<HomeCatalogDefinition>, List<CollectionCatalogDefinition>, HomeCatalogSettingsUiState>? = null
+    private var lastCollectionSync: Pair<List<CollectionCatalogDefinition>, HomeCatalogSettingsUiState>? = null
+
     fun syncCatalogs(addons: List<ManagedAddon>) {
+        PerfTelemetry.count("HomeCatalogSettingsRepository.syncCatalogs")
         ensureLoaded()
         definitions = buildHomeCatalogDefinitions(addons)
         collectionDefinitions = buildCollectionDefinitions(CollectionRepository.collections.value)
+        lastCatalogSync?.let { (lastDefinitions, lastCollections, publishedState) ->
+            if (lastDefinitions === definitions && lastCollections === collectionDefinitions &&
+                publishedState === _uiState.value
+            ) {
+                // Still lets HomeRepository retry rows that failed; it returns early otherwise.
+                HomeRepository.refresh(addons.enabledAddons(), force = false)
+                return
+            }
+        }
         if (definitions.isEmpty() && collectionDefinitions.isEmpty()) {
             publish()
             return
@@ -744,16 +827,22 @@ object HomeCatalogSettingsRepository {
             collectionDefinitions.map(CollectionCatalogDefinition::key)
         val catalogSetChanged = lastSyncedCatalogKeys != catalogKeys
         lastSyncedCatalogKeys = catalogKeys
+        lastCatalogSync = Triple(definitions, collectionDefinitions, _uiState.value)
         HomeRepository.refresh(addons.enabledAddons(), force = catalogSetChanged)
     }
 
     fun syncCollections(collections: List<Collection>) {
+        PerfTelemetry.count("HomeCatalogSettingsRepository.syncCollections")
         ensureLoaded()
         collectionDefinitions = buildCollectionDefinitions(collections)
+        lastCollectionSync?.let { (lastCollections, publishedState) ->
+            if (lastCollections === collectionDefinitions && publishedState === _uiState.value) return
+        }
         normalizePreferences()
         enforcePinnedCollectionsAtTop()
         publish()
         persist()
+        lastCollectionSync = collectionDefinitions to _uiState.value
         HomeRepository.applyCurrentSettings()
     }
 
@@ -768,12 +857,15 @@ object HomeCatalogSettingsRepository {
             heroBadgeScale = heroBadgeScale,
             heroReleaseStatusUnavailableOnly = heroReleaseStatusUnavailableOnly,
             hideUnreleasedContent = hideUnreleasedContent,
+            hideWatchedContent = hideWatchedContent,
             discoverHideWatched = discoverHideWatched,
             discoverBecauseYouWatchedRows = discoverBecauseYouWatchedRows,
             discoverFinishWhatYouStartedEnabled = discoverFinishWhatYouStartedEnabled,
             discoverFinishIdleDays = discoverFinishIdleDays,
             discoverMoreLikeFavouritesEnabled = discoverMoreLikeFavouritesEnabled,
             discoverHiddenGemsEnabled = discoverHiddenGemsEnabled,
+            discoverTopPicksEnabled = discoverTopPicksEnabled,
+            discoverPeopleRowsEnabled = discoverPeopleRowsEnabled,
             discoverTrendingGenreRows = discoverTrendingGenreRows,
             discoverExcludedGenres = discoverExcludedGenres,
             discoverRowOrder = normalizeDiscoverRowOrder(
@@ -789,6 +881,7 @@ object HomeCatalogSettingsRepository {
             catalogRowShuffleEnabled = catalogRowShuffleEnabled,
             adaptiveHeroEnabled = adaptiveHeroEnabled,
             adaptiveHeroVerticalBias = adaptiveHeroVerticalBias,
+            adaptiveHeroAutoFraming = adaptiveHeroAutoFraming,
             adaptiveHeroHeightMultiplier = adaptiveHeroHeightMultiplier,
             heroAmbientBackgroundEnabled = heroAmbientBackgroundEnabled,
             tvModeEnabled = tvModeEnabled,
@@ -929,6 +1022,22 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    fun setDiscoverTopPicksEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (discoverTopPicksEnabled == enabled) return
+        discoverTopPicksEnabled = enabled
+        publish()
+        persist()
+    }
+
+    fun setDiscoverPeopleRowsEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (discoverPeopleRowsEnabled == enabled) return
+        discoverPeopleRowsEnabled = enabled
+        publish()
+        persist()
+    }
+
     fun setDiscoverTrendingGenreRows(count: Int) {
         ensureLoaded()
         val clamped = count.coerceIn(
@@ -955,6 +1064,8 @@ object HomeCatalogSettingsRepository {
             DiscoverRowFamily.Finish -> setDiscoverFinishWhatYouStartedEnabled(enabled)
             DiscoverRowFamily.Favourites -> setDiscoverMoreLikeFavouritesEnabled(enabled)
             DiscoverRowFamily.Gems -> setDiscoverHiddenGemsEnabled(enabled)
+            DiscoverRowFamily.TopPicks -> setDiscoverTopPicksEnabled(enabled)
+            DiscoverRowFamily.People -> setDiscoverPeopleRowsEnabled(enabled)
             DiscoverRowFamily.Because -> setDiscoverBecauseYouWatchedRows(
                 countForFamilyToggle(family, enabled, discoverBecauseYouWatchedRows, DISCOVER_BECAUSE_ROWS_DEFAULT),
             )
@@ -1129,6 +1240,15 @@ object HomeCatalogSettingsRepository {
         HomeRepository.applyCurrentSettings()
     }
 
+    fun setHideWatchedContent(enabled: Boolean) {
+        ensureLoaded()
+        if (hideWatchedContent == enabled) return
+        hideWatchedContent = enabled
+        publish()
+        persist()
+        HomeRepository.applyCurrentSettings()
+    }
+
     fun setHideCatalogUnderline(enabled: Boolean) {
         ensureLoaded()
         if (hideCatalogUnderline == enabled) return
@@ -1138,7 +1258,7 @@ object HomeCatalogSettingsRepository {
     }
 
     /**
-     * Shows the per-row shuffle control on home catalog rows.
+     * Shows the per-row shuffle control on home and collection folder catalog rows.
      *
      * Local-only: it stays out of [SyncHomeCatalogPayload] because that schema is shared with the
      * TV and mobile clients, which have no such control. Turning it off also drops any shuffles
@@ -1149,7 +1269,10 @@ object HomeCatalogSettingsRepository {
         ensureLoaded()
         if (catalogRowShuffleEnabled == enabled) return
         catalogRowShuffleEnabled = enabled
-        if (!enabled) HomeRowShuffleState.clearAll()
+        if (!enabled) {
+            HomeRowShuffleState.clearAll()
+            FolderRowShuffleState.clearAll()
+        }
         publish()
         persist()
     }
@@ -1175,6 +1298,14 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    fun setAdaptiveHeroAutoFraming(enabled: Boolean) {
+        ensureLoaded()
+        if (adaptiveHeroAutoFraming == enabled) return
+        adaptiveHeroAutoFraming = enabled
+        publish()
+        persist()
+    }
+
     fun setAdaptiveHeroHeightMultiplier(multiplier: Float) {
         ensureLoaded()
         val normalized = normalizeAdaptiveHeroHeightMultiplier(multiplier)
@@ -1184,23 +1315,20 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    /** Adaptive's ambient toggle. Stored whatever the mode; drawn only in Adaptive ([adaptiveAmbientActive]). */
     fun setHeroAmbientBackgroundEnabled(enabled: Boolean) {
         ensureLoaded()
-        val next = enabled && !tvModeEnabled
-        if (heroAmbientBackgroundEnabled == next) return
-        heroAmbientBackgroundEnabled = next
+        if (heroAmbientBackgroundEnabled == enabled) return
+        heroAmbientBackgroundEnabled = enabled
         publish()
         persist()
     }
 
     fun setTvModeEnabled(enabled: Boolean) {
         ensureLoaded()
-        if (tvModeEnabled == enabled && !(enabled && (adaptiveHeroEnabled || heroAmbientBackgroundEnabled))) return
+        if (tvModeEnabled == enabled && !(enabled && adaptiveHeroEnabled)) return
         tvModeEnabled = enabled
-        if (enabled) {
-            adaptiveHeroEnabled = false
-            heroAmbientBackgroundEnabled = false
-        }
+        if (enabled) adaptiveHeroEnabled = false
         publish()
         persist()
     }
@@ -1208,24 +1336,21 @@ object HomeCatalogSettingsRepository {
     /**
      * Moves the home screen to [mode] in one write.
      *
-     * Deliberately assigns all three backing flags rather than delegating to
-     * [setAdaptiveHeroEnabled]/[setHeroAmbientBackgroundEnabled]/[setTvModeEnabled]: those clear
-     * each other, so calling them in sequence is order-dependent — ambient set before the adaptive
-     * hero, or while TV mode is still on, is silently coerced back to false. Going through them
-     * would also cost up to three persists and a Home rebuild through a transient state that is
-     * none of the four modes.
+     * Deliberately assigns both backing flags rather than delegating to
+     * [setAdaptiveHeroEnabled]/[setTvModeEnabled]: those clear each other, so calling them in
+     * sequence is order-dependent, and would cost two persists and a Home rebuild through a
+     * transient state that is none of the modes. The ambient toggles are left alone: each belongs
+     * to its mode and comes back with it.
      */
     fun setDisplayMode(mode: HomeDisplayMode) {
         ensureLoaded()
         val next = mode.toFlags()
         if (adaptiveHeroEnabled == next.adaptiveHeroEnabled &&
-            heroAmbientBackgroundEnabled == next.heroAmbientBackgroundEnabled &&
             tvModeEnabled == next.tvModeEnabled
         ) {
             return
         }
         adaptiveHeroEnabled = next.adaptiveHeroEnabled
-        heroAmbientBackgroundEnabled = next.heroAmbientBackgroundEnabled
         tvModeEnabled = next.tvModeEnabled
         publish()
         persist()
@@ -1240,6 +1365,14 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    fun setSnapScrollingEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (snapScrollingEnabled == enabled) return
+        snapScrollingEnabled = enabled
+        publish()
+        persist()
+    }
+
     fun setCatalogSeeMoreEnabled(enabled: Boolean) {
         ensureLoaded()
         if (catalogSeeMoreEnabled == enabled) return
@@ -1248,10 +1381,28 @@ object HomeCatalogSettingsRepository {
         persist()
     }
 
+    /** Collection folder GIFs play only on the highlighted card; the rest show their first frame. */
+    fun setCollectionGifsOnFocusOnly(enabled: Boolean) {
+        ensureLoaded()
+        if (collectionGifsOnFocusOnly == enabled) return
+        collectionGifsOnFocusOnly = enabled
+        publish()
+        persist()
+    }
+
     fun setCatalogRowNumbersEnabled(enabled: Boolean) {
         ensureLoaded()
         if (catalogRowNumbersEnabled == enabled) return
         catalogRowNumbersEnabled = enabled
+        publish()
+        persist()
+    }
+
+    /** Whether each catalog row's header carries a small tag naming the addon that served it. */
+    fun setCatalogProviderTagEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (catalogProviderTagEnabled == enabled) return
+        catalogProviderTagEnabled = enabled
         publish()
         persist()
     }
@@ -1270,6 +1421,19 @@ object HomeCatalogSettingsRepository {
     }
 
     /**
+     * Whether TV Mode paints the Adaptive Ambient wash (blurred backdrop + accent tint) behind the
+     * screen, so the shelf sits on a tinted picture instead of black. Stored regardless of the mode
+     * being on, same as [setTvFullBackdropEnabled].
+     */
+    fun setTvAmbientBackgroundEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (tvAmbientBackgroundEnabled == enabled) return
+        tvAmbientBackgroundEnabled = enabled
+        publish()
+        persist()
+    }
+
+    /**
      * Whether hovering a poster opens the preview card, stored per display mode rather than
      * globally: the preview suits Basic, where the page is otherwise static, and fights the
      * Adaptive hero, which is already reacting to the row under the pointer. TV Mode has no
@@ -1282,7 +1446,7 @@ object HomeCatalogSettingsRepository {
                 if (hoverPreviewBasicEnabled == enabled) return
                 hoverPreviewBasicEnabled = enabled
             }
-            HomeDisplayMode.Adaptive, HomeDisplayMode.AdaptiveAmbient -> {
+            HomeDisplayMode.Adaptive -> {
                 if (hoverPreviewAdaptiveEnabled == enabled) return
                 hoverPreviewAdaptiveEnabled = enabled
             }
@@ -1426,12 +1590,15 @@ object HomeCatalogSettingsRepository {
         heroBadgeScale = 1f
         heroReleaseStatusUnavailableOnly = true
         hideUnreleasedContent = false
+        hideWatchedContent = false
         discoverHideWatched = true
         discoverBecauseYouWatchedRows = DISCOVER_BECAUSE_ROWS_DEFAULT
         discoverFinishWhatYouStartedEnabled = true
         discoverFinishIdleDays = DISCOVER_FINISH_IDLE_DAYS_DEFAULT
         discoverMoreLikeFavouritesEnabled = true
         discoverHiddenGemsEnabled = true
+        discoverTopPicksEnabled = true
+        discoverPeopleRowsEnabled = true
         discoverTrendingGenreRows = DISCOVER_TRENDING_GENRE_ROWS_DEFAULT
         discoverExcludedGenres = emptySet()
         discoverRowOrder = emptyList()
@@ -1443,18 +1610,23 @@ object HomeCatalogSettingsRepository {
         catalogRowShuffleEnabled = false
         adaptiveHeroEnabled = false
         adaptiveHeroVerticalBias = ADAPTIVE_HERO_VERTICAL_BIAS_DEFAULT
+        adaptiveHeroAutoFraming = true
         adaptiveHeroHeightMultiplier = ADAPTIVE_HERO_HEIGHT_MULTIPLIER_DEFAULT
         heroAmbientBackgroundEnabled = false
         tvModeEnabled = false
         smoothScrollingEnabled = true
+        snapScrollingEnabled = false
         hoverPreviewBasicEnabled = true
         hoverPreviewAdaptiveEnabled = false
         catalogSeeMoreEnabled = false
         catalogRowNumbersEnabled = false
+        collectionGifsOnFocusOnly = true
+        catalogProviderTagEnabled = false
         tvRowDotsEnabled = false
-        tvRowDotsAnchor = HomeTvRowDotsAnchor.RowTitle
-        tvRowTransition = HomeTvRowTransition.Fade
+        tvRowDotsAnchor = HomeTvRowDotsAnchor.HeroBackdrop
+        tvRowTransition = HomeTvRowTransition.Off
         tvFullBackdropEnabled = false
+        tvAmbientBackgroundEnabled = false
         resetRandomPlaySettings()
         preferences.clear()
         normalizePreferences()
@@ -1535,6 +1707,7 @@ object HomeCatalogSettingsRepository {
             heroBadgeScale = normalizeHeroBadgeScale(parsedPayload.heroBadgeScale)
             heroReleaseStatusUnavailableOnly = parsedPayload.heroReleaseStatusUnavailableOnly
             hideUnreleasedContent = parsedPayload.hideUnreleasedContent
+            hideWatchedContent = parsedPayload.hideWatchedContent
             discoverHideWatched = parsedPayload.discoverHideWatched
             discoverBecauseYouWatchedRows = parsedPayload.discoverBecauseYouWatchedRows
                 .coerceIn(DISCOVER_BECAUSE_ROWS_RANGE.first, DISCOVER_BECAUSE_ROWS_RANGE.last)
@@ -1543,6 +1716,8 @@ object HomeCatalogSettingsRepository {
                 .coerceIn(DISCOVER_FINISH_IDLE_DAYS_RANGE.first, DISCOVER_FINISH_IDLE_DAYS_RANGE.last)
             discoverMoreLikeFavouritesEnabled = parsedPayload.discoverMoreLikeFavouritesEnabled
             discoverHiddenGemsEnabled = parsedPayload.discoverHiddenGemsEnabled
+            discoverTopPicksEnabled = parsedPayload.discoverTopPicksEnabled
+            discoverPeopleRowsEnabled = parsedPayload.discoverPeopleRowsEnabled
             discoverTrendingGenreRows = parsedPayload.discoverTrendingGenreRows
                 .coerceIn(DISCOVER_TRENDING_GENRE_ROWS_RANGE.first, DISCOVER_TRENDING_GENRE_ROWS_RANGE.last)
             // Canonicalised on load so a stored name that no longer matches the list is dropped
@@ -1570,18 +1745,23 @@ object HomeCatalogSettingsRepository {
             catalogRowShuffleEnabled = parsedPayload.catalogRowShuffleEnabled
             adaptiveHeroEnabled = parsedPayload.adaptiveHeroEnabled
             adaptiveHeroVerticalBias = normalizeAdaptiveHeroVerticalBias(parsedPayload.adaptiveHeroVerticalBias)
+            adaptiveHeroAutoFraming = parsedPayload.adaptiveHeroAutoFraming
             adaptiveHeroHeightMultiplier = normalizeAdaptiveHeroHeightMultiplier(parsedPayload.adaptiveHeroHeightMultiplier)
             heroAmbientBackgroundEnabled = parsedPayload.heroAmbientBackgroundEnabled
             tvModeEnabled = parsedPayload.tvModeEnabled
             smoothScrollingEnabled = parsedPayload.smoothScrollingEnabled
+            snapScrollingEnabled = parsedPayload.snapScrollingEnabled
             hoverPreviewBasicEnabled = parsedPayload.hoverPreviewBasicEnabled
             hoverPreviewAdaptiveEnabled = parsedPayload.hoverPreviewAdaptiveEnabled
             catalogSeeMoreEnabled = parsedPayload.catalogSeeMoreEnabled
             catalogRowNumbersEnabled = parsedPayload.catalogRowNumbersEnabled
+            collectionGifsOnFocusOnly = parsedPayload.collectionGifsOnFocusOnly
+            catalogProviderTagEnabled = parsedPayload.catalogProviderTagEnabled
             tvRowDotsEnabled = parsedPayload.tvRowDotsEnabled
             tvRowDotsAnchor = parsedPayload.tvRowDotsAnchor
             tvRowTransition = parsedPayload.tvRowTransition
             tvFullBackdropEnabled = parsedPayload.tvFullBackdropEnabled
+            tvAmbientBackgroundEnabled = parsedPayload.tvAmbientBackgroundEnabled
             randomPlayEnabled = parsedPayload.randomPlayEnabled
             randomPlayIncludeCollections = parsedPayload.randomPlayIncludeCollections
             randomPlayCategories = parsedPayload.randomPlayCategories
@@ -1723,6 +1903,7 @@ object HomeCatalogSettingsRepository {
             heroBadgeScale = heroBadgeScale,
             heroReleaseStatusUnavailableOnly = heroReleaseStatusUnavailableOnly,
             hideUnreleasedContent = hideUnreleasedContent,
+            hideWatchedContent = hideWatchedContent,
             // Discover's knobs are read by the repository through `snapshot()`, but the settings
             // page renders from this state — leaving them out here left the rows slider and the
             // hide-watched switch showing their defaults no matter what was saved.
@@ -1732,6 +1913,8 @@ object HomeCatalogSettingsRepository {
             discoverFinishIdleDays = discoverFinishIdleDays,
             discoverMoreLikeFavouritesEnabled = discoverMoreLikeFavouritesEnabled,
             discoverHiddenGemsEnabled = discoverHiddenGemsEnabled,
+            discoverTopPicksEnabled = discoverTopPicksEnabled,
+            discoverPeopleRowsEnabled = discoverPeopleRowsEnabled,
             discoverTrendingGenreRows = discoverTrendingGenreRows,
             discoverExcludedGenres = discoverExcludedGenres,
             discoverRowOrder = normalizeDiscoverRowOrder(
@@ -1750,22 +1933,27 @@ object HomeCatalogSettingsRepository {
             catalogRowShuffleEnabled = catalogRowShuffleEnabled,
             adaptiveHeroEnabled = adaptiveHeroEnabled,
             adaptiveHeroVerticalBias = adaptiveHeroVerticalBias,
+            adaptiveHeroAutoFraming = adaptiveHeroAutoFraming,
             adaptiveHeroHeightMultiplier = adaptiveHeroHeightMultiplier,
             heroAmbientBackgroundEnabled = heroAmbientBackgroundEnabled,
             tvModeEnabled = tvModeEnabled,
             smoothScrollingEnabled = smoothScrollingEnabled,
+            snapScrollingEnabled = snapScrollingEnabled,
             // Reported raw for the same reason the TV row dots are: the settings row shows
             // what the user saved for that mode, and the preview itself gates on the mode.
             hoverPreviewBasicEnabled = hoverPreviewBasicEnabled,
             hoverPreviewAdaptiveEnabled = hoverPreviewAdaptiveEnabled,
             catalogSeeMoreEnabled = catalogSeeMoreEnabled,
             catalogRowNumbersEnabled = catalogRowNumbersEnabled,
+            collectionGifsOnFocusOnly = collectionGifsOnFocusOnly,
+            catalogProviderTagEnabled = catalogProviderTagEnabled,
             // Reported raw (not && tvModeEnabled) so the settings row keeps showing what the user
             // saved while the toggle sits disabled outside TV Mode; the shelf gates on the mode.
             tvRowDotsEnabled = tvRowDotsEnabled,
             tvRowDotsAnchor = tvRowDotsAnchor,
             tvRowTransition = tvRowTransition,
             tvFullBackdropEnabled = tvFullBackdropEnabled,
+            tvAmbientBackgroundEnabled = tvAmbientBackgroundEnabled,
             randomPlayEnabled = randomPlayEnabled,
             randomPlayIncludeCollections = randomPlayIncludeCollections,
             randomPlayCategories = randomPlayCategories,
@@ -1777,10 +1965,8 @@ object HomeCatalogSettingsRepository {
     }
 
     private fun normalizeHeroModes() {
-        if (tvModeEnabled) {
-            adaptiveHeroEnabled = false
-            heroAmbientBackgroundEnabled = false
-        }
+        // Adaptive's ambient toggle is kept: it is only drawn in Adaptive, and comes back with it.
+        if (tvModeEnabled) adaptiveHeroEnabled = false
         heroInfoLines = normalizeHeroInfoLines(heroInfoLines)
         heroBackdropCrossfadeMillis = normalizeHeroCrossfade(heroBackdropCrossfadeMillis)
         heroInfoPriority = normalizeHeroInfoPriority(heroInfoPriority)
@@ -1828,9 +2014,18 @@ object HomeCatalogSettingsRepository {
         return true
     }
 
+    /**
+     * Snapshots the settings on the caller's thread and writes them on [persistScope].
+     *
+     * Every mutation persists, and Home's own startup effects (syncCatalogs, syncCollections) do
+     * too — on the UI thread, where encoding the whole payload (every row preference, the Discover
+     * layout, Random Play...) sat inside Home's first-composition freeze in a startup profile. The
+     * snapshot below is cheap and copies the one mutable field ([preferences]); the encode and the
+     * store write happen off the caller. Writes stay in order on a single-file writer, and a burst
+     * of changes collapses into one write of the newest snapshot.
+     */
     private fun persist() {
-        HomeCatalogSettingsStorage.savePayload(
-            json.encodeToString(
+        val payload =
                 StoredHomeCatalogSettingsPayload(
                     heroEnabled = heroEnabled,
                     heroInfoLines = heroInfoLines,
@@ -1841,12 +2036,15 @@ object HomeCatalogSettingsRepository {
                     heroBadgeScale = heroBadgeScale,
                     heroReleaseStatusUnavailableOnly = heroReleaseStatusUnavailableOnly,
                     hideUnreleasedContent = hideUnreleasedContent,
+                    hideWatchedContent = hideWatchedContent,
                     discoverHideWatched = discoverHideWatched,
                     discoverBecauseYouWatchedRows = discoverBecauseYouWatchedRows,
                     discoverFinishWhatYouStartedEnabled = discoverFinishWhatYouStartedEnabled,
                     discoverFinishIdleDays = discoverFinishIdleDays,
                     discoverMoreLikeFavouritesEnabled = discoverMoreLikeFavouritesEnabled,
                     discoverHiddenGemsEnabled = discoverHiddenGemsEnabled,
+                    discoverTopPicksEnabled = discoverTopPicksEnabled,
+                    discoverPeopleRowsEnabled = discoverPeopleRowsEnabled,
                     discoverTrendingGenreRows = discoverTrendingGenreRows,
                     discoverExcludedGenres = discoverExcludedGenres,
                     // Saved raw, not normalised — see HomeCatalogSettingsUiState.discoverRowOrder.
@@ -1858,16 +2056,21 @@ object HomeCatalogSettingsRepository {
                     catalogRowShuffleEnabled = catalogRowShuffleEnabled,
                     adaptiveHeroEnabled = adaptiveHeroEnabled,
                     adaptiveHeroVerticalBias = adaptiveHeroVerticalBias,
+                    adaptiveHeroAutoFraming = adaptiveHeroAutoFraming,
                     adaptiveHeroHeightMultiplier = adaptiveHeroHeightMultiplier,
                     heroAmbientBackgroundEnabled = heroAmbientBackgroundEnabled,
                     tvModeEnabled = tvModeEnabled,
                     smoothScrollingEnabled = smoothScrollingEnabled,
+                    snapScrollingEnabled = snapScrollingEnabled,
                     hoverPreviewBasicEnabled = hoverPreviewBasicEnabled,
                     hoverPreviewAdaptiveEnabled = hoverPreviewAdaptiveEnabled,
                     catalogSeeMoreEnabled = catalogSeeMoreEnabled,
                     catalogRowNumbersEnabled = catalogRowNumbersEnabled,
+                    collectionGifsOnFocusOnly = collectionGifsOnFocusOnly,
+            catalogProviderTagEnabled = catalogProviderTagEnabled,
                     tvRowDotsEnabled = tvRowDotsEnabled,
                     tvFullBackdropEnabled = tvFullBackdropEnabled,
+                    tvAmbientBackgroundEnabled = tvAmbientBackgroundEnabled,
                     tvRowDotsAnchor = tvRowDotsAnchor,
                     tvRowTransition = tvRowTransition,
                     randomPlayEnabled = randomPlayEnabled,
@@ -1880,10 +2083,29 @@ object HomeCatalogSettingsRepository {
                     randomPlayMinimumImdbRating = randomPlayMinimumImdbRating,
                     randomPlayAction = randomPlayAction,
                     items = preferences.values.sortedBy { it.order },
-                ),
-            ),
-        )
+                )
+        // The profile is fixed now, not at write time: a write landing after a profile switch must
+        // still go to the profile the settings belong to.
+        if (pendingPersist.getAndSet(ProfileRepository.activeProfileId to payload) == null) {
+            persistScope.launch { writePendingPersist() }
+        }
     }
+
+    private val pendingPersist =
+        java.util.concurrent.atomic.AtomicReference<Pair<Int, StoredHomeCatalogSettingsPayload>?>(null)
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val persistScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default.limitedParallelism(1),
+    )
+
+    private fun writePendingPersist() {
+        val (profileId, payload) = pendingPersist.getAndSet(null) ?: return
+        HomeCatalogSettingsStorage.savePayload(json.encodeToString(payload), profileId)
+    }
+
+    /** Writes a pending snapshot now, on the caller. For tests and the exit path. */
+    internal fun flushPendingPersist() = writePendingPersist()
 
     private fun updatePreference(
         key: String,
@@ -1951,7 +2173,11 @@ object HomeCatalogSettingsRepository {
 
     fun exportToSyncPayload(): SyncHomeCatalogPayload {
         ensureLoaded()
-        val items = preferences.values.sortedBy { it.order }.map { pref ->
+        // A media server's rows are this device's: the server list syncs, its sign-in does not.
+        val items = preferences.values
+            .filterNot { com.nuvio.app.features.servers.ServerCatalog.isServerKey(it.key) }
+            .sortedBy { it.order }
+            .map { pref ->
             val parts = pref.key.split(":")
             val isCollection = pref.key.startsWith("collection_")
             if (isCollection) {
@@ -2060,7 +2286,21 @@ internal data class CollectionCatalogDefinition(
     val hasHeroBackdrop: Boolean = false,
 )
 
-internal fun buildCollectionDefinitions(collections: List<Collection>): List<CollectionCatalogDefinition> =
+// Memoized like buildHomeCatalogDefinitions: each subtitle is a runBlocking resource lookup on the
+// UI thread, and Home entry rebuilds this twice. CollectionRepository replaces the list on change.
+private var collectionDefinitionsMemo: Triple<List<Collection>, String, List<CollectionCatalogDefinition>>? = null
+
+internal fun buildCollectionDefinitions(collections: List<Collection>): List<CollectionCatalogDefinition> {
+    val locale = androidx.compose.ui.text.intl.Locale.current.toLanguageTag()
+    collectionDefinitionsMemo?.let { (input, memoLocale, result) ->
+        if (memoLocale == locale && (input === collections || input == collections)) return result
+    }
+    return computeCollectionDefinitions(collections).also {
+        collectionDefinitionsMemo = Triple(collections, locale, it)
+    }
+}
+
+private fun computeCollectionDefinitions(collections: List<Collection>): List<CollectionCatalogDefinition> =
     collections.filter { it.folders.isNotEmpty() }.map { collection ->
         CollectionCatalogDefinition(
             key = "collection_${collection.id}",

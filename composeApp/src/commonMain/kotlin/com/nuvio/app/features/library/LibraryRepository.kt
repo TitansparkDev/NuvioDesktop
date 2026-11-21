@@ -2,6 +2,7 @@ package com.nuvio.app.features.library
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.network.SupabaseProvider
@@ -33,6 +34,7 @@ import com.nuvio.app.features.tracking.TrackingLibraryTabKind
 import com.nuvio.app.features.tracking.trackingProvider
 import com.nuvio.app.features.tracking.resolveLibrarySource
 import com.nuvio.app.features.trakt.shouldUseTraktLibrary
+import com.nuvio.app.features.yamtrack.YamtrackLibraryAdapter
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.rpc
 import kotlinx.coroutines.CoroutineScope
@@ -64,6 +66,11 @@ import nuvio.composeapp.generated.resources.library_other
 import nuvio.composeapp.generated.resources.trakt_lists_update_failed
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
+import com.nuvio.app.features.addons.ADDON_LIBRARY_RESOURCE
+import com.nuvio.app.features.addons.AddonEventDispatcher
+import com.nuvio.app.features.addons.AddonLibraryAction
 
 @Serializable
 private data class StoredLibraryPayload(
@@ -241,6 +248,7 @@ object LibraryRepository {
     }
 
     suspend fun pullFromServer(profileId: Int) {
+        PerfTelemetry.count("LibraryRepository.pullFromServer")
         currentProfileId = profileId
 
         activeLibraryProvider()?.let { provider ->
@@ -280,11 +288,14 @@ object LibraryRepository {
             syncScope.launch {
                 runCatching {
                     val current = provider.membership(item)
+                    val desired = provider.toggledDefaultMembership(current)
                     provider.applyMembership(
                         profileId = ProfileRepository.activeProfileId,
                         item = item,
-                        desiredMembership = provider.toggledDefaultMembership(current),
+                        desiredMembership = desired,
                     )
+                    mirrorLibraryToFloppy(provider.providerId, item, inLibrary = desired.values.any { it })
+                    emitAddonLibraryChange(item, wasSaved = current.values.any { it }, isSavedNow = desired.values.any { it })
                 }
                     .onFailure { e ->
                         log.e(e) { "Failed to toggle ${provider.providerId} library" }
@@ -300,9 +311,21 @@ object LibraryRepository {
 
         if (itemsById.containsKey(libraryItemKey(item.id, item.type))) {
             remove(item.id, item.type)
+            emitAddonLibraryChange(item, wasSaved = true, isSavedNow = false)
         } else {
             save(item)
+            emitAddonLibraryChange(item, wasSaved = false, isSavedNow = true)
         }
+    }
+
+    /** Stremio `library` event for tracking addons (upstream 964ecfd8d); user actions only. */
+    private fun emitAddonLibraryChange(item: LibraryItem, wasSaved: Boolean, isSavedNow: Boolean) {
+        if (wasSaved == isSavedNow) return
+        AddonEventDispatcher.library(
+            type = item.type,
+            id = item.id,
+            action = if (isSavedNow) AddonLibraryAction.LIBRARY_ADD else AddonLibraryAction.LIBRARY_REMOVE,
+        )
     }
 
     fun save(item: LibraryItem) {
@@ -311,26 +334,42 @@ object LibraryRepository {
         publish()
         persist()
         pushToServer()
+        mirrorLocalLibraryToFloppy(item, inLibrary = true)
     }
 
     fun remove(id: String) {
         ensureLoaded()
-        val before = itemsById.size
+        val removed = itemsById.values.filter { item -> item.id == id }
         itemsById.entries.removeAll { (_, item) -> item.id == id }
-        if (itemsById.size != before) {
+        if (removed.isNotEmpty()) {
             publish()
             persist()
             pushToServer()
+            removed.forEach { item -> mirrorLocalLibraryToFloppy(item, inLibrary = false) }
+            removed.distinctBy { it.type }.forEach { item ->
+                emitAddonLibraryChange(item, wasSaved = true, isSavedNow = false)
+            }
         }
     }
 
     private fun remove(id: String, type: String) {
         ensureLoaded()
-        if (itemsById.remove(libraryItemKey(id, type)) != null) {
+        val removed = itemsById.remove(libraryItemKey(id, type))
+        if (removed != null) {
             publish()
             persist()
             pushToServer()
+            mirrorLocalLibraryToFloppy(removed, inLibrary = false)
         }
+    }
+
+    /**
+     * Local saves mirror only when the local/Nuvio Sync library *is* the Library source. Alongside
+     * an active provider the local list is a secondary tab, and the provider path already mirrors.
+     */
+    private fun mirrorLocalLibraryToFloppy(item: LibraryItem, inLibrary: Boolean) {
+        if (activeLibraryProvider() != null) return
+        mirrorLibraryToFloppy(sourceProviderId = null, item = item, inLibrary = inLibrary)
     }
 
     fun isSaved(id: String, type: String? = null): Boolean {
@@ -343,6 +382,15 @@ object LibraryRepository {
         } else {
             itemsById.values.any { it.id == id }
         }
+    }
+
+    /**
+     * The profile's own Nuvio library, whichever service the Library screen is showing — the
+     * local calendar follows what is saved in Nuvio, not a provider's watchlist.
+     */
+    internal fun nuvioLibraryItems(): List<LibraryItem> {
+        ensureLoaded()
+        return itemsById.values.toList()
     }
 
     fun savedItem(id: String): LibraryItem? {
@@ -384,6 +432,16 @@ object LibraryRepository {
     }
 
     suspend fun applyMembershipChanges(item: LibraryItem, desiredMembership: Map<String, Boolean>) {
+        if (!AddonEventDispatcher.hasEnabledAddonFor(ADDON_LIBRARY_RESOURCE)) {
+            applyMembershipChangesInternal(item, desiredMembership)
+            return
+        }
+        val wasSaved = isSaved(item.id, item.type)
+        applyMembershipChangesInternal(item, desiredMembership)
+        emitAddonLibraryChange(item, wasSaved = wasSaved, isSavedNow = isSaved(item.id, item.type))
+    }
+
+    private suspend fun applyMembershipChangesInternal(item: LibraryItem, desiredMembership: Map<String, Boolean>) {
         ensureLoaded()
         val localDesired = desiredMembership[LOCAL_LIBRARY_LIST_KEY] == true
         val currentlyInLocal = itemsById.containsKey(libraryItemKey(item.id, item.type))
@@ -403,6 +461,7 @@ object LibraryRepository {
                     item = item,
                     desiredMembership = providerMembership,
                 )
+                mirrorLibraryToFloppy(provider.providerId, item, inLibrary = providerMembership.values.any { it })
             }
             publish()
         } ?: run {
@@ -417,13 +476,164 @@ object LibraryRepository {
         } else {
             // Single-watchlist providers may split their Library presentation into movie/show rows.
             // Those row keys are display-only; route removal to the provider's sole destination.
-            activeLibraryProvider()?.snapshot()?.tabs?.singleOrNull()?.key ?: listKey
+            // MDBList also has its lists as tabs now, so fall back to the watchlist tab, not the only one.
+            activeLibraryProvider()?.snapshot()?.tabs?.let { tabs ->
+                tabs.singleOrNull() ?: tabs.firstOrNull { it.kind == com.nuvio.app.features.tracking.TrackingLibraryTabKind.WATCHLIST }
+            }?.key ?: listKey
         }
         val desiredMembership = libraryMembershipWithRemovedList(
             currentMembership = currentMembership,
             listKey = resolvedListKey,
         )
         applyMembershipChanges(item, desiredMembership)
+    }
+
+    /**
+     * Every library the title can be written to: the Nuvio library plus each connected provider's
+     * lists, whichever one the Library screen is showing. Provider keys are namespaced
+     * ([connectedLibraryKey]) because two providers can both have a "watchlist".
+     */
+    fun connectedLibraryTabs(): List<TraktListTab> =
+        libraryTabsWithLocal(
+            connectedLibraryProviders().flatMap { provider ->
+                val providerName = libraryProviderName(provider.providerId)
+                provider.snapshot().tabs
+                    .filter { it.isMembershipDestination }
+                    .map { tab ->
+                        TraktListTab(
+                            key = connectedLibraryKey(provider.providerId, tab.key),
+                            title = if (tab.title.contains(providerName, ignoreCase = true)) {
+                                tab.title
+                            } else {
+                                "$providerName · ${tab.title}"
+                            },
+                            type = if (tab.kind == TrackingLibraryTabKind.PERSONAL) {
+                                TraktListType.PERSONAL
+                            } else {
+                                TraktListType.WATCHLIST
+                            },
+                        )
+                    }
+            },
+        )
+
+    /** Membership across [connectedLibraryTabs]; a provider that fails to answer is left out. */
+    suspend fun connectedMembershipSnapshot(item: LibraryItem): Map<String, Boolean> {
+        ensureLoaded()
+        val membership = libraryMembershipWithLocal(inLocal = itemsById.containsKey(libraryItemKey(item.id, item.type)))
+            .toMutableMap()
+        connectedLibraryProviders().forEach { provider ->
+            runCatching { provider.membership(item) }
+                .onSuccess { providerMembership ->
+                    providerMembership.forEach { (key, inList) ->
+                        membership[connectedLibraryKey(provider.providerId, key)] = inList
+                    }
+                }
+                .onFailure { e -> log.e(e) { "Failed to read ${provider.providerId} membership" } }
+        }
+        return membership
+    }
+
+    /**
+     * Applies a [connectedLibraryTabs] picker selection. Each provider is only written when its
+     * part of the selection differs from what it holds now, so untouched services see no traffic.
+     */
+    suspend fun applyConnectedMembershipChanges(item: LibraryItem, desiredMembership: Map<String, Boolean>) {
+        ensureLoaded()
+        desiredMembership[LOCAL_LIBRARY_LIST_KEY]?.let { localDesired ->
+            val currentlyInLocal = itemsById.containsKey(libraryItemKey(item.id, item.type))
+            if (localDesired && !currentlyInLocal) save(item)
+            if (!localDesired && currentlyInLocal) remove(item.id, item.type)
+        }
+        val failures = mutableListOf<Throwable>()
+        connectedLibraryProviders().forEach { provider ->
+            val prefix = connectedLibraryKey(provider.providerId, "")
+            val providerDesired = desiredMembership
+                .filterKeys { it.startsWith(prefix) }
+                .mapKeys { (key, _) -> key.removePrefix(prefix) }
+            if (providerDesired.isEmpty()) return@forEach
+            runCatching {
+                val current = provider.membership(item)
+                if (providerDesired.all { (key, inList) -> (current[key] == true) == inList }) return@runCatching
+                provider.applyMembership(
+                    profileId = ProfileRepository.activeProfileId,
+                    item = item,
+                    desiredMembership = current + providerDesired,
+                )
+            }.onFailure { e ->
+                log.e(e) { "Failed to update ${provider.providerId} library" }
+                failures += e
+            }
+        }
+        publish()
+        failures.firstOrNull()?.let { throw it }
+    }
+
+    /**
+     * Adds the title to the Nuvio library and to the default list (the one a plain save click
+     * uses) of every connected provider. Already-saved destinations are left alone.
+     */
+    fun addToAllLibraries(item: LibraryItem) {
+        ensureLoaded()
+        if (!itemsById.containsKey(libraryItemKey(item.id, item.type))) save(item)
+        syncScope.launch {
+            val failed = mutableListOf<String>()
+            connectedLibraryProviders().forEach { provider ->
+                runCatching {
+                    val current = provider.membership(item)
+                    val desired = provider.toggledDefaultMembership(current)
+                    if (desired.none { (key, inList) -> inList && current[key] != true }) return@runCatching
+                    provider.applyMembership(
+                        profileId = ProfileRepository.activeProfileId,
+                        item = item,
+                        desiredMembership = desired,
+                    )
+                }.onFailure { e ->
+                    log.e(e) { "Failed to add to ${provider.providerId} library" }
+                    failed += libraryProviderName(provider.providerId)
+                }
+            }
+            publish()
+            NuvioToastController.show(
+                if (failed.isEmpty()) {
+                    "Added to all libraries"
+                } else {
+                    "Couldn't add to ${failed.joinToString()}"
+                },
+            )
+        }
+    }
+
+    /** Whether any provider library is connected, i.e. "all libraries" means more than Nuvio's own. */
+    fun hasConnectedLibraryProviders(): Boolean = connectedLibraryProviders().isNotEmpty()
+
+    private fun libraryProviderName(id: TrackingProviderId): String =
+        TrackingProviderRegistry.authProvider(id)?.descriptor?.displayName ?: id.name
+
+    private fun connectedLibraryProviders(): List<TrackingLibraryProvider> =
+        TrackingProviderRegistry.libraryProviders().filter { provider ->
+            TrackingProviderRegistry.isAuthenticated(provider.providerId)
+        }
+
+    /**
+     * Copies a library add/remove to Floppy when it is enabled, for every Library source but Floppy
+     * itself (whose own write already went there) — the same rule watched marks follow.
+     *
+     * [sourceProviderId] is the active provider (e.g. SIMKL), or null for the local/Nuvio Sync
+     * library. For a provider this runs only after its write succeeded. Failures are logged and
+     * never undo the source's change.
+     */
+    private fun mirrorLibraryToFloppy(
+        sourceProviderId: TrackingProviderId?,
+        item: LibraryItem,
+        inLibrary: Boolean,
+    ) {
+        if (sourceProviderId == TrackingProviderId.YAMTRACK) return
+        if (!TrackingProviderRegistry.isAuthenticated(TrackingProviderId.YAMTRACK)) return
+        syncScope.launch {
+            runCatching { YamtrackLibraryAdapter.mirrorMembership(item, inLibrary) }
+                .onFailure { e -> log.e(e) { "Failed to mirror library change to Floppy" } }
+        }
     }
 
     private fun pushToServer() {
@@ -482,6 +692,7 @@ object LibraryRepository {
                 isLoaded = snapshot.hasLoaded,
                 isLoading = snapshot.isLoading,
                 errorMessage = snapshot.errorMessage,
+                savedKeys = snapshot.items.toSavedKeys(),
             )
             startPrefetch(sections)
             return
@@ -509,6 +720,7 @@ object LibraryRepository {
             isLoaded = true,
             isLoading = false,
             errorMessage = null,
+            savedKeys = items.toSavedKeys(),
         )
 
         startPrefetch(sectionsWithCloud)
@@ -529,7 +741,7 @@ object LibraryRepository {
             }
             // Anything the user hasn't filed yet.
             state.itemsInCatalog(null).takeIf { it.isNotEmpty() }?.let {
-                add(LibrarySection("locallibrary_unsorted", "Local (Unsorted)", it.map(LocalMediaItem::toLibraryItem)))
+                add(LibrarySection("locallibrary_unsorted", localizedString(Res.string.library_local_unsorted), it.map(LocalMediaItem::toLibraryItem)))
             }
         }
     }
@@ -644,6 +856,13 @@ object LibraryRepository {
                 TrackingProviderRegistry.libraryProvider(providerId) != null
         }
 
+    /**
+     * fork:phone-remote - the library source the Library tab means to show (the one picked in Settings, once its
+     * provider is signed in). While [uiState]'s sourceMode differs, what is published is the stand-in from before that
+     * provider loaded, so the phone asks again rather than taking it as the library.
+     */
+    fun intendedSourceMode(): LibrarySourceMode = effectiveLibrarySourceMode()
+
     private fun activeLibraryProvider(): TrackingLibraryProvider? =
         effectiveLibrarySourceMode().trackingProvider?.let(TrackingProviderRegistry::libraryProvider)
 
@@ -655,7 +874,7 @@ object LibraryRepository {
 }
 
 internal const val LOCAL_LIBRARY_LIST_KEY = "local"
-private const val DEFAULT_LOCAL_LIBRARY_TAB_TITLE = "Nuvio Library"
+private val DEFAULT_LOCAL_LIBRARY_TAB_TITLE: String get() = localizedString(Res.string.library_local_tab_default_title)
 private const val DEFAULT_LIBRARY_OTHER_TITLE = "Other"
 
 internal fun localLibraryListTab(): TraktListTab =
@@ -667,6 +886,9 @@ internal fun localLibraryListTab(): TraktListTab =
         ),
         type = TraktListType.WATCHLIST,
     )
+
+internal fun connectedLibraryKey(providerId: TrackingProviderId, tabKey: String): String =
+    "${providerId.storageId}:$tabKey"
 
 internal fun libraryTabsWithLocal(traktTabs: List<TraktListTab>): List<TraktListTab> =
     listOf(localLibraryListTab()) + traktTabs
@@ -717,7 +939,7 @@ private fun LibraryItem.toSyncItem(): LibrarySyncItem = LibrarySyncItem(
     addedAt = savedAtEpochMs,
 )
 
-private fun libraryItemKey(id: String, type: String): String =
+internal fun libraryItemKey(id: String, type: String): String =
     "${type.trim().lowercase()}:${id.trim()}"
 
 private fun String.toPosterShape(): PosterShape =

@@ -1,7 +1,9 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.i18n.localizedString
 import androidx.compose.runtime.Composable
 import kotlinx.serialization.Serializable
+import nuvio.composeapp.generated.resources.*
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.player_ios_hardware_decoder_off
 import nuvio.composeapp.generated.resources.player_ios_preset_compatibility_desc
@@ -12,6 +14,7 @@ import nuvio.composeapp.generated.resources.player_ios_preset_native_edr_desc
 import nuvio.composeapp.generated.resources.player_ios_preset_native_edr_label
 import nuvio.composeapp.generated.resources.player_ios_preset_sdr_tone_mapped_desc
 import nuvio.composeapp.generated.resources.player_ios_preset_sdr_tone_mapped_label
+import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.stringResource
 
 @Serializable
@@ -48,6 +51,7 @@ data class PlayerLaunch(
     // It disambiguates artwork lookup and library download names.
     val releaseYear: Int? = null,
     val streamTitle: String,
+    val streamFilename: String? = null,
     val streamSubtitle: String? = null,
     val sourceIdentityKey: String? = null,
     val bingeGroup: String? = null,
@@ -67,11 +71,20 @@ data class PlayerLaunch(
     val initialProgressFraction: Float? = null,
     val disableProgressTracking: Boolean = false,
     val autoPlayMode: PlayerAutoPlayMode = PlayerAutoPlayMode.NextEpisode,
+    /** The stream being played, when the launch came from one; a watch-party host can share it. */
+    val stream: com.nuvio.app.features.streams.StreamItem? = null,
+    /** The source was taken from the reuse-last-link cache, not picked fresh from add-ons. */
+    val sourceFromLinkCache: Boolean = false,
 )
 
 enum class PlayerAutoPlayMode {
     NextEpisode,
     RandomEpisode,
+    /**
+     * Playing an entry of a playlist (see `PlaylistPlaybackSession`). Next-episode binge is off: the
+     * end of the file, or the up-next card, moves on to the playlist's next entry instead.
+     */
+    Playlist,
 }
 
 object PlayerLaunchStore {
@@ -100,6 +113,7 @@ enum class PlayerResizeMode {
     Fit,
     Fill,
     Zoom,
+    AutoCrop,
 }
 
 enum class IosVideoOutputPreset(
@@ -178,17 +192,17 @@ enum class IosAudioOutputMode(
     AudioUnit("audiounit", "AudioUnit"),
 }
 
-enum class DesktopHdrMode(val label: String, val description: String) {
-    Auto("Auto", "Let the OS decide between passthrough and tonemapping based on your display."),
-    AlwaysTonemap("Always Tonemap", "Force HDR content to be tonemapped to SDR, even on HDR displays."),
-    AlwaysPassthrough("Always Passthrough", "Always attempt HDR passthrough, even on SDR displays."),
+enum class DesktopHdrMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Auto(Res.string.player_hdr_mode_auto_label, Res.string.player_hdr_mode_auto_desc),
+    AlwaysTonemap(Res.string.player_hdr_mode_always_tonemap_label, Res.string.player_hdr_mode_always_tonemap_desc),
+    AlwaysPassthrough(Res.string.player_hdr_mode_always_passthrough_label, Res.string.player_hdr_mode_always_passthrough_desc),
 }
 
-enum class DesktopColorProfile(val label: String, val description: String) {
-    Neutral("Neutral", "No color adjustments applied. Accurate to the source."),
-    Cinematic("Cinematic", "Slightly deeper contrast with richer colors for a cinematic look."),
-    Vivid("Vivid", "Boosted contrast and saturation for a punchier image."),
-    Custom("Custom", "Your own contrast, brightness, saturation and gamma offsets."),
+enum class DesktopColorProfile(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Neutral(Res.string.player_color_profile_neutral_label, Res.string.player_color_profile_neutral_desc),
+    Cinematic(Res.string.player_color_profile_cinematic_label, Res.string.player_color_profile_cinematic_desc),
+    Vivid(Res.string.player_color_profile_vivid_label, Res.string.player_color_profile_vivid_desc),
+    Custom(Res.string.player_color_profile_custom_label, Res.string.player_color_profile_custom_desc),
 }
 
 /**
@@ -210,10 +224,80 @@ enum class DesktopColorProfile(val label: String, val description: String) {
  * Anime4K and custom GLSL chains are left alone in every mode — they are an explicit, visible user
  * choice, and silently dropping them would be a worse surprise than the quality loss here.
  */
-enum class DesktopLowVramMode(val label: String, val description: String) {
-    Off("Off", "Always use the full rendering pipeline, whatever the GPU reports."),
-    Auto("Auto", "Trim the pipeline on integrated graphics and GPUs with under 2 GB of video memory."),
-    On("On", "Always trim: bilinear scaling, no debanding, dithering or HDR peak detection."),
+enum class DesktopLowVramMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Off(Res.string.player_low_vram_off_label, Res.string.player_low_vram_off_desc),
+    Auto(Res.string.player_low_vram_auto_label, Res.string.player_low_vram_auto_desc),
+    On(Res.string.player_low_vram_on_label, Res.string.player_low_vram_on_desc),
+}
+
+/**
+ * What drives the desktop player's zones (the left, middle and right thirds of the video): nothing,
+ * the mouse wheel, or a vertical drag with a mouse button held (left, right, or a side button).
+ * A drag leaves the wheel alone, so it also works on the YouTube watch page, where the wheel
+ * scrolls the page. [Drag] is the left button; its name predates the other buttons.
+ */
+enum class DesktopPlayerZoneInput(val hudKey: String, val buttonLabel: String?) {
+    Off("off", null),
+    Wheel("wheel", null),
+    Drag("drag", "LMB"),
+    RightDrag("rmb", "RMB"),
+    Back("xb1", "XB1"),
+    Forward("xb2", "XB2"),
+    ;
+
+    val isDrag: Boolean get() = buttonLabel != null
+
+    companion object {
+        fun fromStorage(value: String?): DesktopPlayerZoneInput? =
+            entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
+    }
+}
+
+/** What one zone does. [FastForward] is the press-and-hold 2x, so it only exists for the drag inputs. */
+enum class DesktopPlayerZoneAction(val hudKey: String) {
+    None("none"),
+    Speed("speed"),
+    Seek("seek"),
+    Volume("volume"),
+    FastForward("fastforward"),
+    ;
+
+    fun availableFor(input: DesktopPlayerZoneInput): Boolean =
+        this != FastForward || input.isDrag
+
+    companion object {
+        fun fromStorage(value: String?): DesktopPlayerZoneAction? =
+            entries.firstOrNull { it.name.equals(value?.trim(), ignoreCase = true) }
+    }
+}
+
+/** The action of each zone, left to right. The default is the original Speed / Seek / Volume split. */
+data class DesktopPlayerZoneActions(
+    val left: DesktopPlayerZoneAction = DesktopPlayerZoneAction.Speed,
+    val middle: DesktopPlayerZoneAction = DesktopPlayerZoneAction.Seek,
+    val right: DesktopPlayerZoneAction = DesktopPlayerZoneAction.Volume,
+) {
+    val all: List<DesktopPlayerZoneAction> get() = listOf(left, middle, right)
+
+    fun toStorage(): String = all.joinToString(",") { it.name }
+
+    /** The HUD's list; an action the input can't perform is sent as none. */
+    fun hudValue(input: DesktopPlayerZoneInput): String =
+        all.joinToString(",") { (if (it.availableFor(input)) it else DesktopPlayerZoneAction.None).hudKey }
+
+    companion object {
+        fun fromStorage(value: String?): DesktopPlayerZoneActions {
+            val defaults = DesktopPlayerZoneActions()
+            val parts = value?.split(',').orEmpty()
+            fun at(index: Int, fallback: DesktopPlayerZoneAction) =
+                DesktopPlayerZoneAction.fromStorage(parts.getOrNull(index)) ?: fallback
+            return DesktopPlayerZoneActions(
+                left = at(0, defaults.left),
+                middle = at(1, defaults.middle),
+                right = at(2, defaults.right),
+            )
+        }
+    }
 }
 
 enum class DesktopSourceNotchPosition {
@@ -246,36 +330,95 @@ enum class DesktopPlayerNotificationPosition(val webValue: String) {
     }
 }
 
-enum class DesktopBufferPreset(val label: String, val description: String) {
-    Metered(
-        "Metered",
-        "Smallest buffer, and pausing stops the download instead of filling the buffer. " +
-            "For capped or metered connections; high-bitrate files may stall.",
-    ),
-    LowData("Low Data", "Minimizes network and memory use with a short playback buffer."),
-    Balanced("Balanced", "Keeps a moderate buffer for reliable playback without excessive read-ahead."),
-    Resilient("Resilient", "Uses a large buffer for unstable or high-latency connections."),
+/**
+ * How the desktop HUD's bottom control bar is composed. Persisted as three booleans
+ * (`desktop_legacy_hud_enabled` / `desktop_minimal_hud_enabled` / `desktop_ultra_hud_enabled`,
+ * plus `desktop_official_hud_enabled`) so the pre-existing legacy toggle keeps its stored value; the repository guarantees at most one
+ * of them is set.
+ *
+ * [Minimal] is the single-row layout: transport, volume and time on the left, tools on the right,
+ * with the seek bar spanning the full width above them.
+ *
+ * [Ultra] strips that down to the seek bar plus two buttons: a gear that opens a frosted-glass
+ * options popover (volume and every tool icon) and a fullscreen toggle. No transport buttons --
+ * the video surface itself is the play/pause control.
+ *
+ * [Official] is the bottom bar of the official Nuvio Desktop player (NuvioMedia/NuvioDesktop,
+ * which shipped it after this fork split off): an accent play button leading a row of round
+ * icon-only tools, and the volume slider plus a "position / duration" readout on the right,
+ * under a thick edge-to-edge seek bar. Only the bottom bar is ported; the header and side chrome
+ * stay this fork's.
+ */
+enum class DesktopHudLayout {
+    Standard,
+    Legacy,
+    Minimal,
+    Ultra,
+    Official,
 }
 
-enum class DesktopMpvConfigMode(val label: String, val description: String) {
-    Off("Off", "Use Nuvio's mpv configuration and ignore the custom options below."),
-    Add("Add", "Add custom options only when Nuvio has not already configured that option."),
-    Replace("Replace", "Custom options override matching Nuvio options; unspecified options keep Nuvio defaults."),
-    Full("Full", "Use only the custom configuration plus the options required to embed mpv in Nuvio."),
+enum class DesktopBufferPreset(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Metered(Res.string.player_buffer_metered_label, Res.string.player_buffer_metered_desc),
+    LowData(Res.string.player_buffer_low_data_label, Res.string.player_buffer_low_data_desc),
+    Balanced(Res.string.player_buffer_balanced_label, Res.string.player_buffer_balanced_desc),
+    Resilient(Res.string.player_buffer_resilient_label, Res.string.player_buffer_resilient_desc),
+}
+
+/**
+ * Seek-bar hover previews come from a second libmpv instance that opens the same stream and issues
+ * one byte-range request per hovered position. Against a debrid CDN those opens are exactly what
+ * gets rate-limited, so previews can be limited to sources the user controls.
+ */
+enum class DesktopSeekThumbnailMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Off(Res.string.player_seek_thumbnails_off_label, Res.string.player_seek_thumbnails_off_desc),
+    Local(Res.string.player_seek_thumbnails_local_label, Res.string.player_seek_thumbnails_local_desc),
+    LocalAndSeekr(Res.string.player_seek_thumbnails_local_seekr_label, Res.string.player_seek_thumbnails_local_seekr_desc),
+    Streaming(Res.string.player_seek_thumbnails_streaming_label, Res.string.player_seek_thumbnails_streaming_desc),
+}
+
+/**
+ * What the desktop player does when a stream that was already playing gets an HTTP 429 (almost
+ * always a seek whose range request the host throttled). TorBox's CDN answers that with a per-IP
+ * ban on one `nexus-N` node lasting over an hour (measured 2026-09-26), so for TorBox "reconnect"
+ * means reopening the same link through another node; other hosts are reopened after a wait.
+ */
+enum class DesktopRateLimitRecoveryMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Off(Res.string.player_rate_limit_recovery_off_label, Res.string.player_rate_limit_recovery_off_desc),
+    PreferFailover(Res.string.player_rate_limit_recovery_prefer_failover_label, Res.string.player_rate_limit_recovery_prefer_failover_desc),
+    PreferReconnect(Res.string.player_rate_limit_recovery_prefer_reconnect_label, Res.string.player_rate_limit_recovery_prefer_reconnect_desc),
+}
+
+/** Choices for the two reconnect waits used on hosts other than TorBox. */
+val RATE_LIMIT_RECONNECT_DELAY_VALUES: List<Int> = listOf(3, 5, 10, 20, 30, 60, 120)
+const val RATE_LIMIT_RECONNECT_FIRST_DEFAULT_SECONDS = 5
+const val RATE_LIMIT_RECONNECT_SECOND_DEFAULT_SECONDS = 20
+
+enum class DesktopMpvConfigMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Off(Res.string.player_mpv_config_off_label, Res.string.player_mpv_config_off_desc),
+    Add(Res.string.player_mpv_config_add_label, Res.string.player_mpv_config_add_desc),
+    Replace(Res.string.player_mpv_config_replace_label, Res.string.player_mpv_config_replace_desc),
+    Full(Res.string.player_mpv_config_full_label, Res.string.player_mpv_config_full_desc),
 }
 
 /**
  * Graphics backend the desktop app UI (Compose/Skiko) renders with. Not the video player —
  * mpv always uses Direct3D 11. Applied to `skiko.renderApi` at startup, so a change only takes
- * effect after an app restart. OpenGL is the default: Direct3D has subtle lighting/color
- * differences that make the UI look slightly worse. Direct3D is offered as a compatibility
- * fallback for systems where OpenGL misbehaves (e.g. fullscreen optimizations on older GPUs).
+ * effect after an app restart. Direct3D is the default: on some drivers a monitor-covering
+ * OpenGL window is flipped straight to the display, bypassing DWM, so mpv's child swapchain and
+ * the WebView2 HUD never reach the screen — fullscreen playback goes black with audio (1.15.0
+ * reports, confirmed fixed by Direct3D). Which systems do this depends on driver settings, MPO and
+ * HDR rather than the GPU model, so it cannot be predicted. OpenGL renders the UI slightly better
+ * and stays selectable as an opt-in.
  */
-enum class DesktopRendererApi(val label: String, val description: String, val skikoRenderApi: String) {
-    OpenGL("OpenGL", "Best-looking UI. Recommended for most systems.", "OPENGL"),
+enum class DesktopRendererApi(val label: String, val descriptionRes: StringResource, val skikoRenderApi: String) {
+    OpenGL(
+        "OpenGL",
+        Res.string.player_renderer_opengl_desc,
+        "OPENGL",
+    ),
     D3D11(
         "Direct3D 11",
-        "Compatibility option for systems where OpenGL has issues. UI colors may look slightly different.",
+        Res.string.player_renderer_d3d11_desc,
         "DIRECT3D",
     ),
 }
@@ -286,18 +429,18 @@ enum class DesktopRendererApi(val label: String, val description: String, val sk
  * "Auto-apply to Anime" is on); CustomShader points at a user-provided shader from the desktop
  * shader library. F10 cycles a session-scoped force instead — see [DesktopAnimeSessionOverride].
  */
-enum class DesktopAnimeMode(val label: String, val description: String) {
-    Off("Off", "Never apply anime enhancements."),
-    Optimized("Optimized", "Anime4K Optimized — razor-sharp edges with the lightest GPU load."),
-    Fast("Fast", "Anime4K Eye-Candy (Fast) — stronger restore and line-thinning."),
-    Hq("HQ", "Anime4K Eye-Candy (HQ) — maximum quality, heaviest GPU load."),
-    ModeAFast("Mode A (Fast)", "Anime4K Mode A — best for blurry/compressed sources. Balanced speed and quality."),
-    ModeAHq("Mode A (HQ)", "Anime4K Mode A — best for blurry/compressed sources. Highest quality, heavier GPU load."),
-    ModeBFast("Mode B (Fast)", "Anime4K Mode B — best for already-clean or soft sources. Balanced speed and quality."),
-    ModeBHq("Mode B (HQ)", "Anime4K Mode B — best for already-clean or soft sources. Highest quality, heavier GPU load."),
-    ModeCFast("Mode C (Fast)", "Anime4K Mode C — best for noisy or heavily compressed sources. Balanced speed and quality."),
-    ModeCHq("Mode C (HQ)", "Anime4K Mode C — best for noisy or heavily compressed sources. Highest quality, heavier GPU load."),
-    CustomShader("Custom Shader", "Use the selected user shader from the desktop shader library."),
+enum class DesktopAnimeMode(val labelRes: StringResource, val descriptionRes: StringResource) {
+    Off(Res.string.player_anime_mode_off_label, Res.string.player_anime_mode_off_desc),
+    Optimized(Res.string.player_anime_mode_optimized_label, Res.string.player_anime_mode_optimized_desc),
+    Fast(Res.string.player_anime_mode_fast_label, Res.string.player_anime_mode_fast_desc),
+    Hq(Res.string.player_anime_mode_hq_label, Res.string.player_anime_mode_hq_desc),
+    ModeAFast(Res.string.player_anime_mode_a_fast_label, Res.string.player_anime_mode_a_fast_desc),
+    ModeAHq(Res.string.player_anime_mode_a_hq_label, Res.string.player_anime_mode_a_hq_desc),
+    ModeBFast(Res.string.player_anime_mode_b_fast_label, Res.string.player_anime_mode_b_fast_desc),
+    ModeBHq(Res.string.player_anime_mode_b_hq_label, Res.string.player_anime_mode_b_hq_desc),
+    ModeCFast(Res.string.player_anime_mode_c_fast_label, Res.string.player_anime_mode_c_fast_desc),
+    ModeCHq(Res.string.player_anime_mode_c_hq_label, Res.string.player_anime_mode_c_hq_desc),
+    CustomShader(Res.string.player_anime_mode_custom_shader_label, Res.string.player_anime_mode_custom_shader_desc),
 }
 
 /**
@@ -310,7 +453,7 @@ data class DesktopAnimeSessionOverride(
     val mode: DesktopAnimeMode,
     val customShaderPath: String = "",
     // Display label for pills/HUD: the preset label, or the shader file name for CustomShader.
-    val label: String = mode.label,
+    val label: String = localizedString(mode.labelRes),
 )
 
 /**
@@ -377,7 +520,7 @@ fun classifyAnimeContent(
     originCountries: Iterable<String> = emptyList(),
 ): AnimeContentKind {
     val normalized = genres.map { it.trim().lowercase() }
-    if (normalized.none { it == "anime" || it == "animation" }) return AnimeContentKind.NotAnimation
+    if (normalized.none { it == "anime" || isAnimationGenreName(it) }) return AnimeContentKind.NotAnimation
     if (normalized.any { it == "anime" }) return AnimeContentKind.Anime
     return if (hasNonJapaneseProvenance(originalLanguage, originCountries)) {
         AnimeContentKind.WesternAnimation
@@ -401,6 +544,50 @@ private fun hasNonJapaneseProvenance(
     if (countries.any { it in JAPAN_COUNTRY_CODES }) return false
     return true
 }
+
+/**
+ * True for the Animation genre in any language TMDB names it in. TMDB enrichment returns genre
+ * *names* in the user's TMDB language, so a Spanish setup sees "Animación" where an English one sees
+ * "Animation"; comparing against the English word alone left every non-English user without
+ * animation detection (reported 2026-11-08 on Rick and Morty: isAnime=false with Western animation
+ * on). Names are TMDB's own for genre 16; matching one too many is harmless, since only animation
+ * carries these words.
+ */
+internal fun isAnimationGenreName(genre: String): Boolean =
+    genre.trim().lowercase() in ANIMATION_GENRE_NAMES
+
+private val ANIMATION_GENRE_NAMES = setOf(
+    "animation", // en, fr, de, da
+    "animación", // es
+    "animació", // ca
+    "animação", // pt
+    "animazione", // it
+    "animatie", // nl
+    "animacja", // pl
+    "animovaný", // cs, sk
+    "animasjon", // nb, no
+    "animerat", // sv
+    "animaatio", // fi
+    "animasyon", // tr
+    "animasi", // id, ms
+    "animációs", "animáció", // hu
+    "animație", "animaţie", // ro
+    "animacija", "анимација", // hr, sr, lt, sl
+    "animācija", // lv
+    "animatsioon", // et
+    "κινούμενα σχέδια", // el
+    "мультфильм", "анимация", // ru, bg
+    "мультфільм", // uk
+    "אנימציה", // he
+    "رسوم متحركة", // ar
+    "انیمیشن", // fa
+    "एनिमेशन", // hi
+    "แอนิเมชัน", "แอนนิเมชั่น", // th
+    "phim hoạt hình", "hoạt hình", // vi
+    "アニメーション", // ja
+    "애니메이션", // ko
+    "动画", "動畫", "動畫片", // zh
+)
 
 private val JAPANESE_LANGUAGE_CODES = setOf("ja", "jpn", "ja-jp")
 private val JAPAN_COUNTRY_CODES = setOf("jp", "jpn", "japan")

@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.ui.LocalNuvioShelfItemHighlighted
 import com.nuvio.app.core.ui.NuvioShelfSection
 import com.nuvio.app.core.ui.PosterLandscapeAspectRatio
 import com.nuvio.app.core.ui.landscapePosterWidth
@@ -149,6 +150,7 @@ private fun HomeCollectionRowSectionContent(
             folder = folder,
             basePosterWidthDpOverride = basePosterWidthDpOverride,
             animateGifs = animateGifs,
+            animateOnlyWhenHighlighted = homeCatalogSettings.collectionGifsOnFocusOnly,
             hideTitleBelow = homeCatalogSettings.tvModeEnabled,
             onClick = onFolderClick?.let { { it(collection.id, folder.id) } },
         )
@@ -161,6 +163,7 @@ private fun CollectionFolderCard(
     modifier: Modifier = Modifier,
     basePosterWidthDpOverride: Int? = null,
     animateGifs: Boolean = true,
+    animateOnlyWhenHighlighted: Boolean = false,
     hideTitleBelow: Boolean = false,
     onClick: (() -> Unit)? = null,
 ) {
@@ -192,11 +195,13 @@ private fun CollectionFolderCard(
     ) {
         val shapeCorner = RoundedCornerShape(posterCardStyle.cornerRadiusDp.dp)
         val imageUrl = collectionFolderCardImageUrl(folder, animateGifs)
+        // The shelf's highlight (mouse or keyboard) is the focus signal; see nuvioPosterHighlight.
+        val playAnimation = !animateOnlyWhenHighlighted || LocalNuvioShelfItemHighlighted.current
         Card(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspectRatio)
-                .nuvioPosterHighlight(posterCardStyle.cornerRadiusDp.dp),
+                .nuvioPosterHighlight(posterCardStyle.cornerRadiusDp.dp, artworkUrl = imageUrl),
             shape = shapeCorner,
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surface,
@@ -217,6 +222,7 @@ private fun CollectionFolderCard(
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Crop,
                             animateIfPossible = animateGifs && isAnimatedCollectionFolderImage(folder, imageUrl),
+                            playAnimation = playAnimation,
                             // The still behind the animation. When the folder has no separate GIF
                             // this is the same URL as [imageUrl] and the card skips the extra load.
                             staticImageUrl = firstNonBlank(folder.coverImageUrl),
@@ -315,7 +321,7 @@ private fun PrefetchCollectionArtwork(collection: Collection, animateGifs: Boole
 }
 
 /** Enough to cover a long row without turning one screen into a hundred queued requests. */
-private const val COLLECTION_ARTWORK_PREFETCH_LIMIT = 40
+internal const val COLLECTION_ARTWORK_PREFETCH_LIMIT = 40
 
 internal fun collectionFolderCardImageUrl(folder: CollectionFolder, animateGifs: Boolean): String? {
     return if (folder.mobileFocusGifEnabled && animateGifs) {

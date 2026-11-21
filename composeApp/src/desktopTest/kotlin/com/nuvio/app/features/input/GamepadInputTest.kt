@@ -1,5 +1,6 @@
 package com.nuvio.app.features.input
 
+import com.nuvio.app.core.i18n.localizedString
 import com.nuvio.app.features.player.AppShortcutAction
 import com.nuvio.app.features.player.PlayerShortcutAction
 import kotlin.test.Test
@@ -157,7 +158,22 @@ class GamepadInputTest {
     fun `every keyboard action is reachable from the pad`() {
         val boundApp = allTargets().filterIsInstance<GamepadTarget.AppAction>().map { it.action }.toSet()
         assertEquals(
-            emptySet(),
+            setOf(
+                // Every browsing button is taken. Live TV is a tab, which the D-pad already reaches
+                // in the top bar, and it only exists once a playlist has been added.
+                AppShortcutAction.OpenLiveTv,
+                // The same: Music is a top-bar tab the D-pad reaches, and only there while it is turned on.
+                AppShortcutAction.OpenMusic,
+                // And YouTube, likewise a top-bar tab while it is turned on.
+                AppShortcutAction.OpenYouTube,
+                // Settings is a top-bar / sidebar entry the D-pad reaches too.
+                AppShortcutAction.OpenSettings,
+                // The pad's Y (the trailer key) does this wherever music is playing (Home's trailer gives way to it).
+                AppShortcutAction.FocusMusicPlayer,
+                // The panel ring is not a button's tap: holding the ring button (LB by default,
+                // GamepadSettingsRepository.ringButton) opens it, and it reaches every tab above.
+                AppShortcutAction.OpenPanelRing,
+            ),
             AppShortcutAction.entries.toSet() - boundApp,
             "app actions with no button",
         )
@@ -182,6 +198,12 @@ class GamepadInputTest {
                 // player's dispatcher maps to seek before any rebindable action is considered.
                 PlayerShortcutAction.SeekBackward,
                 PlayerShortcutAction.SeekForward,
+                // During live TV, RB/LB (OpenSources/OpenEpisodes) open the channel switcher instead
+                // (PlayerEngine.desktop's dispatcher), where the D-pad picks a channel.
+                PlayerShortcutAction.ChannelUp,
+                PlayerShortcutAction.ChannelDown,
+                // Zoom gave the View button to the player menu (2026-11-15), where it is a quick tile.
+                PlayerShortcutAction.CycleZoom,
             ),
             PlayerShortcutAction.entries.toSet() - boundPlayer,
             "player actions with no button",
@@ -302,11 +324,11 @@ class GamepadInputTest {
 
         // A read "Select / open focused item (Enter)" before; the action name stands alone now.
         assertEquals(
-            AppShortcutAction.SelectFocused.displayName,
+            localizedString(AppShortcutAction.SelectFocused.displayNameRes),
             rows.getValue(GamepadButton.A).browsingLabel,
         )
         assertEquals(
-            PlayerShortcutAction.PlayPause.displayName,
+            localizedString(PlayerShortcutAction.PlayPause.displayNameRes),
             rows.getValue(GamepadButton.A).playerLabel,
         )
         assertEquals("Move up", rows.getValue(GamepadButton.DpadUp).browsingLabel)
@@ -351,6 +373,18 @@ class GamepadInputTest {
             browsingTargets.size,
             browsingTargets.toSet().size,
             "two buttons share a browsing action: $browsingTargets",
+        )
+    }
+
+    @Test
+    fun `only select keeps its key down while the button is held`() {
+        // Hold-to-select needs a real press and release from A; every other button keeps the
+        // instant pair, so nothing else changes timing.
+        val browsingA = GamepadDefaults.binding(GamepadButton.A).browsing
+        assertTrue(GamepadInput.holdsUntilRelease(browsingA))
+        assertEquals(
+            listOf(browsingA),
+            allTargets().filter(GamepadInput::holdsUntilRelease).distinct(),
         )
     }
 

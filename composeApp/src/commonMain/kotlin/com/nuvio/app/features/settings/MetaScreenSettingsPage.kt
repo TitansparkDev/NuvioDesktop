@@ -35,6 +35,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +54,9 @@ import com.nuvio.app.features.details.MetaEpisodeCardStyle
 import com.nuvio.app.features.details.MetaScreenSectionItem
 import com.nuvio.app.features.details.MetaScreenBackgroundMode
 import com.nuvio.app.features.details.MetaScreenSectionKey
+import com.nuvio.app.features.details.EpisodeRatingsVisibility
+import com.nuvio.app.features.details.CastEpisodeCountVisibility
+import com.nuvio.app.features.details.SameCastLabelPlacement
 import com.nuvio.app.features.details.MetaScreenSettingsRepository
 import com.nuvio.app.features.details.MetaScreenSettingsUiState
 import com.nuvio.app.features.player.HERO_TV_TRAILER_DELAY_VALUES
@@ -115,6 +119,16 @@ import nuvio.composeapp.generated.resources.settings_meta_background_normal
 import nuvio.composeapp.generated.resources.settings_meta_background_title
 import nuvio.composeapp.generated.resources.settings_meta_episode_ratings
 import nuvio.composeapp.generated.resources.settings_meta_episode_ratings_description
+import nuvio.composeapp.generated.resources.settings_meta_episode_ratings_hide
+import nuvio.composeapp.generated.resources.settings_meta_episode_ratings_hide_unwatched
+import nuvio.composeapp.generated.resources.settings_meta_cast_episode_counts
+import nuvio.composeapp.generated.resources.settings_meta_cast_episode_counts_description
+import nuvio.composeapp.generated.resources.settings_meta_cast_episode_counts_show
+import nuvio.composeapp.generated.resources.settings_meta_cast_episode_counts_hide_reality
+import nuvio.composeapp.generated.resources.settings_meta_cast_episode_counts_hide
+import nuvio.composeapp.generated.resources.settings_meta_episode_ratings_show
+import nuvio.composeapp.generated.resources.settings_meta_overall_ratings
+import nuvio.composeapp.generated.resources.settings_meta_overall_ratings_description
 import nuvio.composeapp.generated.resources.settings_meta_hero_trailer_background
 import nuvio.composeapp.generated.resources.settings_meta_hero_trailer_background_backdrop
 import nuvio.composeapp.generated.resources.settings_meta_hero_trailer_background_black
@@ -126,16 +140,20 @@ import org.jetbrains.compose.resources.stringResource
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import com.nuvio.app.core.ui.accentBrush
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 internal fun LazyListScope.metaScreenSettingsContent(
     isTablet: Boolean,
     uiState: MetaScreenSettingsUiState,
+    /** The panel's heading. Desktop shows it inside Layout, where "Appearance" would mislead. */
+    sectionTitle: StringResource = Res.string.settings_meta_section_appearance,
 ) {
     val showHeroTrailerPlaybackSetting = AppFeaturePolicy.heroTrailerPlaybackSupported &&
         AppFeaturePolicy.trailerPlaybackMode == TrailerPlaybackMode.IN_APP
     item {
         SettingsSection(
-            title = stringResource(Res.string.settings_meta_section_appearance),
+            title = stringResource(sectionTitle),
             isTablet = isTablet,
         ) {
             SettingsGroup(isTablet = isTablet) {
@@ -259,18 +277,83 @@ internal fun LazyListScope.metaScreenSettingsContent(
                     onCheckedChange = { MetaScreenSettingsRepository.setBlurUnwatchedEpisodes(it) },
                 )
                 SettingsGroupDivider(isTablet = isTablet)
-                SettingsSwitchRow(
+                SettingsChoiceRow(
                     title = stringResource(Res.string.settings_meta_episode_ratings),
                     description = stringResource(Res.string.settings_meta_episode_ratings_description),
-                    checked = uiState.episodeRatingsEnabled,
+                    options = listOf(
+                        SettingsChoiceOption(
+                            EpisodeRatingsVisibility.SHOW_ALL,
+                            stringResource(Res.string.settings_meta_episode_ratings_show),
+                        ),
+                        SettingsChoiceOption(
+                            EpisodeRatingsVisibility.HIDE_UNWATCHED_EPISODES,
+                            stringResource(Res.string.settings_meta_episode_ratings_hide_unwatched),
+                        ),
+                        SettingsChoiceOption(
+                            EpisodeRatingsVisibility.HIDE_EPISODES,
+                            stringResource(Res.string.settings_meta_episode_ratings_hide),
+                        ),
+                    ),
+                    selectedValue = uiState.episodeRatingsVisibility,
                     isTablet = isTablet,
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("meta-episode-ratings")),
-                    onCheckedChange = MetaScreenSettingsRepository::setEpisodeRatingsEnabled,
+                    onSelected = MetaScreenSettingsRepository::setEpisodeRatingsVisibility,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_meta_overall_ratings),
+                    description = stringResource(Res.string.settings_meta_overall_ratings_description),
+                    checked = uiState.showOverallRatings,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("meta-overall-ratings")),
+                    onCheckedChange = MetaScreenSettingsRepository::setShowOverallRatings,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsChoiceRow(
+                    title = SAME_CAST_LABEL_TITLE,
+                    description = SAME_CAST_LABEL_DESCRIPTION,
+                    options = listOf(
+                        SettingsChoiceOption(SameCastLabelPlacement.AUTO, "Auto"),
+                        SettingsChoiceOption(SameCastLabelPlacement.ON_POSTER, stringResource(Res.string.settings_meta_on_poster)),
+                        SettingsChoiceOption(SameCastLabelPlacement.BELOW_POSTER, stringResource(Res.string.settings_meta_below_poster)),
+                    ),
+                    selectedValue = uiState.sameCastLabelPlacement,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("meta-same-cast-label")),
+                    onSelected = MetaScreenSettingsRepository::setSameCastLabelPlacement,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsChoiceRow(
+                    title = stringResource(Res.string.settings_meta_cast_episode_counts),
+                    description = stringResource(Res.string.settings_meta_cast_episode_counts_description),
+                    options = listOf(
+                        SettingsChoiceOption(
+                            CastEpisodeCountVisibility.SHOW,
+                            stringResource(Res.string.settings_meta_cast_episode_counts_show),
+                        ),
+                        SettingsChoiceOption(
+                            CastEpisodeCountVisibility.HIDE_REALITY,
+                            stringResource(Res.string.settings_meta_cast_episode_counts_hide_reality),
+                        ),
+                        SettingsChoiceOption(
+                            CastEpisodeCountVisibility.HIDE,
+                            stringResource(Res.string.settings_meta_cast_episode_counts_hide),
+                        ),
+                    ),
+                    selectedValue = uiState.castEpisodeCountVisibility,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("meta-cast-episode-counts")),
+                    onSelected = MetaScreenSettingsRepository::setCastEpisodeCountVisibility,
                 )
             }
         }
     }
 }
+
+// Literal, like the other Same Cast strings: see nuviodesktop-build-facts on new string keys.
+internal val SAME_CAST_LABEL_TITLE: String get() = localizedString(Res.string.settings_meta_same_cast_label)
+internal val SAME_CAST_LABEL_DESCRIPTION: String
+    get() = localizedString(Res.string.settings_meta_same_cast_label_description)
 
 private enum class HeroTrailerPlaybackArea {
     Off,

@@ -56,7 +56,10 @@ data class MetaScreenSettingsUiState(
     val tabLayout: Boolean = false,
     val episodeCardStyle: MetaEpisodeCardStyle = MetaEpisodeCardStyle.Horizontal,
     val blurUnwatchedEpisodes: Boolean = false,
-    val episodeRatingsEnabled: Boolean = true,
+    val episodeRatingsVisibility: EpisodeRatingsVisibility = EpisodeRatingsVisibility.SHOW_ALL,
+    val showOverallRatings: Boolean = true,
+    val sameCastLabelPlacement: SameCastLabelPlacement = SameCastLabelPlacement.AUTO,
+    val castEpisodeCountVisibility: CastEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW,
 )
 
 enum class MetaScreenBackgroundMode {
@@ -179,6 +182,15 @@ private data class StoredMetaScreenSettingsPayload(
     val blurUnwatchedEpisodes: Boolean = false,
     @SerialName("episode_ratings_enabled")
     val episodeRatingsEnabled: Boolean = true,
+    /** Supersedes [episodeRatingsEnabled], which is still written so older builds read the same thing. */
+    @SerialName("episode_ratings_visibility")
+    val episodeRatingsVisibility: String? = null,
+    @SerialName("show_overall_ratings")
+    val showOverallRatings: Boolean = true,
+    @SerialName("same_cast_label_placement")
+    val sameCastLabelPlacement: String? = null,
+    @SerialName("cast_episode_count_visibility")
+    val castEpisodeCountVisibility: String? = null,
 )
 
 private data class MetaScreenSectionDefinition(
@@ -262,7 +274,10 @@ object MetaScreenSettingsRepository {
     private var tabLayout: Boolean = false
     private var episodeCardStyle: MetaEpisodeCardStyle = MetaEpisodeCardStyle.Horizontal
     private var blurUnwatchedEpisodes: Boolean = false
-    private var episodeRatingsEnabled: Boolean = true
+    private var episodeRatingsVisibility: EpisodeRatingsVisibility = EpisodeRatingsVisibility.SHOW_ALL
+    private var showOverallRatings: Boolean = true
+    private var sameCastLabelPlacement: SameCastLabelPlacement = SameCastLabelPlacement.AUTO
+    private var castEpisodeCountVisibility: CastEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW
     private fun localizedString(resource: StringResource): String = runBlocking { getString(resource) }
 
     fun ensureLoaded() {
@@ -289,7 +304,20 @@ object MetaScreenSettingsRepository {
                 tabLayout = false
                 episodeCardStyle = MetaEpisodeCardStyle.Horizontal
                 blurUnwatchedEpisodes = parsed.blurUnwatchedEpisodes
-                episodeRatingsEnabled = parsed.episodeRatingsEnabled
+                episodeRatingsVisibility = parsed.episodeRatingsVisibility
+                    ?.let(EpisodeRatingsVisibility::parse)
+                    ?: if (parsed.episodeRatingsEnabled) {
+                        EpisodeRatingsVisibility.SHOW_ALL
+                    } else {
+                        EpisodeRatingsVisibility.HIDE_EPISODES
+                    }
+                showOverallRatings = parsed.showOverallRatings
+                sameCastLabelPlacement = parsed.sameCastLabelPlacement
+                    ?.let(SameCastLabelPlacement::parse)
+                    ?: SameCastLabelPlacement.AUTO
+                castEpisodeCountVisibility = parsed.castEpisodeCountVisibility
+                    ?.let(CastEpisodeCountVisibility::parse)
+                    ?: CastEpisodeCountVisibility.SHOW
                 preferences = parsed.items.mapNotNull { item ->
                     val key = runCatching { MetaScreenSectionKey.valueOf(item.key) }.getOrNull() ?: return@mapNotNull null
                     key to item
@@ -316,7 +344,10 @@ object MetaScreenSettingsRepository {
         tabLayout = false
         episodeCardStyle = MetaEpisodeCardStyle.Horizontal
         blurUnwatchedEpisodes = false
-        episodeRatingsEnabled = true
+        episodeRatingsVisibility = EpisodeRatingsVisibility.SHOW_ALL
+        showOverallRatings = true
+        sameCastLabelPlacement = SameCastLabelPlacement.AUTO
+        castEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW
         _uiState.value = MetaScreenSettingsUiState()
         ensureLoaded()
     }
@@ -402,9 +433,30 @@ object MetaScreenSettingsRepository {
         persist()
     }
 
-    fun setEpisodeRatingsEnabled(enabled: Boolean) {
+    fun setEpisodeRatingsVisibility(visibility: EpisodeRatingsVisibility) {
         ensureLoaded()
-        episodeRatingsEnabled = enabled
+        episodeRatingsVisibility = visibility
+        publish()
+        persist()
+    }
+
+    fun setSameCastLabelPlacement(placement: SameCastLabelPlacement) {
+        ensureLoaded()
+        sameCastLabelPlacement = placement
+        publish()
+        persist()
+    }
+
+    fun setCastEpisodeCountVisibility(visibility: CastEpisodeCountVisibility) {
+        ensureLoaded()
+        castEpisodeCountVisibility = visibility
+        publish()
+        persist()
+    }
+
+    fun setShowOverallRatings(enabled: Boolean) {
+        ensureLoaded()
+        showOverallRatings = enabled
         publish()
         persist()
     }
@@ -430,7 +482,10 @@ object MetaScreenSettingsRepository {
         tabLayout = false
         episodeCardStyle = MetaEpisodeCardStyle.Horizontal
         blurUnwatchedEpisodes = false
-        episodeRatingsEnabled = true
+        episodeRatingsVisibility = EpisodeRatingsVisibility.SHOW_ALL
+        showOverallRatings = true
+        sameCastLabelPlacement = SameCastLabelPlacement.AUTO
+        castEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW
         _uiState.value = MetaScreenSettingsUiState()
     }
 
@@ -493,7 +548,10 @@ object MetaScreenSettingsRepository {
         tabLayout = false
         episodeCardStyle = MetaEpisodeCardStyle.Horizontal
         blurUnwatchedEpisodes = false
-        episodeRatingsEnabled = true
+        episodeRatingsVisibility = EpisodeRatingsVisibility.SHOW_ALL
+        showOverallRatings = true
+        sameCastLabelPlacement = SameCastLabelPlacement.AUTO
+        castEpisodeCountVisibility = CastEpisodeCountVisibility.SHOW
         normalizePreferences()
         publish()
         persist()
@@ -556,7 +614,10 @@ object MetaScreenSettingsRepository {
             tabLayout = false,
             episodeCardStyle = MetaEpisodeCardStyle.Horizontal,
             blurUnwatchedEpisodes = blurUnwatchedEpisodes,
-            episodeRatingsEnabled = episodeRatingsEnabled,
+            episodeRatingsVisibility = episodeRatingsVisibility,
+            showOverallRatings = showOverallRatings,
+            sameCastLabelPlacement = sameCastLabelPlacement,
+            castEpisodeCountVisibility = castEpisodeCountVisibility,
         )
     }
 
@@ -576,7 +637,11 @@ object MetaScreenSettingsRepository {
                     tabLayout = false,
                     episodeCardStyle = MetaEpisodeCardStyle.persist(MetaEpisodeCardStyle.Horizontal),
                     blurUnwatchedEpisodes = blurUnwatchedEpisodes,
-                    episodeRatingsEnabled = episodeRatingsEnabled,
+                    episodeRatingsEnabled = episodeRatingsVisibility.showRatings,
+                    episodeRatingsVisibility = episodeRatingsVisibility.name,
+                    showOverallRatings = showOverallRatings,
+                    sameCastLabelPlacement = sameCastLabelPlacement.name,
+                    castEpisodeCountVisibility = castEpisodeCountVisibility.name,
                 ),
             ),
         )

@@ -1,5 +1,7 @@
 package com.nuvio.app.features.input
 
+import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.core.ui.KeyboardSuggestions
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,8 +22,11 @@ internal sealed interface OskKey {
 
 internal enum class OskAction { Space, Backspace, Caps, Done }
 
-/** Row and column of the highlighted key. */
+/** Row and column of the highlighted key. Row [OSK_SUGGESTION_ROW] is the predictions strip above the keys. */
 internal data class OskSelection(val row: Int, val column: Int)
+
+/** The row index of the predictions strip ([KeyboardSuggestions]), above the digits. */
+internal const val OSK_SUGGESTION_ROW = -1
 
 internal enum class OskDirection { Up, Down, Left, Right }
 
@@ -78,6 +83,61 @@ internal object OskLayout {
 }
 
 /**
+ * Where a floating keyboard sits. [xFraction]/[yFraction] are fractions of the window's free space
+ * (window minus panel), so the panel stays on screen whatever size the window is next time.
+ */
+internal data class OskPlacementState(
+    val floating: Boolean = false,
+    val xFraction: Float = 0.5f,
+    val yFraction: Float = 0.92f,
+    val widthDp: Float = OskPlacement.DEFAULT_FLOATING_WIDTH_DP,
+)
+
+/** Docked or floating, and the floating panel's position and size. Per PC, not per account. */
+internal object OskPlacement {
+    const val DEFAULT_FLOATING_WIDTH_DP = 560f
+    const val MIN_FLOATING_WIDTH_DP = 340f
+    const val MAX_FLOATING_WIDTH_DP = 1100f
+
+    private const val KEY_FLOATING = "osk_floating"
+    private const val KEY_X = "osk_x_fraction"
+    private const val KEY_Y = "osk_y_fraction"
+    private const val KEY_WIDTH = "osk_width_dp"
+
+    private val store by lazy { DesktopStorage.store("nuvio_osk_layout") }
+
+    private val _state by lazy {
+        MutableStateFlow(
+            OskPlacementState(
+                floating = store.getBoolean(KEY_FLOATING) ?: false,
+                xFraction = (store.getFloat(KEY_X) ?: 0.5f).coerceIn(0f, 1f),
+                yFraction = (store.getFloat(KEY_Y) ?: 0.92f).coerceIn(0f, 1f),
+                widthDp = (store.getFloat(KEY_WIDTH) ?: DEFAULT_FLOATING_WIDTH_DP)
+                    .coerceIn(MIN_FLOATING_WIDTH_DP, MAX_FLOATING_WIDTH_DP),
+            ),
+        )
+    }
+    val state: StateFlow<OskPlacementState> get() = _state.asStateFlow()
+
+    fun setFloating(floating: Boolean) {
+        _state.value = _state.value.copy(floating = floating)
+        store.putBoolean(KEY_FLOATING, floating)
+    }
+
+    fun setFloatingBounds(xFraction: Float, yFraction: Float, widthDp: Float) {
+        val next = _state.value.copy(
+            xFraction = xFraction.coerceIn(0f, 1f),
+            yFraction = yFraction.coerceIn(0f, 1f),
+            widthDp = widthDp.coerceIn(MIN_FLOATING_WIDTH_DP, MAX_FLOATING_WIDTH_DP),
+        )
+        _state.value = next
+        store.putFloat(KEY_X, next.xFraction)
+        store.putFloat(KEY_Y, next.yFraction)
+        store.putFloat(KEY_WIDTH, next.widthDp)
+    }
+}
+
+/**
  * On-screen keyboard for controller text entry.
  *
  * It types the same way the pad's buttons navigate: by synthesizing key events at the focused
@@ -86,7 +146,7 @@ internal object OskLayout {
  *
  * Visibility follows [com.nuvio.app.core.ui.TextInputFocusTracker] — the app-wide signal that some
  * editable field holds focus — gated on a pad actually being connected, so a keyboard user never
- * sees it.
+ * sees it, or on the opt-in mouse setting for someone with only a mouse on the couch.
  */
 internal object OnScreenKeyboard {
 
@@ -112,8 +172,8 @@ internal object OnScreenKeyboard {
     private var isVisible = false
 
     /**
-     * Drives visibility from the app-wide text-focus signal. [padReady] keeps the panel away from
-     * anyone typing on a real keyboard.
+     * Drives visibility from the app-wide text-focus signal. [padReady] — a pad in use, or the
+     * mouse-keyboard setting on — keeps the panel away from anyone typing on a real keyboard.
      */
     fun onTextFocusChanged(textFieldFocused: Boolean, padReady: Boolean) {
         if (!textFieldFocused) {
@@ -180,7 +240,7 @@ internal object OnScreenKeyboard {
             GamepadButton.DpadDown -> moveSelection(OskDirection.Down)
             GamepadButton.DpadLeft -> moveSelection(OskDirection.Left)
             GamepadButton.DpadRight -> moveSelection(OskDirection.Right)
-            GamepadButton.A -> press(OskLayout.keyAt(_selection.value))
+            GamepadButton.A -> pressSelected()
             GamepadButton.B -> backspace()
             GamepadButton.X -> perform(OskAction.Space)
             GamepadButton.Y -> perform(OskAction.Caps)
@@ -197,7 +257,50 @@ internal object OnScreenKeyboard {
     }
 
     fun moveSelection(direction: OskDirection) {
-        _selection.value = OskLayout.move(_selection.value, direction)
+        val words = KeyboardSuggestions.offer.value?.words.orEmpty()
+        val from = _selection.value
+        val digits = OskLayout.rows.first().size
+        _selection.value = when {
+            // The strip went away while it was highlighted: back to the first key.
+            from.row == OSK_SUGGESTION_ROW && words.isEmpty() -> OskSelection(0, 0)
+            from.row == OSK_SUGGESTION_ROW -> when (direction) {
+                OskDirection.Left -> from.copy(column = (from.column - 1).coerceAtLeast(0))
+                OskDirection.Right -> from.copy(column = (from.column + 1).coerceAtMost(words.lastIndex))
+                OskDirection.Down -> OskSelection(0, scaled(from.column, words.size, digits))
+                OskDirection.Up -> from
+            }
+            from.row == 0 && direction == OskDirection.Up && words.isNotEmpty() ->
+                OskSelection(OSK_SUGGESTION_ROW, scaled(from.column, digits, words.size))
+            else -> OskLayout.move(from, direction)
+        }
+    }
+
+    private fun scaled(column: Int, fromWidth: Int, toWidth: Int): Int {
+        if (fromWidth <= 1 || toWidth <= 1) return 0
+        return (column.toFloat() / (fromWidth - 1) * (toWidth - 1)).roundToInt().coerceIn(0, toWidth - 1)
+    }
+
+    /** Presses whatever is highlighted: a key, or a prediction on the strip. */
+    private fun pressSelected() {
+        val selected = _selection.value
+        if (selected.row == OSK_SUGGESTION_ROW) {
+            KeyboardSuggestions.offer.value?.words?.getOrNull(selected.column)?.let(::pickSuggestion)
+        } else {
+            press(OskLayout.keyAt(selected))
+        }
+    }
+
+    /**
+     * Puts a prediction in the field (the screen that offered it sets its own text), then moves the caret to the end so
+     * the next key types after it rather than where the caret was. The caret key waits a moment for the field to take
+     * its new text; sent at once it could land before the text changed.
+     */
+    fun pickSuggestion(word: String) {
+        KeyboardSuggestions.pick(word)
+        _selection.value = OskSelection(1, 0)
+        javax.swing.Timer(CARET_AFTER_PICK_MS) { GamepadKeyInjector.sendKeyCode(KeyEvent.VK_END) }
+            .apply { isRepeats = false }
+            .start()
     }
 
     /** Presses a key, from the pad or from a mouse click on the panel. */
@@ -222,3 +325,5 @@ internal object OnScreenKeyboard {
         GamepadKeyInjector.sendKeyCode(KeyEvent.VK_BACK_SPACE)
     }
 }
+
+private const val CARET_AFTER_PICK_MS = 80

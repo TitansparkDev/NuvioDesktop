@@ -7,9 +7,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -20,13 +23,18 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.ui.LocalNuvioBaseDensity
+import com.nuvio.app.features.home.components.forbiddenStreamRetryDelayMs
+import com.nuvio.app.features.home.components.youtubeStreamMpvOptions
 import com.nuvio.app.features.player.PlayerControlsAction
 import com.nuvio.app.features.player.PlayerControlsState
+import com.nuvio.app.features.player.PlayerHeroTrailerState
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
-import com.nuvio.app.features.player.desktop.TRAILER_AUDIO_NORMALIZATION_FILTER
+import com.nuvio.app.features.preroll.mpvAudioFilterValue
+import com.nuvio.app.features.preroll.trailerLoudnessChain
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private val detailHeroTrailerSurfaceLog = Logger.withTag("DetailHeroTrailerSurface")
 
@@ -34,6 +42,7 @@ private val detailHeroTrailerSurfaceLog = Logger.withTag("DetailHeroTrailerSurfa
 actual fun HeroTrailerPlayerSurface(
     sourceUrl: String,
     sourceAudioUrl: String?,
+    sourceHeaders: Map<String, String>,
     playWhenReady: Boolean,
     muted: Boolean,
     volume: Int,
@@ -46,6 +55,9 @@ actual fun HeroTrailerPlayerSurface(
     onVolumeChange: (Int) -> Unit,
     onReclaimFocus: () -> Unit,
 ) {
+    // fork:pip-browse - no trailer over a film playing on in the corner box; the hero keeps its artwork.
+    val browsePip by com.nuvio.app.features.player.PlayerBrowsePip.active.collectAsState()
+    if (browsePip) return
     val supported = DesktopHostOs.current == DesktopHostOs.WINDOWS ||
         DesktopHostOs.current == DesktopHostOs.MACOS
     val latestOnReady = rememberUpdatedState(onReady)
@@ -56,6 +68,8 @@ actual fun HeroTrailerPlayerSurface(
     val latestOnReclaimFocus = rememberUpdatedState(onReclaimFocus)
     // Effective mpv volume: muting forces silence regardless of the slider position.
     val effectiveVolume = if (muted) 0 else volume.coerceIn(0, 100)
+    // Music steps aside while this trailer is audible, and comes back after.
+    com.nuvio.app.features.music.MusicPausedWhileTrailerPlays(audible = playWhenReady && effectiveVolume > 0)
 
     if (!supported) {
         LaunchedEffect(sourceUrl) {
@@ -154,15 +168,22 @@ actual fun HeroTrailerPlayerSurface(
         }
     }
 
-    LaunchedEffect(controller, sourceUrl) {
+    // Re-opens of this URL after a googlevideo 403 (see forbiddenStreamRetryDelayMs).
+    var forbiddenRetries by remember(sourceUrl) { mutableIntStateOf(0) }
+    // fork:trailer-403 - outlives the attach effect, whose scope has finished by the time mpv reports a 403.
+    val retryScope = rememberCoroutineScope()
+
+    LaunchedEffect(controller, sourceUrl, forbiddenRetries) {
         playbackRevealReady = false
         controller.updateControls(
             PlayerControlsState(
-                heroTrailerMode = true,
-                heroTrailerBackgroundColor = "#000000",
                 isLoading = true,
-                heroTrailerMuted = muted,
-                heroTrailerVolume = effectiveVolume,
+                heroTrailer = PlayerHeroTrailerState(
+                    enabled = true,
+                    backgroundColor = "#000000",
+                    muted = muted,
+                    volume = effectiveVolume,
+                ),
             ),
         )
         detailHeroTrailerSurfaceLog.i {
@@ -171,7 +192,7 @@ actual fun HeroTrailerPlayerSurface(
         controller.attach(
             sourceUrl = sourceUrl,
             sourceAudioUrl = sourceAudioUrl?.takeIf { it.isNotBlank() },
-            sourceHeaders = emptyMap(),
+            sourceHeaders = sourceHeaders, // fork:trailer-signed-in
             playWhenReady = playWhenReady,
             initialPositionMs = 0L,
             nvidiaRtxSuperResolutionEnabled = false,
@@ -181,20 +202,32 @@ actual fun HeroTrailerPlayerSurface(
             animeSvpEnabled = false,
             onError = { message ->
                 detailHeroTrailerSurfaceLog.w { "playback error: $message" }
-                latestOnError.value()
+                val retryInMs = forbiddenStreamRetryDelayMs(message, forbiddenRetries)
+                if (retryInMs != null) {
+                    detailHeroTrailerSurfaceLog.i { "re-opening in ${retryInMs}ms (retry ${forbiddenRetries + 1})" }
+                    retryScope.launch {
+                        delay(retryInMs)
+                        forbiddenRetries++
+                    }
+                } else {
+                    latestOnError.value()
+                }
             },
             controlsPageUrlSuffix = "?heroTrailer=1",
+            initMpvOptions = youtubeStreamMpvOptions(sourceUrl),
         )
     }
 
-    LaunchedEffect(controller, sourceUrl, muted, effectiveVolume) {
+    LaunchedEffect(controller, sourceUrl, forbiddenRetries, muted, effectiveVolume) {
         controller.updateControls(
             PlayerControlsState(
-                heroTrailerMode = true,
-                heroTrailerBackgroundColor = "#000000",
                 isLoading = true,
-                heroTrailerMuted = muted,
-                heroTrailerVolume = effectiveVolume,
+                heroTrailer = PlayerHeroTrailerState(
+                    enabled = true,
+                    backgroundColor = "#000000",
+                    muted = muted,
+                    volume = effectiveVolume,
+                ),
             ),
         )
         controller.setMpvProperty("mute", if (muted) "yes" else "no")
@@ -203,10 +236,11 @@ actual fun HeroTrailerPlayerSurface(
         controller.setHeroTrailerVolume(effectiveVolume)
     }
 
-    LaunchedEffect(controller, sourceUrl) {
-        controller.setMpvProperty("panscan", "1.0")
+    LaunchedEffect(controller, sourceUrl, forbiddenRetries) {
+        // Fill the hero and trim bars baked into the video, as on Home (HomeHeroTrailerSurface).
+        controller.setResizeMode(com.nuvio.app.features.player.PlayerResizeMode.AutoCrop, quickAutoCrop = true)
         // Trailer loudness is wildly inconsistent between uploads; smooth it out in real time.
-        controller.setMpvProperty("af", TRAILER_AUDIO_NORMALIZATION_FILTER)
+        controller.setMpvProperty("af", mpvAudioFilterValue(*trailerLoudnessChain(sourceUrl).toTypedArray())) // fork:loudness
     }
 
     LaunchedEffect(controller, playWhenReady) {
@@ -217,7 +251,7 @@ actual fun HeroTrailerPlayerSurface(
         var readyReported = false
         var endedReported = false
         while (true) {
-            val snapshot = controller.snapshot()
+            val snapshot = controller.snapshotOffUiThread()
             if (
                 playWhenReady &&
                 (firstPaintComplete || hasPaintedOnce) &&

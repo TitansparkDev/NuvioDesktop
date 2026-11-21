@@ -1,5 +1,28 @@
 package com.nuvio.app.features.settings
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.semantics.Role
+import com.nuvio.app.core.ui.arrowFocusDirection
+import com.nuvio.app.core.ui.requestFocusLogged
+import kotlinx.coroutines.delay
+import nuvio.composeapp.generated.resources.settings_home_hero_info_priority_keys
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.clickable
@@ -38,6 +61,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import com.nuvio.app.core.ui.NuvioDialogSurface
+import com.nuvio.app.core.ui.NuvioGlass
+import com.nuvio.app.core.ui.NuvioModalDialog
+import com.nuvio.app.core.ui.NuvioPrimaryButton
+import com.nuvio.app.core.ui.nuvio
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.ui.Modifier
@@ -67,6 +94,8 @@ import nuvio.composeapp.generated.resources.*
 import nuvio.composeapp.generated.resources.action_reset
 import nuvio.composeapp.generated.resources.layout_hide_unreleased
 import nuvio.composeapp.generated.resources.layout_hide_unreleased_sub
+import nuvio.composeapp.generated.resources.layout_hide_watched
+import nuvio.composeapp.generated.resources.layout_hide_watched_sub
 import nuvio.composeapp.generated.resources.settings_meta_hero_trailer_playback_area_fullscreen
 import nuvio.composeapp.generated.resources.settings_meta_hero_trailer_playback_area_hero
 import nuvio.composeapp.generated.resources.settings_homescreen_empty_message
@@ -104,6 +133,7 @@ internal fun LazyListScope.homescreenSettingsContent(
     heroBadgeScale: Float,
     heroReleaseStatusUnavailableOnly: Boolean,
     hideUnreleasedContent: Boolean,
+    hideWatchedContent: Boolean,
     hideCatalogUnderline: Boolean,
     catalogRowShuffleEnabled: Boolean = false,
     adaptiveHeroEnabled: Boolean = false,
@@ -111,6 +141,12 @@ internal fun LazyListScope.homescreenSettingsContent(
     heroAmbientBackgroundEnabled: Boolean = false,
     tvModeEnabled: Boolean = false,
     items: List<HomeCatalogSettingsItem>,
+    /**
+     * Sections slotted in above hero sources and the catalog list, which stay last: hero sources
+     * picks from that list, and with every addon catalog listed it can run to hundreds of rows.
+     * Desktop puts the Continue Watching settings here.
+     */
+    beforeCatalogs: LazyListScope.() -> Unit = {},
 ) {
     val heroEligibleItems = items.filter { !it.isCollection || it.hasHeroBackdrop }
     val selectedHeroSourceCount = heroEligibleItems.count { it.heroSourceEnabled }
@@ -121,7 +157,6 @@ internal fun LazyListScope.homescreenSettingsContent(
             val homeSettings by HomeCatalogSettingsRepository.uiState.collectAsStateWithLifecycle()
             val currentMode = homeDisplayModeOf(
                 adaptiveHeroEnabled = adaptiveHeroEnabled,
-                heroAmbientBackgroundEnabled = heroAmbientBackgroundEnabled,
                 tvModeEnabled = tvModeEnabled,
             )
             // Where the trailer plays is independent of whether it autoplays: the area selector only
@@ -154,21 +189,53 @@ internal fun LazyListScope.homescreenSettingsContent(
                     )
                     // Keep mode-specific controls out of the page entirely. A disabled Adaptive
                     // position slider in Basic/TV mode looks like a setting that failed to load.
-                    if (currentMode == HomeDisplayMode.Adaptive ||
-                        currentMode == HomeDisplayMode.AdaptiveAmbient
-                    ) {
+                    if (currentMode == HomeDisplayMode.Adaptive) {
                         SettingsGroupDivider(isTablet = isTablet)
-                        AdaptiveHeroVerticalBiasRow(
-                            bias = adaptiveHeroVerticalBias,
+                        SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_home_backdrop_auto_framing),
+                            description = stringResource(
+                                Res.string.settings_home_backdrop_auto_framing_description,
+                            ),
+                            checked = homeSettings.adaptiveHeroAutoFraming,
                             enabled = heroEnabled,
                             isTablet = isTablet,
-                            modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.AdaptiveHeroPosition),
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("home-adaptive-hero-auto-framing"),
+                            ),
+                            onCheckedChange = HomeCatalogSettingsRepository::setAdaptiveHeroAutoFraming,
                         )
+                        // The manual position only applies with automatic framing off; showing it
+                        // alongside would read as a second control over the same crop.
+                        if (!homeSettings.adaptiveHeroAutoFraming) {
+                            SettingsGroupDivider(isTablet = isTablet)
+                            AdaptiveHeroVerticalBiasRow(
+                                bias = adaptiveHeroVerticalBias,
+                                enabled = heroEnabled,
+                                isTablet = isTablet,
+                                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.AdaptiveHeroPosition),
+                            )
+                        }
                         SettingsGroupDivider(isTablet = isTablet)
                         AdaptiveHeroHeightRow(
                             enabled = heroEnabled,
                             isTablet = isTablet,
                             modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.AdaptiveHeroHeight),
+                        )
+                        // Adaptive's own ambient toggle, as TV Mode has one: it used to be a fourth
+                        // display mode, which made two near-identical layouts look like a big choice.
+                        SettingsGroupDivider(isTablet = isTablet)
+                        SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_home_adaptive_ambient_background),
+                            description = stringResource(
+                                Res.string.settings_home_adaptive_ambient_background_description,
+                            ),
+                            checked = heroAmbientBackgroundEnabled,
+                            enabled = heroEnabled,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("home-adaptive-ambient-background"),
+                            ),
+                            onCheckedChange = HomeCatalogSettingsRepository::setHeroAmbientBackgroundEnabled,
                         )
                     }
                     val crossfadeOffLabel = stringResource(Res.string.settings_hero_backdrop_crossfade_off)
@@ -223,6 +290,19 @@ internal fun LazyListScope.homescreenSettingsContent(
                         )
                         SettingsGroupDivider(isTablet = isTablet)
                         SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_home_tv_ambient_background),
+                            description = stringResource(
+                                Res.string.settings_home_tv_ambient_background_description,
+                            ),
+                            checked = homeSettings.tvAmbientBackgroundEnabled,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("home-tv-ambient-background"),
+                            ),
+                            onCheckedChange = HomeCatalogSettingsRepository::setTvAmbientBackgroundEnabled,
+                        )
+                        SettingsGroupDivider(isTablet = isTablet)
+                        SettingsSwitchRow(
                             title = stringResource(Res.string.settings_home_row_jump_dots),
                             description = stringResource(Res.string.settings_home_row_jump_dots_description),
                             checked = homeSettings.tvRowDotsEnabled,
@@ -251,15 +331,45 @@ internal fun LazyListScope.homescreenSettingsContent(
                         }
                     } else {
                         SettingsGroupDivider(isTablet = isTablet)
-                        SettingsSwitchRow(
-                            title = stringResource(Res.string.settings_home_smooth_scrolling),
-                            description = stringResource(Res.string.settings_home_smooth_scrolling_description),
-                            checked = homeSettings.smoothScrollingEnabled,
+                        // Smooth and snap are two stored switches (the first-run wizard offers the
+                        // same three choices); shown as one choice because only one can drive the wheel.
+                        val wheelScroll = when {
+                            homeSettings.snapScrollingEnabled -> HomeWheelScroll.Snap
+                            homeSettings.smoothScrollingEnabled -> HomeWheelScroll.Smooth
+                            else -> HomeWheelScroll.Standard
+                        }
+                        SettingsChoiceRow(
+                            title = stringResource(Res.string.settings_home_wheel_scrolling),
+                            description = stringResource(
+                                when (wheelScroll) {
+                                    HomeWheelScroll.Smooth -> Res.string.settings_home_wheel_smooth_description
+                                    HomeWheelScroll.Snap -> Res.string.settings_home_wheel_snap_description
+                                    HomeWheelScroll.Standard -> Res.string.settings_home_wheel_standard_description
+                                },
+                            ),
+                            options = listOf(
+                                SettingsChoiceOption(HomeWheelScroll.Smooth, stringResource(Res.string.settings_home_wheel_smooth)),
+                                SettingsChoiceOption(HomeWheelScroll.Snap, stringResource(Res.string.settings_home_wheel_snap)),
+                                SettingsChoiceOption(HomeWheelScroll.Standard, stringResource(Res.string.settings_home_wheel_standard)),
+                            ),
+                            selectedValue = wheelScroll,
                             isTablet = isTablet,
                             modifier = Modifier.settingsScrollAnchor(
                                 SettingsScrollAnchor.searchKey("home-smooth-scrolling"),
                             ),
-                            onCheckedChange = HomeCatalogSettingsRepository::setSmoothScrollingEnabled,
+                            onSelected = { choice ->
+                                when (choice) {
+                                    HomeWheelScroll.Snap -> HomeCatalogSettingsRepository.setSnapScrollingEnabled(true)
+                                    HomeWheelScroll.Smooth -> {
+                                        HomeCatalogSettingsRepository.setSnapScrollingEnabled(false)
+                                        HomeCatalogSettingsRepository.setSmoothScrollingEnabled(true)
+                                    }
+                                    HomeWheelScroll.Standard -> {
+                                        HomeCatalogSettingsRepository.setSnapScrollingEnabled(false)
+                                        HomeCatalogSettingsRepository.setSmoothScrollingEnabled(false)
+                                    }
+                                }
+                            },
                         )
                         SettingsGroupDivider(isTablet = isTablet)
                         // One switch per mode rather than one switch overall: the preview is on by
@@ -300,6 +410,28 @@ internal fun LazyListScope.homescreenSettingsContent(
                             SettingsScrollAnchor.searchKey("home-catalog-row-numbers"),
                         ),
                         onCheckedChange = HomeCatalogSettingsRepository::setCatalogRowNumbersEnabled,
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSwitchRow(
+                        title = stringResource(Res.string.settings_homescreen_animate_collection_gifs_on_focus_only),
+                        description = stringResource(Res.string.settings_homescreen_collection_gifs_play_only_on_the),
+                        checked = homeSettings.collectionGifsOnFocusOnly,
+                        isTablet = isTablet,
+                        modifier = Modifier.settingsScrollAnchor(
+                            SettingsScrollAnchor.searchKey("home-collection-gifs-on-focus"),
+                        ),
+                        onCheckedChange = HomeCatalogSettingsRepository::setCollectionGifsOnFocusOnly,
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSwitchRow(
+                        title = stringResource(Res.string.settings_home_catalog_provider_tag),
+                        description = stringResource(Res.string.settings_home_catalog_provider_tag_description),
+                        checked = homeSettings.catalogProviderTagEnabled,
+                        isTablet = isTablet,
+                        modifier = Modifier.settingsScrollAnchor(
+                            SettingsScrollAnchor.searchKey("home-catalog-provider-tag"),
+                        ),
+                        onCheckedChange = HomeCatalogSettingsRepository::setCatalogProviderTagEnabled,
                     )
                     // Basic's hero sits in the rows list, so it has no area to play a trailer
                     // in that would survive a scroll — there it is always full screen and
@@ -463,6 +595,15 @@ internal fun LazyListScope.homescreenSettingsContent(
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("home-hide-unreleased")),
                     onCheckedChange = HomeCatalogSettingsRepository::setHideUnreleasedContent,
                 )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.layout_hide_watched),
+                    description = stringResource(Res.string.layout_hide_watched_sub),
+                    checked = hideWatchedContent,
+                    isTablet = isTablet,
+                    modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("home-hide-watched")),
+                    onCheckedChange = HomeCatalogSettingsRepository::setHideWatchedContent,
+                )
 
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsSwitchRow(
@@ -486,6 +627,10 @@ internal fun LazyListScope.homescreenSettingsContent(
             }
         }
     }
+    item {
+        ConfidentSearchSettingsSection(isTablet = isTablet)
+    }
+    beforeCatalogs()
     item {
         // Catalogs are always eligible; collections qualify only when they or their
         // folders have curated hero art.
@@ -529,18 +674,15 @@ internal fun LazyListScope.homescreenSettingsContent(
                         onClick = HomeCatalogSettingsRepository::resetToDefaults,
                     )
                 },
+                subtitle = stringResource(
+                    Res.string.settings_homescreen_summary,
+                    enabledCatalogCount,
+                    items.size,
+                    selectedHeroSourceCount,
+                ),
             ) {
                 val hapticFeedback = LocalHapticFeedback.current
                 val pinToMoveToast = stringResource(Res.string.settings_homescreen_pin_to_move_toast)
-                SettingsSectionNote(
-                    text = stringResource(
-                        Res.string.settings_homescreen_summary,
-                        enabledCatalogCount,
-                        items.size,
-                        selectedHeroSourceCount,
-                    ),
-                    isTablet = isTablet,
-                )
 
                 HomescreenCatalogList(
                     isTablet = isTablet,
@@ -565,7 +707,6 @@ private fun HomeDisplayMode.localizedLabel(): String =
     when (this) {
         HomeDisplayMode.Basic -> stringResource(Res.string.settings_home_display_mode_basic)
         HomeDisplayMode.Adaptive -> stringResource(Res.string.settings_home_display_mode_adaptive)
-        HomeDisplayMode.AdaptiveAmbient -> stringResource(Res.string.settings_home_display_mode_adaptive_ambient)
         HomeDisplayMode.TvMode -> stringResource(Res.string.settings_home_display_mode_tv)
     }
 
@@ -574,7 +715,6 @@ private fun HomeDisplayMode.localizedDescription(): String =
     when (this) {
         HomeDisplayMode.Basic -> stringResource(Res.string.settings_home_display_mode_basic_description)
         HomeDisplayMode.Adaptive -> stringResource(Res.string.settings_home_display_mode_adaptive_description)
-        HomeDisplayMode.AdaptiveAmbient -> stringResource(Res.string.settings_home_display_mode_adaptive_ambient_description)
         HomeDisplayMode.TvMode -> stringResource(Res.string.settings_home_display_mode_tv_description)
     }
 
@@ -623,7 +763,7 @@ private fun AdaptiveHeroVerticalBiasRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = horizontalPadding, vertical = 8.dp)
+            .padding(horizontal = horizontalPadding, vertical = if (isTablet) DesktopRowVerticalPadding else 8.dp)
             .alpha(if (enabled) 1f else 0.55f),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -642,12 +782,10 @@ private fun AdaptiveHeroVerticalBiasRow(
                 isTablet = isTablet,
             )
         }
-        Column(
-            modifier = Modifier.width(if (isTablet) 210.dp else 220.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+        Row(
+            modifier = Modifier.width(if (isTablet) DesktopControlWidth else 220.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            ValueBox(text = sliderValue.formatAdaptiveHeroVerticalBias())
             SettingsModernSlider(
                 value = sliderValue,
                 onValueChange = { if (enabled) sliderValue = it },
@@ -656,7 +794,8 @@ private fun AdaptiveHeroVerticalBiasRow(
                 },
                 enabled = enabled,
                 valueRange = -1f..1f,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.weight(1f),
+                valueLabel = sliderValue.formatAdaptiveHeroVerticalBias(),
             )
         }
     }
@@ -683,7 +822,7 @@ private fun AdaptiveHeroHeightRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .padding(horizontal = 16.dp, vertical = if (isTablet) DesktopRowVerticalPadding else 8.dp)
             .alpha(if (enabled) 1f else 0.55f),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -702,12 +841,10 @@ private fun AdaptiveHeroHeightRow(
                 isTablet = isTablet,
             )
         }
-        Column(
-            modifier = Modifier.width(if (isTablet) 210.dp else 220.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+        Row(
+            modifier = Modifier.width(if (isTablet) DesktopControlWidth else 220.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            ValueBox(text = sliderValue.formatAdaptiveHeroHeight())
             SettingsModernSlider(
                 value = sliderValue,
                 onValueChange = { if (enabled) sliderValue = it },
@@ -716,7 +853,8 @@ private fun AdaptiveHeroHeightRow(
                 },
                 enabled = enabled,
                 valueRange = 0.5f..1.75f,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.weight(1f),
+                valueLabel = sliderValue.formatAdaptiveHeroHeight(),
             )
         }
     }
@@ -880,7 +1018,6 @@ private fun HeroInfoPriorityRow(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HeroInfoPriorityDialog(
     value: String,
@@ -888,52 +1025,26 @@ private fun HeroInfoPriorityDialog(
     isTablet: Boolean,
     onDismiss: () -> Unit,
 ) {
-    BasicAlertDialog(onDismissRequest = onDismiss) {
-        NuvioDialogSurface(modifier = Modifier
-                .fillMaxWidth()
-                .widthIn(max = 640.dp)) {
-            Column(
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        Text(
-                            text = stringResource(Res.string.settings_home_hero_info_priority),
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = stringResource(Res.string.settings_home_hero_info_priority_description),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    IconButton(onClick = onDismiss) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = stringResource(Res.string.action_close),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                HeroInfoPriorityList(
-                    value = value,
-                    enabled = enabled,
-                    isTablet = isTablet,
-                    showHeader = false,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
+    NuvioModalDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(Res.string.settings_home_hero_info_priority),
+        subtitle = stringResource(Res.string.settings_home_hero_info_priority_description) + " " +
+            stringResource(Res.string.settings_home_hero_info_priority_keys),
+        maxWidth = 640.dp,
+        actions = {
+            NuvioPrimaryButton(
+                text = stringResource(Res.string.action_close),
+                onClick = onDismiss,
+            )
+        },
+    ) {
+        HeroInfoPriorityList(
+            value = value,
+            enabled = enabled,
+            isTablet = isTablet,
+            showHeader = false,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 
@@ -949,6 +1060,31 @@ private fun HeroInfoPriorityList(
     val selectedKeys = fields.filter { it.selected }.map { it.key }
     val hapticFeedback = LocalHapticFeedback.current
     val lazyListState = rememberLazyListState()
+    // fork:settings-arrows - the dialog is a window of its own, where the settings page's arrow keys do not
+    // reach, and nothing in it took focus when it opened, so a keyboard or pad could not use it (Nov 20 2026).
+    // Now each row is one focus stop: Up/Down walk, Enter turns it on or off, Shift+Up/Down (or Left/Right)
+    // moves a turned-on badge earlier or later, the same as dragging it.
+    val focusManager = LocalFocusManager.current
+    val firstRowFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        repeat(10) { attempt ->
+            delay(if (attempt == 0) 32L else 60L)
+            if (firstRowFocus.requestFocusLogged()) return@LaunchedEffect
+        }
+    }
+    fun moveSelected(fieldKey: String, by: Int): Boolean {
+        val reordered = selectedKeys.toMutableList()
+        val from = reordered.indexOf(fieldKey)
+        val to = from + by
+        if (from < 0 || to !in reordered.indices) return false
+        reordered.add(to, reordered.removeAt(from))
+        HomeCatalogSettingsRepository.setHeroInfoPriority(reordered.joinToString(","))
+        return true
+    }
+    fun toggle(fieldKey: String, checked: Boolean) {
+        val nextKeys = if (checked) selectedKeys + fieldKey else selectedKeys.filterNot { it == fieldKey }
+        HomeCatalogSettingsRepository.setHeroInfoPriority(nextKeys.joinToString(","))
+    }
     val reorderableLazyListState = rememberReorderableLazyListState(lazyListState) { from, to ->
         val fromField = fields.getOrNull(from.index) ?: return@rememberReorderableLazyListState
         val toField = fields.getOrNull(to.index) ?: return@rememberReorderableLazyListState
@@ -1000,12 +1136,70 @@ private fun HeroInfoPriorityList(
                             )
                         },
                         shadowElevation = elevation,
+                        // Clear so the rows sit on the dialog's glass; the row being dragged takes
+                        // the glass night as an opaque base so it reads above the rows it passes.
+                        color = if (isDragging) {
+                            NuvioGlass.night(MaterialTheme.nuvio.colors.background, MaterialTheme.nuvio.colors.accent)
+                        } else {
+                            Color.Transparent
+                        },
                     ) {
                         Column {
-                            if (index > 0) SettingsGroupDivider(isTablet = isTablet)
+                            // A hairline of the dialog's glass. SettingsGroupDivider is the gap between
+                            // settings cards and paints the page colour outside one: black bars here.
+                            if (index > 0) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp)
+                                        .height(1.dp)
+                                        .background(Color.White.copy(alpha = 0.10f)),
+                                )
+                            }
+                            val rowInteraction = remember { MutableInteractionSource() }
+                            val rowFocused by rowInteraction.collectIsFocusedAsState()
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .then(if (index == 0) Modifier.focusRequester(firstRowFocus) else Modifier)
+                                    .onKeyEvent { event ->
+                                        if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                                        val direction = arrowFocusDirection(event)
+                                        val reorderBy = when {
+                                            direction == FocusDirection.Up && event.isShiftPressed -> -1
+                                            direction == FocusDirection.Down && event.isShiftPressed -> 1
+                                            direction == FocusDirection.Left -> -1
+                                            direction == FocusDirection.Right -> 1
+                                            else -> 0
+                                        }
+                                        when {
+                                            reorderBy != 0 -> {
+                                                if (enabled && field.selected) moveSelected(field.key, reorderBy)
+                                                true
+                                            }
+                                            direction == FocusDirection.Up -> {
+                                                focusManager.moveFocus(FocusDirection.Previous)
+                                                true
+                                            }
+                                            direction == FocusDirection.Down -> {
+                                                focusManager.moveFocus(FocusDirection.Next)
+                                                true
+                                            }
+                                            else -> false
+                                        }
+                                    }
+                                    .toggleable(
+                                        value = field.selected,
+                                        enabled = enabled,
+                                        role = Role.Switch,
+                                        interactionSource = rowInteraction,
+                                        indication = null,
+                                        onValueChange = { checked -> toggle(field.key, checked) },
+                                    )
+                                    .background(
+                                        if (rowFocused) Color.White.copy(alpha = 0.08f) else Color.Transparent,
+                                        RoundedCornerShape(12.dp),
+                                    )
                                     .padding(horizontal = 16.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
@@ -1029,14 +1223,9 @@ private fun HeroInfoPriorityList(
                                 SettingsSquareSwitch(
                                     checked = field.selected,
                                     enabled = enabled,
-                                    onCheckedChange = { checked ->
-                                        val nextKeys = if (checked) {
-                                            selectedKeys + field.key
-                                        } else {
-                                            selectedKeys.filterNot { it == field.key }
-                                        }
-                                        HomeCatalogSettingsRepository.setHeroInfoPriority(nextKeys.joinToString(","))
-                                    },
+                                    // The row is the focus stop; the switch is only clicked.
+                                    modifier = Modifier.focusProperties { canFocus = false },
+                                    onCheckedChange = { checked -> toggle(field.key, checked) },
                                 )
                             }
                         }
@@ -1202,3 +1391,5 @@ private fun HomescreenCatalogList(
 
 private fun heroCrossfadeLabel(millis: Int, offLabel: String): String =
     if (millis <= 0) offLabel else "${millis}ms"
+
+private enum class HomeWheelScroll { Smooth, Snap, Standard }

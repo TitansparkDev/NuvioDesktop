@@ -1,5 +1,9 @@
 package com.nuvio.app.features.details
 
+import com.nuvio.app.core.ui.keyLayer
+import com.nuvio.app.core.ui.requestFocusLogged
+import com.nuvio.app.features.posterservice.CustomPosterScreen
+import com.nuvio.app.features.posterservice.rememberCustomPosters
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalSharedTransitionApi
@@ -32,6 +36,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -54,6 +59,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -82,11 +88,16 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.currentStateAsState
 import com.nuvio.app.features.games.GameModeController
+import com.nuvio.app.features.simkl.SimklRewatchRepository
 import com.nuvio.app.features.streams.StreamPrefetchService
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.build.AppFeaturePolicy
@@ -97,6 +108,8 @@ import com.nuvio.app.core.ui.LocalNuvioDesktopCompactWindow
 import com.nuvio.app.core.ui.NuvioBackButton
 import com.nuvio.app.core.ui.NuvioInputField
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.core.ui.StartupOverlayCoordinator
+import com.nuvio.app.features.streams.StreamPickerController
 import com.nuvio.app.core.ui.TraktListPickerDialog
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.rememberMouseActivityState
@@ -124,7 +137,12 @@ import com.nuvio.app.features.details.components.DetailSeriesContent
 import com.nuvio.app.features.details.components.DetailTrailersSection
 import com.nuvio.app.features.details.components.DetailTvKey
 import com.nuvio.app.features.details.components.DetailTvKeyboardBridge
+import com.nuvio.app.core.ui.ContextMenuInvocation
 import com.nuvio.app.features.details.components.EpisodeWatchedActionSheet
+import com.nuvio.app.features.playlist.PlaylistAddController
+import com.nuvio.app.features.playlist.playlistAddTargetFor
+import com.nuvio.app.features.playlist.playlistAddTargetForEpisode
+import com.nuvio.app.features.playlist.playlistAddTargetForEpisodes
 import com.nuvio.app.features.details.components.MetaDetailsTvFocusState
 import com.nuvio.app.features.details.components.SeasonWatchedActionSheet
 import com.nuvio.app.features.details.components.TrailerPlayerPopup
@@ -149,6 +167,7 @@ import com.nuvio.app.features.player.appShortcutMatches
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.tmdb.TmdbSettingsRepository
 import com.nuvio.app.features.tmdb.TmdbService
+import com.nuvio.app.features.tmdb.TmdbMetadataService
 import com.nuvio.app.features.trakt.TraktAuthRepository
 import com.nuvio.app.features.trakt.TraktCommentReview
 import com.nuvio.app.features.trakt.TraktCommentsRepository
@@ -156,6 +175,7 @@ import com.nuvio.app.features.trakt.TraktCommentsSettings
 import com.nuvio.app.features.trakt.TraktConnectionMode
 import com.nuvio.app.features.trakt.TraktListTab
 import com.nuvio.app.features.trakt.TraktSettingsRepository
+import com.nuvio.app.features.themesong.DetailsThemeSong // fork:themesong
 import com.nuvio.app.features.trailer.TrailerPlaybackResolver
 import com.nuvio.app.features.trailer.TrailerPlaybackSource
 import com.nuvio.app.features.trailer.TrailerResolution
@@ -170,6 +190,7 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.tracking.RatingPromptRepository
 import com.nuvio.app.features.tracking.TrackingProviderRegistry
 import com.nuvio.app.features.tracking.buildTrackingMediaReference
 import com.nuvio.app.features.tracking.trackingRatingProviderDisplayName
@@ -187,6 +208,7 @@ import org.jetbrains.compose.resources.stringResource
 import kotlin.random.Random
 import androidx.compose.material.icons.rounded.Search
 import com.nuvio.app.core.ui.trackTextInputFocus
+import com.nuvio.app.core.i18n.localizedString
 
 private fun dominantBackdropBlendColor(dominantColor: Color, backgroundColor: Color): Color =
     backgroundColor.blendTowards(dominantColor, fraction = 0.42f)
@@ -222,8 +244,21 @@ fun MetaDetailsScreen(
     modifier: Modifier = Modifier,
 ) {
     val uiState by MetaDetailsRepository.uiState.collectAsStateWithLifecycle()
-    val displayedMeta = uiState.meta?.takeIf { it.type == type && it.id == id }
+    val startupOverlay by StartupOverlayCoordinator.visibleOverlay.collectAsStateWithLifecycle()
+    val streamPickerRequest by StreamPickerController.request.collectAsStateWithLifecycle()
+    val streamPickerClosedCount by StreamPickerController.closedCount.collectAsStateWithLifecycle()
+    val repositoryMeta = uiState.meta?.takeIf { it.type == type && it.id == id }
         ?: MetaDetailsRepository.peek(type, id)
+    // Collection parts take the poster service here; More Like This already has it from the repository.
+    val collectionItems = rememberCustomPosters(
+        repositoryMeta?.collectionItems.orEmpty(),
+        CustomPosterScreen.Details,
+    )
+    val displayedMeta = remember(repositoryMeta, collectionItems) {
+        repositoryMeta?.takeIf { it.collectionItems !== collectionItems && it.collectionItems.isNotEmpty() }
+            ?.copy(collectionItems = collectionItems)
+            ?: repositoryMeta
+    }
     val metaScreenSettingsUiState by remember {
         MetaScreenSettingsRepository.ensureLoaded()
         MetaScreenSettingsRepository.uiState
@@ -254,6 +289,10 @@ fun MetaDetailsScreen(
         WatchProgressRepository.uiState
     }.collectAsStateWithLifecycle()
     val connectedTrackingProviders by TrackingProviderRegistry.connectedProviderIds.collectAsStateWithLifecycle()
+    val ratingSource by remember {
+        com.nuvio.app.features.tracking.TrackingRatingSourceRepository.ensureLoaded()
+        com.nuvio.app.features.tracking.TrackingRatingSourceRepository.uiState
+    }.collectAsStateWithLifecycle()
     val localLibraryUiState by remember {
         LocalLibraryRepository.ensureLoaded()
         LocalLibraryRepository.uiState
@@ -268,6 +307,8 @@ fun MetaDetailsScreen(
     var observedOfflineState by remember(type, id) { mutableStateOf(false) }
     var selectedEpisodeForActions by remember(type, id) { mutableStateOf<MetaVideo?>(null) }
     var selectedSeasonForActions by remember(type, id) { mutableStateOf<Int?>(null) }
+    // Set when a right-click opened the episode/season menu: it then appears at the cursor.
+    var actionsMenuPosition by remember(type, id) { mutableStateOf<IntOffset?>(null) }
     // The recap panel's boundary, and its open/closed state in one value: a recap is entirely
     // described by where it stops.
     var recapBoundary by remember(type, id) { mutableStateOf<RecapBoundary?>(null) }
@@ -289,6 +330,8 @@ fun MetaDetailsScreen(
     val detailsScope = rememberCoroutineScope()
     var showLibraryListPicker by remember(type, id) { mutableStateOf(false) }
     var showRatingDialog by remember(type, id) { mutableStateOf(false) }
+    // The score already saved on the rating service, looked up when the rating dialog opens.
+    var savedRating by remember(type, id) { mutableStateOf<Int?>(null) }
     var ratingPending by remember(type, id) { mutableStateOf(false) }
     var ratingError by remember(type, id) { mutableStateOf<String?>(null) }
     var pickerTabs by remember(type, id) { mutableStateOf<List<TraktListTab>>(emptyList()) }
@@ -383,10 +426,10 @@ fun MetaDetailsScreen(
         displayedMeta?.id,
         displayedMeta?.videos,
         deferredMetaWorkAllowed,
-        metaScreenSettingsUiState.episodeRatingsEnabled,
+        metaScreenSettingsUiState.episodeRatingsVisibility.showRatings,
     ) {
         val metaForRatings = displayedMeta
-        if (!metaScreenSettingsUiState.episodeRatingsEnabled) {
+        if (!metaScreenSettingsUiState.episodeRatingsVisibility.showRatings) {
             episodeImdbRatings = emptyMap()
             return@LaunchedEffect
         }
@@ -414,6 +457,29 @@ fun MetaDetailsScreen(
         episodeImdbRatings = ImdbEpisodeRatingsRepository.getEpisodeRatings(
             imdbId = imdbId,
             tmdbId = tmdbId,
+        )
+    }
+
+    val animeFillerSettings by com.nuvio.app.features.details.filler.AnimeFillerSettings.state.collectAsStateWithLifecycle()
+    LaunchedEffect(
+        displayedMeta?.id,
+        displayedMeta?.videos,
+        deferredMetaWorkAllowed,
+        animeFillerSettings,
+    ) {
+        val metaForFiller = displayedMeta ?: return@LaunchedEffect
+        if (!deferredMetaWorkAllowed || metaForFiller.videos.isEmpty()) return@LaunchedEffect
+        if (!com.nuvio.app.features.details.filler.AnimeFillerSettings.lookupWanted()) return@LaunchedEffect
+        // Ids proven to belong to another title would find another show's page.
+        val trusted = metaForFiller.imdbTmdbIdentityTrusted
+        com.nuvio.app.features.details.filler.AnimeFillerRepository.episodeKinds(
+            lookup = com.nuvio.app.features.details.filler.AnimeFillerLookup(
+                metaId = metaForFiller.id,
+                imdbId = metaForFiller.imdbId.takeIf { trusted },
+                tmdbId = metaForFiller.tmdbId.takeIf { trusted },
+                malId = metaForFiller.malId,
+            ),
+            videos = metaForFiller.videos,
         )
     }
 
@@ -546,15 +612,15 @@ fun MetaDetailsScreen(
                 val openLibraryListPicker = remember(meta) {
                     {
                         val libraryItem = meta.toLibraryItem(savedAtEpochMs = 0L)
-                        pickerTabs = LibraryRepository.libraryListTabs()
+                        pickerTabs = LibraryRepository.connectedLibraryTabs()
                         pickerMembership = pickerTabs.associate { it.key to false }
                         pickerPending = true
                         pickerError = null
                         showLibraryListPicker = true
                         detailsScope.launch {
                             runCatching {
-                                val snapshot = LibraryRepository.getMembershipSnapshot(libraryItem)
-                                val tabs = LibraryRepository.libraryListTabs()
+                                val snapshot = LibraryRepository.connectedMembershipSnapshot(libraryItem)
+                                val tabs = LibraryRepository.connectedLibraryTabs().filter { tab -> tab.key in snapshot }
                                 pickerTabs = tabs
                                 pickerMembership = tabs.associate { tab ->
                                     tab.key to (snapshot[tab.key] == true)
@@ -575,13 +641,13 @@ fun MetaDetailsScreen(
                 val toggleWatched = remember(metaPreview) {
                     {
                         detailsScope.launch {
-                            WatchingActions.togglePosterWatched(metaPreview)
+                            WatchingActions.togglePosterWatched(metaPreview, origin = "details page")
                         }
                         Unit
                     }
                 }
-                val ratingProviderId = remember(libraryUiState.sourceMode) {
-                    trackingRatingProviderFor(libraryUiState.sourceMode)
+                val ratingProviderId = remember(ratingSource, libraryUiState.sourceMode) {
+                    trackingRatingProviderFor(ratingSource, libraryUiState.sourceMode)
                 }
                 val ratingWriter = ratingProviderId?.let(TrackingProviderRegistry::ratingWriter)
                 val canRate = ratingProviderId != null &&
@@ -624,6 +690,7 @@ fun MetaDetailsScreen(
                                     rating = rating,
                                 )
                             }.onSuccess {
+                                savedRating = rating
                                 showRatingDialog = false
                                 NuvioToastController.show(
                                     getString(Res.string.details_rating_saved, ratingProviderName),
@@ -633,6 +700,18 @@ fun MetaDetailsScreen(
                             }
                             ratingPending = false
                         }
+                    }
+                }
+                LaunchedEffect(showRatingDialog, ratingProviderId, ratingMedia) {
+                    val writer = ratingWriter
+                    if (!showRatingDialog || writer == null) return@LaunchedEffect
+                    savedRating = try {
+                        writer.currentRating(ProfileRepository.activeProfileId, ratingMedia)
+                    } catch (error: kotlinx.coroutines.CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        // Only a convenience: the dialog still rates without it.
+                        null
                     }
                 }
                 val libraryPvrUiState by LibraryPvrRepository.uiState.collectAsStateWithLifecycle()
@@ -697,12 +776,25 @@ fun MetaDetailsScreen(
                 val movieProgress = progressByVideoId[meta.id]
                     ?.takeUnless { it.isCompleted }
                 val cwPrefs by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
-                val seriesAction = remember(watchProgressUiState.entries, watchedUiState.items, meta, todayIsoDate, cwPrefs.upNextFromFurthestEpisode) {
+                val simklRewatchUiState by SimklRewatchRepository.uiState.collectAsStateWithLifecycle()
+                val seriesAction = remember(
+                    watchProgressUiState.entries,
+                    watchedUiState.items,
+                    meta,
+                    todayIsoDate,
+                    cwPrefs.upNextFromFurthestEpisode,
+                    simklRewatchUiState.sessions,
+                ) {
                     meta.seriesPrimaryAction(
                         entries = watchProgressUiState.entries,
                         watchedItems = watchedUiState.items,
                         todayIsoDate = todayIsoDate,
                         preferFurthestEpisode = cwPrefs.upNextFromFurthestEpisode,
+                        rewatchSeed = SimklRewatchRepository.rewatchSeedFor(meta.id),
+                    ) ?: meta.seriesRestartAction(
+                        entries = watchProgressUiState.entries,
+                        watchedItems = watchedUiState.items,
+                        todayIsoDate = todayIsoDate,
                     )
                 }
                 val seriesActionVideo = remember(seriesAction, meta.id, meta.videos) {
@@ -765,6 +857,26 @@ fun MetaDetailsScreen(
                 val hasMoreLikeThisSection = remember(meta) {
                     meta.moreLikeThis.isNotEmpty()
                 }
+                // "Starring the same cast" (ported from the Nuvio Tracker site): loaded after the
+                // page, since it costs up to eleven TMDB calls, and only while related titles are on.
+                val sameCastEnabled = metaScreenSettingsUiState.items
+                    .any { it.key == MetaScreenSectionKey.MORE_LIKE_THIS && it.enabled }
+                // Not when the details page doubts its own IMDb/TMDB pairing (some anime): the cast
+                // would be another title's.
+                val sameCastTmdbId = (
+                    meta.tmdbId ?: meta.id.removePrefix("tmdb:").substringBefore(':').toIntOrNull()
+                        .takeIf { meta.id.startsWith("tmdb:") }
+                    ).takeIf { meta.imdbTmdbIdentityTrusted }
+                val sameCastRaw by produceState(emptyList<MetaPreview>(), sameCastTmdbId, meta.type, sameCastEnabled) {
+                    value = emptyList()
+                    if (!sameCastEnabled || sameCastTmdbId == null) return@produceState
+                    value = TmdbMetadataService.fetchSameCast(
+                        tmdbId = sameCastTmdbId,
+                        mediaType = if (meta.type.trim().lowercase() == "movie") "movie" else "tv",
+                    )
+                }
+                // Through the user's poster service, as More Like This and the collection already are.
+                val sameCast = rememberCustomPosters(sameCastRaw, CustomPosterScreen.Details)
                 val hasTrailersSection = remember(meta) {
                     meta.trailers.isNotEmpty()
                 }
@@ -802,6 +914,11 @@ fun MetaDetailsScreen(
                 // in place (mpv loadfile) instead of rebuilding the native surface — a rebuild
                 // comes up on a permanent black frame.
                 var heroTrailerDismissed by remember(meta.id, heroTrailerCandidate?.id) { mutableStateOf(false) }
+                // The trailer last clicked (null while the auto candidate plays), and whether its
+                // one retry after a playback error has been spent. YouTube refuses its media URLs
+                // (403) often enough that one fresh extraction is worth it, as the home hero does.
+                var heroTrailerLastClicked by remember(meta.id) { mutableStateOf<MetaTrailer?>(null) }
+                var heroTrailerRetryUsed by remember(meta.id) { mutableStateOf(false) }
                 val heroTrailerMuted by HeroTrailerAudioState.muted.collectAsStateWithLifecycle()
                 val heroTrailerVolume by HeroTrailerAudioState.volume.collectAsStateWithLifecycle()
                 LaunchedEffect(
@@ -829,7 +946,9 @@ fun MetaDetailsScreen(
                         return@LaunchedEffect
                     }
                     val resolvedSource = runCatching {
-                        TrailerPlaybackResolver.resolveFromYouTubeUrl(heroTrailerCandidate.youtubePlaybackUrl())
+                        kotlinx.coroutines.withContext(com.nuvio.app.features.music.YouTubeCaller("hero trailer")) {
+                            TrailerPlaybackResolver.resolveTrailerFromYouTubeUrl(heroTrailerCandidate.youtubePlaybackUrl()) // fork:trailer-signed-in
+                        }
                     }.getOrNull()?.sourceOrNull()
                     if (resolvedSource == null) {
                         heroTrailerFinished = true
@@ -864,6 +983,11 @@ fun MetaDetailsScreen(
                     // and rebuilding it leaves the native player on a black frame.
                     trailerRequestToken += 1
                     val currentRequestToken = trailerRequestToken
+                    heroTrailerLastClicked = trailer
+                    heroTrailerRetryUsed = false
+                    // The source picker docks into the same hero area and holds trailers while
+                    // open. A trailer click is the newer request, so it takes the area back.
+                    StreamPickerController.close()
                     selectedTrailer = null
                     trailerPlaybackSource = null
                     trailerErrorMessage = null
@@ -881,7 +1005,9 @@ fun MetaDetailsScreen(
                     HeroTrailerAudioState.setMuted(false)
                     trailerScope.launch {
                         val resolution = runCatching {
-                            TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
+                            kotlinx.coroutines.withContext(com.nuvio.app.features.music.YouTubeCaller("hero trailer", urgent = true)) {
+                                TrailerPlaybackResolver.resolveTrailerFromYouTubeUrl(youtubeUrl) // fork:trailer-signed-in
+                            }
                         }.getOrNull()
                         if (currentRequestToken != trailerRequestToken) {
                             return@launch
@@ -920,7 +1046,9 @@ fun MetaDetailsScreen(
                             val currentRequestToken = trailerRequestToken
                             trailerScope.launch {
                                 val resolution = runCatching {
-                                    TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
+                                    kotlinx.coroutines.withContext(com.nuvio.app.features.music.YouTubeCaller("hero trailer", urgent = true)) {
+                                        TrailerPlaybackResolver.resolveTrailerFromYouTubeUrl(youtubeUrl) // fork:trailer-signed-in
+                                    }
                                 }.getOrNull()
                                 if (currentRequestToken != trailerRequestToken) {
                                     return@launch
@@ -981,10 +1109,11 @@ fun MetaDetailsScreen(
                     }
                 }
                 val dropTrailerForPlaybackNavigation: () -> Unit = {
-                    // Native video surfaces can remain visually above Compose content for the
-                    // frame in which navigation begins. Remove the trailer source first so the
-                    // MPV host is disposed before the streams/player destination is presented.
-                    isLeavingDetails = true
+                    // Play usually opens the source picker on this page now rather than leaving
+                    // it, so the trailer is parked (paused, hidden, surface kept mounted) instead
+                    // of torn down: a later trailer click must still re-attach in place, and this
+                    // page must not think it is being left. Parking hides the native surface in
+                    // the same frame, so it cannot show over the picker or a player route either.
                     trailerRequestToken += 1
                     selectedTrailer = null
                     trailerPlaybackSource = null
@@ -994,10 +1123,15 @@ fun MetaDetailsScreen(
                     heroTrailerAutoplayReady = false
                     heroTrailerManualPlayback = false
                     heroTrailerDismissed = true
-                    heroTrailerFinished = true
-                    heroTrailerPlaybackSource = null
                 }
-                val onPrimaryPlayClick: () -> Unit = {
+                val onPrimaryPlayClick: () -> Unit = primaryPlay@{
+                    // A show with episodes but no episode to start (nothing released yet) must not
+                    // fall through to the bare show id below: that searches streams for "any
+                    // episode" and records progress no episode can ever match.
+                    if (hasEpisodes && seriesAction == null) {
+                        NuvioToastController.show(localizedString(Res.string.details_no_released_episode_to_play_yet))
+                        return@primaryPlay
+                    }
                     if (onPlay != null) {
                         dropTrailerForPlaybackNavigation()
                     }
@@ -1055,6 +1189,19 @@ fun MetaDetailsScreen(
                     randomPlayAutoPlayHandled = true
                     onAutoPlayOnLoadConsumed?.invoke()
                     onPrimaryPlayClick()
+                }
+                // fork:voice-control - "play" / "start playback" on this page presses its Play button.
+                if (onPlay != null) {
+                    val latestPrimaryPlay = rememberUpdatedState(onPrimaryPlayClick)
+                    DisposableEffect(meta.id) {
+                        val target: () -> Unit = { latestPrimaryPlay.value() }
+                        com.nuvio.app.features.voice.VoiceScreenTargets.detailsPlay = target
+                        onDispose {
+                            if (com.nuvio.app.features.voice.VoiceScreenTargets.detailsPlay === target) {
+                                com.nuvio.app.features.voice.VoiceScreenTargets.detailsPlay = null
+                            }
+                        }
+                    }
                 }
                 val alternatePlayHandler = onPlayAlternate
                 val primaryPlaybackVideoId =
@@ -1127,8 +1274,9 @@ fun MetaDetailsScreen(
                 // immediately and is indistinguishable from an ordinary Resume, so the gesture read
                 // as doing nothing at all. Which `useAlternate` value actually reaches the picker
                 // depends on the preference, so it is resolved rather than hardcoded.
-                val primaryAlternateOpensPicker = localLibraryUiState.playbackPreference
-                    .alternateOpensSourcePicker(primaryHasLocalPlayback)
+                val primaryAlternateOpensPicker = remember(meta.id, primaryPlaybackVideoId, localLibraryUiState) {
+                    LocalLibraryRepository.routingFor(meta.id, primaryPlaybackVideoId)
+                }.alternateOpensSourcePicker(primaryHasLocalPlayback)
                 val showManualPlayOption = alternatePlayHandler != null
                 val onPrimaryPlayLongClick: (() -> Unit)? = alternatePlayHandler
                     ?.let { alternatePlay ->
@@ -1137,6 +1285,10 @@ fun MetaDetailsScreen(
                                 // The configured preference already routes a normal click to the
                                 // picker, so the normal handler is the one that opens it.
                                 onPrimaryPlayClick()
+                                return@playSecondary
+                            }
+                            if (hasEpisodes && seriesAction == null) {
+                                NuvioToastController.show(localizedString(Res.string.details_no_released_episode_to_play_yet))
                                 return@playSecondary
                             }
                             dropTrailerForPlaybackNavigation()
@@ -1297,7 +1449,7 @@ fun MetaDetailsScreen(
                     episodeSearchQuery = ""
                     episodeSearchInputReady = false
                     if (detailsKeyboardNavigationEnabled) {
-                        try { tvFocusRequester.requestFocus() } catch (_: Exception) {}
+                        tvFocusRequester.requestFocusLogged()
                     }
                 }
                 val tvCoroutineScope = rememberCoroutineScope()
@@ -1311,6 +1463,7 @@ fun MetaDetailsScreen(
                         withSeasonOrEp
                             .sortedWith(metaVideoSeasonEpisodeComparator)
                             .groupBy { normalizeSeasonNumber(it.effectiveSeasonNumber()) }
+                            .withEpisodeRanges()
                     } else if (meta.type != "series" && episodeVideosForTv.isNotEmpty()) {
                         mapOf(normalizeSeasonNumber(null) to episodeVideosForTv)
                     } else {
@@ -1318,12 +1471,10 @@ fun MetaDetailsScreen(
                     }
                 }
                 val seasonsForTv = remember(groupedEpisodesForTv) {
-                    groupedEpisodesForTv.keys.sortedBy(::seasonSortKey)
+                    groupedEpisodesForTv.keys.sortedBy(::episodeGroupSortKey)
                 }
-                val defaultSeasonForTv = remember(seasonsForTv, preferredSeriesSeasonNumber) {
-                    preferredSeriesSeasonNumber
-                        ?.let(::normalizeSeasonNumber)
-                        ?.takeIf { it in groupedEpisodesForTv }
+                val defaultSeasonForTv = remember(seasonsForTv, preferredSeriesSeasonNumber, preferredSeriesEpisodeNumber) {
+                    groupedEpisodesForTv.episodeGroupKeyFor(preferredSeriesSeasonNumber, preferredSeriesEpisodeNumber)
                         ?: seasonsForTv.firstOrNull()
                         ?: SPECIALS_SEASON_NUMBER
                 }
@@ -1331,6 +1482,11 @@ fun MetaDetailsScreen(
                 val currentSeasonForTv = selectedSeasonForTv
                     ?.takeIf { it in groupedEpisodesForTv }
                     ?: defaultSeasonForTv
+                // A long show decorates the season it opens on first and the rest in the background;
+                // a season picked before that lands is fetched now (no-op once it is decorated).
+                LaunchedEffect(meta.id, currentSeasonForTv) {
+                    currentSeasonForTv?.let(MetaDetailsRepository::prioritizeSeason)
+                }
 
                 LaunchedEffect(meta.id) {
                     listState.scrollToItem(0)
@@ -1381,6 +1537,7 @@ fun MetaDetailsScreen(
                     meta.trailers,
                     meta.collectionItems,
                     meta.moreLikeThis,
+                    sameCast,
                 ) {
                     buildList {
                         if (MetaScreenSectionKey.TRAILERS in visibleSectionKeys && meta.trailers.isNotEmpty()) {
@@ -1394,6 +1551,9 @@ fun MetaDetailsScreen(
                         }
                         if (MetaScreenSectionKey.MORE_LIKE_THIS in visibleSectionKeys && meta.moreLikeThis.isNotEmpty()) {
                             add(DETAIL_MORE_LIKE_THIS_SELECTOR)
+                        }
+                        if (sameCast.isNotEmpty()) {
+                            add(DETAIL_SAME_CAST_SELECTOR)
                         }
                     }
                 }
@@ -1420,6 +1580,7 @@ fun MetaDetailsScreen(
                         add(toggleSaved)
                         onMonitorClick?.let { add(it) }
                         openRatingDialog?.let { add(it) }
+                        add { PlaylistAddController.request(playlistAddTargetFor(meta)) }
                     }
                 }
 
@@ -1435,6 +1596,7 @@ fun MetaDetailsScreen(
                     mergedSelectorTabs,
                     meta.collectionItems,
                     meta.moreLikeThis,
+                    sameCast,
                     hasEpisodes,
                     mergedDetailKeyboardNavigation,
                 ) {
@@ -1490,6 +1652,16 @@ fun MetaDetailsScreen(
                                             lazyItemIndex = 0,
                                             itemCount = meta.moreLikeThis.size,
                                             onEnter = { idx -> meta.moreLikeThis.getOrNull(idx)?.let { onOpenMeta?.invoke(it) } },
+                                        ),
+                                    )
+                                }
+                                DETAIL_SAME_CAST_SELECTOR -> if (sameCast.isNotEmpty()) {
+                                    add(
+                                        MetaTvSection(
+                                            kind = MetaTvSectionKind.SAME_CAST,
+                                            lazyItemIndex = 0,
+                                            itemCount = sameCast.size,
+                                            onEnter = { idx -> sameCast.getOrNull(idx)?.let { onOpenMeta?.invoke(it) } },
                                         ),
                                     )
                                 }
@@ -1608,7 +1780,7 @@ fun MetaDetailsScreen(
                 val gameModeActive by GameModeController.active.collectAsStateWithLifecycle()
                 LaunchedEffect(detailsKeyboardNavigationEnabled, gameModeActive) {
                     if (detailsKeyboardNavigationEnabled && !gameModeActive) {
-                        runCatching { tvFocusRequester.requestFocus() }
+                        tvFocusRequester.requestFocusLogged()
                     }
                 }
 
@@ -1621,6 +1793,7 @@ fun MetaDetailsScreen(
                     focusedEpisodeIndex = tvFocus.itemIndex.takeIf { tvFocusedSection?.kind == MetaTvSectionKind.EPISODES },
                     focusedCollectionIndex = tvFocus.itemIndex.takeIf { tvFocusedSection?.kind == MetaTvSectionKind.COLLECTION },
                     focusedMoreLikeThisIndex = tvFocus.itemIndex.takeIf { tvFocusedSection?.kind == MetaTvSectionKind.MORE_LIKE_THIS },
+                    focusedSameCastIndex = tvFocus.itemIndex.takeIf { tvFocusedSection?.kind == MetaTvSectionKind.SAME_CAST },
                 )
 
                 LaunchedEffect(tvFocusInfo.focusedSeasonIndex, seasonsForTv, mergedSelectorTabs, mergedDetailKeyboardNavigation) {
@@ -1684,15 +1857,25 @@ fun MetaDetailsScreen(
                     heroTrailerManualPlayback = false
                     heroTrailerDismissed = true
                 }
+                // A startup overlay (updater, API-key prompt, setup wizard) is a Compose sheet the
+                // native trailer would paint over, so the countdown holds while one is up and
+                // starts again from zero once it closes. The source picker docks into the very
+                // area the trailer plays in, so it holds the trailer the same way.
+                val startupOverlayVisible = startupOverlay != null || streamPickerRequest != null
                 LaunchedEffect(
                     heroTrailerSourceUrl,
                     metaScreenSettingsUiState.heroTrailerDelaySeconds,
                     isLeavingDetails,
                     heroTrailerManualPlayback,
                     heroTrailerDismissed,
+                    startupOverlayVisible,
                 ) {
                     heroTrailerAutoplayReady = false
-                    if (heroTrailerSourceUrl == null || isLeavingDetails || heroTrailerDismissed) return@LaunchedEffect
+                    if (heroTrailerSourceUrl == null || isLeavingDetails || heroTrailerDismissed ||
+                        startupOverlayVisible
+                    ) {
+                        return@LaunchedEffect
+                    }
                     // Both paths keep playWhenReady false during this wait, so the surface attaches
                     // paused and decodes its first frame before playback starts. The automatic path
                     // waits the configured delay; a user-clicked trailer only needs a brief buffer.
@@ -1715,13 +1898,25 @@ fun MetaDetailsScreen(
                 // the native child to 1px (see HeroTrailerPlayerSurface.desktop.kt), and closing the
                 // modal resumes in place — the same park/resume the scroll gate below already uses,
                 // so the surface is never torn down and never comes back on a black frame.
-                val heroTrailerModalVisible = showLibraryListPicker ||
+                // Another screen is opening over this one (a cast member, a related title, a browse
+                // page). The outgoing entry drops out of RESUMED as the navigation starts, but stays
+                // composed through the transition, so without this the native trailer kept painting
+                // over the incoming page for several frames. Back is covered by isLeavingDetails.
+                val detailsLifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateAsState()
+                val detailsCovered = !detailsLifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+                // The after-playback rating prompt is drawn by a host above every screen, so this screen only
+                // learns of it through the shared flag.
+                val ratingPromptShowing by RatingPromptRepository.isShowing.collectAsStateWithLifecycle()
+                val heroTrailerModalVisible = detailsCovered ||
+                    ratingPromptShowing ||
+                    showLibraryListPicker ||
                     showRatingDialog ||
                     showMonitorDialog ||
                     selectedEpisodeForActions != null ||
                     selectedSeasonForActions != null ||
                     recapBoundary != null ||
                     selectedComment != null ||
+                    startupOverlayVisible ||
                     // Only non-null while another trailer is being resolved/played elsewhere (the
                     // play-in-hero path clears it), so this never fights hero playback itself.
                     selectedTrailer != null
@@ -1747,13 +1942,18 @@ fun MetaDetailsScreen(
                 // — while the native hero-trailer surface holds OS focus — by DetailTvKeyboardBridge
                 // (see the surface's global key dispatcher). Both feed identical navigation.
                 val handleDetailTvKey: (DetailTvKey) -> Boolean = handleKey@{ key ->
-                    if ((key == DetailTvKey.Dismiss || key == DetailTvKey.Back) &&
-                        heroTrailerSourceUrl != null && !heroTrailerDismissed
-                    ) {
+                    // Escape puts away a hero trailer that is on screen; otherwise it leaves, like
+                    // Back. A trailer counts once it is actually showing, not once a source has
+                    // resolved: that happens seconds before it appears, and Escape then "dismissed"
+                    // something invisible and did nothing visible (2026-10-19). Escape is the key
+                    // under the left hand while the right is on the mouse, so it must leave.
+                    val heroTrailerShowing = heroTrailerSourceUrl != null && !heroTrailerDismissed &&
+                        heroTrailerReady && heroTrailerPlayWhenReady
+                    if (key == DetailTvKey.Dismiss && heroTrailerShowing) {
                         dismissHeroTrailerPlayback()
                         return@handleKey true
                     }
-                    if (key == DetailTvKey.Back) {
+                    if (key == DetailTvKey.Back || key == DetailTvKey.Dismiss) {
                         onBack()
                         return@handleKey true
                     }
@@ -1903,6 +2103,11 @@ fun MetaDetailsScreen(
                     }
                 }
                 val currentHandleDetailTvKey = rememberUpdatedState(handleDetailTvKey)
+                // The picker held keyboard focus while it was open; take it back when it closes.
+                LaunchedEffect(streamPickerClosedCount) {
+                    if (streamPickerClosedCount == 0 || !detailsKeyboardNavigationEnabled) return@LaunchedEffect
+                    tvFocusRequester.requestFocusLogged()
+                }
                 LaunchedEffect(Unit) {
                     DetailTvKeyboardBridge.keys.collect { key ->
                         if (detailsKeyboardNavigationEnabled) {
@@ -1954,13 +2159,17 @@ fun MetaDetailsScreen(
                         .then(
                             if (detailsKeyboardNavigationEnabled) {
                                 Modifier
+                                    // Focus router fallback (KeyLayers): an arrow or OK that went to no one puts focus
+                                    // back here.
+                                    .keyLayer("Details") { tvFocusRequester.requestFocusLogged() }
                                     .focusRequester(tvFocusRequester)
                                     .focusable()
                                     .onPointerEvent(PointerEventType.Move) { event ->
                                         mouseActivity.onMouseMoved(event.changes.first().position)
                                     }
                             } else {
-                                Modifier
+                                // Its controls take focus themselves; the fallback returns it to the last one (KeyLayers).
+                                Modifier.keyLayer("Details")
                             },
                         ),
                 ) {
@@ -2091,6 +2300,7 @@ fun MetaDetailsScreen(
                                         onHeightChanged = { heroHeightPx = it },
                                         heroTrailerSourceUrl = heroTrailerSourceUrl,
                                         heroTrailerSourceAudioUrl = heroTrailerSourceAudioUrl,
+                                        heroTrailerSourceHeaders = heroTrailerPlaybackSource?.headers.orEmpty(), // fork:trailer-signed-in
                                         heroTrailerReady = heroTrailerReady && heroTrailerPlayWhenReady,
                                         heroTrailerPlayWhenReady = heroTrailerPlayWhenReady,
                                         heroTrailerMuted = heroTrailerMuted,
@@ -2104,6 +2314,10 @@ fun MetaDetailsScreen(
                                             dominantBackdropImageBitmap = imageBitmap
                                         },
                                         desktopOverlay = useDesktopDetailLayout,
+                                        backdropFrosted = useDesktopDetailLayout &&
+                                            streamPickerRequest?.launch?.let { launch ->
+                                                (launch.parentMetaId ?: launch.videoId) == meta.id
+                                            } == true,
                                         discoveryFacts = if (metaScreenSettingsUiState.discoveryBadgesEnabled) {
                                             heroDiscoveryFacts
                                         } else {
@@ -2123,6 +2337,7 @@ fun MetaDetailsScreen(
                                         showCast = useDesktopDetailLayout &&
                                             MetaScreenSectionKey.CAST in enabledHeroSections &&
                                             meta.cast.isNotEmpty(),
+                                        castEpisodeCountVisibility = metaScreenSettingsUiState.castEpisodeCountVisibility,
                                         showProduction = useDesktopDetailLayout &&
                                             MetaScreenSectionKey.PRODUCTION in enabledHeroSections &&
                                             hasProductionSection,
@@ -2152,7 +2367,7 @@ fun MetaDetailsScreen(
                                             HeroTrailerAudioState.setVolume(newVolume)
                                         },
                                         onHeroTrailerReclaimFocus = {
-                                            try { tvFocusRequester.requestFocus() } catch (_: Exception) {}
+                                            tvFocusRequester.requestFocusLogged()
                                         },
                                         onHeroTrailerDismiss = dismissHeroTrailerPlayback,
                                         onHeroTrailerReady = {
@@ -2169,9 +2384,21 @@ fun MetaDetailsScreen(
                                             heroTrailerManualPlayback = false
                                         },
                                         onHeroTrailerError = {
-                                            heroTrailerReady = false
-                                            heroTrailerDismissed = true
-                                            heroTrailerManualPlayback = false
+                                            val retryTrailer = heroTrailerLastClicked ?: heroTrailerCandidate
+                                            // Never while the picker is open: the retry goes
+                                            // through the click path, which would close it.
+                                            if (!heroTrailerRetryUsed && retryTrailer != null && streamPickerRequest == null) {
+                                                // The auto candidate keeps its mute state; the
+                                                // click path would otherwise turn sound on.
+                                                val keepMuted = heroTrailerLastClicked == null && heroTrailerMuted
+                                                playTrailerInHero.value(retryTrailer)
+                                                heroTrailerRetryUsed = true
+                                                if (keepMuted) HeroTrailerAudioState.setMuted(true)
+                                            } else {
+                                                heroTrailerReady = false
+                                                heroTrailerDismissed = true
+                                                heroTrailerManualPlayback = false
+                                            }
                                         },
                                     )
                                     val showDesktopEpisodesOverlay = useDesktopDetailLayout &&
@@ -2182,11 +2409,15 @@ fun MetaDetailsScreen(
                                         (
                                             MetaScreenSectionKey.TRAILERS in enabledHeroSections && meta.trailers.isNotEmpty() ||
                                                 MetaScreenSectionKey.COLLECTION in enabledHeroSections && meta.collectionItems.isNotEmpty() ||
-                                                MetaScreenSectionKey.MORE_LIKE_THIS in enabledHeroSections && meta.moreLikeThis.isNotEmpty()
+                                                MetaScreenSectionKey.MORE_LIKE_THIS in enabledHeroSections && meta.moreLikeThis.isNotEmpty() ||
+                                                sameCast.isNotEmpty()
                                             )
                                     if (showDesktopEpisodesOverlay) {
                                         DetailSeriesContent(
                                             meta = meta,
+                                            pickingSourceVideoId = streamPickerRequest?.launch
+                                                ?.takeIf { (it.parentMetaId ?: it.videoId) == meta.id }
+                                                ?.videoId,
                                             modifier = Modifier
                                                 .align(Alignment.BottomStart)
                                                 .fillMaxWidth()
@@ -2204,10 +2435,17 @@ fun MetaDetailsScreen(
                                             progressByVideoId = progressByVideoId,
                                             watchedKeys = watchedUiState.watchedKeys,
                                             episodeRatings = episodeImdbRatings,
+                                            episodeRatingsVisibility = metaScreenSettingsUiState.episodeRatingsVisibility,
                                             blurUnwatchedEpisodes = metaScreenSettingsUiState.blurUnwatchedEpisodes,
                                             onEpisodeClick = onEpisodePlayClick,
-                                            onEpisodeLongPress = { video -> selectedEpisodeForActions = video },
-                                            onSeasonLongPress = { season -> selectedSeasonForActions = season },
+                                            onEpisodeLongPress = { video ->
+                                                actionsMenuPosition = ContextMenuInvocation.consume()
+                                                selectedEpisodeForActions = video
+                                            },
+                                            onSeasonLongPress = { season ->
+                                                actionsMenuPosition = ContextMenuInvocation.consume()
+                                                selectedSeasonForActions = season
+                                            },
                                             externalSelectedSeason = selectedSeasonForTv,
                                             onSeasonSelected = { season -> selectedSeasonForTv = season },
                                             focusedSeasonIndex = tvFocusInfo.focusedSeasonIndex,
@@ -2229,6 +2467,10 @@ fun MetaDetailsScreen(
                                                 MetaScreenSectionKey.MORE_LIKE_THIS in enabledHeroSections
                                             }.orEmpty(),
                                             onMoreLikeThisClick = { preview -> onOpenMeta?.invoke(preview) },
+                                            sameCast = sameCast,
+                                            onSameCastClick = { preview -> onOpenMeta?.invoke(preview) },
+                                            focusedSameCastIndex = tvFocusInfo.focusedSameCastIndex,
+                                            sameCastLabelPlacement = metaScreenSettingsUiState.sameCastLabelPlacement,
                                             episodeSearchQuery = episodeSearchQuery,
                                         )
                                     } else if (showDesktopRelatedOverlay) {
@@ -2258,6 +2500,10 @@ fun MetaDetailsScreen(
                                             focusedTrailerIndex = tvFocusInfo.focusedTrailersIndex,
                                             focusedCollectionIndex = tvFocusInfo.focusedCollectionIndex,
                                             focusedMoreLikeThisIndex = tvFocusInfo.focusedMoreLikeThisIndex,
+                                            sameCast = sameCast,
+                                            onSameCastClick = { preview -> onOpenMeta?.invoke(preview) },
+                                            focusedSameCastIndex = tvFocusInfo.focusedSameCastIndex,
+                                            sameCastLabelPlacement = metaScreenSettingsUiState.sameCastLabelPlacement,
                                         )
                                     }
                                 }
@@ -2344,8 +2590,14 @@ fun MetaDetailsScreen(
                                 watchedKeys = watchedUiState.watchedKeys,
                                 blurUnwatchedEpisodes = metaScreenSettingsUiState.blurUnwatchedEpisodes,
                                 onEpisodeClick = onEpisodePlayClick,
-                                onEpisodeLongPress = { video -> selectedEpisodeForActions = video },
-                                onSeasonLongPress = { season -> selectedSeasonForActions = season },
+                                onEpisodeLongPress = { video ->
+                                    actionsMenuPosition = ContextMenuInvocation.consume()
+                                    selectedEpisodeForActions = video
+                                },
+                                onSeasonLongPress = { season ->
+                                    actionsMenuPosition = ContextMenuInvocation.consume()
+                                    selectedSeasonForActions = season
+                                },
                                 onOpenMeta = onOpenMeta,
                                 onCastClick = onCastClick,
                                 onCompanyClick = onCompanyClick,
@@ -2454,8 +2706,9 @@ fun MetaDetailsScreen(
                             // on the configured preference, so it is resolved rather than assumed:
                             // under SOURCE_PICKER with a local file present it is the *normal*
                             // click that opens the picker, and the alternate that plays the file.
-                            val alternateOpensPicker = localLibraryUiState.playbackPreference
-                                .alternateOpensSourcePicker(selectedHasLocalPlayback)
+                            val alternateOpensPicker = remember(meta.id, selectedPlaybackVideoId, localLibraryUiState) {
+                                LocalLibraryRepository.routingFor(meta.id, selectedPlaybackVideoId)
+                            }.alternateOpensSourcePicker(selectedHasLocalPlayback)
                             // Only offered when there is a local file AND a normal tap is not
                             // already playing it — with none, or under the Local library
                             // preference, this entry would duplicate the tap.
@@ -2516,7 +2769,11 @@ fun MetaDetailsScreen(
                                 canMarkPreviousEpisodes = previousEpisodes.isNotEmpty(),
                                 arePreviousEpisodesWatched = arePreviousEpisodesWatched,
                                 isSeasonWatched = isSeasonWatched,
-                                onDismiss = { selectedEpisodeForActions = null },
+                                onDismiss = {
+                                    selectedEpisodeForActions = null
+                                    actionsMenuPosition = null
+                                },
+                                contextMenuPosition = actionsMenuPosition,
                                 onRecap = if (canRecapBeforeEpisode) {
                                     {
                                         recapBoundary = RecapBoundary(
@@ -2560,6 +2817,22 @@ fun MetaDetailsScreen(
                                         onEpisodeAlternatePlayClick(selectedEpisode)
                                     } else {
                                         onEpisodePlayClick(selectedEpisode)
+                                    }
+                                },
+                                onAddToPlaylist = {
+                                    PlaylistAddController.request(
+                                        playlistAddTargetForEpisode(meta, selectedEpisode),
+                                    )
+                                },
+                                onAddSeasonToPlaylist = seasonEpisodes.takeIf { it.size > 1 }?.let { episodes ->
+                                    {
+                                        PlaylistAddController.request(
+                                            playlistAddTargetForEpisodes(
+                                                meta = meta,
+                                                label = selectedEpisode.season?.let { localizedString(Res.string.playlist_add_season, it) } ?: localizedString(Res.string.playlist_specials),
+                                                videos = episodes,
+                                            ),
+                                        )
                                     }
                                 },
                             )
@@ -2609,7 +2882,11 @@ fun MetaDetailsScreen(
                                 seasonLabel = seasonLabel,
                                 isSeasonWatched = isSeasonWatched,
                                 canMarkPreviousSeasons = canMarkPreviousSeasons,
-                                onDismiss = { selectedSeasonForActions = null },
+                                onDismiss = {
+                                    selectedSeasonForActions = null
+                                    actionsMenuPosition = null
+                                },
+                                contextMenuPosition = actionsMenuPosition,
                                 onRecap = if (canRecap) {
                                     { recapBoundary = RecapBoundary(season = selectedSeason) }
                                 } else {
@@ -2629,6 +2906,13 @@ fun MetaDetailsScreen(
                                         areCurrentlyWatched = false,
                                     )
                                 },
+                                onAddSeasonToPlaylist = seasonEpisodes.takeIf { it.isNotEmpty() }?.let { episodes ->
+                                    {
+                                        PlaylistAddController.request(
+                                            playlistAddTargetForEpisodes(meta, seasonLabel, episodes),
+                                        )
+                                    }
+                                },
                             )
                         }
 
@@ -2640,6 +2924,26 @@ fun MetaDetailsScreen(
                                 onDismiss = { recapBoundary = null },
                             )
                         }
+
+                        DetailsThemeSong( // fork:themesong
+                            metaType = meta.type,
+                            metaName = meta.name,
+                            releaseInfo = meta.releaseInfo,
+                            metaId = meta.id,
+                            isAnime = com.nuvio.app.features.player.isAnimeFromGenres(
+                                genres = meta.genres,
+                                originalLanguage = meta.language,
+                                originCountries = listOfNotNull(meta.country),
+                            ),
+                            deferredWorkAllowed = deferredMetaWorkAllowed,
+                            leavingDetails = isLeavingDetails,
+                            heroTrailerAudible = heroTrailerSourceUrl != null && heroTrailerPlayWhenReady && !heroTrailerMuted,
+                            modalVisible = heroTrailerModalVisible,
+                            // An auto-playing trailer with sound is resolving or counting down.
+                            heroTrailerPending = heroTrailerPlaybackEnabled && heroTrailerCandidate != null &&
+                                !heroTrailerManualOnly && !heroTrailerFinished && !heroTrailerDismissed &&
+                                !heroTrailerMuted,
+                        )
 
                         if (inAppTrailerPlaybackEnabled) {
                             TrailerPlayerPopup(
@@ -2696,7 +3000,7 @@ fun MetaDetailsScreen(
                                     pickerPending = true
                                     pickerError = null
                                     runCatching {
-                                        LibraryRepository.applyMembershipChanges(
+                                        LibraryRepository.applyConnectedMembershipChanges(
                                             item = meta.toLibraryItem(savedAtEpochMs = 0L),
                                             desiredMembership = pickerMembership,
                                         )
@@ -2707,6 +3011,10 @@ fun MetaDetailsScreen(
                                     }
                                     pickerPending = false
                                 }
+                            },
+                            onAddToAll = {
+                                showLibraryListPicker = false
+                                LibraryRepository.addToAllLibraries(meta.toLibraryItem(savedAtEpochMs = 0L))
                             },
                         )
 
@@ -2724,6 +3032,7 @@ fun MetaDetailsScreen(
                                     showRatingDialog = false
                                 }
                             },
+                            initialScore = savedRating,
                         )
 
                         selectedComment?.let { comment ->
@@ -2833,7 +3142,7 @@ private fun areEpisodesWatchedForActions(
     )
 }
 
-private fun MetaVideo.streamVideoIdForPlayback(parentMetaId: String, playbackVideoId: String): String {
+internal fun MetaVideo.streamVideoIdForPlayback(parentMetaId: String, playbackVideoId: String): String {
     val rawId = id.trim()
     return if (parentMetaId.isNativeAnimeMetaId() && rawId.isBareNumericId()) {
         playbackVideoId
@@ -2866,7 +3175,7 @@ private fun String.isNativeAnimeMetaId(): Boolean =
         startsWith("anidb:", ignoreCase = true) ||
         startsWith("simkl:", ignoreCase = true)
 
-private fun String.isBareNumericId(): Boolean =
+internal fun String.isBareNumericId(): Boolean =
     isNotBlank() && all(Char::isDigit)
 
 private fun extractImdbId(value: String?): String? =
@@ -3137,7 +3446,7 @@ private fun EpisodeSearchOverlay(
     LaunchedEffect(Unit) {
         // Let the overlay enter composition before handing focus to its text editor.
         delay(1)
-        try { focusRequester.requestFocus() } catch (_: Exception) {}
+        focusRequester.requestFocusLogged()
     }
 
     Column(
@@ -3266,6 +3575,7 @@ private fun metaSectionHasContent(
 private const val DETAIL_TRAILER_SELECTOR = Int.MIN_VALUE
 private const val DETAIL_COLLECTION_SELECTOR = Int.MAX_VALUE - 1
 private const val DETAIL_MORE_LIKE_THIS_SELECTOR = Int.MAX_VALUE
+private const val DETAIL_SAME_CAST_SELECTOR = Int.MAX_VALUE - 2
 
 // Brief pause before a clicked hero trailer starts, so the native surface can attach and
 // decode its first frame while paused (mirrors the automatic path's longer wait). Without
@@ -3273,7 +3583,7 @@ private const val DETAIL_MORE_LIKE_THIS_SELECTOR = Int.MAX_VALUE
 private const val HERO_TRAILER_MANUAL_PREBUFFER_MS = 750L
 
 private enum class MetaTvSectionKind {
-    ACTIONS, COMMENTS, TRAILERS, SEASONS, EPISODES, COLLECTION, MORE_LIKE_THIS
+    ACTIONS, COMMENTS, TRAILERS, SEASONS, EPISODES, COLLECTION, MORE_LIKE_THIS, SAME_CAST
 }
 
 private data class MetaTvSection(
@@ -3293,6 +3603,7 @@ private data class MetaTvFocusInfo(
     val focusedEpisodeIndex: Int? = null,
     val focusedCollectionIndex: Int? = null,
     val focusedMoreLikeThisIndex: Int? = null,
+    val focusedSameCastIndex: Int? = null,
 )
 
 @Composable
@@ -3454,6 +3765,11 @@ private fun ConfiguredMetaSections(
                                 onClick = rate,
                             )
                         },
+                        DetailSecondaryAction(
+                            label = stringResource(Res.string.playlist_add_to_playlist_2),
+                            icon = Icons.AutoMirrored.Filled.PlaylistAdd,
+                            onClick = { PlaylistAddController.request(playlistAddTargetFor(meta)) },
+                        ),
                     ),
                     isTablet = isTablet,
                     onPlayClick = onPrimaryPlayClick,
@@ -3462,7 +3778,7 @@ private fun ConfiguredMetaSections(
                 )
             }
             MetaScreenSectionKey.OVERVIEW -> {
-                DetailMetaInfo(meta = meta)
+                DetailMetaInfo(meta = meta, showOverallRatings = settings.showOverallRatings)
             }
             MetaScreenSectionKey.PRODUCTION -> {
                 if (hasProductionSection) {
@@ -3473,6 +3789,7 @@ private fun ConfiguredMetaSections(
                 DetailCastSection(
                     cast = meta.cast,
                     showHeader = showHeader,
+                    showEpisodeCounts = settings.castEpisodeCountVisibility.showCounts(meta.genres),
                     onCastClick = onCastClick,
                     sharedTransitionScope = sharedTransitionScope,
                     animatedVisibilityScope = animatedVisibilityScope,
@@ -3515,6 +3832,7 @@ private fun ConfiguredMetaSections(
                         progressByVideoId = progressByVideoId,
                         watchedKeys = watchedKeys,
                         episodeRatings = episodeImdbRatings,
+                        episodeRatingsVisibility = settings.episodeRatingsVisibility,
                         blurUnwatchedEpisodes = blurUnwatchedEpisodes,
                         onEpisodeClick = onEpisodeClick,
                         onEpisodeLongPress = onEpisodeLongPress,
@@ -3554,6 +3872,7 @@ private fun ConfiguredMetaSections(
                     val sourceLabel = when (meta.moreLikeThisSource) {
                         MoreLikeThisSource.TMDB -> stringResource(Res.string.detail_more_like_this_powered_by_tmdb)
                         MoreLikeThisSource.TRAKT -> stringResource(Res.string.detail_more_like_this_powered_by_trakt)
+                        MoreLikeThisSource.SIMKL -> stringResource(Res.string.detail_more_like_this_powered_by_simkl)
                         null -> null
                     }
                     DetailPosterRailSection(

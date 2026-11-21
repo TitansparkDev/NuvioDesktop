@@ -27,18 +27,24 @@ internal expect object ThemeSettingsStorage {
     fun saveDesktopSettingsFullWidth(enabled: Boolean)
     fun loadWasdNavigationEnabled(): Boolean?
     fun saveWasdNavigationEnabled(enabled: Boolean)
+    fun loadHoldToSelectEnabled(): Boolean?
+    fun saveHoldToSelectEnabled(enabled: Boolean)
     fun loadDesktopNavigationLayout(): String?
     fun saveDesktopNavigationLayout(layoutName: String)
     fun loadDesktopTopBarAlwaysVisible(): Boolean?
     fun saveDesktopTopBarAlwaysVisible(enabled: Boolean)
     fun loadDesktopDiscoverTabVisible(): Boolean?
     fun saveDesktopDiscoverTabVisible(visible: Boolean)
+    fun loadDesktopSidebarItemsTop(): Boolean?
+    fun saveDesktopSidebarItemsTop(top: Boolean)
     fun loadDesktopAppUiScalePercent(): Int?
     fun saveDesktopAppUiScalePercent(percent: Int)
     fun loadDesktopAppUiScaleAppliesToDetails(): Boolean?
     fun saveDesktopAppUiScaleAppliesToDetails(enabled: Boolean)
     fun loadAppFontFamily(): String?
     fun saveAppFontFamily(fontFamily: String)
+    fun loadAppFontScalePercent(): Int?
+    fun saveAppFontScalePercent(percent: Int)
     fun loadSelectedAppLanguage(): String?
     fun saveSelectedAppLanguage(languageCode: String)
     fun applySelectedAppLanguage(languageCode: String)

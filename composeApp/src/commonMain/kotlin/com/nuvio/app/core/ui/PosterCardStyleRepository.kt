@@ -52,11 +52,20 @@ enum class PosterHighlightMode {
     Accent,
     Shine,
     Sweep,
+
+    /**
+     * The What to watch picker's bloom, in the card's own main colour (TonightAmbient), in place of the highlighted
+     * card's enlarge: enlarged as well, the glow ran over the next poster (Nov 16, chosen over a narrower glow that
+     * kept the enlarge).
+     */
+    Glow,
     ;
 
     companion object {
         fun fromStoredName(name: String?): PosterHighlightMode =
-            entries.firstOrNull { it.name == name } ?: Off
+            entries.firstOrNull { it.name == name }
+                // The no-zoom glow was "GlowFlat" while both versions were on trial.
+                ?: if (name == "GlowFlat") Glow else Off
     }
 }
 
@@ -69,9 +78,10 @@ private data class StoredPosterCardStylePreferences(
     val collectionsPortraitPostersEnabled: Boolean = false,
     val landscapeTextTitlesEnabled: Boolean = false,
     val landscapeRatingBadgeScale: String = "OutOfTen",
-    val posterHighlightMode: String = "Off",
+    val portraitRatingBadgeScale: String = "Off",
+    val posterHighlightMode: String = "Shine",
     val hideLabelsEnabled: Boolean = false,
-    val depthEnabled: Boolean = false,
+    val depthEnabled: Boolean = true,
     val depthEdgeStrength: Int = 42,
     val depthSheenStrength: Int = 10,
     val depthEdgeCoverage: Int = 64,
@@ -81,6 +91,7 @@ private data class StoredPosterCardStylePreferences(
     val depthCast: Boolean = true,
     val depthTrailers: Boolean = true,
     val zoomActionPreviewEnabled: Boolean = true,
+    val watchlistBadgeEnabled: Boolean = false,
 )
 
 data class PosterCardStyleUiState(
@@ -93,10 +104,12 @@ data class PosterCardStyleUiState(
     val landscapeTextTitlesEnabled: Boolean = false,
     /** Corner rating badge on landscape cards, using whatever score the row's catalog supplied. */
     val landscapeRatingBadgeScale: PosterRatingBadgeScale = PosterRatingBadgeScale.OutOfTen,
+    /** The same badge on portrait posters. Off by default: posters often carry their own art text. */
+    val portraitRatingBadgeScale: PosterRatingBadgeScale = PosterRatingBadgeScale.Off,
     /** Ring drawn around the highlighted poster in addition to its magnification. */
-    val posterHighlightMode: PosterHighlightMode = PosterHighlightMode.Off,
+    val posterHighlightMode: PosterHighlightMode = PosterHighlightMode.Shine,
     val hideLabelsEnabled: Boolean = false,
-    val depthEnabled: Boolean = false,
+    val depthEnabled: Boolean = true,
     val depthEdgeStrength: Int = 42,
     val depthSheenStrength: Int = 10,
     val depthEdgeCoverage: Int = 64,
@@ -106,6 +119,7 @@ data class PosterCardStyleUiState(
     val depthCast: Boolean = true,
     val depthTrailers: Boolean = true,
     val zoomActionPreviewEnabled: Boolean = true,
+    val watchlistBadgeEnabled: Boolean = false,
 )
 
 object PosterCardStyleRepository {
@@ -187,6 +201,13 @@ object PosterCardStyleRepository {
         persist()
     }
 
+    fun setPortraitRatingBadgeScale(scale: PosterRatingBadgeScale) {
+        ensureLoaded()
+        if (_uiState.value.portraitRatingBadgeScale == scale) return
+        _uiState.value = _uiState.value.copy(portraitRatingBadgeScale = scale)
+        persist()
+    }
+
     fun setPosterHighlightMode(mode: PosterHighlightMode) {
         ensureLoaded()
         if (_uiState.value.posterHighlightMode == mode) return
@@ -231,10 +252,46 @@ object PosterCardStyleRepository {
         persist()
     }
 
+    /** Every card depth value at once, for [CardDepthSync]: one publish and one write. */
+    internal fun applyDepth(
+        enabled: Boolean,
+        edgeStrength: Int,
+        sheenStrength: Int,
+        edgeCoverage: Int,
+        posters: Boolean,
+        continueWatching: Boolean,
+        episodes: Boolean,
+        cast: Boolean,
+        trailers: Boolean,
+    ) {
+        ensureLoaded()
+        val next = _uiState.value.copy(
+            depthEnabled = enabled,
+            depthEdgeStrength = edgeStrength.coerceIn(0, 100),
+            depthSheenStrength = sheenStrength.coerceIn(0, 100),
+            depthEdgeCoverage = edgeCoverage.coerceIn(0, 100),
+            depthPosters = posters,
+            depthContinueWatching = continueWatching,
+            depthEpisodes = episodes,
+            depthCast = cast,
+            depthTrailers = trailers,
+        )
+        if (next == _uiState.value) return
+        _uiState.value = next
+        persist()
+    }
+
     fun setZoomActionPreviewEnabled(enabled: Boolean) {
         ensureLoaded()
         if (_uiState.value.zoomActionPreviewEnabled == enabled) return
         _uiState.value = _uiState.value.copy(zoomActionPreviewEnabled = enabled)
+        persist()
+    }
+
+    fun setWatchlistBadgeEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (_uiState.value.watchlistBadgeEnabled == enabled) return
+        _uiState.value = _uiState.value.copy(watchlistBadgeEnabled = enabled)
         persist()
     }
 
@@ -279,6 +336,10 @@ object PosterCardStyleRepository {
                 landscapeRatingBadgeScale = PosterRatingBadgeScale.fromStoredName(
                     stored.landscapeRatingBadgeScale,
                 ),
+                // fromStoredName falls back to OutOfTen, which suits landscape; portrait is opt-in.
+                portraitRatingBadgeScale = PosterRatingBadgeScale.entries
+                    .firstOrNull { it.name == stored.portraitRatingBadgeScale }
+                    ?: PosterRatingBadgeScale.Off,
                 posterHighlightMode = PosterHighlightMode.fromStoredName(stored.posterHighlightMode),
                 hideLabelsEnabled = stored.hideLabelsEnabled,
                 depthEnabled = stored.depthEnabled,
@@ -291,6 +352,7 @@ object PosterCardStyleRepository {
                 depthCast = stored.depthCast,
                 depthTrailers = stored.depthTrailers,
                 zoomActionPreviewEnabled = stored.zoomActionPreviewEnabled,
+                watchlistBadgeEnabled = stored.watchlistBadgeEnabled,
             )
         } else {
             PosterCardStyleUiState()
@@ -308,6 +370,7 @@ object PosterCardStyleRepository {
                     collectionsPortraitPostersEnabled = _uiState.value.collectionsPortraitPostersEnabled,
                     landscapeTextTitlesEnabled = _uiState.value.landscapeTextTitlesEnabled,
                     landscapeRatingBadgeScale = _uiState.value.landscapeRatingBadgeScale.name,
+                    portraitRatingBadgeScale = _uiState.value.portraitRatingBadgeScale.name,
                     posterHighlightMode = _uiState.value.posterHighlightMode.name,
                     hideLabelsEnabled = _uiState.value.hideLabelsEnabled,
                     depthEnabled = _uiState.value.depthEnabled,
@@ -320,6 +383,7 @@ object PosterCardStyleRepository {
                     depthCast = _uiState.value.depthCast,
                     depthTrailers = _uiState.value.depthTrailers,
                     zoomActionPreviewEnabled = _uiState.value.zoomActionPreviewEnabled,
+                    watchlistBadgeEnabled = _uiState.value.watchlistBadgeEnabled,
                 ),
             ),
         )

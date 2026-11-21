@@ -2,11 +2,15 @@ package com.nuvio.app.features.trailer
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.details.MetaDetailsRepository
-import com.nuvio.app.features.details.selectHeroTrailer
+import com.nuvio.app.features.details.rankHeroTrailers
 import com.nuvio.app.features.details.youtubePlaybackUrl
 import com.nuvio.app.features.library.LibraryClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -36,12 +40,15 @@ object HeroTrailerMetadataService {
      * while the details screen (which always re-extracts) played it fine.
      */
     suspend fun invalidate(type: String, id: String) {
-        cacheMutex.withLock { cache.remove(cacheKey(type, id)) }
+        cacheMutex.withLock {
+            cache.remove(cacheKey(type, id, sharpest = false))
+            cache.remove(cacheKey(type, id, sharpest = true))
+        }
     }
 
     /** Returns a cached, still-valid resolved trailer source if present, else null. */
     fun peek(type: String, id: String): TrailerPlaybackSource? {
-        val entry = cache[cacheKey(type, id)] ?: return null
+        val entry = cache[cacheKey(type, id, sharpest = false)] ?: return null
         return entry.source.takeIf { entry.expiresAtMs > LibraryClock.nowEpochMs() }
     }
 
@@ -49,9 +56,13 @@ object HeroTrailerMetadataService {
      * Resolves a playable trailer source for [type]/[id], or null when the item has no
      * usable YouTube trailer or resolution fails. Concurrent callers for the same item
      * share a single resolution.
+     *
+     * [sharpest] (the pre-show) also resolves other uploads of the trailer and plays the sharpest
+     * one; that is up to ten lookups, so the Home and details heroes, which start on focus, keep
+     * to the listed trailer. The two are cached apart.
      */
-    suspend fun resolve(type: String, id: String): TrailerPlaybackSource? {
-        val cacheKey = cacheKey(type, id)
+    suspend fun resolve(type: String, id: String, sharpest: Boolean = false): TrailerPlaybackSource? {
+        val cacheKey = cacheKey(type, id, sharpest)
         val now = LibraryClock.nowEpochMs()
         var ownsRequest = false
         val pending = cacheMutex.withLock {
@@ -65,6 +76,23 @@ object HeroTrailerMetadataService {
         }
         if (!ownsRequest) return pending.await()
 
+        // The work runs in the service's own scope, not the caller's: moving off a hero used to cancel its extraction
+        // part way, the extractor reported that as "unavailable", and the next visit started again from nothing (the
+        // same trailer ids "failed" two to four times a day, all with "The coroutine scope left the composition").
+        // Finishing it means the next visit to that hero plays at once. The caller only stops waiting.
+        resolveScope.launch { pending.complete(computeAndCache(type, id, sharpest, cacheKey, now)) }
+        return pending.await()
+    }
+
+    private val resolveScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private suspend fun computeAndCache(
+        type: String,
+        id: String,
+        sharpest: Boolean,
+        cacheKey: String,
+        now: Long,
+    ): TrailerPlaybackSource? {
         val source = try {
             // Summary rather than the details-screen record. It scopes TMDB trailers to season 1,
             // which is exactly what the spoiler filter below keeps - the full fetch was pulling a
@@ -75,17 +103,25 @@ object HeroTrailerMetadataService {
             // a major spoiler risk to surface unprompted on the hero.
             val spoilerSafeTrailers = meta?.trailers
                 ?.filter { it.seasonNumber == null || it.seasonNumber == 1 }
-            val candidate = spoilerSafeTrailers?.let(::selectHeroTrailer)
+            val ranked = spoilerSafeTrailers?.let(::rankHeroTrailers).orEmpty() // fork:trailer-quality
+            val candidate = ranked.firstOrNull()
             log.i {
                 "resolve $type/$id metaFound=${meta != null} trailers=${meta?.trailers?.size ?: 0} " +
                     "candidate=${candidate?.key} (${candidate?.site})"
             }
-            candidate?.let { TrailerPlaybackResolver.resolveFromYouTubeUrl(it.youtubePlaybackUrl()).sourceOrNull() }
-                .also { log.i { "resolve $type/$id playbackSource=${it != null}" } }
-        } catch (error: CancellationException) {
-            cacheMutex.withLock {
-                inFlightRequests.remove(cacheKey)?.completeExceptionally(error)
+            // fork:trailer-quality - the pre-show plays the sharpest upload, not just the listed one.
+            if (sharpest) {
+                SharpestTrailerResolver.resolve(meta?.name, meta?.releaseInfo, ranked.map { it.key })
+            } else {
+                candidate?.let {
+                    kotlinx.coroutines.withContext(com.nuvio.app.features.music.YouTubeCaller("hero trailer")) {
+                        TrailerPlaybackResolver.resolveTrailerFromYouTubeUrl(it.youtubePlaybackUrl()).sourceOrNull() // fork:trailer-signed-in
+                    }
+                }
             }
+                .also { log.i { "resolve $type/$id playbackSource=${it != null} height=${it?.heightPx}" } }
+        } catch (error: CancellationException) {
+            cacheMutex.withLock { inFlightRequests.remove(cacheKey)?.completeExceptionally(error) }
             throw error
         } catch (error: Throwable) {
             log.w { "Hero trailer resolve failed for $type/$id: ${error.message}" }
@@ -93,14 +129,18 @@ object HeroTrailerMetadataService {
         }
 
         val ttl = if (source == null) MISSING_TTL_MS else FOUND_TTL_MS
+        // fork:preshow-caller — a miss decided while YouTube was paused says nothing about the title, so it is not kept
+        // (on Nov 1 a pause made the pre-show's whole lineup "no trailer" for the next ten minutes).
+        val keep = source != null || !com.nuvio.app.features.music.MusicRateLimit.isBlocked()
         cacheMutex.withLock {
-            cache[cacheKey] = CachedTrailer(source = source, expiresAtMs = now + ttl)
-            inFlightRequests.remove(cacheKey)?.complete(source)
+            if (keep) cache[cacheKey] = CachedTrailer(source = source, expiresAtMs = now + ttl)
+            inFlightRequests.remove(cacheKey)
         }
         return source
     }
 
-    private fun cacheKey(type: String, id: String): String = "$type:$id"
+    private fun cacheKey(type: String, id: String, sharpest: Boolean): String =
+        if (sharpest) "$type:$id:sharpest" else "$type:$id"
 
     private data class CachedTrailer(
         val source: TrailerPlaybackSource?,

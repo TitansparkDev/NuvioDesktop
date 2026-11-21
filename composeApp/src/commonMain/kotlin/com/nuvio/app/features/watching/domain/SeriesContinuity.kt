@@ -11,6 +11,12 @@ fun resumeProgressForSeries(
     progressRecords: List<WatchingProgressRecord>,
 ): WatchingProgressRecord? = progressRecords
     .filter { record -> record.content == content && !record.isCompleted }
+    // A row with no episode for the bare show id resumes nothing: Play would search streams for
+    // "any episode". It can only come from an older build or a remote store; see
+    // isEpisodelessSeriesEntry.
+    .filterNot { record ->
+        record.seasonNumber == null && record.episodeNumber == null && record.videoId == content.id
+    }
     .maxByOrNull { record -> record.lastUpdatedEpochMs }
 
 fun continueWatchingProgressEntries(
@@ -91,12 +97,17 @@ fun decideSeriesPrimaryAction(
     todayIsoDate: String,
     preferFurthestEpisode: Boolean = true,
     showUnairedNextUp: Boolean = false,
+    /**
+     * The episode an active rewatch has reached. Replaces the history-derived seed, whose furthest
+     * episode is the original watch's finale and leaves a rewatched show with nothing after it.
+     */
+    rewatchSeed: WatchingCompletedEpisode? = null,
 ): WatchingSeriesPrimaryAction? {
     val resumeRecord = resumeProgressForSeries(
         content = content,
         progressRecords = progressRecords,
     )
-    val latestCompletedEpisode = latestCompletedSeriesEpisode(
+    val latestCompletedEpisode = rewatchSeed ?: latestCompletedSeriesEpisode(
         content = content,
         progressRecords = progressRecords,
         watchedRecords = watchedRecords,

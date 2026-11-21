@@ -132,6 +132,54 @@ internal fun shouldCascadeCompletedProgressToWatchedHistory(
 internal fun String?.isSeriesTypeForContinueWatching(): Boolean =
     equals("series", ignoreCase = true) || equals("tv", ignoreCase = true)
 
+/**
+ * Content types that name a live event rather than a recording — nothing about them can be resumed.
+ *
+ * A live HLS source reports its sliding window as the duration (about thirty seconds for the sports
+ * addons seen so far), so playback stores a position inside that window the moment it passes the
+ * store threshold and can never reach the completion fraction: the row then sits in Continue
+ * Watching showing "1m left" long after the match is over. Reported 2026-09-20 with SIMKL as the
+ * source and the seed-from-Nuvio-Sync toggle on, which appends exactly these locally-stored,
+ * tracker-unaddressable rows to the remote list.
+ *
+ * Matched by type because the meta carries nothing else structural: the sports addon marks its
+ * events only with `type: "sport"` and `releaseInfo: "LIVE"`. `tv` is deliberately absent — the
+ * Stremio spec means live channels by it, but the addons this app meets use it as a series alias
+ * (see [isSeriesTypeForContinueWatching]), and a series must keep its progress.
+ */
+internal fun String?.isLiveEventContentType(): Boolean =
+    this != null && trim().lowercase() in liveEventContentTypes
+
+private val liveEventContentTypes = setOf("sport", "sports", "event", "events", "live", "livetv", "iptv")
+
+internal fun WatchProgressEntry.isLiveEventEntry(): Boolean =
+    contentType.isLiveEventContentType() || parentMetaType.isLiveEventContentType()
+
+/**
+ * A series playback with no episode: the bare show id, no season, no episode. Only reachable when
+ * Play launched a show without resolving an episode, and harmful to keep — as the newest resumable
+ * row for the show it became the Resume target, so every later Play searched streams for "any
+ * episode" and wrote another one.
+ */
+internal fun isEpisodelessSeriesProgress(
+    parentMetaType: String,
+    parentMetaId: String,
+    videoId: String,
+    seasonNumber: Int?,
+    episodeNumber: Int?,
+): Boolean = parentMetaType.equals("series", ignoreCase = true) &&
+    seasonNumber == null &&
+    episodeNumber == null &&
+    videoId.trim() == parentMetaId.trim()
+
+internal fun WatchProgressEntry.isEpisodelessSeriesEntry(): Boolean = isEpisodelessSeriesProgress(
+    parentMetaType = parentMetaType,
+    parentMetaId = parentMetaId,
+    videoId = videoId,
+    seasonNumber = seasonNumber,
+    episodeNumber = episodeNumber,
+)
+
 private val nativeAnimeContentIdPrefixes = listOf(
     "kitsu:", "mal:", "myanimelist:", "al:", "anilist:", "anidb:",
 )

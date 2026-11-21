@@ -86,6 +86,7 @@ fun HomescreenSettingsScreen(
             heroBadgeScale = homescreenSettingsUiState.heroBadgeScale,
             heroReleaseStatusUnavailableOnly = homescreenSettingsUiState.heroReleaseStatusUnavailableOnly,
             hideUnreleasedContent = homescreenSettingsUiState.hideUnreleasedContent,
+            hideWatchedContent = homescreenSettingsUiState.hideWatchedContent,
             hideCatalogUnderline = homescreenSettingsUiState.hideCatalogUnderline,
             catalogRowShuffleEnabled = homescreenSettingsUiState.catalogRowShuffleEnabled,
             adaptiveHeroEnabled = homescreenSettingsUiState.adaptiveHeroEnabled,
@@ -149,9 +150,11 @@ fun ContinueWatchingSettingsScreen(
             useEpisodeThumbnails = continueWatchingPreferencesUiState.useEpisodeThumbnails,
             showUnairedNextUp = continueWatchingPreferencesUiState.showUnairedNextUp,
             separateNextUpRow = continueWatchingPreferencesUiState.separateNextUpRow,
+            separateUpcomingRow = continueWatchingPreferencesUiState.separateUpcomingRow,
             blurNextUp = continueWatchingPreferencesUiState.blurNextUp,
             showResumePromptOnLaunch = continueWatchingPreferencesUiState.showResumePromptOnLaunch,
             sortMode = continueWatchingPreferencesUiState.sortMode,
+            relativeAirCountdown = continueWatchingPreferencesUiState.relativeAirCountdown,
         )
     }
 }

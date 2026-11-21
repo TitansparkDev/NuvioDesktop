@@ -8,7 +8,74 @@ const isHeroTrailerSurface = (() => {
   }
 })();
 
+// The pre-show pipeline plays each clip and trailer as a plain video: a Skip button and nothing else
+// (no mute, no volume slider). Known from the page URL, like the hero-trailer flag above.
+const isPreshowSurface = (() => {
+  try {
+    return new URLSearchParams(location.search).get("preshow") === "1";
+  } catch (_err) {
+    return false;
+  }
+})();
+
+// fork:music - The music player draws its own controls and wants the bare picture: no stop button, volume pill or
+// fade scrim from the hero-trailer chrome (they showed up shrunk inside the mini-player thumbnail).
+const isChromelessSurface = (() => {
+  try {
+    return new URLSearchParams(location.search).get("chromeless") === "1";
+  } catch (_err) {
+    return false;
+  }
+})();
+
 const root = document.getElementById("playerRoot");
+// fork:youtube-mini-player - the YouTube corner player wears PiP's controls (play, seek, move and
+// resize; see the pip-ui class). Its exit button goes back up to the video and its X closes it; any
+// other click on the picture does nothing, as in PiP, so a drag never also starts something.
+root.addEventListener("click", event => {
+  // fork:pip-browse - classic PiP's X closes the video straight away, without filling the screen first.
+  if (state.pictureInPictureActive && event.target.closest("#miniPlayerCloseButton")) {
+    event.preventDefault();
+    event.stopPropagation();
+    send("pictureInPictureClose", 0);
+    return;
+  }
+  // fork:pip-browse - classic PiP's Browse button: the window back to its size, the video in its corner.
+  if (state.pictureInPictureActive && event.target.closest("#pictureInPictureBrowseButton")) {
+    event.preventDefault();
+    event.stopPropagation();
+    send("pictureInPictureBrowse", 0);
+    return;
+  }
+  if (!state.miniPlayer || state.pictureInPictureActive) return;
+  if (event.target.closest("#pictureInPictureExitButton")) {
+    event.preventDefault();
+    event.stopPropagation();
+    send("miniPlayerClick", 0);
+    return;
+  }
+  if (event.target.closest("#miniPlayerCloseButton")) {
+    event.preventDefault();
+    event.stopPropagation();
+    send("miniPlayerClose", 0);
+    return;
+  }
+  // fork:pip-browse - the corner box over the app: Pop out goes back to PiP over Windows.
+  if (event.target.closest("#miniPlayerPopOutButton")) {
+    event.preventDefault();
+    event.stopPropagation();
+    send("miniPlayerPopOut", 0);
+    return;
+  }
+  if (event.target.closest("button,input")) return;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
+
+/** The YouTube corner player (not in PiP): PiP's controls, its gestures moving the box instead of the window. */
+const isMiniPlayerUi = () => Boolean(state.miniPlayer) && !state.pictureInPictureActive;
+/** PiP or the YouTube corner player: the small video with PiP's controls. */
+const isCompactPlayerUi = () => Boolean(state.pictureInPictureActive) || isMiniPlayerUi();
 const contextMenu = document.getElementById("contextMenu");
 const seek = document.getElementById("seek");
 const pipSeek = document.getElementById("pipSeek");
@@ -17,10 +84,13 @@ const chapterMarkers = document.getElementById("chapterMarkers");
 const chapterTooltip = document.getElementById("chapterTooltip");
 const seekThumbnail = document.getElementById("seekThumbnail");
 const seekThumbnailImage = document.getElementById("seekThumbnailImage");
+const seekThumbnailSprite = document.getElementById("seekThumbnailSprite");
 const seekThumbnailChapter = document.getElementById("seekThumbnailChapter");
 const seekThumbnailTime = document.getElementById("seekThumbnailTime");
 const positionLabel = document.getElementById("position");
 const durationLabel = document.getElementById("duration");
+const minimalTime = document.getElementById("minimalTime");
+const minimalTimeSeparator = document.getElementById("minimalTimeSeparator");
 const bufferingStatus = document.getElementById("bufferingStatus");
 const playbackError = document.getElementById("playbackError");
 const playbackErrorTitle = document.getElementById("playbackErrorTitle");
@@ -34,6 +104,8 @@ const pauseTitle = document.getElementById("pauseTitle");
 const pauseSource = document.getElementById("pauseSource");
 const pauseSourceTitle = document.getElementById("pauseSourceTitle");
 const pauseSourceProvider = document.getElementById("pauseSourceProvider");
+const pauseCast = document.getElementById("pauseCast");
+const pauseCastList = document.getElementById("pauseCastList");
 const pauseEpisodeLine = document.getElementById("pauseEpisodeLine");
 const pauseEpisodeInfo = document.getElementById("pauseEpisodeInfo");
 const pauseEpisodeSeparator = document.getElementById("pauseEpisodeSeparator");
@@ -43,6 +115,7 @@ const toggle = document.getElementById("toggle");
 const toggleIcon = document.getElementById("toggleIcon");
 const lockIcon = document.getElementById("lockIcon");
 const title = document.getElementById("title");
+const titleBadges = document.getElementById("titleBadges");
 const episode = document.getElementById("episode");
 const streamTitle = document.getElementById("streamTitle");
 const providerName = document.getElementById("providerName");
@@ -51,11 +124,24 @@ const speedLabel = document.getElementById("speedLabel");
 const speedButton = document.getElementById("speedButton");
 const playerVolumeSlider = document.getElementById("playerVolumeSlider");
 const playerVolumeIcon = document.getElementById("playerVolumeIcon");
+const playerVolumeControl = document.getElementById("playerVolumeControl");
+const volumeMuteButton = document.getElementById("volumeMuteButton");
 const controlTooltip = document.getElementById("controlTooltip");
 const actionRow = document.querySelector(".action-row");
 const actionOverflowButton = document.getElementById("actionOverflowButton");
 const actionOverflowMenu = document.getElementById("actionOverflowMenu");
+const ultraMenuVolume = document.getElementById("ultraMenuVolume");
+const ultraMenuActions = document.getElementById("ultraMenuActions");
 let actionOverflowOpen = false;
+const metadataSection = document.querySelector(".metadata");
+const playlistPeekTag = document.getElementById("playlistPeekTag");
+const playlistPeek = document.getElementById("playlistPeek");
+const playlistPeekHeader = document.getElementById("playlistPeekHeader");
+const playlistPeekList = document.getElementById("playlistPeekList");
+// True while the pointer rests on the title block in playlist mode; holds the chrome up like an
+// open menu does, so the peek does not fade out from under the cursor.
+let playlistPeekOpen = false;
+let playlistPeekKey = "";
 const subtitlesLabel = document.getElementById("subtitlesLabel");
 const audioLabel = document.getElementById("audioLabel");
 const sourcesLabel = document.getElementById("sourcesLabel");
@@ -66,6 +152,7 @@ const videoSettingsButton = document.getElementById("videoSettingsButton");
 const pictureInPictureButton = document.getElementById("pictureInPictureButton");
 const pictureInPictureExitButton = document.getElementById("pictureInPictureExitButton");
 const pictureInPicturePlayButton = document.getElementById("pictureInPicturePlayButton");
+const pictureInPictureExitButtonElement = document.getElementById("pictureInPictureExitButton");
 const pictureInPictureToggleIcon = document.getElementById("pictureInPictureToggleIcon");
 const pictureInPictureResizeHandles = document.querySelectorAll("[data-pip-resize]");
 const backButton = document.getElementById("backButton");
@@ -90,7 +177,6 @@ const openingMessage = document.getElementById("openingMessage");
 const openingProgressTrack = document.getElementById("openingProgressTrack");
 const openingProgressBar = document.getElementById("openingProgressBar");
 const parentalGuide = document.getElementById("parentalGuide");
-const parentalGuideLine = document.getElementById("parentalGuideLine");
 const parentalGuideList = document.getElementById("parentalGuideList");
 const volumePill = document.getElementById("volumePill");
 const volumePillIcon = document.getElementById("volumePillIcon");
@@ -98,21 +184,45 @@ const volumePillLabel = document.getElementById("volumePillLabel");
 const skipPrompt = document.getElementById("skipPrompt");
 const skipPromptLabel = document.getElementById("skipPromptLabel");
 const skipPromptProgress = document.getElementById("skipPromptProgress");
+const skipSubmitToast = document.getElementById("skipSubmitToast");
+const skipSubmitToastTitle = document.getElementById("skipSubmitToastTitle");
+const skipSubmitToastDetail = document.getElementById("skipSubmitToastDetail");
+const skipSubmitToastHint = document.getElementById("skipSubmitToastHint");
+const skipSubmitToastProgress = document.getElementById("skipSubmitToastProgress");
 const nextEpisodeCard = document.getElementById("nextEpisodeCard");
 const nextEpisodeThumb = document.getElementById("nextEpisodeThumb");
 const nextEpisodeHeader = document.getElementById("nextEpisodeHeader");
 const nextEpisodeTitle = document.getElementById("nextEpisodeTitle");
 const nextEpisodeStatus = document.getElementById("nextEpisodeStatus");
 const nextEpisodeAction = document.getElementById("nextEpisodeAction");
+const nextEpisodeProgressFill = document.getElementById("nextEpisodeProgressFill");
 const sourcesButton = document.getElementById("sourcesButton");
 const episodesButton = document.getElementById("episodesButton");
 const episodeNotch = document.getElementById("episodeNotch");
 const episodeNotchLabel = document.getElementById("episodeNotchLabel");
+const iptvNow = document.getElementById("iptvNow");
+const iptvNowTime = document.getElementById("iptvNowTime");
+const iptvNowTitle = document.getElementById("iptvNowTitle");
+const iptvNowTrack = document.getElementById("iptvNowTrack");
+const iptvNowFill = document.getElementById("iptvNowFill");
+const iptvNext = document.getElementById("iptvNext");
+const iptvLiveBadge = document.getElementById("iptvLiveBadge");
+const iptvLiveLabel = document.getElementById("iptvLiveLabel");
+const iptvLiveBehind = document.getElementById("iptvLiveBehind");
+const iptvNumber = document.getElementById("iptvNumber");
+const iptvChannelModal = document.getElementById("iptvChannelModal");
+const iptvGroupButton = document.getElementById("iptvGroupButton");
+const iptvChannelCloseButton = document.getElementById("iptvChannelCloseButton");
+const iptvPanelNote = document.getElementById("iptvPanelNote");
+const iptvChannelList = document.getElementById("iptvChannelList");
+const iptvGroupList = document.getElementById("iptvGroupList");
+const iptvChannelsButton = document.getElementById("iptvChannelsButton");
+const iptvChannelsLabel = document.getElementById("iptvChannelsLabel");
+const iptvSearchInput = document.getElementById("iptvSearchInput");
 const sourceNotch = document.getElementById("sourceNotch");
 const lockedLabel = document.getElementById("lockedLabel");
 const audioModal = document.getElementById("audioModal");
 const subtitleModal = document.getElementById("subtitleModal");
-const audioPanel = audioModal ? audioModal.querySelector(".track-panel") : null;
 const audioTrackList = document.getElementById("audioTrackList");
 const subtitleTrackList = document.getElementById("subtitleTrackList");
 const subtitlePanelTitle = document.getElementById("subtitlePanelTitle");
@@ -164,6 +274,8 @@ const bottomOffsetLabel = document.getElementById("bottomOffsetLabel");
 const assStyleModeLabel = document.getElementById("assStyleModeLabel");
 const assStyleModeSelect = document.getElementById("assStyleModeSelect");
 const assScaleRow = document.getElementById("assScaleRow");
+const subtitleOutlineGroup = document.getElementById("subtitleOutlineGroup");
+const subtitleShadowGroup = document.getElementById("subtitleShadowGroup");
 const assScaleLabel = document.getElementById("assScaleLabel");
 const assScaleMinus = document.getElementById("assScaleMinus");
 const assScaleValue = document.getElementById("assScaleValue");
@@ -186,8 +298,11 @@ const shadowColorSwatches = document.getElementById("shadowColorSwatches");
 const subtitleStyleReset = document.getElementById("subtitleStyleReset");
 const sourceModal = document.getElementById("sourceModal");
 const sourcePanel = sourceModal ? sourceModal.querySelector(".track-panel") : null;
+const sourcePanelResizeHandle = document.getElementById("sourcePanelResizeHandle");
 const sourcePanelTitle = document.getElementById("sourcePanelTitle");
 const sourceReloadButton = document.getElementById("sourceReloadButton");
+const sourceSortButton = document.getElementById("sourceSortButton");
+const sourceSortMenu = document.getElementById("sourceSortMenu");
 const sourceCloseButton = document.getElementById("sourceCloseButton");
 const sourceFilterList = document.getElementById("sourceFilterList");
 const sourceList = document.getElementById("sourceList");
@@ -239,6 +354,48 @@ const p2pConsentBody = document.getElementById("p2pConsentBody");
 const p2pConsentCancelButton = document.getElementById("p2pConsentCancelButton");
 const p2pConsentEnableButton = document.getElementById("p2pConsentEnableButton");
 
+// The HUD's own text comes from the app's string resources: Kotlin sends them once per page as
+// `hudLabels` (key = strings.xml name) with the first controls push. Every call site keeps its
+// English as the fallback, so a missing key, or text drawn before that push, still reads right.
+function hudText(key, fallback) {
+  const labels = typeof state === "object" && state ? state.hudLabels : null;
+  const value = labels && key ? labels[key] : null;
+  return typeof value === "string" && value ? value : fallback;
+}
+
+// hudText for a string resource with %1$s-style arguments.
+function hudFormat(key, fallback, ...args) {
+  return hudText(key, fallback).replace(/%(\d+)\$[sd]/g, (match, index) => {
+    const arg = args[Number(index) - 1];
+    return arg == null ? "" : String(arg);
+  });
+}
+
+// Static markup carries its key in data-i18n* attributes (controls.html); this rewrites those
+// nodes once the labels arrive. Text JS sets later goes through hudText at its own call site.
+const HUD_I18N_ATTRIBUTES = [
+  ["i18nAriaLabel", "aria-label"],
+  ["i18nTitle", "title"],
+  ["i18nPlaceholder", "placeholder"],
+  ["i18nTooltip", "data-tooltip"],
+  ["i18nAlt", "alt"],
+];
+function applyHudLabels(root = document) {
+  root.querySelectorAll("[data-i18n]").forEach(element => {
+    element.textContent = hudText(element.dataset.i18n, element.textContent);
+  });
+  HUD_I18N_ATTRIBUTES.forEach(([datasetKey, attribute]) => {
+    const selector = `[data-${datasetKey.replace(/[A-Z]/g, c => "-" + c.toLowerCase())}]`;
+    root.querySelectorAll(selector).forEach(element => {
+      element.setAttribute(attribute, hudText(element.dataset[datasetKey], element.getAttribute(attribute) || ""));
+    });
+  });
+  // Context-menu rows whose checkmark compares against their own (now translated) label.
+  root.querySelectorAll("[data-i18n-selected-value]").forEach(element => {
+    element.dataset.selectedValue = hudText(element.dataset.i18nSelectedValue, element.dataset.selectedValue || "");
+  });
+}
+
 let state = {
   title: "",
   episodeText: "",
@@ -250,9 +407,12 @@ let state = {
   pauseOverlayEpisodeTitle: "",
   pauseOverlayDescription: "",
   pauseOverlaySourceEnabled: false,
+  pauseOverlayEnabled: true,
   resizeModeLabel: "Fit",
   playbackSpeedLabel: "1x",
   playbackSpeedFineIncrementsEnabled: false,
+  zoneInput: "off",
+  zoneActions: "speed,seek,volume",
   playbackSpeedToggleLow: 1,
   playbackSpeedToggleHigh: 2,
   subtitlesLabel: "Subs",
@@ -273,7 +433,12 @@ let state = {
   desktopColorProfileLabel: "Neutral",
   desktopAnimeModeLabel: "Off",
   desktopAnimeSvpEnabled: false,
+  rtxVsrEnabled: false,
+  rtxTrueHdrEnabled: false,
   seekThumbnailsEnabled: true,
+  seekrVttUrl: "",
+  seekrScale: 1,
+  storyboardUrl: "",
   seekStepSeconds: 10,
   tapToUnlockLabel: "Tap to unlock",
   playbackErrorTitle: "Playback error",
@@ -309,6 +474,8 @@ let state = {
   subtitleAddonsTabLabel: "Addons",
   subtitleStyleTabLabel: "Style",
   downloadSubtitleLabel: "Download subtitle",
+  autoSyncedSubtitleLabel: "Synced by Auto Sync",
+  pauseOverlayCast: [],
   noneLabel: "None",
   fetchSubtitlesLabel: "Tap to fetch subtitles",
   subtitleDelayLabel: "Subtitle Delay",
@@ -350,10 +517,17 @@ let state = {
   controlsVisible: true,
   mouseMoveRevealsControlsEnabled: false,
   legacyHudEnabled: false,
+  minimalHudEnabled: false,
+  minimalHudPillsEnabled: false,
+  ultraHudEnabled: false,
+  officialHudEnabled: false,
+  seekHandleEnabled: true,
+  hudVignetteEnabled: true,
   alwaysShowClock: false,
   playbackInfoPanelEnabled: false,
   activeSubtitleLabel: "",
   appFullscreenKeyCode: 122,
+  voiceKeyCode: 0,
   playerShortcutKeyCodes: {},
   uiScalePercent: 0,
   controlIconScalePercent: 0,
@@ -374,6 +548,16 @@ let state = {
   skipPromptStartMs: 0,
   skipPromptEndMs: 0,
   skipPromptDismissed: false,
+  skipKeyAction: "",
+  skipIntervalKeyLabel: "Tab",
+  skipSubmitToastVisible: false,
+  skipSubmitToastPhase: "",
+  skipSubmitToastTitle: "",
+  skipSubmitToastDetail: "",
+  skipSubmitToastHint: "",
+  skipSubmitToastAccepted: false,
+  skipSubmitToastKey: "",
+  skipSubmitToastDismissible: false,
   nextEpisodeVisible: false,
   nextEpisodeHeaderLabel: "Next episode",
   nextEpisodeTitle: "",
@@ -381,6 +565,8 @@ let state = {
   nextEpisodeStatus: "",
   nextEpisodeActionLabel: "Play",
   nextEpisodePlayable: false,
+  nextEpisodeProgress: -1,
+  nextEpisodeSearching: false,
   showSubmitIntro: false,
   showVideoSettings: false,
   showSources: false,
@@ -389,6 +575,7 @@ let state = {
   durationMs: 0,
   positionMs: 0,
   chapters: [],
+  seekSegments: [],
   audioTracks: [],
   subtitleTracks: [],
   sourceIsLoading: false,
@@ -475,7 +662,20 @@ let sourceVirtualRenderRaf = 0;
 let selectedEpisodeSeason = null;
 let episodeStreamFilterId = "";
 let keyboardPanelMode = "";
+// Which input last acted on the HUD ("keyboard" or "pointer"): menus opened by keys open centred (setMenuStyleForInput).
+let lastHudInput = "pointer";
+// The player menu was opened by its key (window.nuvioOpenPlayerMenu): Escape then closes it and the key navigation.
+let playerMenuOpenedByKey = false;
 let keyboardSourceIndex = 0;
+// True while the Sources list sits at its top. Providers answer one at a time and every answer
+// re-sorts the list; a list the user has not scrolled keeps showing its (new) top instead of
+// keeping a stale offset. Once the user scrolls, their position is left alone.
+let sourceListPinnedTop = true;
+const setSourceSortMenuOpen = open => {
+  if (!sourceSortMenu || !sourceSortButton) return;
+  sourceSortMenu.hidden = !open;
+  sourceSortButton.setAttribute("aria-expanded", open ? "true" : "false");
+};
 let keyboardEpisodeIndex = 0;
 let keyboardEpisodeStreamIndex = 0;
 let keyboardEpisodeShowingStreams = false;
@@ -497,6 +697,13 @@ let submitIntroDraft = {
   status: "",
 };
 let hasReceivedPlayerControls = false;
+// mpv's loading state from the native playerUpdate push; null until the first push arrives.
+let nativeIsLoading = null;
+// The spinner appears only once loading has lasted this long, and hides at once. In-cache seeks
+// finish in 10–40 ms; showing the spinner for each was the "lag" felt on every local seek.
+const BUFFERING_SHOW_DELAY_MS = 250;
+let bufferingWantedSince = 0;
+let bufferingShowTimer = 0;
 let parentalGuideRunId = 0;
 let parentalGuideStartedKey = "";
 let parentalGuideCompletedKey = "";
@@ -505,6 +712,7 @@ let skipPromptWasDismissed = false;
 let skipPromptAutoHidden = false;
 let skipPromptAutoHideTimer = 0;
 let skipPromptAutoHideActive = false;
+let skipSubmitToastKey = "";
 let pauseMetadataReady = false;
 let pauseMetadataTimer = 0;
 let pauseMetadataEligibilityKey = "";
@@ -568,6 +776,11 @@ function applyControlIconScale(percent) {
   invalidateActionRowOverflow();
 }
 
+// Windows display scale of the monitor the player is on (DPI / 96), pushed by the native bridge
+// with each playerUpdate. The page itself cannot see it: the bridge's 192/dpi zoom normalizes it
+// away, so devicePixelRatio is the same 2x on every display.
+let hostDisplayScale = 1;
+
 function updateViewportUiScale() {
   const userScale = 1;
   // Native zoom owns DPI normalization and the user's preference. This second factor is strictly
@@ -577,11 +790,19 @@ function updateViewportUiScale() {
   const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
   const proportionalScale = Math.min(viewportWidth / 1920, viewportHeight / 1080, 1);
   // Below this, further shrinking would make targets unreadable. Compactness tiers remove controls
-  // instead while preserving play/pause and the timeline.
-  const autoScale = Math.max(0.5, proportionalScale);
+  // instead while preserving play/pause and the timeline. The floor is the full-screen 1080p size
+  // in Windows DIPs, not raw pixels: because the zoom normalizes DPI away, a fixed 0.5 let a
+  // windowed player on a scaled display (4K at 150-200%) shrink its text to half or less of normal
+  // Windows text. PiP and the hero trailer are deliberately tiny surfaces and keep the raw floor.
+  const minScale = state.pictureInPictureActive || isHeroTrailerSurface
+    ? 0.5
+    : Math.min(1, 0.5 * hostDisplayScale);
+  const autoScale = Math.max(minScale, proportionalScale);
   const combined = userScale * autoScale;
 
   const panelScale = Math.max(0.72, Math.min(1, autoScale));
+  // The Sources sheet follows the HUD exactly (see --source-panel-scale in controls.css).
+  const sourcePanelScale = Math.min(1, autoScale);
 
   const feedbackViewportScale = Math.max(0.65, Math.min(1, autoScale));
   const feedbackScale = feedbackViewportScale * userScale;
@@ -598,14 +819,20 @@ function updateViewportUiScale() {
     : layoutWidth < 1500 ? "medium"
     : "full";
 
-  const signature = `${combined}|${panelScale}|${feedbackScale}|${tier}`;
+  // PiP's and the YouTube corner player's controls: the windowed player's floor (what the corner
+  // player's small box comes to), not PiP's raw 0.5, so both are the same size on any display.
+  const pipUiScale = userScale * Math.min(1, 0.5 * hostDisplayScale);
+
+  const signature = `${combined}|${panelScale}|${sourcePanelScale}|${feedbackScale}|${tier}|${pipUiScale}`;
   if (signature === appliedScaleSignature) return;
   appliedScaleSignature = signature;
   appliedCombinedUserScale = combined;
 
   const rootStyle = document.documentElement.style;
   rootStyle.setProperty("--user-scale", String(combined));
+  rootStyle.setProperty("--pip-ui-scale", String(pipUiScale));
   rootStyle.setProperty("--panel-scale", String(panelScale));
+  rootStyle.setProperty("--source-panel-scale", String(sourcePanelScale));
   rootStyle.setProperty("--feedback-scale", String(feedbackScale));
   rootStyle.setProperty("--feedback-hidden-scale", String(feedbackScale * 0.85));
   root.classList.toggle("hud-medium", tier !== "full");
@@ -638,10 +865,41 @@ const chromeInteractionSelector = [
   ".modal-layer",
   ".skip-prompt",
   ".next-episode-card",
+  ".party-pill",
   "#heroTrailerChrome",
 ].join(",");
 
+// Play/pause intent from the HUD itself, shown at once and held briefly. The real state arrives
+// from two producers (the native mpv push and Kotlin's controls push) at different latencies, so
+// rapid toggling used to show whichever stale copy landed last until both caught up.
+const PLAY_INTENT_HOLD_MS = 900;
+let playIntent = null;
+let playIntentAt = 0;
+let playIntentTimer = 0;
+const displayedIsPlaying = () => {
+  if (playIntent !== null && performance.now() - playIntentAt < PLAY_INTENT_HOLD_MS) return playIntent;
+  playIntent = null;
+  return Boolean(state.isPlaying);
+};
+const notePlayToggleIntent = () => {
+  playIntent = !displayedIsPlaying();
+  playIntentAt = performance.now();
+  window.clearTimeout(playIntentTimer);
+  // Re-render once the hold lapses so the icon settles on the confirmed state.
+  playIntentTimer = window.setTimeout(() => renderChrome(), PLAY_INTENT_HOLD_MS + 20);
+  renderChrome();
+};
+
+// Rewriting a <use> href rebuilds its shadow instance even when the value is unchanged. A redraw
+// landing between press and release then removes the element that was pressed, and Chromium drops
+// the click — which is how play/pause "missed" clicks once state pushes made redraws frequent.
+const setIconHref = (icon, href) => {
+  if (icon && icon.getAttribute("href") !== href) icon.setAttribute("href", href);
+};
+
 const send = (type, value = 0) => {
+  if ((type === "toggle" || type === "keyboardToggle") && !state.isLocked) notePlayToggleIntent();
+  predictSubtitleStyle(type, value);
   const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.player;
   if (bridge) {
     bridge.postMessage({ type, value });
@@ -649,6 +907,96 @@ const send = (type, value = 0) => {
   }
   const webViewBridge = window.chrome && window.chrome.webview;
   if (webViewBridge) webViewBridge.postMessage({ type, value });
+};
+
+// --- Optimistic subtitle style ------------------------------------------------------------------
+// The Style tab answers a click at once: the change is predicted here and drawn before Kotlin has
+// saved it and pushed the new state back, which made every step feel like it was waiting on
+// something (it was). Each predictor mirrors its handler in PlayerScreenRuntimeUi exactly (same
+// steps, clamps and alpha rules), so the confirmed state matches and simply replaces the guess.
+// Until it does, a push still carrying the old style keeps the guess rather than flicking the
+// control back; after OptimisticSubtitleStyleMs the pushed state wins regardless, so a change
+// Kotlin refused cannot stick on screen.
+const OptimisticSubtitleStyleMs = 1500;
+let optimisticSubtitleStyle = null;
+let optimisticSubtitleStyleUntil = 0;
+
+const clampInt = (value, min, max) => Math.max(min, Math.min(max, Math.round(value)));
+const argbWithAlpha = (color, alpha) => {
+  const parsed = parseArgb(color);
+  const hex = n => n.toString(16).padStart(2, "0").toUpperCase();
+  return `#${hex(clampInt(alpha, 0, 255))}${hex(parsed.red)}${hex(parsed.green)}${hex(parsed.blue)}`;
+};
+const swatchKeepingAlpha = (swatches, index, current) => {
+  const color = Array.isArray(swatches) ? swatches[index] : null;
+  return color ? argbWithAlpha(color, parseArgb(current).alpha) : null;
+};
+
+const SUBTITLE_STYLE_PREDICTORS = {
+  subtitleFontSizeDelta: (style, v) => ({ fontSizeSp: clampInt((Number(style.fontSizeSp) || 18) + v, 6, 40) }),
+  subtitleFontIndex: (style, v) => {
+    const fonts = Array.isArray(state.subtitleFontFamilies) ? state.subtitleFontFamilies : [];
+    return v >= 0 && v < fonts.length ? { fontFamily: fonts[v] } : null;
+  },
+  subtitleOutlineToggle: style => ({ outlineEnabled: !style.outlineEnabled }),
+  subtitleShadowToggle: style => ({ shadowEnabled: !style.shadowEnabled }),
+  subtitleBoldToggle: style => ({ bold: !style.bold }),
+  subtitleItalicToggle: style => ({ italic: !style.italic }),
+  subtitleOutlineWidthDelta: (style, v) => ({ outlineWidth: clampInt((Number(style.outlineWidth) || 0) + v, 0, 6) }),
+  subtitleShadowOffsetDelta: (style, v) => ({ shadowOffset: clampInt((Number(style.shadowOffset) || 0) + v, 0, 60) }),
+  subtitleBlurDelta: (style, v) => ({ blur: clampInt((Number(style.blur) || 0) + v, 0, 10) }),
+  subtitleBottomOffsetDelta: (style, v) => ({ bottomOffset: clampInt((Number(style.bottomOffset) || 0) + v, 0, 200) }),
+  subtitleAssScaleDelta: (style, v) => ({ assScalePercent: clampInt((Number(style.assScalePercent) || 100) + v, 50, 250) }),
+  subtitleAssStyleMode: (style, v) => {
+    const mode = assStyleModes()[v];
+    return mode ? { assStyleMode: mode.value } : null;
+  },
+  subtitleTextOpacity: (style, v) => ({ textColor: argbWithAlpha(style.textColor, (Math.max(0, Math.min(100, v)) / 100) * 255) }),
+  subtitleShadowOpacity: (style, v) => ({ shadowColor: argbWithAlpha(style.shadowColor, (Math.max(0, Math.min(100, v)) / 100) * 255) }),
+  subtitleTextColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleColorSwatches, v, style.textColor);
+    return color ? { textColor: color } : null;
+  },
+  subtitleOutlineColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleColorSwatches, v, style.outlineColor);
+    return color ? { outlineColor: color } : null;
+  },
+  subtitleShadowColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleShadowColorSwatches, v, style.shadowColor);
+    return color ? { shadowColor: color } : null;
+  },
+  subtitleBackgroundColor: (style, v) => {
+    const swatches = state.subtitleBackgroundColorSwatches;
+    const color = Array.isArray(swatches) ? swatches[v] : null;
+    return color ? { backgroundColor: color } : null;
+  },
+};
+
+const predictSubtitleStyle = (type, value) => {
+  const predictor = SUBTITLE_STYLE_PREDICTORS[type];
+  if (!predictor || !state.subtitleStyle) return;
+  // Built on the latest guess, so quick repeated clicks stack instead of each starting over.
+  const base = optimisticSubtitleStyle && Date.now() < optimisticSubtitleStyleUntil
+    ? optimisticSubtitleStyle
+    : state.subtitleStyle;
+  const change = predictor(base, Number(value) || 0);
+  if (!change) return;
+  optimisticSubtitleStyle = { ...base, ...change };
+  optimisticSubtitleStyleUntil = Date.now() + OptimisticSubtitleStyleMs;
+  state.subtitleStyle = optimisticSubtitleStyle;
+  if (!subtitleStylePanel.hidden) renderSubtitleStylePanel();
+};
+
+// Called with each pushed state: keep the guess while the push has not caught up with it.
+const reconcileOptimisticSubtitleStyle = () => {
+  if (!optimisticSubtitleStyle) return;
+  const pushed = state.subtitleStyle;
+  const confirmed = pushed && JSON.stringify(pushed) === JSON.stringify(optimisticSubtitleStyle);
+  if (confirmed || Date.now() >= optimisticSubtitleStyleUntil) {
+    optimisticSubtitleStyle = null;
+    return;
+  }
+  state.subtitleStyle = optimisticSubtitleStyle;
 };
 
 const animationDelay = ms => new Promise(resolve => {
@@ -679,12 +1027,6 @@ const hideParentalGuide = () => {
 
 const renderParentalGuideRows = warnings => {
   parentalGuideList.innerHTML = "";
-  const rowHeight = 18;
-  const rowGap = 2;
-  const totalHeight = warnings.length > 0
-    ? (rowHeight * warnings.length) + (rowGap * (warnings.length - 1))
-    : 0;
-  parentalGuideLine.style.height = `${totalHeight}px`;
 
   warnings.forEach(warning => {
     const row = document.createElement("div");
@@ -790,12 +1132,15 @@ const applyTheme = () => {
   setColor("--theme-accent", state.themeAccentColor, "#2f6fed");
   setColor("--theme-accent-strong", state.themeAccentStrongColor, "#3c7bff");
   // A paint, not a colour: cssColorOrFallback would reject the gradient form.
-  style.setProperty(
-    "--theme-accent-fill",
-    typeof state.themeAccentFill === "string" && state.themeAccentFill.trim()
-      ? state.themeAccentFill.trim()
-      : "var(--theme-accent)",
-  );
+  const accentFill = typeof state.themeAccentFill === "string" ? state.themeAccentFill.trim() : "";
+  style.setProperty("--theme-accent-fill", accentFill || "var(--theme-accent)");
+  // The same paint again, but only when it really is a gradient. The official layout's seek fill
+  // falls back to the plain timeline colour on a flat theme, as it does upstream.
+  if (accentFill.includes("gradient(")) {
+    style.setProperty("--theme-accent-gradient", accentFill);
+  } else {
+    style.removeProperty("--theme-accent-gradient");
+  }
   setColor("--theme-on-accent", state.themeOnAccentColor, "#fff");
   setColor("--theme-focus", state.themeFocusColor, "#9ecaff");
   setColor("--theme-selected-surface", state.themeSelectedSurfaceColor, "#26384f");
@@ -850,7 +1195,7 @@ const durationLabelText = (durationMs, positionMs) => {
 const applyDurationLabel = () => {
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   durationLabel.textContent = durationLabelText(durationMs, Number(state.positionMs) || 0);
-  durationLabel.title = showRemainingTime ? "Click to show total duration" : "Click to show time remaining";
+  durationLabel.title = showRemainingTime ? hudText("player_hud_click_to_show_total_duration", "Click to show total duration") : hudText("player_hud_click_to_show_time_remaining", "Click to show time remaining");
 };
 
 durationLabel.addEventListener("click", event => {
@@ -866,7 +1211,61 @@ durationLabel.addEventListener("click", event => {
   applyDurationLabel();
 });
 
+/**
+ * The minimal layout (user setting; unrelated to the width tier class `hud-minimal`) reads the
+ * time as one "position / duration" readout beside the volume instead of flanking the seek bar.
+ * The two labels are MOVED rather than mirrored so the remaining-time toggle, its title and
+ * [setProgress] keep working on the same elements. Reverting puts them back around #timeline in
+ * authored order.
+ */
+let appliedMinimalHudTime = false;
+const applyMinimalHudTimeLayout = enabled => {
+  if (!minimalTime || !minimalTimeSeparator || enabled === appliedMinimalHudTime) return;
+  appliedMinimalHudTime = enabled;
+  if (enabled) {
+    minimalTime.insertBefore(positionLabel, minimalTimeSeparator);
+    minimalTime.appendChild(durationLabel);
+    // Live TV's badge follows the time into the control row. Left alone at the end of this
+    // layout's slim, edge-to-edge seek row it had no column of its own and sat over the controls.
+    minimalTime.after(iptvLiveBadge);
+    minimalTime.setAttribute("aria-hidden", "false");
+    return;
+  }
+  const timelineRow = timeline.parentElement;
+  timelineRow.insertBefore(positionLabel, timeline);
+  timelineRow.appendChild(durationLabel);
+  timelineRow.appendChild(iptvLiveBadge);
+  minimalTime.setAttribute("aria-hidden", "true");
+};
+
+/**
+ * The ultra layout has no volume control in the bar; the mute button + slider live in the gear
+ * popover's header row instead. Moved, like the minimal time labels, so the drag/mute/pill wiring
+ * on #playerVolumeControl keeps working untouched. Reverting puts it back at the head of
+ * .time-cluster (before #minimalTime) in authored order.
+ */
+let appliedUltraHudVolume = false;
+const applyUltraHudLayout = enabled => {
+  if (!ultraMenuVolume || !playerVolumeControl || !minimalTime || enabled === appliedUltraHudVolume) return;
+  appliedUltraHudVolume = enabled;
+  if (enabled) {
+    ultraMenuVolume.appendChild(playerVolumeControl);
+  } else {
+    minimalTime.parentElement.insertBefore(playerVolumeControl, minimalTime);
+  }
+  // The same toggle is "the rest of the icons" everywhere else and "the options" here.
+  if (actionOverflowButton) actionOverflowButton.dataset.tooltip = enabled ? hudText("player_hud_options", "Options") : hudText("player_hud_more_controls", "More controls");
+  // The fold rule changes with the layout (everything folds in ultra), so re-measure.
+  invalidateActionRowOverflow();
+};
+
 const setProgress = (positionMs, durationMs) => {
+  // Live TV: positions arrive absolute; draw them against the rewind window.
+  const liveWindow = iptvLiveWindow();
+  if (liveWindow) {
+    positionMs = Math.max(0, positionMs - liveWindow.start);
+    durationMs = liveWindow.end - liveWindow.start;
+  }
   const percent = durationMs > 0 ? Math.max(0, Math.min(100, positionMs / durationMs * 100)) : 0;
   seek.value = Math.round(percent * 10);
   seek.style.setProperty("--progress", `${percent}%`);
@@ -876,15 +1275,98 @@ const setProgress = (positionMs, durationMs) => {
     ? Math.max(percent, Math.min(100, bufferedMs / durationMs * 100))
     : 0;
   seek.style.setProperty("--buffered", `${bufferedPercent}%`);
+  applySeekTrack(percent, bufferedPercent);
   if (pipSeek) {
     pipSeek.value = seek.value;
     pipSeek.style.setProperty("--progress", `${percent}%`);
     pipSeek.style.setProperty("--buffered", `${bufferedPercent}%`);
   }
-  positionLabel.textContent = formatTime(positionMs);
+  positionLabel.textContent = liveWindow
+    ? `-${formatTime(Math.max(0, durationMs - positionMs))}`
+    : formatTime(positionMs);
   // Read through the same helper the click handler uses, so a countdown keeps counting down as
   // playback advances rather than freezing at whatever it read when the label was tapped.
   durationLabel.textContent = durationLabelText(durationMs, positionMs);
+};
+
+// --- Seek track ----------------------------------------------------------------------------------
+// The seek line is drawn as glass with the chapters cut into it, YouTube-style: a small gap at
+// each chapter start instead of a notch laid over the bar. Both live in the track's own background,
+// built here as two gradients with the gaps left transparent: the colours (played in the theme
+// fill, buffered and unplayed as lighter and darker see-through white) and a highlight band across
+// the top half. Kept in the background rather than a mask so the thumb is never sliced by a gap.
+let seekChapterPercents = [];
+// SponsorBlock's marked stretches of a YouTube video, as { from, to, colour } in percent: painted
+// over the bar in its own colour whether played or not, as SponsorBlock's extension does.
+let seekSegmentRanges = [];
+const SEEK_SEGMENT_COLOURS = {
+  sponsor: "rgba(0, 212, 0, .9)",
+  selfpromo: "rgba(255, 221, 0, .9)",
+};
+let seekTrackProgress = 0;
+let seekTrackBuffered = 0;
+
+// Half a chapter gap: 3px wide at full scale, never under 2px in a small window.
+const SEEK_GAP_HALF = "max(1px, calc(var(--user-scale, 1) * 1.5px))";
+const SEEK_PLAYED = "var(--theme-timeline-fill)";
+const SEEK_BUFFERED = "rgba(255, 255, 255, .42)";
+const SEEK_UNPLAYED = "rgba(255, 255, 255, .20)";
+const SEEK_SHEEN_PLAYED = "rgba(255, 255, 255, .30)";
+const SEEK_SHEEN_REST = "rgba(255, 255, 255, .12)";
+
+const seekStop = (percent, offset) => {
+  if (!offset) return `${percent}%`;
+  return `calc(${percent}% ${offset < 0 ? "-" : "+"} ${SEEK_GAP_HALF})`;
+};
+
+const applySeekTrack = (progress, buffered) => {
+  seekTrackProgress = progress;
+  seekTrackBuffered = buffered;
+  // Every place the colour or the gap state changes, in order along the bar. A gap is a chapter
+  // start widened by SEEK_GAP_HALF either side; offset -1/+1 marks its two edges.
+  const events = [
+    { at: progress, offset: 0, kind: "edge" },
+    { at: buffered, offset: 0, kind: "edge" },
+  ];
+  seekChapterPercents.forEach(at => {
+    events.push({ at, offset: -1, kind: "gapStart" });
+    events.push({ at, offset: 1, kind: "gapEnd" });
+  });
+  seekSegmentRanges.forEach((range, index) => {
+    events.push({ at: range.from, offset: 0, kind: "segStart", index });
+    events.push({ at: range.to, offset: 0, kind: "segEnd", index });
+  });
+  events.push({ at: 100, offset: 0, kind: "end" });
+  events.sort((a, b) => a.at - b.at || a.offset - b.offset);
+
+  const colours = [];
+  const sheen = [];
+  let from = seekStop(0, 0);
+  let fromAt = 0;
+  let inGap = 0;
+  const openSegments = [];
+  events.forEach(event => {
+    const to = seekStop(event.at, event.offset);
+    // The segment's colour is decided by where it sits against played/buffered, by its middle.
+    const middle = (fromAt + event.at) / 2;
+    const played = middle < progress;
+    const marked = openSegments.length ? seekSegmentRanges[openSegments[openSegments.length - 1]].colour : null;
+    const colour = inGap > 0 ? "transparent" : marked ? marked : played ? SEEK_PLAYED : middle < buffered ? SEEK_BUFFERED : SEEK_UNPLAYED;
+    const shine = inGap > 0 ? "transparent" : played ? SEEK_SHEEN_PLAYED : SEEK_SHEEN_REST;
+    colours.push(`${colour} ${from} ${to}`);
+    sheen.push(`${shine} ${from} ${to}`);
+    if (event.kind === "gapStart") inGap += 1;
+    if (event.kind === "gapEnd") inGap = Math.max(0, inGap - 1);
+    if (event.kind === "segStart") openSegments.push(event.index);
+    if (event.kind === "segEnd") {
+      const open = openSegments.indexOf(event.index);
+      if (open >= 0) openSegments.splice(open, 1);
+    }
+    from = to;
+    fromAt = event.at;
+  });
+  seek.style.setProperty("--seek-colours", `linear-gradient(to right, ${colours.join(", ")})`);
+  seek.style.setProperty("--seek-sheen", `linear-gradient(to right, ${sheen.join(", ")})`);
 };
 
 let chapterMarkersSignature = "";
@@ -903,12 +1385,31 @@ const displayChapters = () => {
   return chapters.length > 1 ? chapters : [];
 };
 
+const normalizedSeekSegments = () => (Array.isArray(state.seekSegments) ? state.seekSegments : [])
+  .map(segment => ({
+    start: Number(segment?.start),
+    end: Number(segment?.end),
+    colour: SEEK_SEGMENT_COLOURS[String(segment?.kind || "")],
+  }))
+  .filter(segment => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.colour);
+
 const renderChapterMarkers = durationMs => {
   const chapters = normalizedChapters();
-  const signature = `${Math.round(durationMs)}:${chapters.map(chapter => `${chapter.startTime}:${chapter.title}`).join("|")}`;
+  const segments = normalizedSeekSegments();
+  const signature = `${Math.round(durationMs)}:${chapters.map(chapter => `${chapter.startTime}:${chapter.title}`).join("|")}` +
+    `#${segments.map(segment => `${segment.start}-${segment.end}:${segment.colour}`).join("|")}`;
   if (signature === chapterMarkersSignature) return;
   chapterMarkersSignature = signature;
   chapterMarkers.textContent = "";
+  const toPercent = seconds => Math.max(0, Math.min(100, seconds * 1000 / durationMs * 100));
+  seekSegmentRanges = durationMs <= 0 ? [] : segments
+    .map(segment => ({ from: toPercent(segment.start), to: toPercent(segment.end), colour: segment.colour }))
+    .filter(range => range.to > range.from);
+  // The same chapter starts, as gaps cut into the seek track.
+  seekChapterPercents = durationMs <= 0 ? [] : chapters
+    .filter(chapter => chapter.startTime > 0 && chapter.startTime * 1000 < durationMs)
+    .map(chapter => Math.max(0, Math.min(100, chapter.startTime * 1000 / durationMs * 100)));
+  applySeekTrack(seekTrackProgress, seekTrackBuffered);
   if (durationMs <= 0) return;
   chapters.forEach(chapter => {
     if (chapter.startTime <= 0 || chapter.startTime * 1000 >= durationMs) return;
@@ -924,9 +1425,129 @@ const hideChapterTooltip = () => {
   chapterTooltip.textContent = "";
 };
 
+const SEEK_THUMBNAIL_SETTLE_MS = 220;
 const seekThumbnailCache = new Map();
 let seekThumbnailRequestTimer = 0;
 let pendingSeekThumbnailPosition = -1;
+let pendingSeekThumbnailSince = 0;
+// A request with no answer by then is asked again when the pointer is still on its spot (a slow
+// source may have dropped it); the player keeps one running for the same spot, so this is cheap.
+const SEEK_THUMBNAIL_RETRY_MS = 6000;
+
+// Seekr sprites: Kotlin does the keyed lookup and hands over only the signed WebVTT URL, which
+// (like the sheets it lists) needs no key. Cues map source time to a tile on a sprite sheet.
+let seekrTrack = null;
+let seekrTrackUrl = "";
+const seekrSheets = new Map();
+const SEEKR_SHEET_CACHE = 4;
+let seekrPendingCue = null;
+
+const parseVttTimeMs = text => {
+  const parts = String(text).trim().split(":").map(Number);
+  if (parts.some(part => !Number.isFinite(part))) return NaN;
+  return Math.round(parts.reduce((total, part) => total * 60 + part, 0) * 1000);
+};
+
+const parseSeekrVtt = text => {
+  const cues = [];
+  for (const block of String(text).replace(/\r/g, "").split(/\n\n+/)) {
+    const lines = block.split("\n").map(line => line.trim()).filter(Boolean);
+    const timing = lines.findIndex(line => line.includes("-->"));
+    if (timing < 0 || !lines[timing + 1]) continue;
+    const [startText, endText] = lines[timing].split("-->");
+    const match = /^(.*)#xywh=(\d+),(\d+),(\d+),(\d+)$/.exec(lines[timing + 1]);
+    const start = parseVttTimeMs(startText);
+    const end = parseVttTimeMs(endText);
+    if (!match || !Number.isFinite(start) || !Number.isFinite(end)) continue;
+    cues.push({ start, end, src: match[1], x: +match[2], y: +match[3], w: +match[4], h: +match[5] });
+  }
+  return cues.sort((a, b) => a.start - b.start);
+};
+
+const syncSeekrTrack = () => {
+  const url = String(state.seekrVttUrl || "");
+  if (url === seekrTrackUrl) return;
+  seekrTrackUrl = url;
+  seekrTrack = null;
+  seekrSheets.clear();
+  if (!url) return;
+  fetch(url).then(response => (response.ok ? response.text() : Promise.reject(response.status))).then(text => {
+    if (seekrTrackUrl !== url) return;
+    const cues = parseSeekrVtt(text);
+    seekrTrack = cues.length ? cues : null;
+  }).catch(() => {
+    // Leave previews off for this playback rather than show an empty frame.
+  });
+};
+
+// A YouTube video's storyboard: one grid of frames per sheet, frame k on sheet k / (columns x rows).
+// Kotlin sends only the layout; the tile is worked out here, in the shape Seekr's cues take.
+const storyboardCueAt = positionMs => {
+  const url = String(state.storyboardUrl || "");
+  const count = Number(state.storyboardCount) || 0;
+  const interval = Number(state.storyboardIntervalMs) || 0;
+  const columns = Number(state.storyboardColumns) || 0;
+  const rows = Number(state.storyboardRows) || 0;
+  const width = Number(state.storyboardWidth) || 0;
+  const height = Number(state.storyboardHeight) || 0;
+  if (!url || count <= 0 || interval <= 0 || columns <= 0 || rows <= 0 || width <= 0 || height <= 0) return null;
+  const frame = Math.max(0, Math.min(count - 1, Math.floor(positionMs / interval)));
+  const perSheet = columns * rows;
+  const cell = frame % perSheet;
+  return {
+    start: frame * interval,
+    end: (frame + 1) * interval,
+    src: url.replace("$M", String(Math.floor(frame / perSheet))),
+    x: (cell % columns) * width,
+    y: Math.floor(cell / columns) * height,
+    w: width,
+    h: height,
+  };
+};
+
+const seekrCueAt = clientPositionMs => {
+  if (!seekrTrack) return storyboardCueAt(clientPositionMs);
+  const scale = Number(state.seekrScale) > 0 ? Number(state.seekrScale) : 1;
+  const sourceMs = clientPositionMs / scale;
+  let low = 0;
+  let high = seekrTrack.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const cue = seekrTrack[mid];
+    if (sourceMs < cue.start) high = mid - 1;
+    else if (sourceMs >= cue.end) low = mid + 1;
+    else return cue;
+  }
+  return null;
+};
+
+const drawSeekrCue = cue => {
+  seekrPendingCue = cue;
+  const context = seekThumbnailSprite.getContext("2d");
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(seekThumbnailSprite.clientWidth * ratio));
+  const height = Math.max(1, Math.round(seekThumbnailSprite.clientHeight * ratio));
+  if (seekThumbnailSprite.width !== width) seekThumbnailSprite.width = width;
+  if (seekThumbnailSprite.height !== height) seekThumbnailSprite.height = height;
+  let sheet = seekrSheets.get(cue.src);
+  if (!sheet) {
+    sheet = new Image();
+    sheet.decoding = "async";
+    sheet.addEventListener("load", () => {
+      if (seekrPendingCue && seekrPendingCue.src === cue.src) drawSeekrCue(seekrPendingCue);
+    });
+    sheet.src = cue.src;
+    seekrSheets.set(cue.src, sheet);
+    while (seekrSheets.size > SEEKR_SHEET_CACHE) {
+      seekrSheets.delete(seekrSheets.keys().next().value);
+    }
+  }
+  if (!sheet.complete || !sheet.naturalWidth) {
+    context.clearRect(0, 0, width, height);
+    return;
+  }
+  context.drawImage(sheet, cue.x, cue.y, cue.w, cue.h, 0, 0, width, height);
+};
 
 const hideSeekThumbnail = () => {
   window.clearTimeout(seekThumbnailRequestTimer);
@@ -936,15 +1557,37 @@ const hideSeekThumbnail = () => {
 };
 
 const showSeekThumbnailAt = event => {
+  // Live TV: the hovered point as its distance from live ("-0:20"), since a time into the stream
+  // means nothing there. Never a frame preview: that opens a second connection to the channel,
+  // which providers that allow one connection per account answer by dropping the first.
+  const liveWindow = iptvLiveWindow();
+  if (liveWindow) {
+    const liveRect = seek.getBoundingClientRect();
+    if (liveRect.width <= 0) return hideSeekThumbnail();
+    const liveProgress = Math.max(0, Math.min(1, (event.clientX - liveRect.left) / liveRect.width));
+    const behindMs = Math.round((liveWindow.end - liveWindow.start) * (1 - liveProgress));
+    seekThumbnail.classList.add("no-preview");
+    seekThumbnail.classList.remove("seekr");
+    const liveX = Math.max(112, Math.min(liveRect.width - 112, event.clientX - liveRect.left));
+    seekThumbnail.style.left = `${liveRect.left - timeline.getBoundingClientRect().left + liveX}px`;
+    seekThumbnailTime.textContent = behindMs < 1000 ? (state.iptv.liveLabel || "LIVE") : `-${formatTime(behindMs)}`;
+    seekThumbnailChapter.hidden = true;
+    seekThumbnailImage.removeAttribute("src");
+    seekThumbnail.hidden = false;
+    return;
+  }
   // With previews off the card still shows the hovered time and chapter — those cost nothing.
   // Only the frame itself needs the second stream and its range request.
-  const previewsEnabled = !!state.seekThumbnailsEnabled;
-  seekThumbnail.classList.toggle("no-preview", !previewsEnabled);
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   const rect = seek.getBoundingClientRect();
   if (durationMs <= 0 || rect.width <= 0) return hideSeekThumbnail();
   const progress = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
   const exactPositionMs = Math.round(durationMs * progress);
+  // Seekr sprites cost the stream's host nothing, so they draw at once with no settle delay.
+  const seekrCue = seekrCueAt(exactPositionMs);
+  const previewsEnabled = !!seekrCue || !!state.seekThumbnailsEnabled;
+  seekThumbnail.classList.toggle("no-preview", !previewsEnabled);
+  seekThumbnail.classList.toggle("seekr", !!seekrCue);
   const thumbnailPositionMs = Math.round(exactPositionMs / 5000) * 5000;
   const localX = Math.max(112, Math.min(rect.width - 112, event.clientX - rect.left));
   seekThumbnail.style.left = `${rect.left - timeline.getBoundingClientRect().left + localX}px`;
@@ -962,6 +1605,11 @@ const showSeekThumbnailAt = event => {
     seekThumbnail.hidden = false;
     return;
   }
+  if (seekrCue) {
+    seekThumbnail.hidden = false;
+    drawSeekrCue(seekrCue);
+    return;
+  }
   const cached = seekThumbnailCache.get(thumbnailPositionMs);
   if (cached) {
     seekThumbnailImage.src = cached;
@@ -970,12 +1618,18 @@ const showSeekThumbnailAt = event => {
   }
   seekThumbnailImage.removeAttribute("src");
   seekThumbnail.hidden = false;
-  if (pendingSeekThumbnailPosition === thumbnailPositionMs) return;
+  if (pendingSeekThumbnailPosition === thumbnailPositionMs &&
+      Date.now() - pendingSeekThumbnailSince < SEEK_THUMBNAIL_RETRY_MS) return;
   pendingSeekThumbnailPosition = thumbnailPositionMs;
+  pendingSeekThumbnailSince = Date.now();
   window.clearTimeout(seekThumbnailRequestTimer);
+  // Each request is a fresh HTTP range open on the preview stream, against the same host as the
+  // main player. Only ask once the pointer has settled on a spot: sweeping across the bar used to
+  // fire a request per 5 s bucket crossed, enough to trip a debrid CDN's open-rate limit and make
+  // the *next real seek* fail with a 429.
   seekThumbnailRequestTimer = window.setTimeout(() => {
     send("seekThumbnail", thumbnailPositionMs);
-  }, 24);
+  }, SEEK_THUMBNAIL_SETTLE_MS);
 };
 
 window.nuvioSeekThumbnailReady = (positionMs, dataUrl) => {
@@ -1127,6 +1781,17 @@ const setImageSource = (element, source, options) => {
   return url;
 };
 
+/**
+ * A logo whose fetch failed counts as no logo, so the caller falls back to the title text instead
+ * of leaving an empty slot -- or, on the pause overlay, Chrome's broken-image glyph: that <img>
+ * has CSS dimensions, so a failed load paints as a bordered box. The error lands after the render
+ * that set the src, hence the re-render on exhaustion (single-shot: no retry schedule).
+ */
+const usableLogoSource = (element, source) => {
+  const url = setImageSource(element, source, { onExhausted: () => renderChrome() });
+  return url && !element.classList.contains("image-error") ? url : "";
+};
+
 const resetPauseMetadataTimer = () => {
   window.clearTimeout(pauseMetadataTimer);
   pauseMetadataTimer = 0;
@@ -1158,15 +1823,74 @@ const syncPauseMetadataTimer = showOpening => {
   }, prefersReducedMotion ? 1 : 4000);
 };
 
+const castInitials = name => String(name || "")
+  .split(/\s+/)
+  .filter(Boolean)
+  .slice(0, 2)
+  .map(part => part[0].toUpperCase())
+  .join("");
+
+// renderChrome runs on every state push; rebuild the cast rows only when the cast itself changes,
+// so portraits are not refetched and do not flicker while the overlay is up.
+let pauseCastRenderKey = "";
+const renderPauseCast = () => {
+  const cast = (Array.isArray(state.pauseOverlayCast) ? state.pauseOverlayCast : [])
+    .filter(member => String(member?.name || "").trim());
+  pauseCast.hidden = cast.length === 0;
+  const key = JSON.stringify(cast.map(member => [member.name, member.role, member.photo]));
+  if (key === pauseCastRenderKey) return;
+  pauseCastRenderKey = key;
+  pauseCastList.replaceChildren(...cast.map(member => {
+    const row = document.createElement("li");
+    row.className = "pause-cast-member";
+    const initials = () => {
+      const badge = document.createElement("span");
+      badge.className = "pause-cast-photo";
+      badge.setAttribute("aria-hidden", "true");
+      badge.textContent = castInitials(member.name);
+      return badge;
+    };
+    const photoUrl = String(member.photo || "").trim();
+    if (photoUrl) {
+      const photo = document.createElement("img");
+      photo.className = "pause-cast-photo";
+      photo.alt = "";
+      photo.decoding = "async";
+      photo.addEventListener("error", () => photo.replaceWith(initials()), { once: true });
+      photo.src = photoUrl;
+      row.appendChild(photo);
+    } else {
+      row.appendChild(initials());
+    }
+    const text = document.createElement("span");
+    text.className = "pause-cast-text";
+    const name = document.createElement("span");
+    name.className = "pause-cast-name";
+    name.textContent = member.name;
+    text.appendChild(name);
+    const roleText = String(member.role || "").trim();
+    if (roleText) {
+      const role = document.createElement("span");
+      role.className = "pause-cast-role";
+      role.textContent = roleText;
+      text.appendChild(role);
+    }
+    row.appendChild(text);
+    return row;
+  }));
+};
+
 const renderPauseMetadataOverlay = showOpening => {
   syncPauseMetadataTimer(showOpening);
+  renderPauseCast();
 
-  const logoUrl = setImageSource(pauseLogo, state.pauseOverlayLogo);
+  const logoUrl = usableLogoSource(pauseLogo, state.pauseOverlayLogo);
   const titleText = String(state.title || "").trim();
   const episodeInfo = String(state.pauseOverlayEpisodeInfo || "").trim();
   const episodeTitleText = String(state.pauseOverlayEpisodeTitle || "").trim();
   const descriptionText = String(state.pauseOverlayDescription || "").trim();
   const showOverlay = Boolean(
+    state.pauseOverlayEnabled !== false &&
     pauseMetadataReady &&
     !state.controlsVisible &&
     !state.isLocked &&
@@ -1218,6 +1942,10 @@ const normalizedOpeningProgress = () => {
 const playbackErrorText = () => String(state.playbackErrorMessage || "").trim();
 
 const rangePositionMs = (input = seek) => {
+  const liveWindow = iptvLiveWindow();
+  if (liveWindow) {
+    return Math.round(liveWindow.start + (liveWindow.end - liveWindow.start) * Number(input.value) / 1000);
+  }
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   return durationMs > 0 ? Math.round(durationMs * Number(input.value) / 1000) : 0;
 };
@@ -1226,10 +1954,10 @@ const rangePositionMs = (input = seek) => {
 // packed 0xAARRGGBB integer - exact in a Double, and no new string channel to thread through the
 // native player. Alpha is resolved here, on the side that knows the current style.
 const SUBTITLE_COLOR_FIELDS = {
-  textColor: { title: "Custom Text Color", event: "subtitleTextColorArgb" },
-  outlineColor: { title: "Custom Outline Color", event: "subtitleOutlineColorArgb" },
-  backgroundColor: { title: "Custom Background Color", event: "subtitleBackgroundColorArgb" },
-  shadowColor: { title: "Custom Shadow Color", event: "subtitleShadowColorArgb" },
+  textColor: { get title() { return hudText("player_hud_custom_text_color", "Custom Text Color"); }, event: "subtitleTextColorArgb" },
+  outlineColor: { get title() { return hudText("player_hud_custom_outline_color", "Custom Outline Color"); }, event: "subtitleOutlineColorArgb" },
+  backgroundColor: { get title() { return hudText("player_hud_custom_background_color", "Custom Background Color"); }, event: "subtitleBackgroundColorArgb" },
+  shadowColor: { get title() { return hudText("player_hud_custom_shadow_color", "Custom Shadow Color"); }, event: "subtitleShadowColorArgb" },
 };
 
 const SUBTITLE_COLOR_EVENT_FIELDS = {
@@ -1271,7 +1999,7 @@ const updateSubtitleHexPreview = () => {
   const typed = String(subtitleHexInput.value || "").trim();
   const argb = parseHexColorInput(typed, subtitleHexField);
   const valid = argb !== null;
-  subtitleHexStatus.textContent = valid || !typed ? "" : "Enter a hex color like #FFD700 or #B3000000.";
+  subtitleHexStatus.textContent = valid || !typed ? "" : hudText("player_hud_enter_a_hex_color_like_ffd700", "Enter a hex color like #FFD700 or #B3000000.");
   subtitleHexApplyButton.disabled = !valid;
   if (!valid) return;
   const alpha = Math.floor(argb / 0x1000000);
@@ -1332,13 +2060,798 @@ subtitleHexModal.addEventListener("click", event => {
   if (event.target === subtitleHexModal) closeSubtitleHexPrompt();
 });
 
+// --- Watch party -------------------------------------------------------------------------------
+// The party pill and panel. Kotlin sends `state.party` (PlayerControlPartyState) with every label
+// already localized, and hears clicks as `party*` events (handlePartyControlsEvent). The panel is
+// rebuilt only when its data changes, because render() runs on every position tick.
+const partyButton = document.getElementById("partyButton");
+const partyButtonLabel = document.getElementById("partyButtonLabel");
+const partyPill = document.getElementById("partyPill");
+const partyPillAvatars = document.getElementById("partyPillAvatars");
+const partyPillText = document.getElementById("partyPillText");
+const partyModal = document.getElementById("partyModal");
+const partyPanelTitle = document.getElementById("partyPanelTitle");
+const partyCloseButton = document.getElementById("partyCloseButton");
+const partyBody = document.getElementById("partyBody");
+const partyPillBadge = document.getElementById("partyPillBadge");
+const partyTabs = document.getElementById("partyTabs");
+const partyTabParty = document.getElementById("partyTabParty");
+const partyTabChat = document.getElementById("partyTabChat");
+const partyTabChatLabel = document.getElementById("partyTabChatLabel");
+const partyTabBadge = document.getElementById("partyTabBadge");
+const partyChat = document.getElementById("partyChat");
+const partyChatList = document.getElementById("partyChatList");
+const partyChatEmpty = document.getElementById("partyChatEmpty");
+const partyChatEmptyTitle = document.getElementById("partyChatEmptyTitle");
+const partyChatEmptyMessage = document.getElementById("partyChatEmptyMessage");
+const partyChatForm = document.getElementById("partyChatForm");
+const partyChatInput = document.getElementById("partyChatInput");
+const partyChatSend = document.getElementById("partyChatSend");
+const PartyPillMaxAvatars = 4;
+const PartyChatMaxLength = 500;
+// "party" | "chat": which tab of the panel is showing while in a party.
+let partyTab = "party";
+let partyChatSignature = "";
+// A badge on the party button, created once (the button's own markup is static).
+let partyButtonBadge = null;
+// "" | "end" | "remove:<member index>": the inline confirmation the panel is showing.
+let partyConfirm = "";
+let partyPillSignature = "";
+let partyPanelSignature = "";
+
+const currentParty = () => (state.party && typeof state.party === "object" ? state.party : {});
+const partyLabel = (key, fallback = "") => {
+  const labels = currentParty().labels || {};
+  return labels[key] || fallback;
+};
+
+const partyElement = (tag, className, text) => {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
+};
+
+const partyButtonElement = (label, className, onClick, disabled = false) => {
+  const button = partyElement("button", `panel-button ${className || ""}`.trim(), label);
+  button.type = "button";
+  button.disabled = disabled;
+  button.addEventListener("click", event => {
+    event.stopPropagation();
+    button.blur();
+    onClick();
+  });
+  return button;
+};
+
+const partyAvatarElement = (member, className = "") => {
+  const avatar = partyElement("span", `party-avatar ${className}`.trim());
+  if (/^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(member.color || "")) avatar.style.background = member.color;
+  avatar.appendChild(partyElement("span", "party-avatar-initials", member.initials || "?"));
+  if (/^https:\/\//i.test(member.avatarUrl || "")) {
+    const image = new Image();
+    image.className = "party-avatar-image";
+    image.alt = "";
+    image.referrerPolicy = "no-referrer";
+    image.addEventListener("error", () => image.remove());
+    image.src = member.avatarUrl;
+    avatar.appendChild(image);
+  }
+  return avatar;
+};
+
+const renderPartyChrome = (isChromeHidden, pictureInPictureActive) => {
+  const party = currentParty();
+  const partyTitle = partyLabel("title", "Watch party");
+  setVisible(partyButton, Boolean(party.available) && !state.heroTrailerMode);
+  partyButton.classList.toggle("selected", Boolean(party.active));
+  partyButtonLabel.textContent = partyTitle;
+  if (partyButton.dataset.tooltip !== partyTitle) {
+    partyButton.dataset.tooltip = partyTitle;
+    partyButton.setAttribute("aria-label", partyTitle);
+  }
+
+  const message = party.pillMessage || "";
+  const visible = Boolean(party.active) &&
+    !pictureInPictureActive &&
+    !state.isLocked &&
+    !state.heroTrailerMode &&
+    activeModal !== "party" &&
+    (Boolean(message) || !isChromeHidden);
+  partyPill.classList.toggle("visible", visible);
+  partyPill.setAttribute("aria-hidden", visible ? "false" : "true");
+  partyPill.tabIndex = visible ? 0 : -1;
+
+  const members = Array.isArray(party.members) ? party.members : [];
+  const signature = JSON.stringify([members.map(m => [m.name, m.avatarUrl, m.color, m.presence]), message]);
+  if (signature === partyPillSignature) return;
+  partyPillSignature = signature;
+  partyPillAvatars.replaceChildren();
+  members.slice(0, PartyPillMaxAvatars).forEach(member => {
+    partyPillAvatars.appendChild(partyAvatarElement(member, "small"));
+  });
+  if (members.length > PartyPillMaxAvatars) {
+    partyPillAvatars.appendChild(partyElement("span", "party-avatar small party-avatar-more", `+${members.length - PartyPillMaxAvatars}`));
+  }
+  partyPillText.textContent = message;
+  partyPillText.hidden = !message;
+};
+
+const partyUnreadText = () => {
+  const party = currentParty();
+  const unread = party.active ? Math.max(0, Number(party.chatUnread) || 0) : 0;
+  return unread > 0 ? (unread > 99 ? "99+" : String(unread)) : "";
+};
+
+// Unread chat on the pill, the party button and the Chat tab. Runs on every render, so it only
+// touches the DOM when the count changes.
+let partyUnreadShown = null;
+const renderPartyUnread = () => {
+  const text = partyUnreadText();
+  if (text === partyUnreadShown) return;
+  partyUnreadShown = text;
+  if (!partyButtonBadge && partyButton) {
+    partyButtonBadge = partyElement("span", "party-badge");
+    partyButtonBadge.hidden = true;
+    partyButton.style.position = partyButton.style.position || "relative";
+    partyButton.appendChild(partyButtonBadge);
+  }
+  [partyPillBadge, partyButtonBadge, partyTabBadge].forEach(badge => {
+    if (!badge) return;
+    badge.textContent = text;
+    badge.hidden = !text;
+  });
+};
+
+const partySwitchRow = (title, description, checked, eventType, note = "") => {
+  const row = partyElement("button", "party-switch-row");
+  row.type = "button";
+  row.setAttribute("role", "switch");
+  row.setAttribute("aria-checked", checked ? "true" : "false");
+  const text = partyElement("span", "party-switch-text");
+  text.appendChild(partyElement("span", "party-switch-title", title));
+  text.appendChild(partyElement("span", "party-switch-description", description));
+  if (note) text.appendChild(partyElement("span", "party-note", note));
+  row.appendChild(text);
+  const track = partyElement("span", `party-switch${checked ? " on" : ""}`);
+  track.appendChild(partyElement("span", "party-switch-thumb"));
+  row.appendChild(track);
+  row.addEventListener("click", event => {
+    event.stopPropagation();
+    row.blur();
+    send(eventType, checked ? 0 : 1);
+  });
+  return row;
+};
+
+const partyConfirmBlock = (title, message, confirmLabel, onConfirm) => {
+  const block = partyElement("div", "party-confirm");
+  block.appendChild(partyElement("div", "party-section-title", title));
+  if (message) block.appendChild(partyElement("div", "party-text", message));
+  const actions = partyElement("div", "modal-actions");
+  actions.appendChild(partyButtonElement(partyLabel("cancel", "Cancel"), "", () => {
+    partyConfirm = "";
+    renderPartyModal();
+  }));
+  actions.appendChild(partyButtonElement(confirmLabel, "primary danger", () => {
+    partyConfirm = "";
+    onConfirm();
+  }));
+  block.appendChild(actions);
+  return block;
+};
+
+const renderPartyStart = (party, body) => {
+  const hero = partyElement("div", "party-hero");
+  hero.appendChild(partyElement("div", "party-start-title", partyLabel("startTitle", "Watch together")));
+  hero.appendChild(partyElement("div", "party-text", partyLabel("startDescription")));
+  body.appendChild(hero);
+  if (party.startNote) {
+    body.appendChild(partyElement("div", "party-note", party.startNote));
+  } else {
+    body.appendChild(partyButtonElement(
+      partyLabel("startAction", "Start watch party"),
+      "primary party-wide",
+      () => send("partyStart", 0),
+      Boolean(party.busy),
+    ));
+  }
+  body.appendChild(partyElement("div", "party-note", partyLabel("experimental")));
+};
+
+const renderPartyMembers = (party, body) => {
+  const members = Array.isArray(party.members) ? party.members : [];
+  const section = partyElement("div", "party-section");
+  section.appendChild(partyElement("div", "form-label", partyLabel("seats")));
+  members.forEach(member => {
+    if (partyConfirm === `remove:${member.index}`) {
+      section.appendChild(partyConfirmBlock(
+        partyLabel("removeTitle", "Remove {name}?").replace("{name}", member.name),
+        partyLabel("removeMessage"),
+        partyLabel("remove", "Remove"),
+        () => send("partyRemoveMember", Number(member.index)),
+      ));
+      return;
+    }
+    const row = partyElement("div", "party-member");
+    const avatar = partyAvatarElement(member);
+    avatar.appendChild(partyElement("span", `party-presence ${member.presence || "offline"}`));
+    row.appendChild(avatar);
+    const text = partyElement("div", "party-member-text");
+    const nameRow = partyElement("div", "party-member-name");
+    nameRow.appendChild(partyElement("span", "", member.isSelf ? `${member.name} (${partyLabel("you", "You")})` : member.name));
+    if (member.isHost) nameRow.appendChild(partyElement("span", "party-chip", partyLabel("host", "Host")));
+    text.appendChild(nameRow);
+    text.appendChild(partyElement("div", "party-member-status", member.status || ""));
+    row.appendChild(text);
+    if (member.canRemove) {
+      row.appendChild(partyButtonElement(partyLabel("remove", "Remove"), "", () => {
+        partyConfirm = `remove:${member.index}`;
+        renderPartyModal();
+      }));
+    }
+    section.appendChild(row);
+  });
+  body.appendChild(section);
+};
+
+const renderPartyActive = (party, body) => {
+  if (party.behindTitle) {
+    const behind = partyElement("div", "party-section");
+    behind.appendChild(partyElement("div", "party-text strong", party.behindTitle));
+    behind.appendChild(partyButtonElement(partyLabel("catchUp", "Catch up"), "primary party-wide", () => {
+      send("partyCatchUp", 0);
+      closePlayerModal();
+    }));
+    body.appendChild(behind);
+  }
+
+  const code = partyElement("div", "party-code-row");
+  const codeText = partyElement("div", "party-code-text");
+  codeText.appendChild(partyElement("div", "form-label", partyLabel("codeLabel", "Party code")));
+  codeText.appendChild(partyElement("div", "party-code", party.code || ""));
+  if (!party.connected) codeText.appendChild(partyElement("div", "party-note", partyLabel("reconnecting", "")));
+  code.appendChild(codeText);
+  code.appendChild(partyButtonElement(partyLabel("copyInvite", "Copy invite"), "", () => send("partyCopyInvite", 0)));
+  body.appendChild(code);
+
+  renderPartyMembers(party, body);
+
+  if (party.isHost) {
+    const settings = partyElement("div", "party-section");
+    settings.appendChild(partySwitchRow(
+      partyLabel("hostOnlyTitle"),
+      partyLabel("hostOnlyDescription"),
+      Boolean(party.hostOnly),
+      "partyHostOnly",
+    ));
+    settings.appendChild(partySwitchRow(
+      partyLabel("shareTitle"),
+      partyLabel("shareDescription"),
+      Boolean(party.sharing),
+      "partySharing",
+      party.sharing && !party.canShareStream ? partyLabel("shareUnavailable") : "",
+    ));
+    body.appendChild(settings);
+  } else if (party.hostOnly) {
+    body.appendChild(partyElement("div", "party-note", partyLabel("hostOnlyNote")));
+  }
+
+  if (!party.sameMedia && party.elsewhereTitle) {
+    const elsewhere = partyElement("div", "party-section");
+    elsewhere.appendChild(partyElement("div", "party-text strong", party.elsewhereTitle));
+    elsewhere.appendChild(partyButtonElement(partyLabel("watchWithParty", "Watch with the party"), "primary party-wide", () => {
+      closePlayerModal();
+      send("partyWatchWithParty", 0);
+    }));
+    if (party.canControl) {
+      elsewhere.appendChild(partyButtonElement(partyLabel("playForEveryone", "Play this for everyone"), "party-wide", () => {
+        send("partyPlayForEveryone", 0);
+      }));
+    }
+    body.appendChild(elsewhere);
+  }
+
+  if (partyConfirm === "end") {
+    body.appendChild(partyConfirmBlock(
+      partyLabel("endTitle", "End the watch party?"),
+      partyLabel("endMessage"),
+      partyLabel("end", "End for everyone"),
+      () => {
+        send("partyEnd", 0);
+        closePlayerModal();
+      },
+    ));
+    return;
+  }
+  const actions = partyElement("div", "party-actions");
+  actions.appendChild(partyButtonElement(partyLabel("leave", "Leave party"), "", () => {
+    send("partyLeave", 0);
+    closePlayerModal();
+  }));
+  if (party.isHost) {
+    actions.appendChild(partyButtonElement(partyLabel("end", "End for everyone"), "danger", () => {
+      partyConfirm = "end";
+      renderPartyModal();
+    }));
+  }
+  body.appendChild(actions);
+};
+
+const partyChatMessages = () => {
+  const list = currentParty().chatMessages;
+  return Array.isArray(list) ? list : [];
+};
+
+const partyChatNearBottom = () =>
+  partyChatList.scrollHeight - partyChatList.scrollTop - partyChatList.clientHeight < 48;
+
+const renderPartyChat = () => {
+  const party = currentParty();
+  const messages = partyChatMessages();
+  const signature = JSON.stringify([messages, party.labels && party.labels.chatSend]);
+  if (signature === partyChatSignature) return;
+  partyChatSignature = signature;
+  partyChatEmptyTitle.textContent = partyLabel("chatEmptyTitle", "No messages yet");
+  partyChatEmptyMessage.textContent = partyLabel("chatEmptyMessage");
+  partyChatInput.placeholder = partyLabel("chatPlaceholder", "Message");
+  partyChatSend.textContent = partyLabel("chatSend", "Send");
+  partyChatEmpty.hidden = messages.length > 0;
+  partyChatList.hidden = messages.length === 0;
+  // Follow new messages only when already at the bottom, so reading back is not interrupted.
+  const stick = partyChatNearBottom() || partyChatList.childElementCount === 0;
+  partyChatList.replaceChildren();
+  messages.forEach(message => {
+    if (message.time) partyChatList.appendChild(partyElement("div", "party-chat-time", message.time));
+    const classes = ["party-chat-row"];
+    if (message.mine) classes.push("mine");
+    if (message.startsGroup) classes.push("group-start");
+    if (message.sending) classes.push("sending");
+    const row = partyElement("div", classes.join(" "));
+    if (!message.mine) {
+      const avatar = partyAvatarElement(message);
+      if (!message.startsGroup) avatar.classList.add("spacer");
+      row.appendChild(avatar);
+    }
+    const bubble = partyElement("div", "party-chat-bubble");
+    if (!message.mine && message.startsGroup) bubble.appendChild(partyElement("span", "party-chat-name", message.name));
+    bubble.appendChild(partyElement("span", "", message.body));
+    if (message.failed) {
+      const retry = partyElement("button", "party-chat-failed", partyLabel("chatNotSent", "Not sent. Click to retry"));
+      retry.type = "button";
+      retry.addEventListener("click", event => {
+        event.stopPropagation();
+        send(`partyChatRetry:${message.key}`, 0);
+      });
+      bubble.appendChild(retry);
+    }
+    row.appendChild(bubble);
+    partyChatList.appendChild(row);
+  });
+  if (stick) partyChatList.scrollTop = partyChatList.scrollHeight;
+};
+
+const setPartyTab = tab => {
+  const party = currentParty();
+  const next = party.active && tab === "chat" ? "chat" : "party";
+  const changed = next !== partyTab;
+  partyTab = next;
+  partyTabParty.classList.toggle("selected", next === "party");
+  partyTabChat.classList.toggle("selected", next === "chat");
+  partyTabParty.setAttribute("aria-selected", next === "party" ? "true" : "false");
+  partyTabChat.setAttribute("aria-selected", next === "chat" ? "true" : "false");
+  partyBody.hidden = next === "chat";
+  partyChat.hidden = next !== "chat";
+  if (changed) send("partyChatTab", next === "chat" ? 1 : 0);
+  if (next === "chat") {
+    partyChatSignature = "";
+    renderPartyChat();
+    partyChatList.scrollTop = partyChatList.scrollHeight;
+    partyChatInput.focus();
+  }
+};
+
+const renderPartyModal = () => {
+  const party = currentParty();
+  if (!party.active && partyConfirm) partyConfirm = "";
+  partyTabs.hidden = !party.active;
+  partyTabParty.textContent = partyLabel("tabParty", "Party");
+  partyTabChatLabel.textContent = partyLabel("tabChat", "Chat");
+  if (!party.active && partyTab !== "party") setPartyTab("party");
+  if (partyTab === "chat") renderPartyChat();
+  // The chat is rendered on its own above; leaving it out here keeps a new message from
+  // rebuilding the party tab's controls under the pointer.
+  const { chatMessages, chatUnread, ...panelState } = party;
+  const signature = JSON.stringify([panelState, partyConfirm]);
+  if (signature === partyPanelSignature) return;
+  partyPanelSignature = signature;
+  partyPanelTitle.textContent = partyLabel("title", "Watch party");
+  partyCloseButton.textContent = partyLabel("close", "Close");
+  const scrollTop = partyBody.scrollTop;
+  partyBody.replaceChildren();
+  if (party.active) {
+    renderPartyActive(party, partyBody);
+  } else {
+    renderPartyStart(party, partyBody);
+  }
+  partyBody.scrollTop = scrollTop;
+};
+
+const openPartyModal = (tab = "party") => {
+  partyConfirm = "";
+  partyPanelSignature = "";
+  partyTab = "";
+  openPlayerModal("party");
+  send("partyPanelOpened", 0);
+  setPartyTab(tab);
+};
+
+const submitPartyChat = () => {
+  const text = String(partyChatInput.value || "").trim().slice(0, PartyChatMaxLength);
+  if (!text) return;
+  partyChatInput.value = "";
+  // The text rides in the event name (see handlePartyControlsEvent).
+  send(`partyChatSend:${text}`, 0);
+  partyChatList.scrollTop = partyChatList.scrollHeight;
+};
+
+partyTabParty.addEventListener("click", event => {
+  event.stopPropagation();
+  setPartyTab("party");
+});
+partyTabChat.addEventListener("click", event => {
+  event.stopPropagation();
+  setPartyTab("chat");
+});
+partyChatForm.addEventListener("submit", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  submitPartyChat();
+});
+partyChatInput.addEventListener("click", event => event.stopPropagation());
+partyChatInput.addEventListener("keydown", event => {
+  // Enter sends (the form submits); keep other keys away from the player shortcuts. Escape still
+  // reaches the document handler, which closes the panel.
+  if (event.code !== "Escape") event.stopPropagation();
+});
+
+partyPill.addEventListener("click", event => {
+  event.stopPropagation();
+  partyPill.blur();
+  // Unread chat is the likeliest reason to click the pill.
+  openPartyModal(partyUnreadText() ? "chat" : "party");
+});
+partyCloseButton.addEventListener("click", event => {
+  event.stopPropagation();
+  closePlayerModal();
+});
+
+const streamInfoModal = document.getElementById("streamInfoModal");
+const streamInfoTitle = document.getElementById("streamInfoTitle");
+const streamInfoBody = document.getElementById("streamInfoBody");
+const streamInfoCloseButton = document.getElementById("streamInfoCloseButton");
+let streamInfoSignature = "";
+
+// Kotlin fills state.streamInfo only while it knows the panel is open ("streamInfoOpened"), so
+// an empty state right after opening is just the next push on its way.
+const renderStreamInfoModal = () => {
+  const info = state.streamInfo && typeof state.streamInfo === "object" ? state.streamInfo : null;
+  const signature = JSON.stringify(info);
+  if (signature === streamInfoSignature) return;
+  streamInfoSignature = signature;
+  if (!info) return;
+  streamInfoTitle.textContent = info.title || "Stream info";
+  streamInfoCloseButton.textContent = info.closeLabel || "Close";
+  const sections = Array.isArray(info.sections) ? info.sections : [];
+  streamInfoBody.replaceChildren();
+  sections.forEach(section => {
+    const block = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "stream-info-section-title";
+    title.textContent = section.title || "";
+    block.appendChild(title);
+    (Array.isArray(section.rows) ? section.rows : []).forEach(row => {
+      const line = document.createElement("div");
+      line.className = "stream-info-row";
+      const label = document.createElement("span");
+      label.className = "stream-info-label";
+      label.textContent = row.label || "";
+      const value = document.createElement("span");
+      value.className = "stream-info-value";
+      value.textContent = row.value || "";
+      line.appendChild(label);
+      line.appendChild(value);
+      block.appendChild(line);
+    });
+    streamInfoBody.appendChild(block);
+  });
+};
+
+streamInfoCloseButton.addEventListener("click", event => {
+  event.stopPropagation();
+  closePlayerModal();
+});
+
+// The docked panels: subtitles (tracks, addon subtitles and style as three entries), audio, stream
+// info, submit intro and the watch party open as one black glass panel standing on the control
+// row. The rail down its inner side switches between them in place; the panel keeps its spot and
+// size. It always opens in the same place: over the right end of the controls, or the left end
+// for the Official Nuvio layout (its tools sit on the left), and on Minimal with pills it grows
+// out of the tool pill itself. The user can drag its inner edges to resize it (kept per HUD
+// profile in localStorage). The layer under it takes no clicks, so the control row stays usable
+// while it is open, and a click on the bare video closes it (the pointerdown listener further down).
+const subtitleTabIndex = { BuiltIn: 0, Addons: 1, Style: 2 };
+const subtitleTabTitle = tab => {
+  const title = state.subtitlesPanelTitle || hudText("player_hud_subtitles", "Subtitles");
+  if (tab === "Addons") return `${title} · ${state.subtitleAddonsTabLabel || hudText("player_hud_addons", "Addons")}`;
+  if (tab === "Style") return `${title} · ${state.subtitleStyleTabLabel || hudText("player_hud_style", "Style")}`;
+  return title;
+};
+const dockRailEntries = [
+  { id: "subtitles", modal: "subtitles", tab: "BuiltIn", icon: "#icon-subs", label: () => subtitleTabTitle("BuiltIn") },
+  { id: "subtitleAddons", modal: "subtitles", tab: "Addons", icon: "#icon-download", label: () => subtitleTabTitle("Addons") },
+  { id: "subtitleStyle", modal: "subtitles", tab: "Style", icon: "#icon-color-profile", label: () => subtitleTabTitle("Style") },
+  { id: "audio", modal: "audio", icon: "#icon-audio", label: () => hudText("player_hud_audio_tracks", "Audio tracks") },
+  { id: "streamInfo", modal: "streamInfo", icon: "#icon-info", label: () => streamInfoTitle.textContent || "Stream info" },
+  {
+    id: "submitIntro",
+    modal: "submitIntro",
+    icon: "#icon-flag",
+    label: () => state.submitIntroLabel || hudText("player_hud_submit_intro", "Submit intro"),
+    available: () => Boolean(state.showSubmitIntro),
+  },
+  {
+    id: "party",
+    modal: "party",
+    icon: "#icon-party",
+    label: () => hudText("player_hud_watch_party", "Watch party"),
+    available: () => !partyButton.hidden,
+  },
+];
+const dockModalNames = [...new Set(dockRailEntries.map(entry => entry.modal))];
+const isDockModal = name => Boolean(name) && dockModalNames.includes(name);
+const selectedDockEntryId = () => {
+  if (activeModal !== "subtitles") return activeModal;
+  const tab = state.subtitleActiveTab || "BuiltIn";
+  const entry = dockRailEntries.find(item => item.modal === "subtitles" && item.tab === tab);
+  return entry ? entry.id : "subtitles";
+};
+let dockRailSignature = "";
+let consumeDockDismissClick = false;
+
+const renderDockRails = () => {
+  if (!isDockModal(activeModal)) return;
+  const selectedId = selectedDockEntryId();
+  const entries = dockRailEntries.filter(entry => !entry.available || entry.available() || entry.id === selectedId);
+  const signature = `${selectedId}#${entries.map(entry => `${entry.id}:${entry.label()}`).join("|")}`;
+  if (signature === dockRailSignature) return;
+  dockRailSignature = signature;
+  document.querySelectorAll(".dock-rail").forEach(rail => {
+    rail.textContent = "";
+    entries.forEach(entry => {
+      const selected = entry.id === selectedId;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = selected ? "dock-rail-button selected" : "dock-rail-button";
+      button.dataset.dockTarget = entry.id;
+      const label = entry.label();
+      button.title = label;
+      button.setAttribute("aria-label", label);
+      button.setAttribute("aria-pressed", String(selected));
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+      use.setAttribute("href", entry.icon);
+      svg.appendChild(use);
+      button.appendChild(svg);
+      rail.appendChild(button);
+    });
+  });
+};
+
+const currentPanelScale = () => {
+  const raw = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--panel-scale"));
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+};
+
+// Panel size, in the panel's own (unzoomed) pixels.
+const DockPanelDefaultSize = { width: 680, height: 460 };
+const DockPanelMinSize = { width: 400, height: 260 };
+const DockPanelSizeStorageKey = "nuvioDockPanelSize";
+const readStoredDockPanelSize = () => {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(DockPanelSizeStorageKey) || "null");
+    if (raw && Number(raw.width) > 0 && Number(raw.height) > 0) {
+      return { width: Number(raw.width), height: Number(raw.height) };
+    }
+  } catch (_) {
+    // Unreadable or unavailable: the default size.
+  }
+  return null;
+};
+let dockPanelSize = readStoredDockPanelSize();
+const storeDockPanelSize = size => {
+  try {
+    if (size) window.localStorage.setItem(DockPanelSizeStorageKey, JSON.stringify({
+      width: Math.round(size.width),
+      height: Math.round(size.height),
+    }));
+    else window.localStorage.removeItem(DockPanelSizeStorageKey);
+  } catch (_) {
+    // Storage unavailable: the size still applies for this session.
+  }
+};
+// The room above the controls, in panel pixels (measured by positionDockPanel).
+let dockMaxSize = { width: 1200, height: 800 };
+let dockFixedWidth = null;
+const applyDockPanelSize = () => {
+  const size = dockPanelSize || DockPanelDefaultSize;
+  const width = dockFixedWidth != null ? dockFixedWidth : Math.min(dockMaxSize.width, Math.max(Math.min(DockPanelMinSize.width, dockMaxSize.width), size.width));
+  const height = Math.min(dockMaxSize.height, Math.max(Math.min(DockPanelMinSize.height, dockMaxSize.height), size.height));
+  const rootStyle = document.documentElement.style;
+  // Grown from the pill, the width is the pill's to the sub-pixel: rounded in the panel's zoomed
+  // pixels it came back up to a pixel or two off the pill's edges once zoomed.
+  rootStyle.setProperty("--dock-w", dockFixedWidth != null ? `${width.toFixed(3)}px` : `${Math.round(width)}px`);
+  rootStyle.setProperty("--dock-h", `${Math.round(height)}px`);
+};
+
+// Pins the open docked panel to its side of the controls. The frame around the zoomed panel is
+// not zoomed, so its offsets are screen pixels; the size limits go to the panel in its own pixels.
+const positionDockPanel = () => {
+  if (!isDockModal(activeModal)) return;
+  const rootStyle = document.documentElement.style;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const scale = currentPanelScale();
+  const tvMenus = root.classList.contains("tv-menus");
+  const leftSide = !tvMenus && root.classList.contains("official-hud");
+  const pills = !tvMenus && root.classList.contains("minimal-hud") && root.classList.contains("minimal-pills")
+    && Boolean(state.dockPanelFromBarEnabled);
+  const toolPill = pills ? root.querySelector(".desktop-control-row .action-row") : null;
+  const toolRect = toolPill ? toolPill.getBoundingClientRect() : null;
+  const integrated = Boolean(toolRect && toolRect.width > 0 && toolRect.height > 0);
+  root.classList.toggle("dock-side-left", leftSide && !integrated);
+  root.classList.toggle("dock-integrated", integrated);
+  let anchorRect;
+  let gap;
+  if (integrated) {
+    anchorRect = toolRect;
+    gap = 0;
+  } else {
+    const progress = root.querySelector(".progress");
+    const progressRect = progress ? progress.getBoundingClientRect() : null;
+    anchorRect = progressRect && progressRect.height > 0
+      ? progressRect
+      : { top: viewportHeight - 140, left: 24, right: viewportWidth - 24 };
+    gap = 10;
+  }
+  const top = anchorRect.top - gap;
+  // Grown from the pill, the panel's foot and right side sit exactly on the pill's (fractional) edges.
+  const px = value => integrated ? `${value.toFixed(3)}px` : `${Math.round(value)}px`;
+  rootStyle.setProperty("--dock-bottom", px(Math.max(0, viewportHeight - top)));
+  if (leftSide && !integrated) {
+    rootStyle.setProperty("--dock-left", `${Math.round(Math.max(8, anchorRect.left))}px`);
+    rootStyle.setProperty("--dock-right", "auto");
+  } else {
+    rootStyle.setProperty("--dock-left", "auto");
+    rootStyle.setProperty("--dock-right", px(Math.max(integrated ? 0 : 8, viewportWidth - anchorRect.right)));
+  }
+  dockMaxSize = tvMenus
+    // Centred (opened from the keyboard or a pad, CSS .tv-menus): most of the screen, not just what is above the controls.
+    ? { width: Math.max(300, (viewportWidth * 0.9) / scale), height: Math.max(200, (viewportHeight * 0.86) / scale) }
+    : {
+      width: Math.max(300, (viewportWidth - 24) / scale),
+      height: Math.max(200, (top - 16) / scale),
+    };
+  // Grown from the pill, the panel is exactly the pill's width (only its height drags).
+  dockFixedWidth = integrated ? toolRect.width / scale : null;
+  applyDockPanelSize();
+};
+
+// Opens a docked panel (by rail entry id) the way its action-row button does.
+const openDockModal = id => {
+  const entry = dockRailEntries.find(item => item.id === id);
+  if (!entry) return;
+  if (entry.tab) {
+    if ((state.subtitleActiveTab || "BuiltIn") !== entry.tab) selectSubtitleTab(entry.tab, subtitleTabIndex[entry.tab]);
+    if (activeModal !== "subtitles") openPlayerModal("subtitles");
+    else renderDockRails();
+    return;
+  }
+  if (entry.modal === "streamInfo") {
+    streamInfoSignature = "";
+    openPlayerModal("streamInfo");
+    send("streamInfoOpened", 0);
+    return;
+  }
+  if (entry.modal === "party") {
+    openPartyModal(partyUnreadText() ? "chat" : "party");
+    return;
+  }
+  openPlayerModal(entry.modal);
+};
+
+// Drag-to-resize: the panel is pinned by its bottom and outer side, so the top edge, the inner
+// edge and the corner between them move. Pointer travel is screen pixels; the size is panel pixels.
+let dockResize = null;
+const beginDockResize = (event, axis) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const size = dockPanelSize || DockPanelDefaultSize;
+  dockResize = {
+    pointerId: event.pointerId,
+    axis,
+    x: event.clientX,
+    y: event.clientY,
+    width: Math.min(dockMaxSize.width, size.width),
+    height: Math.min(dockMaxSize.height, size.height),
+    leftSide: root.classList.contains("dock-side-left"),
+  };
+  try {
+    event.currentTarget.setPointerCapture(event.pointerId);
+  } catch (_) {
+    // No live pointer to capture (a synthetic event): the moves still arrive on the handle.
+  }
+  root.classList.add("dock-resizing");
+};
+const moveDockResize = event => {
+  if (!dockResize || event.pointerId !== dockResize.pointerId) return;
+  const scale = currentPanelScale();
+  const dx = (dockResize.leftSide ? event.clientX - dockResize.x : dockResize.x - event.clientX) / scale;
+  const dy = (dockResize.y - event.clientY) / scale;
+  dockPanelSize = {
+    width: dockResize.axis === "y" ? dockResize.width : dockResize.width + dx,
+    height: dockResize.axis === "x" ? dockResize.height : dockResize.height + dy,
+  };
+  applyDockPanelSize();
+};
+const endDockResize = event => {
+  if (!dockResize || (event && event.pointerId !== dockResize.pointerId)) return;
+  dockResize = null;
+  root.classList.remove("dock-resizing");
+  if (dockPanelSize) {
+    dockPanelSize = {
+      width: Math.min(dockMaxSize.width, Math.max(DockPanelMinSize.width, dockPanelSize.width)),
+      height: Math.min(dockMaxSize.height, Math.max(DockPanelMinSize.height, dockPanelSize.height)),
+    };
+    storeDockPanelSize(dockPanelSize);
+  }
+  // The click that ends the drag may land outside the panel; it must not pause or close anything.
+  consumeDockDismissClick = true;
+  window.setTimeout(() => { consumeDockDismissClick = false; }, 0);
+};
+document.querySelectorAll(".dock-frame").forEach(frame => {
+  ["x", "y", "xy"].forEach(axis => {
+    const handle = document.createElement("div");
+    handle.className = `dock-resize dock-resize-${axis}`;
+    handle.setAttribute("aria-hidden", "true");
+    handle.title = "Drag to resize. Double-click to reset.";
+    handle.addEventListener("pointerdown", event => beginDockResize(event, axis));
+    handle.addEventListener("pointermove", moveDockResize);
+    handle.addEventListener("pointerup", endDockResize);
+    handle.addEventListener("pointercancel", endDockResize);
+    handle.addEventListener("lostpointercapture", endDockResize);
+    handle.addEventListener("click", event => event.stopPropagation());
+    handle.addEventListener("dblclick", event => {
+      event.stopPropagation();
+      dockPanelSize = null;
+      storeDockPanelSize(null);
+      applyDockPanelSize();
+    });
+    frame.appendChild(handle);
+  });
+});
+
 const modalByName = {
+  streamInfo: streamInfoModal,
   audio: audioModal,
   subtitles: subtitleModal,
   sources: sourceModal,
   episodes: episodesModal,
   submitIntro: submitIntroModal,
   p2pConsent: p2pConsentModal,
+  party: partyModal,
+  iptvChannels: iptvChannelModal,
 };
 const modalElements = Object.values(modalByName);
 const modalCloseTimers = new Map();
@@ -1380,13 +2893,9 @@ const setModalVisibility = (modal, visible, animated = true) => {
   modalCloseTimers.set(modal, timer);
 };
 
-const closePlayerModal = (notifyDismiss = false, animated = true) => {
-  closeSubtitleHexPrompt();
-  const closingModal = activeModal;
-  activeModal = "";
-  modalElements.forEach(modal => {
-    setModalVisibility(modal, false, animated);
-  });
+// What Kotlin has to hear when a panel goes away, whether it was closed or another panel took its
+// place (the docked panels switch between each other without closing).
+const notifyModalClosed = (closingModal, notifyDismiss) => {
   if (notifyDismiss && closingModal === "p2pConsent") {
     send("cancelP2pForPlayerControls", 0);
   }
@@ -1396,6 +2905,29 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   if (closingModal === "sources") {
     send("sourcesPanelClosed", 0);
   }
+  if (closingModal === "party") {
+    partyConfirm = "";
+    send("partyPanelClosed", 0);
+  }
+  if (closingModal === "streamInfo") {
+    send("streamInfoClosed", 0);
+  }
+  if (closingModal === "iptvChannels") {
+    resetIptvSearch();
+    if (document.activeElement === iptvSearchInput) focusShortcutRoot();
+    send("iptvPanelOpen", 0);
+  }
+};
+
+const closePlayerModal = (notifyDismiss = false, animated = true) => {
+  closeSubtitleHexPrompt();
+  closeStyleDropdown();
+  const closingModal = activeModal;
+  activeModal = "";
+  modalElements.forEach(modal => {
+    setModalVisibility(modal, false, animated);
+  });
+  notifyModalClosed(closingModal, notifyDismiss);
   if (keyboardPanelMode && closingModal === keyboardPanelMode) {
     keyboardPanelMode = "";
     send("keyboardPanelClosed", 0);
@@ -1403,17 +2935,41 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   renderChrome();
 };
 
+// Menus follow the input that opened them (2026-11-15): from the keyboard or a pad (whose buttons arrive as keys, or
+// as the app's own keyboard panel calls) the panels and the right-click menu open centred as a TV-style sheet over a
+// scrim (CSS .tv-menus); from the mouse they open at the pointer or docked by the controls, as before.
+document.addEventListener("keydown", () => { lastHudInput = "keyboard"; }, true);
+document.addEventListener("pointerdown", () => { lastHudInput = "pointer"; }, true);
+const setMenuStyleForInput = input => {
+  root.classList.toggle("tv-menus", (input || lastHudInput) === "keyboard");
+};
+
 const openPlayerModal = modal => {
   const targetModal = modalByName[modal];
+  // A panel switch inside an open panel keeps the style it opened with.
+  if (!activeModal) setMenuStyleForInput();
   if (!targetModal) {
     closePlayerModal(false);
     return;
   }
-  if (keyboardPanelMode && modal !== keyboardPanelMode) {
+  // "controls" (the control navigation) stays on across a panel it opened: the arrows then walk the panel.
+  if (keyboardPanelMode && keyboardPanelMode !== "controls" && modal !== keyboardPanelMode) {
     keyboardPanelMode = "";
     send("keyboardPanelClosed", 0);
   }
+  const openingSources = modal === "sources" && activeModal !== "sources";
+  const previousModal = activeModal;
+  const dockSwitch = isDockModal(previousModal) && isDockModal(modal) && previousModal !== modal;
+  if (previousModal && previousModal !== modal) {
+    if (previousModal === "subtitles") closeSubtitleHexPrompt();
+    notifyModalClosed(previousModal, false);
+  }
   activeModal = modal;
+  // Every opening of the Sources sheet starts at the top, whatever it was scrolled to last time.
+  if (openingSources) {
+    sourceListPinnedTop = true;
+    setSourceSortMenuOpen(false);
+  }
   // Modals draw their own scrim at the same stacking level, so the grade panel would sit dimmed
   // and unusable behind one. Close it rather than leave a dead panel on screen.
   setColorGradePanelOpen(false);
@@ -1426,9 +2982,23 @@ const openPlayerModal = modal => {
     };
   }
   renderActiveModal();
+  // One docked panel replacing another is a tab change inside the same panel: no fade, no slide.
+  if (dockSwitch) {
+    targetModal.classList.add("dock-switching");
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      targetModal.classList.remove("dock-switching");
+    }));
+  }
   modalElements.forEach(modalElement => {
-    setModalVisibility(modalElement, modalElement === targetModal);
+    const visible = modalElement === targetModal;
+    setModalVisibility(modalElement, visible, visible || !dockSwitch);
   });
+  if (isDockModal(modal)) positionDockPanel();
+  // Set again once visible: a scrollTop written while the sheet was still hidden is dropped.
+  if (openingSources) {
+    sourceList.scrollTop = 0;
+    requestSourceVirtualRender();
+  }
   renderChrome();
 };
 
@@ -1467,155 +3037,180 @@ const playbackSpeedMenuItems = [
 // Player HUD UI-scale presets (-50..+50%, matching the Playback settings slider). Exposed in the
 // right-click menu for quick testing; each preset checkmarks against the live uiScalePercent and
 // the two nudge rows step by the same 5% as the slider.
-const uiScalePresetItems = [{ label: "Increase (+5%)", action: "uiScaleDelta:5" },
-  { label: "Decrease (−5%)", action: "uiScaleDelta:-5" }];
+const uiScalePresetItems = [{ label: "Increase (+5%)", textKey: "player_hud_increase_5", action: "uiScaleDelta:5" },
+  { label: "Decrease (−5%)", textKey: "player_hud_decrease_5", action: "uiScaleDelta:-5" }];
 for (let pct = 50; pct >= -50; pct -= 10) {
   uiScalePresetItems.push({
     label: pct === 0 ? "Default (0%)" : `${pct > 0 ? "+" : ""}${pct}%`,
+    ...(pct === 0 ? { textKey: "player_hud_default_0" } : {}),
     action: `uiScaleSet:${pct}`,
     selectedField: "uiScalePercentValue",
     selectedValue: String(pct),
   });
 }
 
+// Player Controls Layout, mirrored from Settings > Playback so layouts can be compared without
+// leaving playback. Index = DesktopHudLayout.entries order; the checkmark reads the four HUD flags
+// the page already receives (hudLayoutValue below), so it tracks whichever side changed it.
+const hudLayoutItems = [
+  ["standard", "Standard", "player_hud_standard"],
+  ["legacy", "Legacy", "player_hud_legacy"],
+  ["minimal", "Minimal", "player_hud_minimal"],
+  ["ultra", "Ultra Minimal", "player_hud_ultra_minimal"],
+  ["official", "Official Nuvio", "player_hud_official_nuvio"],
+].map(([value, label, textKey], index) => ({
+  label,
+  textKey,
+  action: `hudLayout:${index}`,
+  selectedField: "hudLayoutValue",
+  selectedValue: value,
+}));
+const currentHudLayoutValue = () => {
+  if (state.officialHudEnabled) return "official";
+  if (state.ultraHudEnabled) return "ultra";
+  if (state.minimalHudEnabled) return "minimal";
+  if (state.legacyHudEnabled) return "legacy";
+  return "standard";
+};
+
 const contextMenuItems = [
   {
-    label: "Playback",
+    label: "Playback", textKey: "player_hud_playback",
     children: [
-      { label: "Play / Pause", action: "send:toggle", shortcut: "K" },
       // Labels carry the configured step, so they are rewritten by refreshSeekStepLabels()
       // whenever the setting changes rather than baked in at build time.
-      { label: "Seek back 10 seconds", labelKey: "seekBack", action: "send:seekBack", shortcut: "←" },
-      { label: "Seek forward 10 seconds", labelKey: "seekForward", action: "send:seekForward", shortcut: "→" },
-      { label: "Playback speed", children: playbackSpeedMenuItems },
-      { label: "Previous episode", action: "send:previousEpisode" },
-      { label: "Next episode", action: "send:nextEpisode" },
-      { label: "Picture in picture", action: "send:pictureInPicture" },
+      { label: "Playback speed", textKey: "player_hud_playback_speed", children: playbackSpeedMenuItems },
+      { label: "Previous episode", textKey: "player_hud_previous_episode", action: "send:previousEpisode", youTube: false },
+      { label: "Next episode", textKey: "player_hud_next_episode", action: "send:nextEpisode", youTube: false },
+      { label: "Picture in picture", textKey: "player_hud_picture_in_picture", action: "send:pictureInPicture" },
     ],
   },
   {
-    label: "Subtitles",
+    label: "Subtitles", textKey: "player_hud_subtitles",
     children: [
-      { label: "Built-in", dynamicKey: "subtitleTracks", children: [] },
-      { label: "Addon", dynamicKey: "addonSubtitles", children: [] },
+      { label: "Built-in", textKey: "player_hud_built_in", dynamicKey: "subtitleTracks", children: [], youTube: false },
+      { label: "Addon", textKey: "player_hud_addon", dynamicKey: "addonSubtitles", children: [] },
       {
-        label: "Style",
+        label: "Style", textKey: "player_hud_style",
         children: [
-          { label: "Outline", action: "subtitleStyle:outline", toggleKey: "outlineEnabled" },
-          { label: "Outline width", children: [
-            { label: "Increase", action: "send:subtitleOutlineWidthDelta:1" },
-            { label: "Decrease", action: "send:subtitleOutlineWidthDelta:-1" },
+          { label: "Outline", textKey: "player_hud_outline", action: "subtitleStyle:outline", toggleKey: "outlineEnabled" },
+          { label: "Outline width", textKey: "player_hud_outline_width_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleOutlineWidthDelta:1" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleOutlineWidthDelta:-1" },
           ] },
-          { label: "Shadow", action: "subtitleStyle:shadow", toggleKey: "shadowEnabled" },
-          { label: "Shadow offset", children: [
-            { label: "Increase", action: "send:subtitleShadowOffsetDelta:5" },
-            { label: "Decrease", action: "send:subtitleShadowOffsetDelta:-5" },
+          { label: "Shadow", textKey: "player_hud_shadow", action: "subtitleStyle:shadow", toggleKey: "shadowEnabled" },
+          { label: "Shadow offset", textKey: "player_hud_shadow_offset_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleShadowOffsetDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleShadowOffsetDelta:-5" },
           ] },
-          { label: "Shadow intensity", children: [
-            { label: "Increase", action: "subtitleShadowOpacity:10" },
-            { label: "Decrease", action: "subtitleShadowOpacity:-10" },
+          { label: "Shadow intensity", textKey: "player_hud_shadow_intensity_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "subtitleShadowOpacity:10" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "subtitleShadowOpacity:-10" },
           ] },
-          { label: "Blur", children: [
-            { label: "Increase", action: "send:subtitleBlurDelta:1" },
-            { label: "Decrease", action: "send:subtitleBlurDelta:-1" },
+          { label: "Blur", textKey: "player_hud_blur", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleBlurDelta:1" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleBlurDelta:-1" },
           ] },
-          { label: "Bold", action: "subtitleStyle:bold", toggleKey: "bold" },
-          { label: "Italic", action: "subtitleStyle:italic", toggleKey: "italic" },
-          { label: "Font", dynamicKey: "fontFamilies", children: [] },
-          { label: "Text color", dynamicKey: "subtitleColors", children: [] },
-          { label: "Outline color", dynamicKey: "outlineColors", children: [] },
-          { label: "Font size", children: [
-            { label: "Increase", action: "send:subtitleFontSizeDelta:2" },
-            { label: "Decrease", action: "send:subtitleFontSizeDelta:-2" },
+          { label: "Bold", textKey: "player_hud_bold", action: "subtitleStyle:bold", toggleKey: "bold" },
+          { label: "Italic", textKey: "player_hud_italic", action: "subtitleStyle:italic", toggleKey: "italic" },
+          { label: "Font", textKey: "player_hud_font", dynamicKey: "fontFamilies", children: [] },
+          { label: "Text color", textKey: "player_hud_text_color", dynamicKey: "subtitleColors", children: [] },
+          { label: "Outline color", textKey: "player_hud_outline_color_2", dynamicKey: "outlineColors", children: [] },
+          { label: "Font size", textKey: "player_hud_font_size_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleFontSizeDelta:2" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleFontSizeDelta:-2" },
           ] },
-          { label: "Bottom offset", children: [
-            { label: "Increase", action: "send:subtitleBottomOffsetDelta:5" },
-            { label: "Decrease", action: "send:subtitleBottomOffsetDelta:-5" },
+          { label: "Bottom offset", textKey: "player_hud_bottom_offset_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleBottomOffsetDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleBottomOffsetDelta:-5" },
           ] },
           // ASS/SSA scripts ignore everything above unless the styling level says otherwise;
           // "Override" is the only level under which Font size and Bottom offset move them.
           // Listed by name with a tick on the active one, like the HDR and colour-profile menus.
-          { label: "ASS/SSA styling", children: [
-            { label: "Original", action: "send:subtitleAssStyleMode:0", selectedField: "assStyleModeValueLabel" },
-            { label: "Resize", action: "send:subtitleAssStyleMode:1", selectedField: "assStyleModeValueLabel" },
-            { label: "Override", action: "send:subtitleAssStyleMode:2", selectedField: "assStyleModeValueLabel" },
+          { label: "ASS/SSA styling", textKey: "player_hud_ass_ssa_styling_2", children: [
+            { label: "Original", textKey: "player_hud_original", selectedValue: "Original", action: "send:subtitleAssStyleMode:0", selectedField: "assStyleModeValueLabel" },
+            { label: "Resize", textKey: "player_hud_resize", selectedValue: "Resize", action: "send:subtitleAssStyleMode:1", selectedField: "assStyleModeValueLabel" },
+            { label: "Override", textKey: "player_hud_override", selectedValue: "Override", action: "send:subtitleAssStyleMode:2", selectedField: "assStyleModeValueLabel" },
           ] },
-          { label: "ASS/SSA size", children: [
-            { label: "Increase", action: "send:subtitleAssScaleDelta:5" },
-            { label: "Decrease", action: "send:subtitleAssScaleDelta:-5" },
+          { label: "ASS/SSA size", textKey: "player_hud_ass_ssa_size_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleAssScaleDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleAssScaleDelta:-5" },
           ] },
-          { label: "Text opacity", children: [
-            { label: "Increase", action: "subtitleOpacity:10" },
-            { label: "Decrease", action: "subtitleOpacity:-10" },
+          { label: "Text opacity", textKey: "player_hud_text_opacity_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "subtitleOpacity:10" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "subtitleOpacity:-10" },
           ] },
-          { label: "Open style panel", action: "subtitleTab:2" },
-          { label: "Reset style defaults", action: "send:subtitleStyleReset" },
+          { label: "Open style panel", textKey: "player_hud_open_style_panel", action: "subtitleTab:2" },
+          { label: "Reset style defaults", textKey: "player_hud_reset_style_defaults", action: "send:subtitleStyleReset" },
         ],
       },
       // Auto sync needs its full card (status text + cue list) to be usable, so the menu
       // entry opens the style panel where it lives instead of firing blind Reload/Capture.
-      { label: "Auto sync", action: "subtitleTab:2" },
-      { label: "Subtitle delay", children: [
-        { label: "Increase", action: "send:subtitleDelayDelta:100" },
-        { label: "Decrease", action: "send:subtitleDelayDelta:-100" },
-        { label: "Reset", action: "send:subtitleDelayReset" },
+      { label: "Auto sync", textKey: "player_hud_auto_sync_2", action: "subtitleTab:2" },
+      { label: "Subtitle delay", textKey: "player_hud_subtitle_delay_2", children: [
+        { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleDelayDelta:100" },
+        { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleDelayDelta:-100" },
+        { label: "Reset", textKey: "player_hud_reset", action: "send:subtitleDelayReset" },
       ] },
     ],
   },
   {
-    label: "Audio",
+    // None (muted) first, then the tracks themselves, one level (2026-11-15: Mute and a nested track list before).
+    label: "Audio", textKey: "player_hud_audio", dynamicKey: "audioTracks",
     children: [
-      { label: "Audio tracks", dynamicKey: "audioTracks", children: [] },
-      { label: "Mute", action: "send:keyboardToggleMute", toggleKey: "localMuted" },
     ],
   },
   {
-    label: "Video",
+    label: "Video", textKey: "player_hud_video",
     children: [
-      { label: "Aspect ratio", children: [
-        { label: "Fit", action: "resizeMode:0", selectedField: "resizeModeLabel" },
-        { label: "Fill", action: "resizeMode:1", selectedField: "resizeModeLabel" },
-        { label: "Zoom", action: "resizeMode:2", selectedField: "resizeModeLabel" },
+      { label: "Aspect ratio", textKey: "player_hud_aspect_ratio", children: [
+        { label: "Fit", textKey: "compose_player_resize_fit", action: "resizeMode:0", selectedField: "resizeModeLabel" },
+        { label: "Fill", textKey: "compose_player_resize_fill", action: "resizeMode:1", selectedField: "resizeModeLabel" },
+        { label: "Zoom", textKey: "compose_player_resize_zoom", action: "resizeMode:2", selectedField: "resizeModeLabel" },
+        { label: "Auto crop", textKey: "compose_player_resize_auto_crop", action: "resizeMode:3", selectedField: "resizeModeLabel" },
       ] },
-      { label: "Video settings", children: [
-        { label: "Auto", action: "send:selectDesktopHdrMode:0", selectedField: "desktopHdrModeLabel" },
-        { label: "Always Tonemap", action: "send:selectDesktopHdrMode:1", selectedField: "desktopHdrModeLabel" },
-        { label: "Always Passthrough", action: "send:selectDesktopHdrMode:2", selectedField: "desktopHdrModeLabel" },
+      // Was "Video settings"; it only ever held the HDR modes (2026-11-20).
+      { label: "HDR mode", textKey: "player_hud_hdr_mode_2", children: [
+        { label: "Auto", textKey: "player_hdr_mode_auto_label", action: "send:selectDesktopHdrMode:0", selectedField: "desktopHdrModeLabel" },
+        { label: "Always Tonemap", textKey: "player_hdr_mode_always_tonemap_label", action: "send:selectDesktopHdrMode:1", selectedField: "desktopHdrModeLabel" },
+        { label: "Always Passthrough", textKey: "player_hdr_mode_always_passthrough_label", action: "send:selectDesktopHdrMode:2", selectedField: "desktopHdrModeLabel" },
       ] },
-      { label: "Color profile", children: [
-        { label: "Neutral", action: "send:selectDesktopColorProfile:0", selectedField: "desktopColorProfileLabel" },
-        { label: "Cinematic", action: "send:selectDesktopColorProfile:1", selectedField: "desktopColorProfileLabel" },
-        { label: "Vivid", action: "send:selectDesktopColorProfile:2", selectedField: "desktopColorProfileLabel" },
+      { label: "Color profile", textKey: "player_hud_color_profile_2", children: [
+        { label: "Neutral", textKey: "player_color_profile_neutral_label", action: "send:selectDesktopColorProfile:0", selectedField: "desktopColorProfileLabel" },
+        { label: "Cinematic", textKey: "player_color_profile_cinematic_label", action: "send:selectDesktopColorProfile:1", selectedField: "desktopColorProfileLabel" },
+        { label: "Vivid", textKey: "player_color_profile_vivid_label", action: "send:selectDesktopColorProfile:2", selectedField: "desktopColorProfileLabel" },
         // Selection only: the offsets themselves live in Settings > Playback. Picking Custom here is
         // what makes the C hotkey an A/B between neutral and the user's own grade mid-playback.
-        { label: "Custom", action: "send:selectDesktopColorProfile:3", selectedField: "desktopColorProfileLabel" },
-        { label: "Adjust custom color…", action: "colorGradePanel" },
+        { label: "Custom", textKey: "player_color_profile_custom_label", action: "send:selectDesktopColorProfile:3", selectedField: "desktopColorProfileLabel" },
+        { label: "Adjust custom color…", textKey: "player_hud_adjust_custom_color", action: "colorGradePanel" },
       ] },
-      { label: "Anime shader", dynamicKey: "animeShaders", children: [] },
-      { label: "SVP interpolation", action: "send:keyboardCycleAnimeSvp", toggleKey: "desktopAnimeSvpEnabled" },
-      { label: "Advanced (mpv)", dynamicKey: "mpvOptions", children: [] },
-      { label: "UI scale", children: uiScalePresetItems },
+      { label: "Anime shader", textKey: "player_hud_anime_shader", dynamicKey: "animeShaders", children: [] },
+      // Moved here from the mouse menu's Quick actions (2026-11-20). The TV sheet keeps them as tiles too.
+      { label: "SVP interpolation", textKey: "player_hud_svp_interpolation", action: "send:keyboardCycleAnimeSvp:0", toggleKey: "svpInChain" },
+      { label: "RTX True HDR", textKey: "player_hud_rtx_true_hdr", action: "send:toggleRtxTrueHdr:0", toggleKey: "rtxTrueHdrEnabled" },
+      { label: "RTX Super Resolution", textKey: "player_hud_rtx_super_resolution", action: "send:toggleRtxVsr:0", toggleKey: "rtxVsrEnabled" },
+      // This session only; the saved defaults stay in Settings > Playback. Neither runs with SVP.
+      { label: "MPV settings", textKey: "player_hud_advanced_mpv", dynamicKey: "mpvOptions", children: [] },
+      { label: "UI scale", textKey: "player_hud_ui_scale", children: uiScalePresetItems },
+      { label: "Controls layout", textKey: "player_hud_controls_layout", children: hudLayoutItems },
     ],
   },
   {
-    label: "Tools",
+    label: "Tools", textKey: "player_hud_tools",
     children: [
-      { label: "Sources", action: "modal:sources" },
-      { label: "Episodes", action: "modal:episodes" },
-      { label: "Submit intro / outro", action: "modal:submitIntro" },
+      { label: "Sources", textKey: "player_hud_sources", action: "modal:sources" },
+      { label: "Episodes", textKey: "player_hud_episodes", action: "modal:episodes" },
+      { label: "Submit intro / outro", textKey: "player_hud_submit_intro_outro", action: "modal:submitIntro", youTube: false },
     ],
   },
   {
-    label: "Window",
+    label: "Window", textKey: "player_hud_window",
     children: [
-      { label: "Fullscreen", action: "send:toggleFullscreen", shortcut: "F11" },
-      { label: "Close playback", action: "send:back", shortcut: "Esc" },
+      { label: "Fullscreen", textKey: "player_hud_fullscreen", action: "send:toggleFullscreen", shortcut: "F11" },
+      { label: "Close playback", textKey: "player_hud_close_playback", action: "send:back", shortcut: "Esc" },
     ],
   },
-  { label: "Copy stream link", action: "copyStreamUrl" },
-  { label: "Stream failover", action: "toggleStreamFailover", toggleKey: "streamFailoverEnabled" },
-  { label: "MPV diagnostics", action: "toggleMpvDiagnostics", toggleKey: "mpvDiagnosticsEnabled" },
-  { label: "Close menu after selecting", action: "toggleCloseOnSelect", toggleKey: "closeMenuOnSelect" },
+  { label: "Copy stream link", textKey: "player_hud_copy_stream_link", action: "copyStreamUrl" },
 ];
 
 let contextMenuOpen = false;
@@ -1634,7 +3229,7 @@ window.nuvioToggleMpvDiagnostics = () => {
   mpvDiagnosticsEnabled = !mpvDiagnosticsEnabled;
   renderChrome();
   refreshContextMenuIndicators();
-  window.nuvioShowPresetPill("MPV diagnostics", mpvDiagnosticsEnabled ? "On" : "Off");
+  window.nuvioShowPresetPill(hudText("player_hud_mpv_diagnostics", "MPV diagnostics"), mpvDiagnosticsEnabled ? hudText("compose_action_on", "On") : hudText("compose_action_off", "Off"));
   send("toggleMpvDiagnostics", mpvDiagnosticsEnabled ? 1 : 0);
 };
 
@@ -1659,11 +3254,21 @@ const setCloseMenuOnSelect = value => {
   }
 };
 
+// What the video-profile pass last pushed (nuvioSetPlaybackInfo, with the playback info panel
+// further down). Declared here, not beside that panel: the context menu is built and its toggles
+// read (svpInChain) while the script is still running top to bottom, and reading a `let` before
+// its line throws, which stopped the whole HUD script before it could take updates or clicks.
+let playbackInfo = { session: "", hdr: "", svp: false, svpInChain: false, video: "", shader: "", quality: "" };
+
 const contextMenuValue = key => {
   if (key === "localMuted") return localMuted;
   if (key === "mpvDiagnosticsEnabled") return mpvDiagnosticsEnabled;
   if (key === "closeMenuOnSelect") return closeMenuOnSelect;
+  // Whether SVP is running on this video, from the video-profile pass. Not desktopAnimeSvpEnabled:
+  // that saved setting is on for live action too, where SVP only runs when forced or set to all videos.
+  if (key === "svpInChain") return playbackInfo.svpInChain;
   if (key === "uiScalePercentValue") return String(Number(state.uiScalePercent) || 0);
+  if (key === "hudLayoutValue") return currentHudLayoutValue();
   if (key === "playbackSpeedValue") return parsedPlaybackSpeed().toFixed(1);
   if (key === "outlineEnabled" || key === "shadowEnabled" || key === "bold" || key === "italic") {
     return Boolean(state.subtitleStyle && state.subtitleStyle[key]);
@@ -1683,6 +3288,8 @@ const applyOptimisticContextSelection = button => {
   if (!toggleKey || toggleKey === "closeMenuOnSelect") return;
   if (toggleKey === "localMuted") {
     localMuted = !localMuted;
+  } else if (toggleKey === "svpInChain") {
+    playbackInfo = { ...playbackInfo, svpInChain: !playbackInfo.svpInChain };
   } else if (toggleKey === "outlineEnabled" || toggleKey === "shadowEnabled" || toggleKey === "bold" || toggleKey === "italic") {
     const style = { ...(state.subtitleStyle || {}) };
     style[toggleKey] = !style[toggleKey];
@@ -1702,10 +3309,9 @@ const seekStepSeconds = () => {
 // there is no number to redraw there.
 const refreshSeekStepLabels = () => {
   const seconds = seekStepSeconds();
-  const unit = seconds === 1 ? "second" : "seconds";
   const labels = {
-    seekBack: `Seek back ${seconds} ${unit}`,
-    seekForward: `Seek forward ${seconds} ${unit}`,
+    seekBack: seconds === 1 ? hudText("player_hud_seek_back_1_second", "Seek back 1 second") : hudFormat("player_hud_seek_back_1_s_seconds", "Seek back %1$s seconds", seconds),
+    seekForward: seconds === 1 ? hudText("player_hud_seek_forward_1_second", "Seek forward 1 second") : hudFormat("player_hud_seek_forward_1_s_seconds", "Seek forward %1$s seconds", seconds),
   };
   Object.entries(labels).forEach(([key, text]) => {
     if (contextMenu) {
@@ -1746,7 +3352,15 @@ const setContextMenuDynamicItems = (key, items) => {
         action: "send:selectBuiltInSubtitleTrack:-1",
         selected: !normalized.some(item => Boolean(item.selected)),
       }, ...normalized]
-    : normalized;
+    : key === "audioTracks"
+      // None mutes; picking a track plays it (and unmutes). Only one of them is ticked.
+      ? [{ label: state.noneLabel || "None", action: "audioNone", selected: localMuted },
+        ...normalized.map((item, index) => ({
+          ...item,
+          action: `audioTrack:${Number(item.index ?? index)}`,
+          selected: !localMuted && Boolean(item.selected),
+        }))]
+      : normalized;
   // Track and colour lists are pushed on every player tick, not only when they change. Rebuilding
   // the DOM under the cursor tore the hovered row out from under a :hover-driven flyout, which is
   // what made an open submenu collapse mid-interaction. Only touch the DOM when it would differ.
@@ -1758,7 +3372,7 @@ const setContextMenuDynamicItems = (key, items) => {
   contextMenuDynamicSignatures.set(key, signature);
   submenu.textContent = "";
   buildContextMenu(entries.map((item, index) => ({
-    label: String(item.label || item.display || item.languageLabel || item.title || "Option"),
+    label: String(item.label || item.display || item.languageLabel || item.title || hudText("player_hud_option", "Option")),
     action: item.action || (key === "subtitleTracks"
       ? `send:selectBuiltInSubtitleTrack:${Number(item.index ?? index)}`
       : key === "addonSubtitles"
@@ -1778,7 +3392,7 @@ const setContextMenuDynamicItems = (key, items) => {
   if (normalized.length === 0) {
     const empty = document.createElement("div");
     empty.className = "context-menu-empty";
-    empty.textContent = key === "addonSubtitles" ? "No addon subtitles loaded" : "No tracks available";
+    empty.textContent = key === "addonSubtitles" ? hudText("player_hud_no_addon_subtitles_loaded", "No addon subtitles loaded") : hudText("player_hud_no_tracks_available", "No tracks available");
     submenu.appendChild(empty);
   }
   refreshContextMenuIndicators();
@@ -1787,6 +3401,8 @@ const setContextMenuDynamicItems = (key, items) => {
 const closeContextMenu = () => {
   if (!contextMenuOpen) return;
   contextMenuOpen = false;
+  playerMenuOpenedByKey = false;
+  resetMenuPages();
   clearOpenContextMenuGroups();
   if (contextMenu) contextMenu.hidden = true;
   // The menu suppressed chrome auto-hide while open; resume normal fading now.
@@ -1825,14 +3441,14 @@ const renderColorGradePanel = () => {
   Object.entries(COLOR_GRADE_VALUE_ELEMENTS).forEach(([command, element]) => {
     if (element) element.textContent = formatColorGradeValue(state[COLOR_GRADE_STATE_FIELDS[command]]);
   });
-  const isCustom = String(state.desktopColorProfileLabel || "") === "Custom";
+  const isCustom = String(state.desktopColorProfileLabel || "") === hudText("player_color_profile_custom_label", "Custom");
   if (colorGradeNote) {
     // Two different reasons the panel can look like it is doing nothing, and the user cannot tell
     // them apart from the picture alone: a preset is active (so these values are not in play), or
     // the grade is suppressed because the content is HDR.
     colorGradeNote.textContent = isCustom
-      ? "Not applied to HDR playback"
-      : `${state.desktopColorProfileLabel || "Neutral"} active — adjusting switches to Custom`;
+      ? hudText("player_hud_not_applied_to_hdr_playback", "Not applied to HDR playback")
+      : hudFormat("player_hud_1_s_active_adjusting_switches_to", "%1$s active — adjusting switches to Custom", state.desktopColorProfileLabel || hudText("player_color_profile_neutral_label", "Neutral"));
   }
   if (colorGradeReset) {
     const isNeutral = Object.values(COLOR_GRADE_STATE_FIELDS)
@@ -1921,13 +3537,30 @@ const openSubtitleContextTab = tab => {
   send("subtitleTab", tab);
 };
 
+// Auto crop needs a few frames (~10 s) before the bars come off, so its pill says so and stays
+// up longer; otherwise picking it looks like nothing happened.
+const showAspectPill = label => {
+  if (label === resizeModeLabels()[3]) {
+    window.nuvioShowPresetPill(hudText("player_hud_aspect_ratio", "Aspect ratio"), hudText("player_hud_auto_crop_detecting_bars_10s", "Auto crop · detecting bars, ~10s"), 4000);
+  } else {
+    window.nuvioShowPresetPill(hudText("player_hud_aspect_ratio", "Aspect ratio"), label);
+  }
+};
+
+const resizeModeLabels = () => [
+  hudText("compose_player_resize_fit", "Fit"),
+  hudText("compose_player_resize_fill", "Fill"),
+  hudText("compose_player_resize_zoom", "Zoom"),
+  hudText("compose_player_resize_auto_crop", "Auto crop"),
+];
+
 const cycleAspectFromControls = () => {
-  const modes = ["Fit", "Fill", "Zoom"];
-  const currentIndex = Math.max(0, modes.findIndex(mode => mode.toLowerCase() === String(state.resizeModeLabel || "Fit").toLowerCase()));
+  const modes = resizeModeLabels();
+  const currentIndex = Math.max(0, modes.findIndex(mode => mode.toLowerCase() === String(state.resizeModeLabel || modes[0]).toLowerCase()));
   const next = modes[(currentIndex + 1) % modes.length];
   state = { ...state, resizeModeLabel: next };
   if (resizeLabel) resizeLabel.textContent = next;
-  window.nuvioShowPresetPill("Aspect ratio", next);
+  showAspectPill(next);
   send("resize", 0);
 };
 
@@ -1961,16 +3594,16 @@ const executeContextAction = action => {
   }
   if (kind === "resizeMode") {
     const index = Number(parts.shift() || 0);
-    const label = ["Fit", "Fill", "Zoom"][index] || "Fit";
+    const label = resizeModeLabels()[index] || resizeModeLabels()[0];
     state = { ...state, resizeModeLabel: label };
     if (resizeLabel) resizeLabel.textContent = label;
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Aspect ratio", label);
+    showAspectPill(label);
     send("selectResizeMode", index);
     return;
   }
   if (kind === "copyStreamUrl") {
-    window.nuvioShowPresetPill("Stream link", "Copied");
+    window.nuvioShowPresetPill(hudText("player_hud_stream_link", "Stream link"), hudText("player_hud_copied", "Copied"));
     send("copyStreamUrl", 0);
     return;
   }
@@ -1978,12 +3611,29 @@ const executeContextAction = action => {
     window.nuvioToggleMpvDiagnostics();
     return;
   }
+  if (kind === "audioNone") {
+    if (!localMuted) {
+      localMuted = true;
+      syncPlayerVolumeControl();
+      send("keyboardToggleMute", 0);
+    }
+    return;
+  }
+  if (kind === "audioTrack") {
+    if (localMuted) {
+      localMuted = false;
+      syncPlayerVolumeControl();
+      send("keyboardToggleMute", 0);
+    }
+    send("selectAudioTrack", Number(parts.shift() || 0));
+    return;
+  }
   if (kind === "toggleStreamFailover") {
     // state.streamFailoverEnabled was already flipped optimistically; forward it to Kotlin, which
     // persists the setting and pushes the corrected value back.
     const enabled = Boolean(state.streamFailoverEnabled);
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Stream failover", enabled ? "On" : "Off");
+    window.nuvioShowPresetPill(hudText("player_hud_stream_failover", "Stream failover"), enabled ? hudText("compose_action_on", "On") : hudText("compose_action_off", "Off"));
     send("toggleStreamFailover", enabled ? 1 : 0);
     return;
   }
@@ -1994,8 +3644,26 @@ const executeContextAction = action => {
     state = { ...state, uiScalePercent: clamped };
     applyUserUiScale(clamped);
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("UI scale", `${clamped > 0 ? "+" : ""}${clamped}%`);
+    window.nuvioShowPresetPill(hudText("player_hud_ui_scale", "UI scale"), `${clamped > 0 ? "+" : ""}${clamped}%`);
     send("setDesktopUiScalePercent", clamped);
+    return;
+  }
+  if (kind === "hudLayout") {
+    const index = Math.max(0, Math.min(hudLayoutItems.length - 1, Number(parts.shift() || 0)));
+    const value = hudLayoutItems[index].selectedValue;
+    // Flip the flags locally so the bar re-lays out this frame; the setting round-trips back
+    // through the controls payload with the same values.
+    state = {
+      ...state,
+      legacyHudEnabled: value === "legacy",
+      minimalHudEnabled: value === "minimal",
+      ultraHudEnabled: value === "ultra",
+      officialHudEnabled: value === "official",
+    };
+    renderChrome();
+    refreshContextMenuIndicators();
+    window.nuvioShowPresetPill(hudText("player_hud_controls_layout", "Controls layout"), hudText(hudLayoutItems[index].textKey, hudLayoutItems[index].label));
+    send("selectDesktopHudLayout", index);
     return;
   }
   if (kind === "speed") {
@@ -2004,7 +3672,7 @@ const executeContextAction = action => {
     state = { ...state, playbackSpeedLabel: label };
     speedLabel.textContent = label;
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Playback speed", label);
+    window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), label);
     send("setPlaybackSpeed", next);
     return;
   }
@@ -2107,15 +3775,21 @@ const buildContextMenu = (items, parent) => {
   items.forEach(item => {
     const group = document.createElement("div");
     group.className = "context-menu-group";
+    // Rows that do nothing for a YouTube tab video (no episodes, other sources or embedded subtitles):
+    // hidden while one plays (.youtube-video in controls.css).
+    if (item.youTube === false) group.dataset.youtubeHidden = "true";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "context-menu-item";
     button.setAttribute("role", "menuitem");
+    // A row that both picks (2x) and leads on (2.1x ...): Enter picks it, Right goes on (pressBarNavElement).
+    if (item.action) button.dataset.hasAction = "1";
     if (item.toggleKey) button.dataset.toggleKey = item.toggleKey;
     if (item.labelKey) button.dataset.labelKey = item.labelKey;
     if (item.selectedField) {
       button.dataset.selectedField = item.selectedField;
-      button.dataset.selectedValue = String(item.selectedValue ?? item.label);
+      button.dataset.selectedValue = String(item.selectedValue ?? hudText(item.textKey, item.label));
+      if (item.selectedValue == null && item.textKey) button.dataset.i18nSelectedValue = item.textKey;
     }
     if (item.swatch) {
       const dot = document.createElement("span");
@@ -2125,7 +3799,8 @@ const buildContextMenu = (items, parent) => {
     }
     const label = document.createElement("span");
     label.className = "context-menu-label";
-    label.textContent = item.label;
+    label.textContent = hudText(item.textKey, item.label);
+    if (item.textKey) label.dataset.i18n = item.textKey;
     button.appendChild(label);
     if (item.toggleKey || item.selectedField || item.selected) {
       const indicator = document.createElement("span");
@@ -2181,9 +3856,335 @@ const buildContextMenu = (items, parent) => {
   });
 };
 
+// Quick actions at the foot of the player menu, in both its forms (2026-11-15): the bar's cycle features (each press
+// steps to the next setting, shown on the tile and in the app's pill) and the switches that sat awkwardly among the
+// settings rows (RTX, failover, diagnostics, closing the menu). Pressing one keeps the menu open, so a feature can be
+// stepped through; the keys bound to them still work for those who know them.
+// [label, run, (unused), toggle key | null, hidden for a YouTube video]. A switch that is on is lit; what a press
+// changed shows in the app's pill, so the tiles carry no value line (2026-11-15).
+const QUICK_TILES = [
+  // Three by four, in rows: picture shape and sound; picture colour; motion and upscaling; about the stream.
+  // Through the menu's own Aspect ratio rows (Fit, Fill, Zoom, Auto crop), so the setting moves at once.
+  ["Aspect", () => {
+    const labels = resizeModeLabels();
+    const current = labels.indexOf(state.resizeModeLabel);
+    executeContextAction(`resizeMode:${(current + 1) % labels.length}`);
+  }, "resizeModeLabel", null],
+  ["Speed", () => send("keyboardSpeedToggle", 1), "playbackSpeedValue", null],
+  ["Audio", () => send("keyboardNextAudio", 0), null, null],
+  ["Color", () => send("keyboardCycleColorProfile", 0), "desktopColorProfileLabel", null],
+  ["HDR", () => send("keyboardCycleHdrMode", 0), "desktopHdrModeLabel", null],
+  ["Shader", () => send("keyboardCycleAnimeMode", 0), null, null],
+  ["SVP", () => send("keyboardCycleAnimeSvp", 0), null, "svpInChain"],
+  ["RTX HDR", () => send("toggleRtxTrueHdr", 0), null, "rtxTrueHdrEnabled"],
+  ["RTX VSR", () => send("toggleRtxVsr", 0), null, "rtxVsrEnabled"],
+  ["Info", () => openStreamInfoFromMenu(), null, null],
+  ["Stats", () => executeContextAction("toggleMpvDiagnostics"), null, "mpvDiagnosticsEnabled"],
+  ["Failover", () => toggleFailoverFromMenu(), null, "streamFailoverEnabled", true],
+];
+function openStreamInfoFromMenu() {
+  if (root.classList.contains("tv-menus")) {
+    openMenuStreamInfo();
+    return;
+  }
+  closeContextMenu();
+  const info = document.getElementById("streamInfoButton");
+  if (info) info.click();
+}
+// The failover action sends what state already says, as the menu row flipped it before calling it: flip it here.
+function toggleFailoverFromMenu() {
+  state = { ...state, streamFailoverEnabled: !state.streamFailoverEnabled };
+  executeContextAction("toggleStreamFailover");
+}
+const buildQuickTiles = parent => {
+  const row = document.createElement("div");
+  row.className = "context-menu-quick";
+  const title = document.createElement("div");
+  title.className = "context-menu-quick-title";
+  title.textContent = "Quick actions";
+  row.appendChild(title);
+  QUICK_TILES.forEach(([label, run, valueField, toggleKey, youTubeHidden]) => {
+    const tile = document.createElement("button");
+    tile.type = "button";
+    tile.className = "context-menu-item context-menu-quick-tile";
+    tile.setAttribute("role", "menuitem");
+    if (toggleKey) tile.dataset.quickToggle = toggleKey;
+    if (youTubeHidden) tile.dataset.youtubeHidden = "true";
+    const name = document.createElement("span");
+    name.className = "context-menu-quick-name";
+    name.textContent = label;
+    tile.appendChild(name);
+    tile.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      // A quick action never closes the menu itself, whatever "Close" says; "Close" itself flips that setting
+      // (it used to be forced off first, so it could only ever turn on).
+      if (toggleKey === "closeMenuOnSelect") {
+        run();
+      } else {
+        const keep = closeMenuOnSelect;
+        closeMenuOnSelect = false;
+        run();
+        closeMenuOnSelect = keep;
+      }
+      refreshQuickTiles();
+      // Values come back from the app a moment later.
+      setTimeout(refreshQuickTiles, 250);
+      noteChromeActivity(true);
+      tile.blur();
+    });
+    row.appendChild(tile);
+  });
+  parent.appendChild(row);
+};
+// The mouse menu's form (2026-11-16, slimmed 2026-11-20): a "Diagnostics" row, just above Copy stream link, whose
+// flyout lists what is not already elsewhere in the menu, ticked when on. Aspect, speed, audio, colour, HDR and the
+// shader each have their own rows; SVP and the RTX switches moved into Video. The centred sheet the keys or a pad open
+// keeps the full tile grid, where one press beats walking several pages. Pause overlay lives only here: the sheet's
+// 3x4 grid has no room for it.
+// [label, hud text key, run, (unused), toggle key | null, hidden for a YouTube video].
+const DIAGNOSTICS_ROWS = [
+  ["Stream info", "player_hud_stream_info", () => openStreamInfoFromMenu(), null, null],
+  ["MPV diagnostics", "player_hud_mpv_diagnostics", () => executeContextAction("toggleMpvDiagnostics"), null, "mpvDiagnosticsEnabled"],
+  ["Failover", null, () => toggleFailoverFromMenu(), null, "streamFailoverEnabled", true],
+  ["Pause overlay", null, () => {
+    const next = state.pauseOverlayEnabled === false;
+    state = { ...state, pauseOverlayEnabled: next };
+    send("togglePauseOverlay", next ? 1 : 0);
+  }, null, "pauseOverlayEnabled"],
+];
+const buildQuickActionsSection = parent => {
+  const group = document.createElement("div");
+  group.className = "context-menu-group context-menu-quick-section";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "context-menu-item";
+  button.setAttribute("role", "menuitem");
+  const label = document.createElement("span");
+  label.className = "context-menu-label";
+  label.textContent = hudText("player_hud_diagnostics", "Diagnostics");
+  label.dataset.i18n = "player_hud_diagnostics";
+  button.appendChild(label);
+  const arrow = document.createElement("span");
+  arrow.className = "context-menu-arrow";
+  arrow.textContent = "›";
+  button.appendChild(arrow);
+  const submenu = document.createElement("div");
+  submenu.className = "context-menu-submenu";
+  submenu.setAttribute("role", "menu");
+  DIAGNOSTICS_ROWS.forEach(([name, textKey, run, , toggleKey, youTubeHidden]) => {
+    const rowGroup = document.createElement("div");
+    rowGroup.className = "context-menu-group";
+    if (youTubeHidden) rowGroup.dataset.youtubeHidden = "true";
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "context-menu-item";
+    row.setAttribute("role", "menuitem");
+    if (toggleKey) row.dataset.quickToggle = toggleKey;
+    const rowLabel = document.createElement("span");
+    rowLabel.className = "context-menu-label";
+    rowLabel.textContent = textKey ? hudText(textKey, name) : name;
+    if (textKey) rowLabel.dataset.i18n = textKey;
+    row.appendChild(rowLabel);
+    if (toggleKey) {
+      const indicator = document.createElement("span");
+      indicator.className = "context-menu-state";
+      row.appendChild(indicator);
+    }
+    row.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      // Like the tiles: the menu stays open, so a feature can be stepped through.
+      if (toggleKey === "closeMenuOnSelect") {
+        run();
+      } else {
+        const keep = closeMenuOnSelect;
+        closeMenuOnSelect = false;
+        run();
+        closeMenuOnSelect = keep;
+      }
+      refreshQuickTiles();
+      setTimeout(refreshQuickTiles, 250);
+      noteChromeActivity(true);
+      row.blur();
+    });
+    rowGroup.appendChild(row);
+    rowGroup.addEventListener("mouseenter", () => openContextMenuGroup(rowGroup));
+    rowGroup.addEventListener("focusin", () => openContextMenuGroup(rowGroup));
+    submenu.appendChild(rowGroup);
+  });
+  group.appendChild(button);
+  group.appendChild(submenu);
+  group.addEventListener("mouseenter", () => {
+    positionSubmenu(group);
+    openContextMenuGroup(group);
+  });
+  group.addEventListener("focusin", () => {
+    positionSubmenu(group);
+    openContextMenuGroup(group);
+  });
+  // Above Copy stream link, the menu's last row.
+  const copyLink = parent.querySelector('[data-i18n="player_hud_copy_stream_link"]');
+  const copyGroup = copyLink ? copyLink.closest(".context-menu-group") : null;
+  if (copyGroup && copyGroup.parentNode === parent) parent.insertBefore(group, copyGroup);
+  else parent.appendChild(group);
+};
+const refreshQuickTiles = () => {
+  if (!contextMenu) return;
+  contextMenu.querySelectorAll(".context-menu-quick-tile").forEach(tile => {
+    const toggleKey = tile.dataset.quickToggle;
+    if (toggleKey) tile.classList.toggle("is-on", Boolean(contextMenuValue(toggleKey)));
+  });
+  contextMenu.querySelectorAll(".context-menu-quick-section .context-menu-item[data-quick-toggle]").forEach(row => {
+    const indicator = row.querySelector(".context-menu-state");
+    if (indicator) indicator.textContent = contextMenuValue(row.dataset.quickToggle) ? "✓" : "";
+  });
+};
+
+// ---- The player menu as pages, for the keys and a pad (.tv-menus) ----
+// A row that leads on opens its choices as the menu's whole page, under a "‹ Name" row that goes back; Escape, a
+// pad's B and Left go back too. The mouse menu keeps its flyouts (2026-11-15).
+const menuPageStack = [];
+let menuPageHead = null;
+const menuRowName = row => (row.querySelector(".context-menu-label") || row).textContent.trim();
+const applyMenuPages = () => {
+  if (!contextMenu) return;
+  contextMenu.querySelectorAll(".drill-path, .drill-path-sub, .drill-page")
+    .forEach(element => element.classList.remove("drill-path", "drill-path-sub", "drill-page"));
+  contextMenu.classList.toggle("drilled", menuPageStack.length > 0);
+  menuPageStack.forEach((entry, index) => {
+    if (entry.group) entry.group.classList.add("drill-path");
+    entry.submenu.classList.add(index === menuPageStack.length - 1 ? "drill-page" : "drill-path-sub");
+  });
+  if (!menuPageHead) {
+    menuPageHead = document.createElement("button");
+    menuPageHead.type = "button";
+    menuPageHead.className = "context-menu-item context-menu-page-back";
+    menuPageHead.setAttribute("role", "menuitem");
+    menuPageHead.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      leaveMenuPage();
+    });
+    contextMenu.insertBefore(menuPageHead, contextMenu.firstChild);
+  }
+  const top = menuPageStack[menuPageStack.length - 1];
+  menuPageHead.textContent = top ? `‹  ${top.title || menuRowName(top.row)}` : "";
+};
+const enterMenuRow = row => {
+  const submenu = menuRowSubmenu(row);
+  if (!submenu) return;
+  if (!root.classList.contains("tv-menus")) {
+    // The mouse menu (reached by keys only by accident): its flyout, as hovering does.
+    openMenuRowForKeys(row);
+    setTimeout(() => {
+      const first = barNavCandidates(submenu)[0];
+      if (first) setBarNavFocus(first);
+    }, 30);
+    return;
+  }
+  menuPageStack.push({ row, group: row.parentElement, submenu });
+  applyMenuPages();
+  submenu.scrollTop = 0;
+  setTimeout(() => {
+    const list = barNavCandidates(submenu);
+    const target = barNavDefault(submenu, list);
+    if (target) setBarNavFocus(target);
+  }, 20);
+};
+// Stream info as a page of the keys' and pad's menu (2026-11-15), filled from the same state the panel shows.
+let menuInfoPage = null;
+const menuStreamInfoOpen = () => Boolean(menuInfoPage) && menuPageStack.some(entry => entry.submenu === menuInfoPage);
+const renderMenuStreamInfo = () => {
+  if (!menuInfoPage) return;
+  const info = state.streamInfo && typeof state.streamInfo === "object" ? state.streamInfo : null;
+  menuInfoPage.replaceChildren();
+  const sections = info && Array.isArray(info.sections) ? info.sections : [];
+  if (sections.length === 0) {
+    const waiting = document.createElement("div");
+    waiting.className = "stream-info-row";
+    waiting.textContent = "Loading…";
+    menuInfoPage.appendChild(waiting);
+    return;
+  }
+  sections.forEach(section => {
+    const title = document.createElement("div");
+    title.className = "stream-info-section-title";
+    title.textContent = section.title || "";
+    menuInfoPage.appendChild(title);
+    (Array.isArray(section.rows) ? section.rows : []).forEach(row => {
+      const line = document.createElement("div");
+      line.className = "stream-info-row";
+      const label = document.createElement("span");
+      label.className = "stream-info-label";
+      label.textContent = row.label || "";
+      const value = document.createElement("span");
+      value.className = "stream-info-value";
+      value.textContent = row.value || "";
+      line.appendChild(label);
+      line.appendChild(value);
+      menuInfoPage.appendChild(line);
+    });
+  });
+};
+const openMenuStreamInfo = () => {
+  if (!contextMenu) return;
+  if (!menuInfoPage) {
+    menuInfoPage = document.createElement("div");
+    menuInfoPage.className = "context-menu-info";
+    // Focusable, so the arrows land somewhere on the page and Escape / B / Left still go back.
+    menuInfoPage.setAttribute("tabindex", "0");
+    contextMenu.appendChild(menuInfoPage);
+  }
+  const tile = Array.from(contextMenu.querySelectorAll(".context-menu-quick-tile"))
+    .find(element => element.textContent.trim() === "Info");
+  menuPageStack.push({ row: tile || menuInfoPage, group: null, submenu: menuInfoPage, title: "Info" });
+  applyMenuPages();
+  renderMenuStreamInfo();
+  send("streamInfoOpened", 0);
+  setTimeout(() => setBarNavFocus(menuInfoPage), 20);
+};
+
+const leaveMenuPage = () => {
+  const left = menuPageStack.pop();
+  if (left && left.submenu === menuInfoPage) send("streamInfoClosed", 0);
+  applyMenuPages();
+  if (left) setTimeout(() => setBarNavFocus(left.row), 20);
+};
+const resetMenuPages = () => {
+  if (menuStreamInfoOpen()) send("streamInfoClosed", 0);
+  menuPageStack.length = 0;
+  applyMenuPages();
+};
+
+// The player menu from its key (P by default) or a pad's View button: the menu centred, the arrows walking it and
+// its flyouts, Enter / A picking, Escape / B closing. Pressed again, it closes.
+window.nuvioOpenPlayerMenu = () => {
+  lastHudInput = "keyboard";
+  if (contextMenuOpen) {
+    closeContextMenu();
+    if (keyboardPanelMode === "controls") exitBarNav();
+    return;
+  }
+  if (state.isLocked || state.postShowInput || playbackErrorText() || isHeroTrailerSurface || state.heroTrailerMode) return;
+  if (activeModal) closePlayerModal(false);
+  if (keyboardPanelMode && keyboardPanelMode !== "controls") {
+    keyboardPanelMode = "";
+    send("keyboardPanelClosed", 0);
+  }
+  openContextMenu({ button: -1, clientX: 0, clientY: 0, preventDefault() {}, stopPropagation() {} });
+  if (!contextMenuOpen) return;
+  playerMenuOpenedByKey = true;
+  if (keyboardPanelMode !== "controls") enterBarNav();
+  setTimeout(syncBarNavScope, 40);
+};
+
 if (contextMenu) {
   buildContextMenu(contextMenuItems, contextMenu);
+  buildQuickActionsSection(contextMenu);
+  buildQuickTiles(contextMenu);
   refreshContextMenuIndicators();
+  refreshQuickTiles();
   refreshSeekStepLabels();
   contextMenu.addEventListener("contextmenu", event => event.preventDefault());
 }
@@ -2198,9 +4199,9 @@ window.nuvioOpenAnimeShaderContextMenu = items => {
 // option) mid-interaction even with "Close menu after selecting" turned off. A selection-only
 // change is therefore applied to the existing rows instead of rebuilding them.
 const mpvOptionsStructureSignature = list => JSON.stringify(list.map(option => [
-  String(option.label || "Option"),
+  String(option.label || hudText("player_hud_option", "Option")),
   (Array.isArray(option.choices) ? option.choices : [])
-    .map(choice => [String(choice.label || "Option"), Number(choice.index) || 0]),
+    .map(choice => [String(choice.label || hudText("player_hud_option", "Option")), Number(choice.index) || 0]),
 ]));
 
 let mpvOptionsMenuSignature = "";
@@ -2247,14 +4248,14 @@ window.nuvioSetMpvOptionsMenu = options => {
   if (list.length === 0) {
     const empty = document.createElement("div");
     empty.className = "context-menu-empty";
-    empty.textContent = "No options available";
+    empty.textContent = hudText("player_hud_no_options_available", "No options available");
     submenu.appendChild(empty);
     return;
   }
   buildContextMenu(list.map(option => ({
-    label: String(option.label || "Option"),
+    label: String(option.label || hudText("player_hud_option", "Option")),
     children: (Array.isArray(option.choices) ? option.choices : []).map(choice => ({
-      label: String(choice.label || "Option"),
+      label: String(choice.label || hudText("player_hud_option", "Option")),
       action: `send:selectMpvOption:${Number(choice.index) || 0}`,
       selected: Boolean(choice.selected),
     })),
@@ -2279,7 +4280,8 @@ const SUBTITLE_COLOR_NAMES = {
 const describeSubtitleColor = value => {
   const clean = String(value || "").replace(/^#/, "").toUpperCase();
   const rgb = clean.length >= 6 ? clean.slice(-6) : clean.padStart(6, "0");
-  return { css: `#${rgb}`, name: SUBTITLE_COLOR_NAMES[rgb] || null };
+  const name = SUBTITLE_COLOR_NAMES[rgb];
+  return { css: `#${rgb}`, name: name ? hudText(`player_hud_color_${name.toLowerCase()}`, name) : null };
 };
 
 const subtitleColorContextEntries = field => {
@@ -2287,7 +4289,7 @@ const subtitleColorContextEntries = field => {
   const entries = (state.subtitleColorSwatches || []).map((value, index) => {
     const info = describeSubtitleColor(value);
     return {
-      label: info.name || `Color ${index + 1}`,
+      label: info.name || hudFormat("player_hud_color_1_s", "Color %1$s", index + 1),
       swatch: info.css,
       // Compared on RGB alone, like the swatch row: the opacity stepper moves the alpha of the
       // same chosen colour, and that should not read as "nothing is selected".
@@ -2296,7 +4298,7 @@ const subtitleColorContextEntries = field => {
   });
   const custom = !entries.some(entry => entry.selected);
   entries.push({
-    label: "Custom...",
+    label: hudText("player_hud_custom", "Custom..."),
     action: `subtitleColorPrompt:${field}`,
     swatch: custom ? describeSubtitleColor(style[field]).css : undefined,
     selected: custom,
@@ -2310,7 +4312,7 @@ const refreshSubtitleStyleContextSubmenus = () => {
     "fontFamilies",
     (state.subtitleFontFamilies || []).map(value => ({
       value,
-      label: value || "Default",
+      label: value || hudText("player_hud_default", "Default"),
       selected: value === style.fontFamily,
     })),
   );
@@ -2319,7 +4321,7 @@ const refreshSubtitleStyleContextSubmenus = () => {
 };
 
 const openContextMenu = event => {
-  if (state.pictureInPictureActive) {
+  if (isCompactPlayerUi()) {
     event.preventDefault();
     event.stopPropagation();
     closeContextMenu();
@@ -2341,9 +4343,20 @@ const openContextMenu = event => {
     send("fetchAddonSubtitles", 0);
   }
   refreshSubtitleStyleContextSubmenus();
+  resetMenuPages();
+  refreshQuickTiles();
   send("openAnimeShaderContextMenu", 0);
   send("openMpvOptionsContextMenu", 0);
   const margin = 8;
+  // A right-click is the mouse: the menu at the pointer. The keyboard's menu key (no pointer) gets the TV sheet.
+  setMenuStyleForInput(event.button === 2 ? "pointer" : "keyboard");
+  if (root.classList.contains("tv-menus")) {
+    // In the middle of the screen; its submenus open to the right of it.
+    contextMenu.classList.remove("context-menu-left");
+    contextMenu.style.left = `${Math.max(margin, Math.round((window.innerWidth - contextMenu.offsetWidth) / 2))}px`;
+    contextMenu.style.top = `${Math.max(margin, Math.round((window.innerHeight - contextMenu.offsetHeight) / 2))}px`;
+    return;
+  }
   const x = Math.min(event.clientX, Math.max(margin, window.innerWidth - contextMenu.offsetWidth - margin));
   const y = Math.min(event.clientY, Math.max(margin, window.innerHeight - contextMenu.offsetHeight - margin));
   contextMenu.style.left = `${Math.max(margin, x)}px`;
@@ -2527,25 +4540,12 @@ const appendEmptyTrackState = (container, label) => {
 const renderAudioTrackList = () => {
   audioTrackList.textContent = "";
   const tracks = visibleAudioTracks();
-  if (audioPanel) {
-    const canvas = renderAudioTrackList.canvas || (renderAudioTrackList.canvas = document.createElement("canvas"));
-    const context = canvas.getContext("2d");
-    if (context) {
-      context.font = `700 15px ${uiFontStack}`;
-      const widest = tracks.reduce((width, track, index) => {
-        const label = track.label || track.language || `Track ${Number(track.index || index) + 1}`;
-        return Math.max(width, context.measureText(String(label)).width);
-      }, context.measureText("Audio tracks").width);
-      const viewportLimit = Math.max(320, window.innerWidth * .70);
-      audioPanel.style.width = `${Math.round(Math.min(viewportLimit, Math.max(360, (widest + 104) * 1.15)))}px`;
-    }
-  }
   if (tracks.length === 0) {
-    appendEmptyTrackState(audioTrackList, "No audio tracks available");
+    appendEmptyTrackState(audioTrackList, hudText("player_hud_no_audio_tracks_available", "No audio tracks available"));
     return;
   }
   tracks.forEach(track => {
-    const label = track.label || track.language || `Track ${Number(track.index || 0) + 1}`;
+    const label = track.label || track.language || hudFormat("player_hud_track_1_s", "Track %1$s", Number(track.index || 0) + 1);
     // A track whose label is already just its language ("Tamil", from a title-less track) would
     // otherwise repeat itself on both lines.
     const languageLabel = String(track.languageLabel || "");
@@ -2592,7 +4592,7 @@ const renderSubtitleTrackList = () => {
     () => send("selectBuiltInSubtitleTrack", -1),
   );
   tracks.forEach(track => {
-    const label = track.label || track.language || `Subtitle ${Number(track.index || 0) + 1}`;
+    const label = track.label || track.language || hudFormat("player_hud_subtitle_1_s", "Subtitle %1$s", Number(track.index || 0) + 1);
     const detail = [track.language, track.id ? `ID: ${track.id}` : ""].filter(Boolean).join(" · ");
     appendSubtitleTrackRow(
       subtitleTrackList,
@@ -2613,6 +4613,7 @@ const renderAddonSubtitleList = () => {
     Boolean(state.isLoadingAddonSubtitles),
     state.fetchSubtitlesLabel || "",
     state.downloadSubtitleLabel || "",
+    state.autoSyncedSubtitleLabel || "",
     items.map(item => [
       item.index,
       item.id,
@@ -2621,13 +4622,14 @@ const renderAddonSubtitleList = () => {
       item.addonName,
       Boolean(item.isSelected),
       Boolean(item.isDownloading),
+      Boolean(item.isAutoSynced),
     ]),
   ]);
   if (nextRenderKey === addonSubtitleListRenderKey) return;
   addonSubtitleListRenderKey = nextRenderKey;
   addonSubtitleList.textContent = "";
   if (state.isLoadingAddonSubtitles) {
-    appendEmptyTrackState(addonSubtitleList, "Loading subtitles...");
+    appendEmptyTrackState(addonSubtitleList, hudText("player_hud_loading_subtitles", "Loading subtitles..."));
     return;
   }
   if (items.length === 0) {
@@ -2647,7 +4649,7 @@ const renderAddonSubtitleList = () => {
   }
   const anyDownloadInProgress = items.some(candidate => Boolean(candidate.isDownloading));
   items.forEach(item => {
-    const label = item.display || item.languageLabel || "Subtitle";
+    const label = item.display || item.languageLabel || hudText("player_hud_subtitle", "Subtitle");
     const secondary = [item.languageLabel, item.addonName, item.id ? `ID: ${item.id}` : ""]
       .filter(Boolean)
       .join(" · ");
@@ -2689,6 +4691,21 @@ const renderAddonSubtitleList = () => {
       copy.appendChild(detail);
     }
     row.appendChild(copy);
+    if (item.isAutoSynced) {
+      const syncedLabel = state.autoSyncedSubtitleLabel || "Synced by Auto Sync";
+      const synced = document.createElement("span");
+      synced.className = "subtitle-synced-badge";
+      synced.setAttribute("role", "img");
+      synced.setAttribute("aria-label", syncedLabel);
+      synced.title = syncedLabel;
+      const syncedIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      syncedIcon.setAttribute("aria-hidden", "true");
+      const syncedUse = document.createElementNS("http://www.w3.org/2000/svg", "use");
+      syncedUse.setAttribute("href", "#icon-synced");
+      syncedIcon.appendChild(syncedUse);
+      synced.appendChild(syncedIcon);
+      row.appendChild(synced);
+    }
     const download = document.createElement("button");
     download.type = "button";
     download.className = "subtitle-download-button";
@@ -2742,6 +4759,12 @@ const sameRgb = (left, right) => {
   return a.red === b.red && a.green === b.green && a.blue === b.blue;
 };
 
+// A swatch matches on colour and on whether it is see-through at all: "None" (fully transparent
+// black) and solid black share their RGB, and comparing RGB alone lit both in the Background row.
+// Partial alpha still matches, since Opacity and Intensity are set separately from the swatch.
+const sameSwatch = (left, right) =>
+  sameRgb(left, right) && (parseArgb(left).alpha === 0) === (parseArgb(right).alpha === 0);
+
 const renderSwatches = (container, selectedColor, eventType, availableColors = state.subtitleColorSwatches) => {
   container.textContent = "";
   const colors = Array.isArray(availableColors) ? availableColors : [];
@@ -2749,7 +4772,7 @@ const renderSwatches = (container, selectedColor, eventType, availableColors = s
     const parsed = parseArgb(color);
     const swatch = document.createElement("button");
     swatch.type = "button";
-    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameRgb(color, selectedColor) ? " selected" : ""}`;
+    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameSwatch(color, selectedColor) ? " selected" : ""}`;
     swatch.style.setProperty("--swatch", parsed.css);
     swatch.addEventListener("click", event => {
       event.stopPropagation();
@@ -2762,11 +4785,11 @@ const renderSwatches = (container, selectedColor, eventType, availableColors = s
   if (!field) return;
   // Trailing entry: a dashed "+" normally, and the colour itself once one is in use that no preset
   // covers - otherwise a custom colour would leave the whole row looking unselected.
-  const isCustom = !colors.some(color => sameRgb(color, selectedColor));
+  const isCustom = !colors.some(color => sameSwatch(color, selectedColor));
   const custom = document.createElement("button");
   custom.type = "button";
   custom.className = `swatch custom${isCustom ? " has-color selected" : ""}`;
-  custom.title = "Custom color";
+  custom.title = hudText("player_hud_custom_color", "Custom color");
   if (isCustom) {
     custom.style.setProperty("--swatch", parseArgb(selectedColor).css);
   } else {
@@ -2881,6 +4904,14 @@ const renderAssStyleRows = style => {
   }
 };
 
+// The Style tab's On/Off controls are switches: the label text stays for the strings, the state is
+// read from aria-checked, which the switch styling keys on.
+const setStyleSwitch = (button, on) => {
+  button.textContent = on ? (state.onLabel || "On") : (state.offLabel || "Off");
+  button.setAttribute("aria-checked", on ? "true" : "false");
+  button.classList.toggle("primary", on);
+};
+
 const renderSubtitleStylePanel = () => {
   const style = state.subtitleStyle || {};
   subtitleDelayLabel.textContent = state.subtitleDelayLabel || "Subtitle Delay";
@@ -2901,7 +4932,7 @@ const renderSubtitleStylePanel = () => {
       fonts.forEach((family, index) => {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = family === "" ? "Default" : family;
+        option.textContent = family === "" ? hudText("player_hud_default", "Default") : family;
         fontFamilySelect.appendChild(option);
       });
       fontFamilySelect.dataset.count = String(fonts.length);
@@ -2911,13 +4942,17 @@ const renderSubtitleStylePanel = () => {
     fontFamilySelect.value = String(selectedIndex >= 0 ? selectedIndex : 0);
   }
   outlineLabel.textContent = state.outlineLabel || "Outline";
-  outlineToggle.textContent = style.outlineEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
-  outlineToggle.classList.toggle("primary", Boolean(style.outlineEnabled));
+  setStyleSwitch(outlineToggle, Boolean(style.outlineEnabled));
+  if (subtitleOutlineGroup) subtitleOutlineGroup.classList.toggle("style-group-off", !style.outlineEnabled);
+  const outlineColorRow = document.getElementById("outlineColorRow");
+  if (outlineColorRow) outlineColorRow.classList.toggle("style-row-inert", !style.outlineEnabled);
   outlineWidthLabel.textContent = state.outlineWidthLabel || "Outline Width";
   outlineWidthValue.textContent = String(Number(style.outlineWidth) || 0);
   shadowLabel.textContent = state.shadowLabel || "Shadow";
-  shadowToggle.textContent = style.shadowEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
-  shadowToggle.classList.toggle("primary", Boolean(style.shadowEnabled));
+  setStyleSwitch(shadowToggle, Boolean(style.shadowEnabled));
+  if (subtitleShadowGroup) subtitleShadowGroup.classList.toggle("style-group-off", !style.shadowEnabled);
+  const shadowColorRow = document.getElementById("shadowColorRow");
+  if (shadowColorRow) shadowColorRow.classList.toggle("style-row-inert", !style.shadowEnabled);
   shadowOffsetLabel.textContent = state.shadowOffsetLabel || "Shadow Offset";
   shadowOffsetValue.textContent = (Number(style.shadowOffset) / 10).toFixed(1);
   shadowIntensityLabel.textContent = state.shadowIntensityLabel || "Shadow Intensity";
@@ -2926,11 +4961,9 @@ const renderSubtitleStylePanel = () => {
   blurLabel.textContent = state.blurLabel || "Blur";
   blurValue.textContent = String(Number(style.blur) || 0);
   boldLabel.textContent = state.boldLabel || "Bold";
-  boldToggle.textContent = style.bold ? (state.onLabel || "On") : (state.offLabel || "Off");
-  boldToggle.classList.toggle("primary", Boolean(style.bold));
+  setStyleSwitch(boldToggle, Boolean(style.bold));
   italicLabel.textContent = state.italicLabel || "Italic";
-  italicToggle.textContent = style.italic ? (state.onLabel || "On") : (state.offLabel || "Off");
-  italicToggle.classList.toggle("primary", Boolean(style.italic));
+  setStyleSwitch(italicToggle, Boolean(style.italic));
   bottomOffsetLabel.textContent = state.bottomOffsetLabel || "Bottom Offset";
   bottomOffsetValue.textContent = String(Number(style.bottomOffset) || 0);
   renderAssStyleRows(style);
@@ -2961,7 +4994,7 @@ const renderSubtitleStylePanel = () => {
 
 const renderSubtitleModal = () => {
   const tab = state.subtitleActiveTab || "BuiltIn";
-  subtitlePanelTitle.textContent = state.subtitlesPanelTitle || "Subtitles";
+  subtitlePanelTitle.textContent = subtitleTabTitle(tab);
   subtitleBuiltInTab.textContent = state.subtitleBuiltInTabLabel || "Built-in";
   subtitleAddonsTab.textContent = state.subtitleAddonsTabLabel || "Addons";
   subtitleStyleTab.textContent = state.subtitleStyleTabLabel || "Style";
@@ -2974,7 +5007,135 @@ const renderSubtitleModal = () => {
   if (tab === "BuiltIn") renderSubtitleTrackList();
   if (tab === "Addons") renderAddonSubtitleList();
   if (tab === "Style") renderSubtitleStylePanel();
+  if (tab !== "Style") closeStyleDropdown();
+  syncStyleDropdowns();
 };
+
+// The style sheet's dropdowns. A native <select> popup is drawn by the OS from the unzoomed field,
+// so inside the zoomed panel it opened wider than its field and off to one side. Each select is
+// kept (it holds the value and fires the change the rest of the code listens for) but hidden, and
+// a field in the sheet's own style opens a list of its options exactly under it, at its width.
+const styleDropdowns = [];
+let openStyleDropdown = null;
+const styleDropdownFont = (select, option) => {
+  if (!select.dataset.fontPreview || !option || option.value === "0") return "";
+  return `"${String(option.textContent).replace(/["\\]/g, "")}", ${uiFontStack}`;
+};
+const closeStyleDropdown = () => {
+  if (!openStyleDropdown) return;
+  openStyleDropdown.menu.remove();
+  openStyleDropdown.button.classList.remove("open");
+  openStyleDropdown.button.setAttribute("aria-expanded", "false");
+  openStyleDropdown = null;
+};
+const syncStyleDropdowns = () => {
+  styleDropdowns.forEach(({ select, label }) => {
+    const option = select.options[select.selectedIndex];
+    const text = option ? option.textContent : "";
+    if (label.textContent !== text) label.textContent = text;
+    label.style.fontFamily = styleDropdownFont(select, option);
+  });
+};
+const openStyleDropdownFor = entry => {
+  closeStyleDropdown();
+  const { select, button } = entry;
+  const panel = select.closest(".track-panel");
+  if (!panel) return;
+  const menu = document.createElement("div");
+  menu.className = "style-dropdown-menu";
+  menu.setAttribute("role", "listbox");
+  Array.from(select.options).forEach((option, index) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = index === select.selectedIndex ? "style-dropdown-item selected" : "style-dropdown-item";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(index === select.selectedIndex));
+    item.dataset.index = String(index);
+    item.textContent = option.textContent;
+    item.style.fontFamily = styleDropdownFont(select, option);
+    menu.appendChild(item);
+  });
+  menu.addEventListener("click", event => {
+    event.stopPropagation();
+    const item = event.target.closest(".style-dropdown-item");
+    if (!item) return;
+    const index = Number(item.dataset.index);
+    closeStyleDropdown();
+    if (index === select.selectedIndex) return;
+    select.selectedIndex = index;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    syncStyleDropdowns();
+  });
+  panel.appendChild(menu);
+  // Placed in the panel's own pixels from the field's offsets, which neither the panel's zoom nor
+  // its open animation's transform distort. The list opens below the field, or above it when there
+  // is more room there, and never past the panel's edge.
+  let x = 0;
+  let y = 0;
+  let node = button;
+  while (node && node !== panel) {
+    x += node.offsetLeft;
+    y += node.offsetTop;
+    node = node.offsetParent;
+  }
+  for (let parent = button.parentElement; parent && parent !== panel; parent = parent.parentElement) {
+    x -= parent.scrollLeft;
+    y -= parent.scrollTop;
+  }
+  const fieldHeight = button.offsetHeight;
+  const below = panel.clientHeight - (y + fieldHeight) - 10;
+  const above = y - 10;
+  menu.style.left = `${x}px`;
+  menu.style.width = `${button.offsetWidth}px`;
+  if (below >= 200 || below >= above) {
+    menu.style.top = `${y + fieldHeight + 4}px`;
+    menu.style.maxHeight = `${Math.max(80, below)}px`;
+  } else {
+    menu.style.bottom = `${panel.clientHeight - y + 4}px`;
+    menu.style.maxHeight = `${Math.max(80, above)}px`;
+  }
+  const selected = menu.querySelector(".style-dropdown-item.selected");
+  if (selected) menu.scrollTop = Math.max(0, selected.offsetTop - (menu.clientHeight - selected.offsetHeight) / 2);
+  button.classList.add("open");
+  button.setAttribute("aria-expanded", "true");
+  openStyleDropdown = { ...entry, menu };
+};
+document.querySelectorAll("#subtitleStylePanel select.style-select").forEach(select => {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "style-dropdown";
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  const labelledBy = select.closest(".style-row") && select.closest(".style-row").querySelector(".style-label");
+  if (labelledBy && labelledBy.id) button.setAttribute("aria-labelledby", labelledBy.id);
+  const label = document.createElement("span");
+  label.className = "style-dropdown-label";
+  button.appendChild(label);
+  select.classList.add("style-select-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+  select.after(button);
+  const entry = { select, button, label };
+  styleDropdowns.push(entry);
+  button.addEventListener("click", event => {
+    event.stopPropagation();
+    if (openStyleDropdown && openStyleDropdown.select === select) closeStyleDropdown();
+    else openStyleDropdownFor(entry);
+  });
+});
+document.addEventListener("pointerdown", event => {
+  if (!openStyleDropdown) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target && (target.closest(".style-dropdown-menu") || target.closest(".style-dropdown"))) return;
+  closeStyleDropdown();
+}, true);
+document.addEventListener("keydown", event => {
+  if (!openStyleDropdown || event.key !== "Escape") return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  closeStyleDropdown();
+}, true);
+subtitleStylePanel.addEventListener("scroll", closeStyleDropdown, { passive: true });
 
 const normalizeItems = items =>
   Array.isArray(items) ? items.filter(item => item && typeof item === "object") : [];
@@ -3014,7 +5175,7 @@ const SourceRowOverscanPx = 720;
 // in the panel's own unzoomed coordinate space — so measured row heights must be divided back into
 // that space or they drift by the scale factor and rows overlap (scaled down) / gap (scaled up).
 const currentSourcePanelScale = () => {
-  const raw = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--panel-scale"));
+  const raw = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--source-panel-scale"));
   return Number.isFinite(raw) && raw > 0 ? raw : 1;
 };
 
@@ -3090,7 +5251,7 @@ const buildSourceRow = (item, onSelect) => {
   top.className = "track-row-top";
   const name = document.createElement("span");
   name.className = "stream-name";
-  name.textContent = item.label || "Stream";
+  name.textContent = item.label || hudText("player_hud_stream", "Stream");
   top.appendChild(name);
   if (item.isCurrent) {
     const chip = document.createElement("span");
@@ -3105,8 +5266,17 @@ const buildSourceRow = (item, onSelect) => {
     const tone = item.scoreRejected || item.score < 0 ? " negative" : item.score > 0 ? " positive" : "";
     scoreChip.className = `score-chip${tone}`;
     scoreChip.textContent = item.score > 0 ? `+${item.score}` : String(item.score);
-    if (item.scoreRejected) scoreChip.title = "Below the minimum score";
+    if (item.scoreRejected) scoreChip.title = hudText("player_hud_below_the_minimum_score", "Below the minimum score");
     top.appendChild(scoreChip);
+  }
+  // The addon name rides at the end of the title line, as a quiet glass tag, rather than taking a
+  // line of its own under the badges: on a long list that trailing line was a third of every row.
+  if (item.addonName) {
+    const addon = document.createElement("span");
+    addon.className = "stream-addon-inline";
+    addon.textContent = item.addonName;
+    addon.title = item.addonName;
+    top.appendChild(addon);
   }
   let subtitle = null;
   if (item.subtitle) {
@@ -3117,7 +5287,7 @@ const buildSourceRow = (item, onSelect) => {
 
   const badges = Array.isArray(item.badges) ? item.badges : [];
   let badgeRail = null;
-  if (badges.length > 0 || item.addonName) {
+  if (badges.length > 0) {
     badgeRail = document.createElement("span");
     badgeRail.className = "stream-badges";
     badges.forEach(badge => {
@@ -3146,12 +5316,6 @@ const buildSourceRow = (item, onSelect) => {
       }
       badgeRail.appendChild(badgeElement);
     });
-    if (item.addonName) {
-      const addon = document.createElement("span");
-      addon.className = "stream-addon-inline";
-      addon.textContent = item.addonName;
-      badgeRail.appendChild(addon);
-    }
   }
   if (badgeRail && state.sourceBadgePlacement === "top") copy.appendChild(badgeRail);
   copy.appendChild(top);
@@ -3222,41 +5386,149 @@ const requestSourceVirtualRender = () => {
   sourceVirtualRenderRaf = window.requestAnimationFrame(renderSourceVirtualRows);
 };
 
-const updateSourcePanelWidth = items => {
+// The sheet's default width in the panel's own (unzoomed) space. Fixed rather than fitted to the
+// rows: it used to grow with the widest label/subtitle, so an addon that prints the full release
+// filename (AIOStreams, Torrentio-style formatters) opened the sheet at its half-player cap. Long
+// lines wrap inside the row instead. Sized for the 16/14px source-row type in controls.css.
+// The user can drag the sheet's inner edge to any width in [SourcePanelMinWidth, max share of the
+// player]; that choice is kept per HUD profile in localStorage and double-clicking the edge resets it.
+const SourcePanelWidth = 600;
+const SourcePanelMinWidth = 360;
+const SourcePanelMaxViewportShare = .75;
+const SourcePanelWidthStorageKey = "nuvioSourcePanelWidth";
+
+const readStoredSourcePanelWidth = () => {
+  try {
+    const raw = Number(window.localStorage.getItem(SourcePanelWidthStorageKey));
+    return Number.isFinite(raw) && raw > 0 ? raw : null;
+  } catch (_) {
+    return null;
+  }
+};
+
+let sourcePanelPreferredWidth = readStoredSourcePanelWidth();
+
+const storeSourcePanelWidth = width => {
+  try {
+    if (width == null) window.localStorage.removeItem(SourcePanelWidthStorageKey);
+    else window.localStorage.setItem(SourcePanelWidthStorageKey, String(Math.round(width)));
+  } catch (_) {
+    // Storage unavailable: the width still applies for this session.
+  }
+};
+
+const updateSourcePanelWidth = () => {
   if (!sourcePanel) return;
-  const canvas = updateSourcePanelWidth.canvas || (updateSourcePanelWidth.canvas = document.createElement("canvas"));
-  const context = canvas.getContext("2d");
-  if (!context) return;
-  const measureLines = (value, font) => {
-    context.font = font;
-    return String(value || "")
-      .split(/\r?\n/)
-      .reduce((widest, line) => Math.max(widest, context.measureText(line).width), 0);
-  };
-  const fontFamily = uiFontStack;
-  const contentWidth = items.reduce((widest, item) => {
-    const primary = Math.max(
-      measureLines(item.label || "Stream", `700 14px ${fontFamily}`),
-      Math.min(620, measureLines(item.subtitle, `400 12px ${fontFamily}`)),
-    );
-    // The addon is absolutely right-aligned inside the row and must not dictate panel width.
-    return Math.max(widest, primary + 92);
-  }, 400);
-  // A side sheet: never more than half the player, so the picture stays watchable beside it.
-  const viewportLimit = Math.max(500, Math.min(760, window.innerWidth * .5));
-  const panelWidth = Math.round(Math.min(viewportLimit, Math.max(540, contentWidth * 1.15)));
+  // The width is set inside the zoomed panel, so the viewport limits are converted into that
+  // unzoomed space. The minimum yields to the maximum on a very small player.
+  const scale = currentSourcePanelScale();
+  const maxWidth = (window.innerWidth * SourcePanelMaxViewportShare) / scale;
+  const preferred = sourcePanelPreferredWidth == null ? SourcePanelWidth : sourcePanelPreferredWidth;
+  // The default (no user width) keeps the old half-player cap; an explicit drag may go wider.
+  const limit = sourcePanelPreferredWidth == null ? (window.innerWidth * .5) / scale : maxWidth;
+  const panelWidth = Math.round(Math.min(limit, Math.max(Math.min(SourcePanelMinWidth, limit), preferred)));
   sourcePanel.style.width = `${panelWidth}px`;
   // On-screen width (the panel is CSS-zoomed) for centring the buffering spinner beside the sheet.
   document.documentElement.style.setProperty(
     "--source-panel-width",
-    `${Math.round(panelWidth * currentSourcePanelScale())}px`,
+    `${Math.round(panelWidth * scale)}px`,
   );
+};
+
+// Drag-to-resize on the sheet's inner edge (left edge when docked right, right edge when docked
+// left). Pointer coords and the modal layer's rect are both viewport pixels; the layer itself is
+// not zoomed, so the docked edge is its own left/right.
+let sourceResizePointerId = null;
+let consumeSourceResizeClick = false;
+
+const sourcePanelWidthFromPointer = event => {
+  const layer = sourceModal.getBoundingClientRect();
+  const dockedLeft = root.classList.contains("source-notch-left");
+  const screenWidth = dockedLeft ? event.clientX - layer.left : layer.right - event.clientX;
+  return screenWidth / currentSourcePanelScale();
+};
+
+const clampSourcePanelWidth = width => {
+  const maxWidth = (window.innerWidth * SourcePanelMaxViewportShare) / currentSourcePanelScale();
+  return Math.min(maxWidth, Math.max(Math.min(SourcePanelMinWidth, maxWidth), width));
+};
+
+const endSourcePanelResize = event => {
+  if (sourceResizePointerId === null || (event && event.pointerId !== sourceResizePointerId)) return;
+  sourceResizePointerId = null;
+  root.classList.remove("source-panel-resizing");
+  if (sourcePanelPreferredWidth != null) storeSourcePanelWidth(sourcePanelPreferredWidth);
+  // The click that follows pointerup may land on the backdrop if the pointer ended outside the
+  // sheet; it must not close it.
+  consumeSourceResizeClick = true;
+  window.setTimeout(() => { consumeSourceResizeClick = false; }, 0);
+};
+
+if (sourcePanelResizeHandle) {
+  sourcePanelResizeHandle.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    sourceResizePointerId = event.pointerId;
+    sourcePanelResizeHandle.setPointerCapture(event.pointerId);
+    root.classList.add("source-panel-resizing");
+    setSourceSortMenuOpen(false);
+  });
+  sourcePanelResizeHandle.addEventListener("pointermove", event => {
+    if (event.pointerId !== sourceResizePointerId) return;
+    sourcePanelPreferredWidth = clampSourcePanelWidth(sourcePanelWidthFromPointer(event));
+    updateSourcePanelWidth();
+    requestSourceVirtualRender();
+  });
+  sourcePanelResizeHandle.addEventListener("pointerup", endSourcePanelResize);
+  sourcePanelResizeHandle.addEventListener("pointercancel", endSourcePanelResize);
+  sourcePanelResizeHandle.addEventListener("lostpointercapture", endSourcePanelResize);
+  sourcePanelResizeHandle.addEventListener("click", event => event.stopPropagation());
+  sourcePanelResizeHandle.addEventListener("dblclick", event => {
+    event.stopPropagation();
+    sourcePanelPreferredWidth = null;
+    storeSourcePanelWidth(null);
+    updateSourcePanelWidth();
+    requestSourceVirtualRender();
+  });
+}
+
+const pinSourceListTop = () => {
+  sourceListPinnedTop = true;
+  sourceList.scrollTop = 0;
+};
+
+// The streams screen's Sort chip, shared setting: Kotlin applies the order to sourceItems.
+const renderSourceSortMenu = () => {
+  if (!sourceSortMenu || !sourceSortButton) return;
+  const options = normalizeItems(state.sourceSortOptions);
+  sourceSortButton.hidden = options.length === 0;
+  const selected = options.find(option => Boolean(option.isSelected));
+  const isDefault = !selected || String(selected.id) === "0";
+  sourceSortButton.textContent = state.sourceSortLabel || "Sort";
+  sourceSortButton.classList.toggle("sort-active", !isDefault || Boolean(state.sourceCachedFirst));
+
+  sourceSortMenu.textContent = "";
+  options.forEach(option => {
+    appendFilterChip(sourceSortMenu, option.label || "", Boolean(option.isSelected), () => {
+      setSourceSortMenuOpen(false);
+      pinSourceListTop();
+      send("setSourceSort", Number(option.id) || 0);
+    });
+  });
+  const divider = document.createElement("div");
+  divider.className = "source-sort-divider";
+  sourceSortMenu.appendChild(divider);
+  appendFilterChip(sourceSortMenu, hudText("player_hud_cached_first", "Cached first"), Boolean(state.sourceCachedFirst), () => {
+    pinSourceListTop();
+    send("setSourceCachedFirst", state.sourceCachedFirst ? 0 : 1);
+  });
 };
 
 const renderSourceModal = () => {
   sourcePanelTitle.textContent = state.sourcesPanelTitle || "Sources";
   sourceReloadButton.textContent = state.reloadLabel || "Reload";
   sourceCloseButton.textContent = state.panelCloseLabel || "Close";
+  renderSourceSortMenu();
 
   const filters = normalizeItems(state.sourceFilters);
   if (sourceFilterId && !filters.some(filter => String(filter.id || "") === sourceFilterId)) {
@@ -3264,17 +5536,22 @@ const renderSourceModal = () => {
   }
   renderFilterRow(sourceFilterList, filters, sourceFilterId, id => {
     sourceFilterId = id;
-    sourceList.scrollTop = 0;
+    pinSourceListTop();
     renderSourceModal();
   });
 
+  // Captured before the list is emptied: anything below that forces a layout (the width
+  // measurement reads computed style) clamps scrollTop to 0 against the empty list, and the
+  // resulting scroll event would also mark the list as pinned.
+  const keepPinnedTop = sourceListPinnedTop;
+  const previousScrollTop = sourceList.scrollTop;
   sourceList.textContent = "";
   sourceList.classList.remove("virtualized");
   let items = normalizeItems(state.sourceItems);
   if (sourceFilterId) {
     items = items.filter(item => String(item.filterId || "") === sourceFilterId);
   }
-  updateSourcePanelWidth(items);
+  updateSourcePanelWidth();
   if (items.length === 0) {
     sourceVirtualItems = [];
     sourceVirtualSpacer = null;
@@ -3282,14 +5559,13 @@ const renderSourceModal = () => {
     sourceVirtualRenderRaf = 0;
     appendEmptyTrackState(
       sourceList,
-      state.sourceIsLoading ? "Loading streams..." : (state.noStreamsLabel || "No streams found"),
+      state.sourceIsLoading ? hudText("player_hud_loading_streams", "Loading streams...") : (state.noStreamsLabel || "No streams found"),
     );
     return;
   }
   const nextKey = sourceKeyForItems(items);
   if (nextKey !== sourceVirtualKey) {
     resetSourceVirtualState(items, nextKey);
-    sourceList.scrollTop = 0;
   } else {
     sourceVirtualItems = items;
   }
@@ -3298,6 +5574,10 @@ const renderSourceModal = () => {
   sourceVirtualSpacer.className = "source-virtual-spacer";
   sourceList.appendChild(sourceVirtualSpacer);
   rebuildSourceVirtualLayout();
+  // Pinned: the top, whatever offset the list last had (a previous opening, a longer list) — that
+  // stale offset is what opened the panel part-way down. Otherwise the user's own position.
+  sourceListPinnedTop = keepPinnedTop;
+  sourceList.scrollTop = keepPinnedTop ? 0 : previousScrollTop;
   renderSourceVirtualRows();
 };
 
@@ -3372,6 +5652,13 @@ const appendEpisodeRow = (container, item, keyboardIndex) => {
     const code = document.createElement("span");
     code.className = "episode-code";
     code.textContent = item.code;
+    // AnimeFillerList verdict rides on the code pill: "S5E2 · Filler".
+    if (item.fillerKind && item.fillerLabel) {
+      const filler = document.createElement("span");
+      filler.className = `episode-filler ${item.fillerKind === "mixed" ? "mixed" : "filler"}`;
+      filler.textContent = ` · ${item.fillerLabel}`;
+      code.appendChild(filler);
+    }
     top.appendChild(code);
   }
   if (item.isCurrent) {
@@ -3380,12 +5667,21 @@ const appendEpisodeRow = (container, item, keyboardIndex) => {
     chip.textContent = state.playingLabel || "Playing";
     top.appendChild(chip);
   }
+  // Same tick the details page puts on a watched episode card; the state has always been sent,
+  // it was just never drawn here.
+  if (item.isWatched) {
+    const watched = document.createElement("span");
+    watched.className = "episode-watched";
+    watched.setAttribute("aria-label", hudText("player_hud_watched", "Watched"));
+    watched.appendChild(buildCheckIcon());
+    top.appendChild(watched);
+  }
   row.appendChild(top);
   const copy = document.createElement("span");
   copy.className = "episode-copy";
   const name = document.createElement("span");
   name.className = "episode-name";
-  name.textContent = item.title || item.code || "Episode";
+  name.textContent = item.title || item.code || hudText("player_hud_episode", "Episode");
   copy.appendChild(name);
   if (item.overview) {
     const overview = document.createElement("span");
@@ -3552,7 +5848,7 @@ const renderEpisodeStreams = () => {
   if (items.length === 0) {
     appendEmptyTrackState(
       episodeStreamList,
-      state.episodeStreamsIsLoading ? "Loading streams..." : (state.noStreamsLabel || "No streams found"),
+      state.episodeStreamsIsLoading ? hudText("player_hud_loading_streams", "Loading streams...") : (state.noStreamsLabel || "No streams found"),
     );
     return;
   }
@@ -3695,12 +5991,16 @@ const renderP2pConsentModal = () => {
 };
 
 const renderActiveModal = () => {
+  renderDockRails();
   if (activeModal === "audio") renderAudioTrackList();
   if (activeModal === "subtitles") renderSubtitleModal();
   if (activeModal === "sources") renderSourceModal();
   if (activeModal === "episodes") renderEpisodesModal();
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
+  if (activeModal === "party") renderPartyModal();
+  if (activeModal === "streamInfo") renderStreamInfoModal();
+  if (menuStreamInfoOpen()) renderMenuStreamInfo();
 };
 
 window.nuvioNativeViewportChanged = () => {
@@ -3711,6 +6011,7 @@ window.nuvioNativeViewportChanged = () => {
     root.classList.remove("native-resizing");
   }, 180);
   if (activeModal) renderActiveModal();
+  positionDockPanel();
 };
 
 const trackListSignature = tracks =>
@@ -3724,22 +6025,68 @@ const trackListSignature = tracks =>
     ].join(":"))
     .join("|");
 
+// Live TV's loading bar. Driven by the real stages rather than a timer alone: connecting fills
+// toward 45%, playing (the opening jump still to land) toward 90%, and landing completes it as the
+// cover fades. Each stage eases toward its ceiling, so the bar always moves but never claims done.
+let iptvLoadingProgress = 0;
+let iptvLoadingFrame = 0;
+let iptvLoadingLastAt = 0;
+const iptvLoadingCeiling = () => (state.isPlaying && !state.isLoading ? 0.9 : 0.45);
+const stepIptvLoadingBar = now => {
+  const bar = document.getElementById("iptvLoadingBar");
+  const elapsed = iptvLoadingLastAt ? Math.min(100, now - iptvLoadingLastAt) : 16;
+  iptvLoadingLastAt = now;
+  const ceiling = iptvLoadingCeiling();
+  if (iptvLoadingProgress < ceiling) {
+    // About 1.2s to close most of the gap to the ceiling.
+    iptvLoadingProgress += (ceiling - iptvLoadingProgress) * (1 - Math.exp(-elapsed / 1200));
+  }
+  if (bar) bar.style.width = `${(iptvLoadingProgress * 100).toFixed(2)}%`;
+  iptvLoadingFrame = requestAnimationFrame(stepIptvLoadingBar);
+};
+const setIptvLoading = (active, channelLabel) => {
+  const bar = document.getElementById("iptvLoadingBar");
+  if (active) {
+    const name = document.getElementById("iptvLoadingName");
+    if (name) name.textContent = channelLabel || "";
+    if (!iptvLoadingFrame) {
+      iptvLoadingProgress = 0;
+      iptvLoadingLastAt = 0;
+      if (bar) bar.style.width = "0%";
+      iptvLoadingFrame = requestAnimationFrame(stepIptvLoadingBar);
+    }
+    return;
+  }
+  if (!iptvLoadingFrame) return;
+  cancelAnimationFrame(iptvLoadingFrame);
+  iptvLoadingFrame = 0;
+  if (bar) bar.style.width = "100%";
+};
+
 const renderOpeningOverlay = suppress => {
   const progress = normalizedOpeningProgress();
   const artworkUrl = setImageSource(openingArtwork, state.openingArtwork);
-  const logoUrl = setImageSource(openingLogoBase, state.openingLogo);
+  const logoUrl = usableLogoSource(openingLogoBase, state.openingLogo);
   setImageSource(openingLogoFill, state.openingLogo);
 
   const hasProgress = progress !== null;
   const openingBootstrap = !hasReceivedPlayerControls;
   const wantsOpening = Boolean(openingBootstrap || state.showOpeningOverlay);
-  const showOpening = Boolean(!suppress && wantsOpening && state.isLoading);
+  // Live TV holds the cover over a channel's opening until its jump to the edge has landed, so
+  // the stale backlog it starts on is never shown and then cut away from.
+  const iptvOpening = Boolean(state.iptv && iptvOpeningJumpPending());
+  const showOpening = Boolean(!suppress && ((wantsOpening && state.isLoading) || iptvOpening));
   const titleText = String(state.openingTitle || state.title || "").trim();
   const messageText = String(state.openingMessage || "").trim();
   const showHorizontalProgress = hasProgress && !logoUrl;
 
   root.classList.toggle("opening-active", showOpening);
   openingOverlay.classList.toggle("visible", showOpening);
+  // Kept on while the cover fades out after loading, so the fade shows the full bar, not the film
+  // layout; it changes over only when the next showing is not a channel.
+  const iptvLoading = Boolean(showOpening && state.iptv);
+  if (showOpening) openingOverlay.classList.toggle("iptv-loading", iptvLoading);
+  setIptvLoading(iptvLoading, state.iptv ? (state.iptv.channelLabel || "") : "");
   openingOverlay.classList.toggle("has-artwork", Boolean(artworkUrl));
   openingOverlay.classList.toggle("has-progress", hasProgress);
   openingOverlay.setAttribute("aria-hidden", showOpening ? "false" : "true");
@@ -3805,6 +6152,64 @@ const startSkipPromptAutoHide = () => {
   }, prefersReducedMotion ? 1 : 10000);
 };
 
+// Timed phases (the post-skip offer, a result) drain a bar so the window is visible; Kotlin owns
+// the actual timeout and clears the toast, the bar only mirrors it. Durations match
+// SKIP_SUBMIT_OFFER_TIMEOUT_MS / SKIP_SUBMIT_RESULT_TIMEOUT_MS.
+const SkipSubmitToastPhaseDurationsMs = { offer: 10000, result: 5000 };
+
+// "{key}" in the copy is the skip key's current label, which only the shortcut table knows.
+const renderSkipSubmitHint = text => {
+  skipSubmitToastHint.textContent = "";
+  const keyLabel = String(state.skipIntervalKeyLabel || "Tab");
+  String(text || "").split(/(\{key\}|Esc)/).forEach(part => {
+    if (!part) return;
+    if (part === "{key}" || part === "Esc") {
+      const kbd = document.createElement("kbd");
+      kbd.textContent = part === "{key}" ? keyLabel : part;
+      skipSubmitToastHint.appendChild(kbd);
+    } else {
+      skipSubmitToastHint.appendChild(document.createTextNode(part));
+    }
+  });
+};
+
+const renderSkipSubmitToast = () => {
+  // Shares the skip prompt's corner, and the prompt owns the key while it is up (a capture in
+  // progress is dropped by the skip), so it yields to the prompt rather than stacking under it.
+  const promptShown = Boolean(state.skipPromptVisible && !state.skipPromptDismissed);
+  const show = Boolean(state.skipSubmitToastVisible) && !promptShown;
+  const phase = String(state.skipSubmitToastPhase || "");
+  const key = String(state.skipSubmitToastKey || "");
+  skipSubmitToastTitle.textContent = state.skipSubmitToastTitle || "";
+  skipSubmitToastDetail.textContent = state.skipSubmitToastDetail || "";
+  renderSkipSubmitHint(state.skipSubmitToastHint);
+  skipSubmitToast.className = "skip-submit-toast";
+  if (show) skipSubmitToast.classList.add("visible");
+  if (phase) skipSubmitToast.classList.add(`phase-${phase}`);
+  if (state.skipSubmitToastAccepted) skipSubmitToast.classList.add("accepted");
+  skipSubmitToast.setAttribute("aria-hidden", show ? "false" : "true");
+  skipSubmitToast.setAttribute("aria-label", `${state.skipSubmitToastTitle || ""} ${state.skipSubmitToastDetail || ""}`.trim());
+
+  const durationMs = SkipSubmitToastPhaseDurationsMs[phase] || 0;
+  const restart = show && durationMs > 0 && key !== skipSubmitToastKey;
+  skipSubmitToastKey = show ? key : "";
+  skipSubmitToast.classList.toggle("show-progress", show && durationMs > 0);
+  if (restart) {
+    skipSubmitToastProgress.style.transition = "none";
+    skipSubmitToastProgress.style.width = "100%";
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (skipSubmitToastKey !== key) return;
+        skipSubmitToastProgress.style.transition = `width ${prefersReducedMotion ? 1 : durationMs}ms linear`;
+        skipSubmitToastProgress.style.width = "0%";
+      });
+    });
+  } else if (!show || durationMs <= 0) {
+    skipSubmitToastProgress.style.transition = "none";
+    skipSubmitToastProgress.style.width = "100%";
+  }
+};
+
 const renderNativePlaybackPrompts = () => {
   const nextSkipKey = [
     state.skipPromptStartMs || 0,
@@ -3833,6 +6238,8 @@ const renderNativePlaybackPrompts = () => {
   skipPromptAutoHideTimer = 0;
   skipPromptAutoHideActive = false;
 
+  renderSkipSubmitToast();
+
   const showNextEpisode = Boolean(state.nextEpisodeVisible);
   // Same treatment as the episode strip: the next-episode card is the other place a lost still
   // leaves a visibly empty frame, and it shares the strip's fallback artwork.
@@ -3859,6 +6266,26 @@ const renderNativePlaybackPrompts = () => {
   nextEpisodeCard.classList.toggle("visible", showNextEpisode);
   nextEpisodeCard.classList.toggle("playable", Boolean(state.nextEpisodePlayable));
   nextEpisodeCard.classList.toggle("has-thumb", Boolean(nextThumbUrl));
+  const rawNextProgress = Number(state.nextEpisodeProgress);
+  const hasNextProgress = Number.isFinite(rawNextProgress) && rawNextProgress >= 0;
+  const nextSearching = Boolean(state.nextEpisodeSearching);
+  nextEpisodeCard.classList.toggle("has-progress", hasNextProgress);
+  nextEpisodeCard.classList.toggle("searching", nextSearching);
+  if (nextEpisodeProgressFill) {
+    const pct = hasNextProgress ? Math.max(0, Math.min(1, rawNextProgress)) * 100 : 0;
+    const prevPct = Number(nextEpisodeProgressFill.dataset.pct ?? -1);
+    const shouldSnap = !showNextEpisode || !hasNextProgress || prevPct < 0 || pct < prevPct;
+    if (shouldSnap) {
+      nextEpisodeProgressFill.style.transition = "none";
+      nextEpisodeProgressFill.style.width = `${pct.toFixed(2)}%`;
+      // Force layout so the next forward update animates smoothly from this snapped position.
+      void nextEpisodeProgressFill.offsetWidth;
+      nextEpisodeProgressFill.style.transition = "";
+    } else {
+      nextEpisodeProgressFill.style.width = `${pct.toFixed(2)}%`;
+    }
+    nextEpisodeProgressFill.dataset.pct = String(pct);
+  }
 };
 
 const isOpeningOverlayActive = () =>
@@ -3981,17 +6408,497 @@ const finishChromePointerInteraction = event => {
   noteChromeActivity(true);
 };
 
+const renderPlaylistPeek = () => {
+  const items = Array.isArray(state.playlistPeekItems) ? state.playlistPeekItems : [];
+  const hasPeek = items.length > 0 && Boolean(state.playlistPeekTitle);
+  setText(playlistPeekTag, hasPeek ? hudFormat("player_hud_playlist_1_s", "Playlist · %1$s", state.playlistPeekTitle) : "");
+  // Called from renderChrome, so close without re-rendering (setPlaylistPeekOpen would recurse).
+  if (!hasPeek && playlistPeekOpen) {
+    playlistPeekOpen = false;
+    root.classList.remove("playlist-peek-open");
+  }
+  playlistPeek.hidden = !(hasPeek && playlistPeekOpen);
+  const key = hasPeek ? JSON.stringify([state.playlistPeekTitle, items]) : "";
+  if (key === playlistPeekKey) return;
+  playlistPeekKey = key;
+  playlistPeekHeader.textContent = state.playlistPeekTitle || "";
+  playlistPeekList.replaceChildren(...items.map(item => {
+    const li = document.createElement("li");
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `playlist-peek-row ${String(item.state || "upcoming")}`;
+    li.append(row);
+    if (item.state === "current") {
+      row.disabled = true;
+      row.setAttribute("aria-current", "true");
+    } else {
+      row.title = hudText("player_hud_play_this_now", "Play this now");
+      row.addEventListener("click", event => {
+        event.stopPropagation();
+        setPlaylistPeekOpen(false);
+        send("playlistJump", Number(item.position) || 0);
+      });
+    }
+    const position = document.createElement("span");
+    position.className = "playlist-peek-position";
+    position.textContent = item.state === "current" ? "▶" : String(item.position || "");
+    const copy = document.createElement("span");
+    copy.className = "playlist-peek-copy";
+    const rowTitle = document.createElement("span");
+    rowTitle.className = "playlist-peek-title";
+    rowTitle.textContent = String(item.title || "");
+    const rowSubtitle = document.createElement("span");
+    rowSubtitle.className = "playlist-peek-subtitle";
+    const label = item.state === "next" ? hudText("player_hud_up_next", "Up next") : item.state === "played" ? hudText("player_hud_played", "Played") : "";
+    rowSubtitle.textContent = [String(item.subtitle || ""), label].filter(Boolean).join(" · ");
+    copy.append(rowTitle, rowSubtitle);
+    row.append(position, copy);
+    return li;
+  }));
+};
+
+// Bring the playing entry into view each time the peek opens; the list scrolls freely after.
+const scrollPlaylistPeekToCurrent = () => {
+  const current = playlistPeekList.querySelector(".playlist-peek-row.current");
+  if (!current) return;
+  const list = playlistPeekList;
+  const rowTop = current.parentElement.offsetTop - list.offsetTop;
+  list.scrollTop = Math.max(0, rowTop - (list.clientHeight - current.offsetHeight) / 2);
+};
+
+function setPlaylistPeekOpen(open) {
+  const next = Boolean(open) && Array.isArray(state.playlistPeekItems) && state.playlistPeekItems.length > 0;
+  if (playlistPeekOpen === next) return;
+  playlistPeekOpen = next;
+  root.classList.toggle("playlist-peek-open", next);
+  renderChrome();
+  if (next) scrollPlaylistPeekToCurrent();
+  // Restart the inactivity timer on the way out rather than leaving the controls pinned.
+  if (!next) noteChromeActivity(true);
+}
+
+if (metadataSection) {
+  metadataSection.addEventListener("mouseenter", () => setPlaylistPeekOpen(true));
+  metadataSection.addEventListener("mouseleave", () => setPlaylistPeekOpen(false));
+}
+
+const debouncedBuffering = wanted => {
+  if (!wanted) {
+    bufferingWantedSince = 0;
+    if (bufferingShowTimer) {
+      clearTimeout(bufferingShowTimer);
+      bufferingShowTimer = 0;
+    }
+    return false;
+  }
+  const now = performance.now();
+  if (!bufferingWantedSince) bufferingWantedSince = now;
+  const remaining = BUFFERING_SHOW_DELAY_MS - (now - bufferingWantedSince);
+  if (remaining <= 0) return true;
+  if (!bufferingShowTimer) {
+    bufferingShowTimer = setTimeout(() => {
+      bufferingShowTimer = 0;
+      renderChrome();
+    }, remaining + 1);
+  }
+  return false;
+};
+
+// Live TV --------------------------------------------------------------------------------------
+// A live stream's position only ever grows, so the seek bar covers the rewind window instead of a
+// film's length: from the earliest point seen on this channel (no further back than the buffer
+// reaches, `rewindWindowMs`) to the end of what has been received (`bufferedMs`, absolute, from
+// playerUpdate), which is the live edge. Within a few seconds of the edge counts as live; further
+// back, the badge shows the gap and jumps to the edge when clicked.
+const IPTV_LIVE_SLACK_MS = 15000;
+// Where Go live and a channel's opening jump land, short of the received end. 5s kept playback
+// close to live but left a 5s buffer, and a provider/proxy delivery gap longer than that stalled
+// (three 5-15s stalls in one evening's session); 10s rides those out. Under IPTV_LIVE_SLACK_MS
+// with room for the buffer to wobble, so the badge reads LIVE after the jump.
+const IPTV_GO_LIVE_CUSHION_MS = 10000;
+let iptvWindowChannel = "";
+let iptvEarliestSeenMs = null;
+
+const iptvRawBehindLiveMs = () => {
+  const positionMs = Math.max(0, Number(state.positionMs) || 0);
+  const bufferedMs = Math.max(0, Number(state.bufferedMs) || 0);
+  return bufferedMs > positionMs ? bufferedMs - positionMs : 0;
+};
+
+// What the badge and seek bar show. Pinned to the edge while a channel's opening jump is pending
+// (see maybeAutoGoLive): otherwise the connect burst pulled the received end ~30s ahead within a
+// second, the thumb slid back and the badge read -0:28, and the jump then threw it forward again,
+// which looked like the player seeking back and forth when playback itself only moved once.
+const iptvBehindLiveMs = () => (iptvOpeningJumpPending() ? 0 : iptvRawBehindLiveMs());
+
+// [start, end] of the live seek bar in absolute stream time, or null when not live TV.
+const iptvLiveWindow = () => {
+  const iptv = state.iptv;
+  if (!iptv) return null;
+  const positionMs = Math.max(0, Number(state.positionMs) || 0);
+  const end = iptvOpeningJumpPending() ? positionMs : Math.max(positionMs, Number(state.bufferedMs) || 0);
+  // A new channel (or a reconnect that restarted the clock) starts a new window.
+  if (iptv.channelLabel !== iptvWindowChannel || iptvEarliestSeenMs === null || positionMs + 5000 < iptvEarliestSeenMs) {
+    iptvWindowChannel = iptv.channelLabel;
+    iptvEarliestSeenMs = positionMs;
+  }
+  iptvEarliestSeenMs = Math.min(iptvEarliestSeenMs, positionMs);
+  const reach = Math.max(60000, Number(iptv.rewindWindowMs) || 0);
+  const start = Math.max(iptvEarliestSeenMs, end - reach);
+  return { start, end: Math.max(end, start + 1000) };
+};
+
+// Opening a channel: the provider's connect burst lands 20-30s of backlog in the cache and mpv
+// plays from the start of it, so every channel opened that far behind live. Once per channel, just
+// into playback (the burst arrives at line speed, so it is in by then), either jump to the edge the
+// way Go live does or, when the burst was small, settle where it is. One decision, early, so it
+// never second-guesses a rewind the viewer made. The opening cover stays up until it has landed
+// (renderOpeningOverlay), so the backlog's first frames are never seen.
+const IPTV_AUTO_LIVE_FROM_MS = 500;
+// How long the display stays pinned after the jump is sent, while mpv lands it.
+const IPTV_AUTO_LIVE_LANDING_MS = 2000;
+let iptvAutoLiveChannel = null;
+let iptvAutoLiveStartMs = 0;
+let iptvAutoLiveDone = false;
+let iptvAutoLiveSentAt = 0;
+
+// True from a channel's first update until its opening jump has landed (or was not needed).
+function iptvOpeningJumpPending() {
+  const iptv = state.iptv;
+  if (!iptv) return false;
+  if (iptv.channelLabel !== iptvAutoLiveChannel || !iptvAutoLiveDone) return true;
+  return iptvAutoLiveSentAt > 0 &&
+    Date.now() - iptvAutoLiveSentAt < IPTV_AUTO_LIVE_LANDING_MS &&
+    iptvRawBehindLiveMs() > IPTV_LIVE_SLACK_MS;
+}
+
+const maybeAutoGoLive = iptv => {
+  const positionMs = Math.max(0, Number(state.positionMs) || 0);
+  if (iptv.channelLabel !== iptvAutoLiveChannel) {
+    iptvAutoLiveChannel = iptv.channelLabel;
+    iptvAutoLiveStartMs = positionMs;
+    iptvAutoLiveDone = false;
+    iptvAutoLiveSentAt = 0;
+  }
+  if (iptvAutoLiveDone) return;
+  const playedMs = positionMs - iptvAutoLiveStartMs;
+  if (!state.isPlaying || state.isLoading || playedMs < IPTV_AUTO_LIVE_FROM_MS) return;
+  iptvAutoLiveDone = true;
+  if (iptvRawBehindLiveMs() <= IPTV_LIVE_SLACK_MS) return;
+  iptvAutoLiveSentAt = Date.now();
+  send("goLive", IPTV_GO_LIVE_CUSHION_MS);
+};
+
+const renderIptvLive = () => {
+  const iptv = state.iptv || null;
+  root.classList.toggle("iptv-live", Boolean(iptv));
+  setVisible(iptvNow, Boolean(iptv && (iptv.nowTitle || iptv.nextLabel)));
+  setVisible(iptvLiveBadge, Boolean(iptv));
+  setVisible(iptvChannelsButton, Boolean(iptv));
+  if (!iptv) return;
+  maybeAutoGoLive(iptv);
+  // The previous/next buttons beside play change channel.
+  document.querySelectorAll(".episode-skip").forEach(button => {
+    setVisible(button, true);
+    const label = button.dataset.command === "previousEpisode" ? iptv.previousChannelLabel : iptv.nextChannelLabel;
+    if (label) {
+      button.setAttribute("aria-label", label);
+      button.dataset.tooltip = label;
+    }
+  });
+  if (iptv.channelsLabel) {
+    iptvChannelsLabel.textContent = iptv.channelsLabel;
+    iptvChannelsButton.setAttribute("aria-label", iptv.channelsLabel);
+    iptvChannelsButton.dataset.tooltip = iptv.channelsLabel;
+  }
+  iptvNowTime.textContent = iptv.nowTimeLabel || "";
+  iptvNowTitle.textContent = iptv.nowTitle || "";
+  const progress = Number(iptv.nowProgress);
+  setVisible(iptvNowTrack, Boolean(iptv.nowTitle) && progress >= 0);
+  iptvNowFill.style.width = `${Math.max(0, Math.min(1, progress || 0)) * 100}%`;
+  iptvNext.textContent = iptv.nextLabel || "";
+  const behindMs = iptvBehindLiveMs();
+  const behind = behindMs > IPTV_LIVE_SLACK_MS;
+  iptvLiveBadge.classList.toggle("behind", behind);
+  iptvLiveLabel.textContent = behind ? (iptv.goLiveLabel || "Go live") : (iptv.liveLabel || "LIVE");
+  iptvLiveBehind.textContent = "";
+  iptvLiveBadge.title = behind ? (iptv.goLiveLabel || "Go live") : "";
+  if (activeModal === "iptvChannels") renderIptvPanel();
+};
+
+iptvLiveBadge.addEventListener("click", event => {
+  event.stopPropagation();
+  if (!state.iptv || iptvBehindLiveMs() <= IPTV_LIVE_SLACK_MS) return;
+  // Short of the received end, so mpv lands on data it has and keeps a cushion: at the very edge
+  // any pause in the provider's delivery longer than the gap left shows up as a stall. The bridge
+  // picks the target from mpv's own seekable cache range rather than this side's bufferedMs; a
+  // seek past that range threw the cache away and restarted from the connection.
+  send("goLive", IPTV_GO_LIVE_CUSHION_MS);
+});
+
+// Typing a channel number: digits collect in a box and the number is sent after a pause.
+let iptvDigits = "";
+let iptvDigitsTimer = null;
+window.nuvioIptvDigit = digit => {
+  if (!state.iptv) return;
+  if (iptvDigits.length >= 5) iptvDigits = "";
+  iptvDigits += String(Math.max(0, Math.min(9, Number(digit) || 0)));
+  iptvNumber.textContent = iptvDigits;
+  iptvNumber.classList.add("visible");
+  clearTimeout(iptvDigitsTimer);
+  iptvDigitsTimer = setTimeout(() => {
+    const number = Number(iptvDigits);
+    iptvDigits = "";
+    iptvNumber.classList.remove("visible");
+    if (number > 0) send("iptvChannelNumber", number);
+  }, 1400);
+};
+
+// Channel switcher (GoatTV's side panel): the channels of one category, the categories, or the
+// channels matching a search. The channel list only arrives while the panel is open
+// ("iptvPanelOpen"), so Kotlin never pushes a 50,000-channel list with every state update.
+// The search runs in Kotlin over the whole playlist; the bridge only carries numbers, so the query
+// rides in the event name ("iptvPanelSearch:<query>").
+let iptvPanelShowingGroups = false;
+let iptvPanelIndex = 0;
+let iptvPanelSignature = "";
+let iptvPanelScrollToPlaying = false;
+let iptvSearchQuery = "";
+let iptvSearchTimer = null;
+// Arrow keys typed into the search box highlight rows the same way the keyboard panel mode does.
+let iptvSearchKeyboard = false;
+
+const sendIptvSearch = query => {
+  clearTimeout(iptvSearchTimer);
+  iptvSearchTimer = null;
+  const trimmed = String(query || "").trim().slice(0, 80);
+  if (trimmed === iptvSearchQuery) return;
+  iptvSearchQuery = trimmed;
+  iptvPanelScrollToPlaying = !trimmed;
+  iptvPanelIndex = 0;
+  send(`iptvPanelSearch:${trimmed}`, 0);
+  if (iptvPanelShowingGroups) iptvPanelShowGroups(false);
+};
+
+const resetIptvSearch = () => {
+  clearTimeout(iptvSearchTimer);
+  iptvSearchTimer = null;
+  iptvSearchQuery = "";
+  iptvSearchKeyboard = false;
+  if (iptvSearchInput) iptvSearchInput.value = "";
+};
+
+const iptvPanelRows = () => (iptvPanelShowingGroups ? iptvGroupList : iptvChannelList).children;
+
+const iptvPanelHighlight = (scroll = true) => {
+  const rows = iptvPanelRows();
+  if (!rows.length) return;
+  iptvPanelIndex = Math.max(0, Math.min(rows.length - 1, iptvPanelIndex));
+  const showFocus = Boolean(keyboardPanelMode) || iptvSearchKeyboard;
+  Array.from(rows).forEach((row, index) => row.classList.toggle("keyboard-focus", showFocus && index === iptvPanelIndex));
+  if (scroll) rows[iptvPanelIndex].scrollIntoView({ block: "nearest" });
+};
+
+const iptvPanelShowGroups = showGroups => {
+  iptvPanelShowingGroups = showGroups;
+  setVisible(iptvGroupList, showGroups);
+  setVisible(iptvChannelList, !showGroups);
+  const rows = Array.from(iptvPanelRows());
+  const selected = rows.findIndex(row => row.classList.contains(showGroups ? "selected" : "playing"));
+  iptvPanelIndex = selected >= 0 ? selected : 0;
+  iptvPanelHighlight();
+};
+
+const renderIptvPanel = () => {
+  const iptv = state.iptv;
+  if (!iptv) return;
+  const groups = Array.isArray(iptv.groups) ? iptv.groups : [];
+  const channels = Array.isArray(iptv.channels) ? iptv.channels : [];
+  const selectedGroup = groups.find(group => group.selected);
+  iptvGroupButton.textContent = selectedGroup ? selectedGroup.name : (iptv.groupsLabel || "Categories");
+  iptvGroupButton.title = iptv.groupsLabel || "Categories";
+  iptvChannelCloseButton.textContent = state.panelCloseLabel || "Close";
+  if (iptvSearchInput) iptvSearchInput.placeholder = iptv.searchLabel || "Search channels";
+  iptvPanelNote.textContent = iptv.channelsNote || "";
+  setVisible(iptvPanelNote, Boolean(iptv.channelsNote));
+  const signature = JSON.stringify([groups.map(g => [g.index, g.count, g.selected]), channels.map(c => [c.uid, c.nowTitle, c.playing])]);
+  if (signature === iptvPanelSignature) return;
+  iptvPanelSignature = signature;
+  iptvGroupList.replaceChildren(...groups.map(group => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "iptv-group-row" + (group.selected ? " selected" : "");
+    const name = document.createElement("span");
+    name.textContent = group.name;
+    const count = document.createElement("span");
+    count.className = "iptv-group-count";
+    count.textContent = String(group.count);
+    row.append(name, count);
+    row.addEventListener("click", event => {
+      event.stopPropagation();
+      iptvPickGroup(Number(group.index));
+    });
+    return row;
+  }));
+  iptvChannelList.replaceChildren(...channels.map(channel => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "iptv-row" + (channel.playing ? " playing" : "");
+    const num = document.createElement("span");
+    num.className = "iptv-row-num";
+    num.textContent = String(channel.num);
+    const logo = document.createElement("img");
+    logo.className = "iptv-row-logo";
+    logo.alt = "";
+    logo.loading = "lazy";
+    if (channel.logo) logo.src = channel.logo;
+    else logo.style.visibility = "hidden";
+    logo.addEventListener("error", () => { logo.style.visibility = "hidden"; });
+    const text = document.createElement("span");
+    text.className = "iptv-row-text";
+    const name = document.createElement("span");
+    name.className = "iptv-row-name";
+    name.textContent = channel.name;
+    const now = document.createElement("span");
+    now.className = "iptv-row-now";
+    now.textContent = channel.nowTitle || "";
+    text.append(name, now);
+    row.append(num, logo, text);
+    row.addEventListener("click", event => {
+      event.stopPropagation();
+      send("iptvPanelPlay", Number(channel.uid));
+    });
+    return row;
+  }));
+  if (iptvPanelScrollToPlaying && channels.length) {
+    iptvPanelScrollToPlaying = false;
+    const playingIndex = channels.findIndex(channel => channel.playing);
+    iptvPanelIndex = playingIndex >= 0 ? playingIndex : 0;
+    const row = iptvChannelList.children[iptvPanelIndex];
+    if (row) row.scrollIntoView({ block: "center" });
+  }
+  iptvPanelHighlight(false);
+};
+
+const iptvPickGroup = index => {
+  // A category replaces the search.
+  if (iptvSearchQuery) {
+    resetIptvSearch();
+    send("iptvPanelSearch:", 0);
+  }
+  iptvPanelScrollToPlaying = true;
+  send("iptvPanelGroup", index);
+  iptvPanelShowGroups(false);
+};
+
+const openIptvPanel = keyboard => {
+  if (!state.iptv) return;
+  iptvPanelSignature = "";
+  iptvPanelScrollToPlaying = true;
+  resetIptvSearch();
+  openPlayerModal("iptvChannels");
+  if (keyboard) {
+    keyboardPanelMode = "iptvChannels";
+    send("keyboardPanelOpened", 0);
+  }
+  send("iptvPanelOpen", 1);
+  iptvPanelShowGroups(false);
+  renderIptvPanel();
+};
+
+const handleIptvPanelKey = code => {
+  const rows = iptvPanelRows();
+  if (code === "ArrowUp") { iptvPanelIndex -= 1; iptvPanelHighlight(); return; }
+  if (code === "ArrowDown") { iptvPanelIndex += 1; iptvPanelHighlight(); return; }
+  if (code === "ArrowLeft") { if (!iptvPanelShowingGroups) iptvPanelShowGroups(true); return; }
+  if (code === "ArrowRight") { if (iptvPanelShowingGroups) iptvPanelShowGroups(false); return; }
+  if (code === "Enter" && rows[iptvPanelIndex]) rows[iptvPanelIndex].click();
+};
+
+iptvGroupButton.addEventListener("click", event => {
+  event.stopPropagation();
+  iptvPanelShowGroups(!iptvPanelShowingGroups);
+});
+iptvChannelCloseButton.addEventListener("click", event => {
+  event.stopPropagation();
+  closePlayerModal(true);
+});
+if (iptvSearchInput) {
+  iptvSearchInput.addEventListener("click", event => event.stopPropagation());
+  iptvSearchInput.addEventListener("input", () => {
+    clearTimeout(iptvSearchTimer);
+    iptvSearchTimer = setTimeout(() => sendIptvSearch(iptvSearchInput.value), 220);
+  });
+  iptvSearchInput.addEventListener("keydown", event => {
+    if (event.code === "ArrowUp" || event.code === "ArrowDown" || event.code === "Enter" || event.code === "NumpadEnter") {
+      // The keyboard panel mode already routes these from the document handler.
+      if (keyboardPanelMode) return;
+      event.preventDefault();
+      event.stopPropagation();
+      // Enter acts on what is typed now, not what the debounce will send in a moment.
+      if (iptvSearchTimer) sendIptvSearch(iptvSearchInput.value);
+      iptvSearchKeyboard = true;
+      handleIptvPanelKey(event.code === "NumpadEnter" ? "Enter" : event.code);
+      return;
+    }
+    if (event.code === "Escape" && iptvSearchInput.value) {
+      // First Escape clears the search; the next closes the panel as usual.
+      event.preventDefault();
+      event.stopPropagation();
+      iptvSearchInput.value = "";
+      sendIptvSearch("");
+    }
+  });
+}
+
 const renderChrome = () => {
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   const positionMs = isScrubbing ? scrubPositionMs : Math.max(0, Number(state.positionMs) || 0);
-  const isPlaying = Boolean(state.isPlaying);
+  const isPlaying = displayedIsPlaying();
   const showError = renderPlaybackError();
   const pictureInPictureActive = Boolean(state.pictureInPictureActive);
-  root.classList.toggle("pip-active", pictureInPictureActive);
+  // PiP takes the raw scale floor (see updateViewportUiScale); re-derive the scale on entry/exit.
+  if (root.classList.contains("pip-active") !== pictureInPictureActive) {
+    root.classList.toggle("pip-active", pictureInPictureActive);
+    updateViewportUiScale();
+  }
   root.classList.toggle("locked", Boolean(state.isLocked));
+  root.classList.toggle("mini-player", Boolean(state.miniPlayer));
+  root.classList.toggle("pip-ui", pictureInPictureActive || Boolean(state.miniPlayer));
+  // fork:pip-browse - PiP has the X too (it closes the video; see the click handler at the top).
+  root.classList.toggle("mini-player-closable", (isMiniPlayerUi() && Boolean(state.miniPlayerClosable)) || pictureInPictureActive);
+  root.classList.toggle("pip-browse-available", pictureInPictureActive && Boolean(state.pipBrowseAvailable));
+  root.classList.toggle("pip-browse-box", isMiniPlayerUi() && Boolean(state.pipBrowseBox));
   root.classList.toggle("episode-panel-open", activeModal === "episodes");
   root.classList.toggle("source-panel-open", activeModal === "sources");
-  root.classList.toggle("legacy-hud", Boolean(state.legacyHudEnabled));
+  root.classList.toggle("iptv-panel-open", activeModal === "iptvChannels");
+  root.classList.toggle("dock-open", isDockModal(activeModal));
+  // The layouts are exclusive; the repository never sets two at once, but the HUD must not depend
+  // on it, and a stale payload mid-switch would otherwise stack two rule sets for a frame.
+  const officialHud = Boolean(state.officialHudEnabled);
+  const ultraHud = Boolean(state.ultraHudEnabled) && !officialHud;
+  const minimalHud = Boolean(state.minimalHudEnabled) && !ultraHud && !officialHud;
+  root.classList.toggle(
+    "legacy-hud",
+    Boolean(state.legacyHudEnabled) && !minimalHud && !ultraHud && !officialHud,
+  );
+  root.classList.toggle("minimal-hud", minimalHud);
+  root.classList.toggle("minimal-pills", minimalHud && Boolean(state.minimalHudPillsEnabled));
+  root.classList.toggle("ultra-hud", ultraHud);
+  root.classList.toggle("official-hud", officialHud);
+  root.classList.toggle("seek-handle-hidden", state.seekHandleEnabled === false);
+  root.classList.toggle("vignette-hidden", state.hudVignetteEnabled === false);
+  applyHiddenHudButtons(state.hiddenHudButtons);
+  // The YouTube watch page hides the comments and related panels it shows itself: their edge notches too.
+  const pageHiddenPanels = state.watchPage
+    ? new Set(String(state.hiddenHudButtons || "").split(",").map(part => part.trim()))
+    : null;
+  document.querySelectorAll(".episode-notch[data-command], .source-notch[data-command]")
+    .forEach(notch => notch.classList.toggle("user-hidden", Boolean(pageHiddenPanels && pageHiddenPanels.has(notch.dataset.command))));
+  applyHudButtonOrder(state.hudButtonOrder);
+  // The official bar also reads the time as one "position / duration" readout, right-aligned.
+  applyMinimalHudTimeLayout(minimalHud || officialHud);
+  applyUltraHudLayout(ultraHud);
   root.classList.toggle("clock-always-visible", Boolean(state.alwaysShowClock));
   root.classList.toggle("mpv-diagnostics", Boolean(mpvDiagnosticsEnabled));
   const posterHighlightMode = ["white", "accent", "shine"].includes(
@@ -4006,21 +6913,27 @@ const renderChrome = () => {
   root.classList.toggle("locked-visible", Boolean(state.isLocked && state.lockedOverlayVisible));
   // Playback failures are a compact notification now. Keep the normal chrome and cursor visible
   // so Back remains immediately available instead of turning the error into a modal takeover.
-  const isChromeHidden = Boolean(!pictureInPictureActive && !showError && (!activeModal && !contextMenuOpen && !colorGradePanelOpen && !actionOverflowOpen && !state.controlsVisible && !(state.isLocked && state.lockedOverlayVisible)));
+  const isChromeHidden = Boolean(!pictureInPictureActive && !showError && (!activeModal && !contextMenuOpen && !colorGradePanelOpen && !actionOverflowOpen && !playlistPeekOpen && !state.controlsVisible && keyboardPanelMode !== "controls" && !(state.isLocked && state.lockedOverlayVisible)));
   root.classList.toggle("chrome-hidden", isChromeHidden);
   if (isChromeHidden || activeModal) hideControlTooltip();
   // Never hide the cursor in hero-trailer mode — it's a background surface, not the
   // focused player, so the OS/app cursor must behave normally.
-  if (!isHeroTrailerSurface && !state.heroTrailerMode && isChromeHidden !== lastCursorHidden) {
-    lastCursorHidden = isChromeHidden;
-    send("cursorVisibility", isChromeHidden ? 0 : 1);
+  // Nor while the post-show cards are up: the chrome is hidden then, but the cards are clickable,
+  // and the native side hides the cursor for the whole window, not just the video box.
+  const cursorHidden = isChromeHidden && !state.postShowInput;
+  if (!isHeroTrailerSurface && !state.heroTrailerMode && cursorHidden !== lastCursorHidden) {
+    lastCursorHidden = cursorHidden;
+    send("cursorVisibility", cursorHidden ? 0 : 1);
   }
+  syncHudSubtitleClearance(isChromeHidden);
   root.classList.toggle("source-visible", Boolean(!showError && !isPlaying && !state.isLoading && (state.streamTitle || state.providerName)));
   const showOpening = renderOpeningOverlay(showError);
   renderPauseMetadataOverlay(showOpening || showError);
   syncParentalGuide(showOpening || showError);
 
   title.textContent = state.title || "";
+  renderTitleBadges();
+  renderPlaylistPeek();
   setText(episode, normalizeEpisodeDisplayText(state.episodeText));
   setText(streamTitle, state.streamTitle);
   setText(providerName, state.providerName);
@@ -4030,12 +6943,19 @@ const renderChrome = () => {
   audioLabel.textContent = state.audioLabel || "Audio";
   sourcesLabel.textContent = state.sourcesLabel || "Sources";
   episodesLabel.textContent = state.episodesLabel || "Episodes";
+  // A YouTube video's Sources panel holds its comments: their text gets more than a stream's two lines.
+  root.classList.toggle("youtube-video", Boolean(state.isYouTubeVideo));
   episodeNotchLabel.textContent = state.episodesLabel || "Episodes";
   lockedLabel.textContent = state.tapToUnlockLabel || "Tap to unlock";
   // The Sources sheet leaves the picture uncovered and stays open across a swap, so buffering
   // must still show through it; every other modal hides the spinner as before.
   const modalHidesBuffering = Boolean(activeModal) && activeModal !== "sources";
-  const showBuffering = Boolean(!showError && state.isLoading && !state.isLocked && !modalHidesBuffering && !showOpening);
+  // The spinner follows mpv's own loading state once it arrives: the Compose feed's isLoading is
+  // a 500 ms-old snapshot that re-raised the spinner after a short seek had already finished.
+  const spinnerLoading = nativeIsLoading === null ? state.isLoading : nativeIsLoading;
+  const showBuffering = debouncedBuffering(
+    Boolean(!showError && spinnerLoading && !state.isLocked && !modalHidesBuffering && !showOpening),
+  );
   bufferingStatus.classList.toggle("visible", showBuffering);
   bufferingStatus.setAttribute("aria-hidden", showBuffering ? "false" : "true");
 
@@ -4045,14 +6965,18 @@ const renderChrome = () => {
   setVisible(sourcesButton, Boolean(state.showSources));
   setVisible(episodesButton, Boolean(state.showEpisodes));
   setVisible(episodeNotch, Boolean(state.showEpisodes));
+  renderPartyChrome(isChromeHidden, pictureInPictureActive);
+  renderPartyUnread();
   const sourceNotchPosition = ["left", "hidden"].includes(state.sourceNotchPosition)
     ? state.sourceNotchPosition
     : "right";
   root.classList.toggle("source-notch-left", sourceNotchPosition === "left");
   sourceNotchHoverOpens = state.sourceNotchHoverEnabled !== false;
   root.classList.toggle("notifications-top", state.notificationPosition === "top-center");
-  setVisible(sourceNotch, Boolean(state.showSources) && sourceNotchPosition !== "hidden");
+  // Live TV keeps the notch: it opens the channel switcher there.
+  setVisible(sourceNotch, Boolean(state.showSources || state.iptv) && sourceNotchPosition !== "hidden");
   document.querySelectorAll(".episode-skip").forEach(button => setVisible(button, Boolean(state.showEpisodes)));
+  renderIptvLive();
   scheduleActionOverflowSync();
 
   const playPauseLabel = isPlaying ? state.pauseLabel : state.playLabel;
@@ -4060,10 +6984,10 @@ const renderChrome = () => {
     toggle.setAttribute("aria-label", playPauseLabel || (isPlaying ? "Pause" : "Play"));
   }
   if (toggleIcon) {
-    toggleIcon.setAttribute("href", isPlaying ? "#icon-pause" : "#icon-play");
+    setIconHref(toggleIcon, isPlaying ? "#icon-pause" : "#icon-play");
   }
   lockButton.setAttribute("aria-label", state.isLocked ? state.unlockLabel : state.lockLabel);
-  lockIcon.setAttribute("href", state.isLocked ? "#icon-lock-open" : "#icon-lock");
+  setIconHref(lockIcon, state.isLocked ? "#icon-lock-open" : "#icon-lock");
   backButton.setAttribute("aria-label", state.closeLabel || "Close player");
   const submitIntroButtonLabel = state.submitIntroLabel || "Submit Intro";
   submitIntroButton.setAttribute("aria-label", submitIntroButtonLabel);
@@ -4072,22 +6996,31 @@ const renderChrome = () => {
   submitIntroButton.dataset.tooltip = submitIntroButtonLabel;
   videoSettingsButton.setAttribute("aria-label", state.videoSettingsLabel || "Video settings");
   const pictureInPictureLabel = state.pictureInPictureActive
-    ? "Exit picture in picture"
+    ? hudText("player_hud_exit_picture_in_picture", "Exit picture in picture")
     : (state.pictureInPictureLabel || "Picture in picture");
   pictureInPictureButton.setAttribute("aria-label", pictureInPictureLabel);
   pictureInPictureButton.setAttribute("title", pictureInPictureLabel);
   pictureInPictureButton.classList.toggle("selected", Boolean(state.pictureInPictureActive));
-  pictureInPictureExitButton.setAttribute("aria-label", "Exit picture in picture");
+  if (pictureInPictureExitButtonElement) {
+    const exitLabel = isMiniPlayerUi()
+      ? hudText("player_hud_back_to_video", "Back to the video")
+      : hudText("player_hud_exit_picture_in_picture", "Exit picture in picture");
+    pictureInPictureExitButtonElement.setAttribute("aria-label", exitLabel);
+    pictureInPictureExitButtonElement.setAttribute("title", exitLabel);
+  }
+  pictureInPictureExitButton.setAttribute("aria-label", hudText("player_hud_exit_picture_in_picture", "Exit picture in picture"));
   const pictureInPicturePlaybackLabel = isPlaying ? (state.pauseLabel || "Pause") : (state.playLabel || "Play");
   pictureInPicturePlayButton.setAttribute("aria-label", pictureInPicturePlaybackLabel);
   pictureInPicturePlayButton.setAttribute("title", pictureInPicturePlaybackLabel);
-  pictureInPictureToggleIcon.setAttribute("href", isPlaying ? "#icon-pause" : "#icon-play");
+  setIconHref(pictureInPictureToggleIcon, isPlaying ? "#icon-pause" : "#icon-play");
   seek.disabled = Boolean(state.isLocked);
   setProgress(positionMs, durationMs);
   renderChapterMarkers(durationMs);
   if (showError) {
     skipPrompt.classList.remove("visible", "show-progress");
     skipPrompt.setAttribute("aria-hidden", "true");
+    skipSubmitToast.classList.remove("visible", "show-progress");
+    skipSubmitToast.setAttribute("aria-hidden", "true");
     nextEpisodeCard.classList.remove("visible");
     nextEpisodeCard.setAttribute("aria-hidden", "true");
   } else {
@@ -4109,8 +7042,13 @@ const updatePlayerClock = () => {
   const speed = Number.isFinite(parsedSpeed) && parsedSpeed > 0 ? parsedSpeed : 1;
   const remainingWallMs = Math.max(0, durationMs - positionMs) / speed;
   const endTime = new Date(now.getTime() + remainingWallMs);
-  const contentLabel = String(state.episodeText || "").trim() ? "Episode" : "Movie";
-  playerEndTime.textContent = `${contentLabel} ends at ${playerClockFormatter.format(endTime)}`;
+  const contentLabel = String(state.episodeText || "").trim()
+    ? hudText("player_hud_episode", "Episode")
+    : state.isYouTubeVideo ? hudText("player_hud_video", "Video") : hudText("player_hud_movie", "Movie");
+  // Live TV never ends; the same spot (and its click, "back") is the way out.
+  playerEndTime.textContent = state.iptv
+    ? (state.iptv.exitLabel || state.closeLabel || "Exit")
+    : `${contentLabel} ends at ${playerClockFormatter.format(endTime)}`;
 };
 window.setInterval(updatePlayerClock, 1000);
 
@@ -4140,6 +7078,41 @@ heroTrailerChrome.innerHTML =
   '</button>' +
   '<input id="heroTrailerVolumeSlider" class="hero-trailer-volume" type="range" min="0" max="100" step="1" value="0" aria-label="Trailer volume">';
 heroTrailerChrome.style.display = "none";
+if (isPreshowSurface) {
+  // Mute and the slider stay in the DOM (the code below updates them) but are hidden by CSS; the
+  // stop button becomes a labelled Skip, which sends the same Back action Kotlin already handles.
+  heroTrailerChrome.classList.add("preshow");
+  // Hidden here as well as in CSS, so the pre-show never shows a sound control even if a stale
+  // stylesheet is in play. They stay in the DOM because the code below updates them.
+  heroTrailerChrome
+    .querySelectorAll('[data-command="heroTrailerMute"], .hero-trailer-volume')
+    .forEach(el => el.style.setProperty("display", "none", "important"));
+  const skipButton = heroTrailerChrome.querySelector('[data-command="back"]');
+  if (skipButton) {
+    skipButton.setAttribute("aria-label", "Skip");
+    skipButton.innerHTML =
+      '<span class="hero-trailer-skip-label">Skip</span>' +
+      '<svg><use href="#icon-skip-next"></use></svg>';
+  }
+  // "Add to library" pill beside Skip, same look. Kotlin supplies the label (empty hides it) and whether the
+  // title is already saved; a click tells Kotlin to save and the pill marks itself done straight away.
+  const addButton = document.createElement("button");
+  addButton.className = "hero-trailer-button";
+  addButton.type = "button";
+  addButton.id = "heroTrailerLibraryButton";
+  addButton.style.display = "none";
+  addButton.innerHTML =
+    '<span class="hero-trailer-skip-label"></span>' +
+    '<svg><use id="heroTrailerLibraryIcon" href="#icon-add"></use></svg>';
+  addButton.addEventListener("click", () => {
+    if (addButton.dataset.done === "1") return;
+    addButton.dataset.done = "1";
+    addButton.querySelector("use").setAttribute("href", "#icon-check");
+    addButton.querySelector(".hero-trailer-skip-label").textContent = "In library";
+    send("preshowAddToLibrary", 0);
+  });
+  heroTrailerChrome.insertBefore(addButton, skipButton || heroTrailerChrome.firstChild);
+}
 root.appendChild(heroTrailerChrome);
 
 const heroTrailerLogo = heroTrailerContent.querySelector("#heroTrailerLogo");
@@ -4262,6 +7235,20 @@ function applyHeroTrailerContent() {
   setHeroTrailerLine(heroTrailerTitle, useLogo ? "" : title);
   setHeroTrailerLine(heroTrailerMeta, state.heroTrailerMeta);
   setHeroTrailerLine(heroTrailerDescription, state.heroTrailerDescription);
+  const addButton = heroTrailerChrome.querySelector("#heroTrailerLibraryButton");
+  if (addButton) {
+    const label = String(state.heroTrailerLibraryLabel || "").trim();
+    // A new trailer pushes fresh state; only reset the pill when the title under it changed, so
+    // the "done" mark survives the other re-renders of the same trailer.
+    if (addButton.dataset.forTitle !== title) {
+      addButton.dataset.forTitle = title;
+      addButton.dataset.done = state.heroTrailerInLibrary ? "1" : "0";
+    }
+    const done = addButton.dataset.done === "1";
+    addButton.style.display = label ? "" : "none";
+    addButton.querySelector(".hero-trailer-skip-label").textContent = done ? "In library" : label;
+    addButton.querySelector("use").setAttribute("href", done ? "#icon-check" : "#icon-add");
+  }
 }
 
 const applyHeroTrailer = () => {
@@ -4277,6 +7264,12 @@ const applyHeroTrailer = () => {
   if (lastCursorHidden) {
     lastCursorHidden = false;
     send("cursorVisibility", 1);
+  }
+  if (isChromelessSurface) { // fork:music
+    heroTrailerFade.style.display = "none";
+    heroTrailerContent.style.display = "none";
+    heroTrailerChrome.style.display = "none";
+    return;
   }
   const { r, g, b } = parseHeroTrailerRgb(state.heroTrailerBackgroundColor);
   const opaque = `rgb(${r}, ${g}, ${b})`;
@@ -4382,6 +7375,8 @@ const shortcutCommandForEvent = event => {
     speed_up: "keyboardSpeedUp",
     speed_down: "keyboardSpeedDown",
     toggle_speed: "keyboardSpeedToggle",
+    channel_up: "iptvChannelUp",
+    channel_down: "iptvChannelDown",
     next_subtitle: "keyboardNextSubtitle",
     next_audio: "keyboardNextAudio",
     open_sources: "keyboardOpenSources",
@@ -4393,6 +7388,7 @@ const shortcutCommandForEvent = event => {
     cycle_color_profile: "keyboardCycleColorProfile",
     cycle_anime: "keyboardCycleAnimeMode",
     toggle_mpv_diagnostics: "keyboardToggleMpvDiagnostics",
+    open_player_menu: "keyboardOpenPlayerMenu",
   }[configuredAction];
   if (configuredCommand) return configuredCommand;
   switch (event.code) {
@@ -4411,6 +7407,30 @@ const shortcutCommandForEvent = event => {
 
 let volumePillHideTimer = null;
 let lastCursorHidden = null;
+// Where the HUD's visible chrome begins while it is up -- the seek track's top edge less a small
+// breathing gap -- as a percentage of the window height from the top, so the app can keep
+// subtitles just clear of it and no higher. The seek input spans the whole touch area, so the
+// visible track is measured from its centre. 0 while hidden. Tenths of a percent, because sub-pos
+// is an integer percent that the app floors: whole percents here would round the text up to a
+// full percent higher than needed. Sent only on change: renderChrome runs on every position tick.
+let lastHudSubtitleClearance = null;
+const syncHudSubtitleClearance = isChromeHidden => {
+  let clearance = 0;
+  if (!isChromeHidden && !isHeroTrailerSurface && !state.heroTrailerMode && seek) {
+    const rect = seek.getBoundingClientRect();
+    const height = window.innerHeight || root.clientHeight || 0;
+    if (height > 0 && rect.height > 0) {
+      const scale = appliedCombinedUserScale || 1;
+      const trackTop = rect.top + rect.height / 2 - 2 * scale;
+      const line = Math.max(0, Math.min(height, trackTop - 10 * scale));
+      clearance = Math.round(line / height * 1000) / 10;
+    }
+  }
+  if (clearance !== lastHudSubtitleClearance) {
+    lastHudSubtitleClearance = clearance;
+    send("hudSubtitleClearance", clearance);
+  }
+};
 
 const volumeIconHref = () => {
   // Volume can exceed 100% (up to 200%), so the wave count is scaled for that range:
@@ -4424,8 +7444,15 @@ const volumeIconHref = () => {
 const syncPlayerVolumeControl = () => {
   if (playerVolumeSlider) {
     playerVolumeSlider.value = String(Math.round(localVolume));
+    // Fill width for the layouts that paint the played part of the track (the official bar).
+    playerVolumeSlider.style.setProperty("--volume-position", `${Math.max(0, Math.min(100, localVolume / 2))}%`);
   }
-  playerVolumeIcon?.setAttribute("href", volumeIconHref());
+  setIconHref(playerVolumeIcon, volumeIconHref());
+  if (volumeMuteButton) {
+    const label = localMuted ? hudText("player_hud_unmute", "Unmute") : hudText("player_hud_mute", "Mute");
+    volumeMuteButton.setAttribute("aria-label", label);
+    volumeMuteButton.title = label;
+  }
 };
 
 const showVolumePill = () => {
@@ -4444,6 +7471,12 @@ const showVolumePill = () => {
 
 const adjustLocalVolume = deltaPercent => {
   localVolume = Math.max(0, Math.min(200, localVolume + deltaPercent));
+  // As with the slider: a non-zero volume unmutes mpv (NativePlayerController.setVolume), so the
+  // wheel and the volume keys must clear the local flag too or the icon stays muted.
+  if (localMuted && localVolume > 0) {
+    localMuted = false;
+    refreshContextMenuIndicators();
+  }
   syncPlayerVolumeControl();
   showVolumePill();
 };
@@ -4473,6 +7506,59 @@ window.nuvioSyncMute = muted => {
   syncPlayerVolumeControl();
 };
 
+// The native player loaded the next source into this same page instead of a new one (a binge
+// advance, or a source picked from the panel). Drop what a freshly loaded page would not have:
+// an open panel and the previous file's seek previews.
+window.nuvioSourceReplaced = () => {
+  if (activeModal) closePlayerModal();
+  window.clearTimeout(seekThumbnailRequestTimer);
+  seekThumbnailRequestTimer = 0;
+  pendingSeekThumbnailPosition = -1;
+  seekThumbnailCache.clear();
+  seekThumbnailImage.removeAttribute("src");
+  hideSeekThumbnail();
+};
+
+// Memory overlay (Settings > Advanced) ---------------------------------------
+// The app's live memory breakdown, pushed once a second as [label, value] rows by
+// MemoryDiagnosticsOverlay; null removes it. The app draws the same panel in Compose, but the
+// video surface covers that layer, so over the player it is drawn here. Never on a hero trailer.
+let memoryOverlayPanel = null;
+window.nuvioSetMemoryOverlay = rows => {
+  if (isHeroTrailerSurface) return;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    if (memoryOverlayPanel) {
+      memoryOverlayPanel.remove();
+      memoryOverlayPanel = null;
+    }
+    return;
+  }
+  if (!memoryOverlayPanel) {
+    memoryOverlayPanel = document.createElement("div");
+    memoryOverlayPanel.style.cssText = [
+      "position:fixed", "top:64px", "right:16px", "z-index:2147483000", "pointer-events:none",
+      "background:rgba(16,16,20,0.9)", "border-radius:10px", "padding:10px 14px", "color:#fff",
+      "font:500 12px/1.5 'Nuvio JetBrains Sans',system-ui,sans-serif", "min-width:260px",
+    ].join(";");
+    document.body.appendChild(memoryOverlayPanel);
+  }
+  const heading = document.createElement("div");
+  heading.textContent = "Memory";
+  heading.style.cssText = "font-weight:600;font-size:13px;margin-bottom:2px";
+  const lines = rows.map(row => {
+    const line = document.createElement("div");
+    line.style.cssText = "display:flex;gap:8px";
+    const label = document.createElement("span");
+    label.textContent = String(row[0]);
+    label.style.cssText = "color:#b8b8c0;width:170px;flex:none";
+    const value = document.createElement("span");
+    value.textContent = String(row[1]);
+    line.append(label, value);
+    return line;
+  });
+  memoryOverlayPanel.replaceChildren(heading, ...lines);
+};
+
 // Playback info panel ------------------------------------------------------
 // Two halves meet here: the pipeline rows (HDR / SVP / shader-or-preset) are pushed from the
 // desktop video-profile pass via nuvioSetPlaybackInfo, because only that pass knows what mpv
@@ -4481,7 +7567,7 @@ window.nuvioSyncMute = muted => {
 const playbackInfoPanel = document.getElementById("playbackInfoPanel");
 const playbackInfoRows = document.getElementById("playbackInfoRows");
 const PLAYBACK_INFO_HOLD_MS = 6500;
-let playbackInfo = { session: "", hdr: "", svp: false, video: "", shader: "" };
+// playbackInfo itself is declared above contextMenuValue: the context menu reads it while it is built.
 // The session this panel has already been shown for. Showing is per playback attempt: a new file
 // (next episode, source switch) is a new start of playback and earns the panel again, while a
 // settings change that merely re-pushes the same session must not pop it back up.
@@ -4556,16 +7642,271 @@ const renderPlaybackInfoPanel = () => {
   playbackInfoHideTimer = window.setTimeout(hidePlaybackInfoPanel, PLAYBACK_INFO_HOLD_MS);
 };
 
+// fork:live-scores - a followed match's goal, card or whistle (LiveScoreEngine). The app draws the same card in
+// Compose, but the video surface covers that layer, so over the player it is drawn here. Three looks: a corner card,
+// a ticker across the top, and a big flash (favourites only; the rest get the corner card). Every box has a fixed
+// size so nothing moves with the text. Never on a hero trailer. null hides it.
+let scoreCardEl = null;
+let scoreCardTimer = null;
+window.nuvioShowScoreCard = card => {
+  if (isHeroTrailerSurface) return;
+  window.clearTimeout(scoreCardTimer);
+  if (scoreCardEl) {
+    scoreCardEl.remove();
+    scoreCardEl = null;
+  }
+  if (!card || typeof card !== "object") return;
+  const look = card.look === "BigFlash" && card.favourite ? "flash" : (card.look === "Ticker" ? "ticker" : "corner");
+  const accent = card.group === "Cards" ? "#e5484d" : (card.group === "PenaltiesVar" ? "#f5a524" : "#3dd68c");
+  const el = document.createElement("div");
+  const base = [
+    "position:fixed", "z-index:2147483001", "pointer-events:none", "color:#fff", "box-sizing:border-box",
+    "background:rgba(14,14,20,0.78)", "border:1px solid rgba(255,255,255,0.14)",
+    "backdrop-filter:blur(18px)", "-webkit-backdrop-filter:blur(18px)",
+    "font-family:var(--nuvio-ui-font,system-ui,sans-serif)", "overflow:hidden",
+    "transition:opacity 260ms ease, transform 260ms ease", "opacity:0",
+  ];
+  const place = {
+    corner: ["right:32px", "bottom:32px", "width:420px", "height:112px", "border-radius:16px", "transform:translateY(16px)"],
+    ticker: ["left:0", "right:0", "top:0", "height:56px", "border-radius:0", "border-width:0 0 1px 0", "transform:translateY(-56px)"],
+    flash: ["left:50%", "top:50%", "width:640px", "height:260px", "margin:-130px 0 0 -320px", "border-radius:24px", "transform:scale(0.92)"],
+  }[look];
+  el.style.cssText = base.concat(place).join(";");
+  const text = (tag, value, css) => {
+    const node = document.createElement(tag);
+    node.textContent = value == null ? "" : String(value);
+    node.style.cssText = css + ";white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    return node;
+  };
+  const scored = side => card.side === side ? `color:${accent}` : "color:#fff";
+  const hasScore = card.homeScore != null && card.awayScore != null;
+  const scoreText = hasScore ? `${card.homeScore} – ${card.awayScore}` : "v";
+  const meta = [card.clock, card.competition].filter(Boolean).join(" · ");
+  if (look === "ticker") {
+    el.style.display = "flex";
+    el.style.alignItems = "center";
+    el.style.gap = "16px";
+    el.style.padding = "0 24px";
+    el.appendChild(text("span", card.kind, `flex:none;width:150px;font-weight:800;font-size:15px;letter-spacing:.08em;color:${accent}`));
+    el.appendChild(text("span", card.away ? `${card.home}  ${scoreText}  ${card.away}` : card.home, "flex:1;font-weight:700;font-size:18px"));
+    el.appendChild(text("span", card.detail, "flex:none;width:260px;font-size:14px;color:#c8c8d0;text-align:right"));
+    el.appendChild(text("span", meta, "flex:none;width:200px;font-size:13px;color:#9a9aa6;text-align:right"));
+  } else {
+    const big = look === "flash";
+    el.style.padding = big ? "28px 36px" : "14px 18px";
+    el.style.borderLeft = `${big ? 6 : 4}px solid ${accent}`;
+    const top = document.createElement("div");
+    top.style.cssText = "display:flex;justify-content:space-between;gap:12px";
+    top.appendChild(text("span", card.kind, `font-weight:800;letter-spacing:.08em;color:${accent};font-size:${big ? 40 : 14}px`));
+    top.appendChild(text("span", meta, `color:#9a9aa6;font-size:${big ? 16 : 12}px;align-self:center;max-width:60%`));
+    el.appendChild(top);
+    const row = document.createElement("div");
+    row.style.cssText = `display:flex;align-items:center;gap:${big ? 18 : 10}px;margin-top:${big ? 26 : 8}px`;
+    const size = big ? 30 : 18;
+    if (card.away) {
+      row.appendChild(text("span", card.home, `flex:1;text-align:right;font-weight:700;font-size:${size}px;${scored("home")}`));
+      row.appendChild(text("span", scoreText, `flex:none;width:${big ? 130 : 70}px;text-align:center;font-weight:800;font-size:${size + (big ? 10 : 2)}px`));
+      row.appendChild(text("span", card.away, `flex:1;font-weight:700;font-size:${size}px;${scored("away")}`));
+    } else {
+      row.appendChild(text("span", card.home, `flex:1;font-weight:700;font-size:${size}px`));
+    }
+    el.appendChild(row);
+    el.appendChild(text("div", card.detail, `margin-top:${big ? 18 : 6}px;color:#c8c8d0;font-size:${big ? 18 : 13}px;text-align:${card.away ? "center" : "left"}`));
+  }
+  document.body.appendChild(el);
+  scoreCardEl = el;
+  window.requestAnimationFrame(() => {
+    el.style.opacity = "1";
+    el.style.transform = look === "flash" ? "scale(1)" : "translateY(0)";
+  });
+  const hold = Number.isFinite(card.durationMs) && card.durationMs > 0 ? card.durationMs : 8000;
+  scoreCardTimer = window.setTimeout(() => {
+    if (scoreCardEl !== el) return;
+    el.style.opacity = "0";
+    window.setTimeout(() => {
+      if (scoreCardEl === el) {
+        el.remove();
+        scoreCardEl = null;
+      }
+    }, 300);
+  }, hold);
+};
+
+// fork:live-tv-brakes - a small glass choice card (zap budget, end card). Arrow keys and Enter pick,
+// Escape dismisses; the answer goes back as "iptvChoice" with the option's index, -1 for dismissed.
+let choiceCardEl = null;
+let choiceCardKeys = null;
+let choiceCardTimer = null;
+const closeChoiceCard = answer => {
+  if (!choiceCardEl) return;
+  if (choiceCardTimer) { window.clearTimeout(choiceCardTimer); choiceCardTimer = null; }
+  const el = choiceCardEl;
+  choiceCardEl = null;
+  if (choiceCardKeys) document.removeEventListener("keydown", choiceCardKeys, true);
+  choiceCardKeys = null;
+  el.style.opacity = "0";
+  window.setTimeout(() => el.remove(), 260);
+  send("iptvChoice", answer);
+};
+// fork:live-tv-reminder-card - [timeoutMs] (optional) closes the card by itself, answering -1.
+window.nuvioShowChoice = (title, line, options, focused, timeoutMs) => {
+  if (isHeroTrailerSurface) return;
+  if (choiceCardTimer) { window.clearTimeout(choiceCardTimer); choiceCardTimer = null; }
+  if (choiceCardEl) {
+    choiceCardEl.remove();
+    if (choiceCardKeys) document.removeEventListener("keydown", choiceCardKeys, true);
+    choiceCardEl = null;
+    choiceCardKeys = null;
+  }
+  const labels = Array.isArray(options) ? options.map(String) : [];
+  if (!labels.length) return;
+  let at = Math.min(Math.max(Number(focused) || 0, 0), labels.length - 1);
+  const el = document.createElement("div");
+  el.style.cssText = [
+    // fork:live-tv-brakes - three answers get a wider card, so every button keeps one line.
+    "position:fixed", "left:50%", "top:50%",
+    labels.length > 2 ? "width:720px" : "width:560px", labels.length > 2 ? "margin:-120px 0 0 -360px" : "margin:-120px 0 0 -280px",
+    "padding:28px 32px",
+    "z-index:2147483002", "box-sizing:border-box", "color:#fff", "text-align:center",
+    "background:rgba(14,14,20,0.82)", "border:1px solid rgba(255,255,255,0.16)", "border-radius:24px",
+    "backdrop-filter:blur(22px)", "-webkit-backdrop-filter:blur(22px)",
+    "font-family:var(--nuvio-ui-font,system-ui,sans-serif)", "opacity:0", "transition:opacity 260ms ease",
+  ].join(";");
+  const head = document.createElement("div");
+  head.textContent = String(title || "");
+  head.style.cssText = "font-weight:800;font-size:24px";
+  const sub = document.createElement("div");
+  sub.textContent = String(line || "");
+  sub.style.cssText = "margin-top:8px;color:#c8c8d0;font-size:16px";
+  const row = document.createElement("div");
+  row.style.cssText = "margin-top:24px;display:flex;gap:14px;justify-content:center";
+  const buttons = labels.map((label, index) => {
+    const b = document.createElement("div");
+    b.textContent = label;
+    b.style.cssText = "flex:1;padding:14px 10px;border-radius:14px;font-weight:700;font-size:17px;cursor:pointer;border:1px solid rgba(255,255,255,0.2)";
+    b.addEventListener("click", () => closeChoiceCard(index));
+    row.appendChild(b);
+    return b;
+  });
+  const paint = () => buttons.forEach((b, index) => {
+    b.style.background = index === at ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.08)";
+    b.style.color = index === at ? "#101014" : "#fff";
+  });
+  paint();
+  el.appendChild(head);
+  el.appendChild(sub);
+  el.appendChild(row);
+  document.body.appendChild(el);
+  choiceCardEl = el;
+  choiceCardKeys = event => {
+    const key = event.key;
+    if (key === "ArrowLeft" || key === "ArrowUp") at = (at + labels.length - 1) % labels.length;
+    else if (key === "ArrowRight" || key === "ArrowDown") at = (at + 1) % labels.length;
+    else if (key === "Enter" || key === " ") { event.preventDefault(); event.stopImmediatePropagation(); closeChoiceCard(at); return; }
+    else if (key === "Escape" || key === "Backspace") { event.preventDefault(); event.stopImmediatePropagation(); closeChoiceCard(-1); return; }
+    else return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    paint();
+  };
+  document.addEventListener("keydown", choiceCardKeys, true);
+  window.requestAnimationFrame(() => { el.style.opacity = "1"; });
+  const wait = Number(timeoutMs) || 0;
+  if (wait > 0) choiceCardTimer = window.setTimeout(() => { choiceCardTimer = null; closeChoiceCard(-1); }, wait);
+};
+
 window.nuvioSetPlaybackInfo = payload => {
   const next = payload || {};
   playbackInfo = {
     session: String(next.session == null ? "" : next.session),
     hdr: String(next.hdr == null ? "" : next.hdr),
     svp: Boolean(next.svp),
+    svpInChain: Boolean(next.svpInChain),
     video: String(next.video == null ? "" : next.video),
     shader: String(next.shader == null ? "" : next.shader),
+    quality: String(next.quality == null ? "" : next.quality),
   };
   renderPlaybackInfoPanel();
+  renderTitleBadges();
+  refreshContextMenuIndicators();
+};
+
+// Badges beside the title: the decoded quality (from the video-profile pass, so it is what mpv
+// is actually playing, not what the source name claims) and the subtitle in use. Runs on every
+// position tick, hence the signature check.
+// Image badges from the user's badge pack, matched in Kotlin against what is decoding (Settings ->
+// Streams -> Show in player). When there are any they stand in for the text quality badge, which
+// says the same thing less well.
+let playerPackBadges = [];
+window.nuvioSetPlayerBadges = list => {
+  playerPackBadges = (Array.isArray(list) ? list : [])
+    .map(item => ({
+      name: String(item && item.name || ""),
+      imageURL: String(item && item.imageURL || ""),
+      // The pack's chip fill: many pack images are dark glyphs drawn for a white chip, and are
+      // unreadable (a black smudge) on the bare video without it.
+      backgroundColor: String(item && item.backgroundColor || ""),
+      borderColor: String(item && item.borderColor || ""),
+    }))
+    .filter(item => item.imageURL);
+  renderTitleBadges();
+};
+
+let titleBadgesSignature = null;
+const renderTitleBadges = () => {
+  if (!titleBadges) return;
+  const badges = [];
+  const quality = String(playbackInfo.quality || "").trim();
+  const subtitle = String(state.activeSubtitleLabel || "").trim();
+  playerPackBadges.forEach(item => badges.push({
+    kind: "image",
+    text: item.name,
+    imageURL: item.imageURL,
+    backgroundColor: item.backgroundColor,
+    borderColor: item.borderColor,
+  }));
+  if (quality && playerPackBadges.length === 0) badges.push({ kind: "quality", text: quality });
+  if (subtitle) badges.push({ kind: "subtitle", text: subtitle });
+  const signature = badges
+    .map(badge => `${badge.kind}:${badge.text}:${badge.imageURL || ""}:${badge.backgroundColor || ""}:${badge.borderColor || ""}`)
+    .join("|");
+  if (signature === titleBadgesSignature) return;
+  titleBadgesSignature = signature;
+  titleBadges.replaceChildren();
+  badges.forEach(badge => {
+    if (badge.kind === "image") {
+      const chip = document.createElement("span");
+      chip.className = "title-badge-chip";
+      chip.title = badge.text;
+      if (badge.backgroundColor) chip.style.backgroundColor = badge.backgroundColor;
+      if (badge.borderColor) chip.style.borderColor = badge.borderColor;
+      const image = document.createElement("img");
+      image.className = "title-badge-image";
+      image.src = badge.imageURL;
+      image.alt = badge.text;
+      image.decoding = "async";
+      // A pack image that fails to load leaves no gap.
+      image.onerror = () => chip.remove();
+      chip.appendChild(image);
+      titleBadges.appendChild(chip);
+      return;
+    }
+    const element = document.createElement("span");
+    element.className = `title-badge title-badge-${badge.kind}`;
+    if (badge.kind === "subtitle") {
+      const icon = document.createElement("span");
+      icon.className = "title-badge-icon";
+      icon.textContent = "CC";
+      element.appendChild(icon);
+    }
+    const text = document.createElement("span");
+    text.className = "title-badge-text";
+    text.textContent = badge.text;
+    element.appendChild(text);
+    element.title = badge.text;
+    titleBadges.appendChild(element);
+  });
+  titleBadges.hidden = badges.length === 0;
 };
 
 const presetPill = document.getElementById("presetPill");
@@ -4600,8 +7941,11 @@ const showControlTooltip = button => {
   const tooltipScale = appliedCombinedUserScale || (1 + (appliedUiScalePercent || 0) / 100);
   // A folded icon has no room for the live value its row button shows, so fold it into the
   // tooltip instead: "Aspect ratio - Fit".
-  const beside = Boolean(actionOverflowMenu && actionOverflowMenu.contains(button));
-  const value = beside ? actionValueLabel(button) : "";
+  const folded = Boolean(actionOverflowMenu && actionOverflowMenu.contains(button));
+  // The ultra popover lays the folded icons out in a row, so the overhead placement works there;
+  // only the vertical strip needs the beside variant.
+  const beside = folded && !root.classList.contains("ultra-hud");
+  const value = folded ? actionValueLabel(button) : "";
   controlTooltip.classList.toggle("tooltip-beside", beside);
   controlTooltip.textContent = value ? `${label} - ${value}` : label;
   if (beside) {
@@ -4676,6 +8020,8 @@ const setActionOverflowOpen = open => {
   actionOverflowMenu.hidden = !next;
   actionOverflowButton.setAttribute("aria-expanded", next ? "true" : "false");
   actionOverflowButton.classList.toggle("selected", next);
+  // The ultra layout fades its seek row out under the open popover (controls.css).
+  root.classList.toggle("action-overflow-open", next);
   if (!next) hideControlTooltip();
   // Mirrors setColorGradePanelOpen: the menu suppressed chrome auto-hide while open, so restart
   // the inactivity timer on the way out instead of leaving the controls pinned.
@@ -4683,7 +8029,41 @@ const setActionOverflowOpen = open => {
   noteChromeActivity(true);
 };
 
-// Returns every collapsible button to the row in authored order, so a measurement always starts
+// Buttons switched off in Settings > Playback. Only the HUD's own controls: the notches, the
+// locked-overlay unlock button and PiP's exit button share some commands and stay put.
+let appliedHiddenHudButtons = "";
+const applyHiddenHudButtons = value => {
+  const next = String(value || "");
+  if (next === appliedHiddenHudButtons) return;
+  appliedHiddenHudButtons = next;
+  const hidden = new Set(next.split(",").map(part => part.trim()).filter(Boolean));
+  document.querySelectorAll(".action[data-command], .side-control[data-command], .header-button[data-command]")
+    .forEach(button => button.classList.toggle("user-hidden", hidden.has(button.dataset.command)));
+  // render() schedules the overflow pass right after; its signature counts user-hidden buttons.
+};
+
+// The action row in the order set in Settings > Playback (comma-separated data-commands). Sorting
+// overflowCapableActions itself means restoreActionRowLayout and the overflow menu follow it too.
+// Commands the setting does not name (a button added after it was saved) keep their authored order
+// after the named ones; an empty value is the authored order.
+const authoredActionOrder = overflowCapableActions.slice();
+let appliedHudButtonOrder = "";
+const applyHudButtonOrder = value => {
+  const next = String(value || "");
+  if (next === appliedHudButtonOrder) return;
+  appliedHudButtonOrder = next;
+  const order = next.split(",").map(part => part.trim()).filter(Boolean);
+  const rank = button => {
+    const index = order.indexOf(button.dataset.command);
+    return index >= 0 ? index : order.length + authoredActionOrder.indexOf(button);
+  };
+  overflowCapableActions.sort((a, b) => rank(a) - rank(b));
+  if (!actionRow || !actionOverflowButton) return;
+  restoreActionRowLayout();
+  invalidateActionRowOverflow();
+};
+
+// Returns every collapsible button to the row in the current order, so a measurement always starts
 // from the uncollapsed layout.
 const restoreActionRowLayout = () => {
   overflowCapableActions.forEach(button => {
@@ -4708,14 +8088,16 @@ function syncActionRowOverflow() {
     return;
   }
 
-  // The 1fr track is content-independent, so this width is stable across the fold below and can
-  // be read before any button moves.
-  const available = actionRow.clientWidth;
+  // Read before any button moves so the cache key describes the row as it stands. It is NOT the
+  // width the fold is decided against (see below): in the minimal-pills layout the row hugs its
+  // content, so with the tools still parked in the ultra popover this reads as the bare toggle,
+  // and deciding on it folded everything into a one-icon strip on every ultra -> minimal switch.
+  const availableBefore = actionRow.clientWidth;
   const signature = [
-    Math.round(available),
+    Math.round(availableBefore),
     appliedCombinedUserScale,
     root.className,
-    overflowCapableActions.map(button => (button.hidden ? "0" : "1")).join(""),
+    overflowCapableActions.map(button => (button.hidden || button.classList.contains("user-hidden") ? "0" : "1")).join(""),
   ].join("|");
   if (signature === appliedActionOverflowSignature) return;
   appliedActionOverflowSignature = signature;
@@ -4724,12 +8106,23 @@ function syncActionRowOverflow() {
   // Measured at its natural width; hidden again below if nothing needs to fold.
   actionOverflowButton.hidden = false;
 
+  // The space the row can actually have with everything in it: the 1fr grid track is
+  // content-independent so this equals availableBefore there, while a hugging pill row now reads
+  // its natural width, or the squeezed width when the window is too narrow for it.
+  const available = actionRow.clientWidth;
   const gap = parseFloat(window.getComputedStyle(actionRow).columnGap) || 0;
   // offsetParent covers #episodesButton, which base CSS keeps display:none outside legacy.
   const items = overflowCapableActions.filter(button => !button.hidden && button.offsetParent);
   const widths = new Map(items.map(button => [button, button.offsetWidth]));
   const natural = items.reduce((total, button) => total + widths.get(button), 0)
     + gap * Math.max(0, items.length - 1);
+
+  // Ultra layout: the toggle is the options button, so every tool folds behind it regardless of
+  // how much room the row has. The popover is what the user opens on purpose, not a spill-over.
+  if (root.classList.contains("ultra-hud")) {
+    items.forEach(button => (ultraMenuActions || actionOverflowMenu).appendChild(button));
+    return;
+  }
 
   if (natural <= available) {
     setActionOverflowOpen(false);
@@ -4836,6 +8229,13 @@ const clearPressedButton = () => {
 
 document.addEventListener("pointerdown", event => {
   const interactingWithChrome = isChromeInteractionTarget(event.target);
+  // Diagnostics: the bridge log pairs these with "hud input toggle", so a press that never
+  // becomes a toggle (chrome hidden, a double-click, a swallowed tap) shows up as a gap.
+  if (event.button === 0 && !isHeroTrailerSurface && !state.heroTrailerMode) {
+    const chromeHiddenOffset = root.classList.contains("chrome-hidden") ? 10 : 0;
+    if (event.target.closest("#toggle")) send("hudTrace", 1 + chromeHiddenOffset);
+    else if (!interactingWithChrome) send("hudTrace", 2 + chromeHiddenOffset);
+  }
   if (interactingWithChrome) {
     isChromePointerDown = true;
     isChromePointerInside = true;
@@ -4908,8 +8308,13 @@ document.querySelectorAll("[data-command]").forEach(button => {
     event.stopPropagation();
     noteChromeActivity(true);
     const command = button.dataset.command;
-    if (command === "audio") {
-      openPlayerModal("audio");
+    // The docked panels: their button opens the panel standing over itself, and closes it again.
+    if (isDockModal(command)) {
+      if (activeModal === command) {
+        closePlayerModal(true);
+        return;
+      }
+      openDockModal(command);
       return;
     }
     if (command === "speed") {
@@ -4920,14 +8325,27 @@ document.querySelectorAll("[data-command]").forEach(button => {
       cycleAspectFromControls();
       return;
     }
-    if (command === "subtitles") {
-      openPlayerModal("subtitles");
+    if (command === "iptvChannels") {
+      openIptvPanel(false);
       return;
     }
     if (command === "sources") {
+      // Live TV's Sources notch is the channel switcher's: same edge, same hover rule.
+      if (state.iptv) {
+        if (activeModal !== "iptvChannels") openIptvPanel(false);
+        return;
+      }
       sourceFilterId = "";
       openPlayerModal("sources");
       send("sources", 0);
+      return;
+    }
+    if (command === "keyboardToggleMute") {
+      // Flip the glyph now; native answers with nuvioShowVolumePill carrying mpv's real state.
+      localMuted = !localMuted;
+      syncPlayerVolumeControl();
+      refreshContextMenuIndicators();
+      send(command, 0);
       return;
     }
     if (command === "episodes") {
@@ -4948,10 +8366,6 @@ document.querySelectorAll("[data-command]").forEach(button => {
       send("episodes", 0);
       return;
     }
-    if (command === "submitIntro") {
-      openPlayerModal("submitIntro");
-      return;
-    }
     send(command, 0);
   });
 });
@@ -4963,9 +8377,43 @@ openingOverlay.addEventListener("click", event => {
   }
 });
 
+document.querySelectorAll(".dock-rail").forEach(rail => {
+  rail.addEventListener("click", event => {
+    const target = event.target.closest("[data-dock-target]");
+    if (!target) return;
+    event.stopPropagation();
+    noteChromeActivity(true);
+    if (target.dataset.dockTarget !== selectedDockEntryId()) openDockModal(target.dataset.dockTarget);
+  });
+});
+
+// The docked panel has no scrim, so a press on the bare video lands on the player. It closes the
+// panel instead, and the click it makes is eaten so it doesn't also pause or show/hide the HUD.
+// Presses on the HUD's own controls go through: they can switch panels with the dock open.
+document.addEventListener("pointerdown", event => {
+  consumeDockDismissClick = false;
+  if (!isDockModal(activeModal) || event.button !== 0 || contextMenuOpen) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target || target.closest(".dock-frame, #subtitleHexModal, #contextMenu, #actionOverflowMenu")) return;
+  if (isChromeInteractionTarget(target)) return;
+  event.stopPropagation();
+  consumeDockDismissClick = true;
+  closePlayerModal(true);
+}, true);
+document.addEventListener("click", event => {
+  if (!consumeDockDismissClick) return;
+  consumeDockDismissClick = false;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
+window.addEventListener("resize", () => {
+  if (isDockModal(activeModal)) positionDockPanel();
+});
+
 modalElements.forEach(modal => {
   modal.addEventListener("click", event => {
     event.stopPropagation();
+    if (modal === sourceModal && consumeSourceResizeClick) return;
     if (event.target === modal) closePlayerModal(true);
   });
 });
@@ -5127,10 +8575,24 @@ sourceCloseButton.addEventListener("click", event => {
   closePlayerModal();
 });
 sourceList.addEventListener("scroll", () => {
+  sourceListPinnedTop = sourceList.scrollTop <= 1;
   if (activeModal === "sources") {
     requestSourceVirtualRender();
   }
 }, { passive: true });
+if (sourceSortButton) {
+  sourceSortButton.addEventListener("click", event => {
+    event.stopPropagation();
+    setSourceSortMenuOpen(sourceSortMenu.hidden);
+  });
+}
+if (sourceSortMenu) {
+  // Clicks inside the menu must not reach the panel's close-menu handler below.
+  sourceSortMenu.addEventListener("click", event => event.stopPropagation());
+}
+if (sourcePanel) {
+  sourcePanel.addEventListener("click", () => setSourceSortMenuOpen(false));
+}
 episodesCloseButton.addEventListener("click", event => {
   event.stopPropagation();
   closePlayerModal();
@@ -5149,7 +8611,288 @@ episodeReloadButton.addEventListener("click", event => {
   send("reloadEpisodeStreams", 0);
 });
 
+// ---- Control navigation with the keyboard or a pad --------------------------------------------
+// Enter puts a focus ring on the play button; the arrows then move it to the nearest control that
+// way (by where the controls are on screen, so it follows any layout), Enter presses it and Escape
+// leaves. A panel opened this way is walked the same way. It is a keyboard panel mode ("controls")
+// so the keys arrive whether the app or this overlay holds the keyboard. Space stays play / pause.
+const BarNavIdleMs = 8000;
+let barNavElement = null;
+let barNavReturnElement = null;
+let barNavScopeKey = "";
+let barNavIdleTimer = 0;
+
+const barNavScope = () => {
+  if (contextMenuOpen) return document.getElementById("contextMenu") || root;
+  if (colorGradePanelOpen) return document.getElementById("colorGradePanel") || root;
+  if (activeModal && modalByName[activeModal]) return modalByName[activeModal];
+  return root;
+};
+const barNavScopeName = () =>
+  contextMenuOpen ? "menu" : colorGradePanelOpen ? "grade" : (activeModal || "");
+
+const barNavUsable = (element, scope) => {
+  if (!element || !element.isConnected || element.disabled || element.hidden) return false;
+  if (element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
+  // On the bare player, nothing inside a panel or menu that happens to be in the document.
+  if (scope === root && element.closest(".modal-layer, .context-menu, .grade-panel")) return false;
+  // Nor the volume slider: Left and Right would be caught adjusting it, and Up / Down already set the volume.
+  if (scope === root && element.matches("input[type='range']")) return false;
+  const rect = element.getBoundingClientRect();
+  // The timeline is one stop; its own slider inside it is not a second one.
+  if (element.id !== "timeline" && element.closest("#timeline")) return false;
+  if (rect.width < 4 || rect.height < 2) return false;
+  const style = getComputedStyle(element);
+  if (style.visibility === "hidden" || style.display === "none" || style.pointerEvents === "none") return false;
+  if (Number(style.opacity) < 0.05) return false;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const onScreen = x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight;
+  // A row scrolled out of a panel's list is still reachable; anything else must be on screen and on top.
+  if (!onScreen) return scope !== root;
+  const hit = document.elementFromPoint(x, y);
+  return !hit || hit === element || element.contains(hit) || hit.contains(element);
+};
+
+const barNavCandidates = scope =>
+  Array.from(scope.querySelectorAll("button, [tabindex='0'], input[type='range'], [role='menuitem'], #timeline"))
+    .filter(element => barNavUsable(element, scope));
+
+// The keys reaching a row of the player menu do what hovering it does: its flyout opens, a sibling's closes.
+const openMenuRowForKeys = element => {
+  if (!element || !contextMenu || !contextMenu.contains(element)) return;
+  const group = element.parentElement;
+  if (!group || !group.classList.contains("context-menu-group")) return;
+  openContextMenuGroup(group);
+  if (group.querySelector(":scope > .context-menu-submenu")) positionSubmenu(group);
+};
+const menuRowSubmenu = element => {
+  const group = element && element.parentElement;
+  if (!group || !group.classList.contains("context-menu-group")) return null;
+  return group.querySelector(":scope > .context-menu-submenu");
+};
+
+const setBarNavFocus = element => {
+  if (barNavElement && barNavElement !== element) barNavElement.classList.remove("kbd-nav-focus");
+  barNavElement = element || null;
+  if (barNavElement) {
+    openMenuRowForKeys(barNavElement);
+    barNavElement.classList.add("kbd-nav-focus");
+    if (barNavScope() !== root) barNavElement.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+};
+
+const barNavDefault = (scope, list) => {
+  if (scope === root) {
+    const play = document.getElementById("toggle");
+    if (play && list.includes(play)) return play;
+  }
+  return list.find(element =>
+    element.classList.contains("selected") ||
+    element.getAttribute("aria-selected") === "true" ||
+    element.getAttribute("aria-checked") === "true") || list[0] || null;
+};
+
+// Keeps the ring in the layer that is on top: into a panel when one opens, back onto the button
+// that opened it when it closes.
+const syncBarNavScope = () => {
+  if (keyboardPanelMode !== "controls") return;
+  const name = barNavScopeName();
+  const scope = barNavScope();
+  if (name !== barNavScopeKey) {
+    const opening = Boolean(name);
+    if (opening && !barNavScopeKey) barNavReturnElement = barNavElement;
+    barNavScopeKey = name;
+    const list = barNavCandidates(scope);
+    const back = !opening && barNavReturnElement && list.includes(barNavReturnElement) ? barNavReturnElement : null;
+    setBarNavFocus(back || barNavDefault(scope, list));
+    return;
+  }
+  if (!barNavElement || !barNavUsable(barNavElement, scope)) {
+    setBarNavFocus(barNavDefault(scope, barNavCandidates(scope)));
+  }
+};
+
+const exitBarNav = () => {
+  if (keyboardPanelMode !== "controls") return;
+  keyboardPanelMode = "";
+  clearTimeout(barNavIdleTimer);
+  setBarNavFocus(null);
+  barNavReturnElement = null;
+  barNavScopeKey = "";
+  send("keyboardPanelClosed", 0);
+  renderChrome();
+};
+
+// Left alone on the bare player, the ring goes and the controls hide again as they normally would.
+const touchBarNav = () => {
+  clearTimeout(barNavIdleTimer);
+  barNavIdleTimer = setTimeout(() => {
+    if (keyboardPanelMode !== "controls") return;
+    if (barNavScopeName() || actionOverflowOpen) touchBarNav();
+    else exitBarNav();
+  }, BarNavIdleMs);
+};
+
+const enterBarNav = () => {
+  if (state.isLocked || state.postShowInput || playbackErrorText() || isHeroTrailerSurface || state.heroTrailerMode) {
+    send("keyboardPanelClosed", 0);
+    return;
+  }
+  keyboardPanelMode = "controls";
+  send("keyboardPanelOpened", 0);
+  barNavScopeKey = barNavScopeName();
+  renderChrome();
+  // The controls fade in over a frame or two; pick the control once they can be hit.
+  setBarNavFocus(null);
+  requestAnimationFrame(() => requestAnimationFrame(syncBarNavScope));
+  // And on a timer: animation frames stop while the overlay is not being drawn.
+  setTimeout(syncBarNavScope, 150);
+  touchBarNav();
+};
+
+const barNavNext = (current, code, list) => {
+  const a = current.getBoundingClientRect();
+  const ax = a.left + a.width / 2;
+  const ay = a.top + a.height / 2;
+  const horizontal = code === "ArrowLeft" || code === "ArrowRight";
+  const sign = code === "ArrowRight" || code === "ArrowDown" ? 1 : -1;
+  let best = null;
+  let bestScore = Infinity;
+  list.forEach(element => {
+    if (element === current) return;
+    const b = element.getBoundingClientRect();
+    const dx = b.left + b.width / 2 - ax;
+    const dy = b.top + b.height / 2 - ay;
+    // Edge to edge that way, so a wide control (the timeline) is "above" the buttons under its whole length.
+    const along = horizontal
+      ? (sign > 0 ? b.left - a.right : a.left - b.right)
+      : (sign > 0 ? b.top - a.bottom : a.top - b.bottom);
+    if (along < -2 || (horizontal ? dx * sign : dy * sign) <= 0) return;
+    const overlaps = horizontal ? (b.top < a.bottom && b.bottom > a.top) : (b.left < a.right && b.right > a.left);
+    const across = Math.abs(horizontal ? dy : dx);
+    // Off to the side counts only when it is roughly that way, not a control across the screen.
+    if (!overlaps && across > Math.max(0, along) * 2 + 60) return;
+    // A control in line that way always wins over one that is off to the side, however near the latter is.
+    const score = Math.max(0, along) + across * (overlaps ? 0.25 : 3) + (overlaps ? 0 : 100000);
+    if (score < bestScore) {
+      bestScore = score;
+      best = element;
+    }
+  });
+  return best;
+};
+
+const pressBarNavElement = element => {
+  const command = element.dataset ? element.dataset.command : "";
+  // These panels have their own keyboard mode (rows chosen with the arrows): hand over to it.
+  if (command === "sources" || command === "episodes" || command === "iptvChannels") {
+    window.nuvioOpenKeyboardPanel(command);
+    return;
+  }
+  if (element.id === "timeline") return;
+  // A menu row that leads on (and does not pick something itself): into its page, onto its first row.
+  const submenu = menuRowSubmenu(element);
+  if (submenu && !element.dataset.hasAction) {
+    enterMenuRow(element);
+    return;
+  }
+  if (element.classList.contains("context-menu-page-back")) {
+    leaveMenuPage();
+    return;
+  }
+  element.click();
+  if (contextMenu && contextMenu.contains(element)) refreshQuickTiles();
+  // A panel or menu it opened is drawn a moment later; move the ring into it then.
+  setTimeout(syncBarNavScope, 80);
+};
+
+const handleBarNavKey = code => {
+  touchBarNav();
+  if (code === "Escape") {
+    // On a page of the player menu, Escape (a pad's B) goes back up a level first.
+    if (contextMenuOpen && menuPageStack.length > 0) {
+      leaveMenuPage();
+      return;
+    }
+    // The player menu opened by its key: Escape closes it and the key navigation with it.
+    if (contextMenuOpen && playerMenuOpenedByKey) {
+      closeContextMenu();
+      exitBarNav();
+      return;
+    }
+    if (contextMenuOpen) closeContextMenu();
+    else if (colorGradePanelOpen) setColorGradePanelOpen(false);
+    else if (activeModal) closePlayerModal(true);
+    else if (actionOverflowOpen) setActionOverflowOpen(false);
+    else {
+      exitBarNav();
+      return;
+    }
+    syncBarNavScope();
+    return;
+  }
+  syncBarNavScope();
+  const current = barNavElement;
+  if (!current) return;
+  if (code === "Enter") {
+    pressBarNavElement(current);
+    return;
+  }
+  if (current === menuInfoPage && (code === "ArrowUp" || code === "ArrowDown")) {
+    menuInfoPage.scrollBy({ top: code === "ArrowDown" ? 80 : -80 });
+    return;
+  }
+  // Right goes on into a row's choices, even one that picks something itself (2x leads on to 2.1x ...).
+  if (code === "ArrowRight" && menuRowSubmenu(current)) {
+    enterMenuRow(current);
+    return;
+  }
+  // Left on a page of the player menu goes back up a level.
+  if (code === "ArrowLeft" && contextMenuOpen && menuPageStack.length > 0 && !current.closest(".context-menu-quick")) {
+    leaveMenuPage();
+    return;
+  }
+  const horizontal = code === "ArrowLeft" || code === "ArrowRight";
+  if (horizontal && current.id === "timeline") {
+    const button = document.querySelector(
+      `.seek-control[data-command="${code === "ArrowLeft" ? "seekBack" : "seekForward"}"]`);
+    if (button) button.click();
+    return;
+  }
+  if (horizontal && current.matches("input[type='range']")) {
+    if (code === "ArrowLeft") current.stepDown();
+    else current.stepUp();
+    current.dispatchEvent(new Event("input", { bubbles: true }));
+    current.dispatchEvent(new Event("change", { bubbles: true }));
+    return;
+  }
+  const next = barNavNext(current, code, barNavCandidates(barNavScope()));
+  if (next) setBarNavFocus(next);
+};
+
+// The mouse takes over: the ring goes (a real click never fires for the presses made above).
+document.addEventListener("mousedown", () => exitBarNav(), true);
+
 window.nuvioOpenKeyboardPanel = panel => {
+  // The app opens these for a key or pad button the HUD never saw (it went to the app window).
+  lastHudInput = "keyboard";
+  if (panel === "controls") {
+    if (keyboardPanelMode === "controls") handleBarNavKey("Enter");
+    else if (!keyboardPanelMode) enterBarNav();
+    return;
+  }
+  if (keyboardPanelMode === "controls") {
+    // One of the panels with its own keyboard mode takes over from here.
+    clearTimeout(barNavIdleTimer);
+    setBarNavFocus(null);
+    barNavReturnElement = null;
+    barNavScopeKey = "";
+  }
+  if (panel === "iptvChannels") {
+    openIptvPanel(true);
+    return;
+  }
   if (panel === "sources") {
     keyboardPanelMode = "sources";
     send("keyboardPanelOpened", 0);
@@ -5180,8 +8923,16 @@ window.nuvioOpenKeyboardPanel = panel => {
 
 window.nuvioHandleKeyboardPanelKey = code => {
   if (!keyboardPanelMode) return;
+  if (keyboardPanelMode === "controls") {
+    handleBarNavKey(code);
+    return;
+  }
   if (code === "Escape") {
     closePlayerModal(true);
+    return;
+  }
+  if (keyboardPanelMode === "iptvChannels") {
+    handleIptvPanelKey(code);
     return;
   }
   if (keyboardPanelMode === "sources") {
@@ -5275,7 +9026,7 @@ submitIntroSubmitButton.addEventListener("click", event => {
   const start = parseIntroTime(submitIntroDraft.startTime);
   const end = parseIntroTime(submitIntroDraft.endTime);
   if (start == null || end == null || end <= start) {
-    submitIntroDraft.status = "Check the start and end times.";
+    submitIntroDraft.status = hudText("player_hud_check_the_start_and_end_times", "Check the start and end times.");
     renderSubmitIntroModal();
     return;
   }
@@ -5321,6 +9072,22 @@ skipPrompt.addEventListener("contextmenu", event => {
   event.stopPropagation();
   focusShortcutRoot();
   send("dismissSkipInterval", 0);
+});
+
+// A click is the same press as the skip key, so it reads the same resolved action — but only
+// while that action belongs to the toast; a click on a result does nothing.
+const SkipSubmitToastClickActions = new Set(["skipSubmitOffer", "skipCaptureMarkEnd", "skipCaptureSubmit"]);
+skipSubmitToast.addEventListener("click", event => {
+  event.stopPropagation();
+  focusShortcutRoot();
+  const action = String(state.skipKeyAction || "");
+  if (SkipSubmitToastClickActions.has(action)) send(action, 0);
+});
+skipSubmitToast.addEventListener("contextmenu", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  focusShortcutRoot();
+  if (state.skipSubmitToastDismissible) send("skipSubmitDismiss", 0);
 });
 
 nextEpisodeCard.addEventListener("click", event => {
@@ -5387,6 +9154,9 @@ episodeList.addEventListener("pointerenter", () => {
   focusShortcutRoot();
 });
 episodeNotch.addEventListener("pointerenter", () => {
+  // Same switch as the Sources notch: the top edge is crossed just as often on the way to a
+  // display above, and an Episodes rail sliding down each time is the same nuisance.
+  if (!sourceNotchHoverOpens) return;
   if (activeModal !== "episodes") episodeNotch.click();
 });
 sourceNotch.addEventListener("pointerenter", () => {
@@ -5504,10 +9274,88 @@ speedButton.addEventListener("contextmenu", event => {
 playerVolumeSlider.addEventListener("input", event => {
   event.stopPropagation();
   localVolume = Math.max(0, Math.min(200, Number(playerVolumeSlider.value) || 0));
+  // A non-zero volume unmutes mpv (NativePlayerController.setVolume), and nothing pushes that
+  // back here, so clear the local flag too or the icon stays on the muted glyph.
+  if (localMuted && localVolume > 0) {
+    localMuted = false;
+    refreshContextMenuIndicators();
+  }
+  // Keep the glyph's wave count in step with the drag, as the keyboard path already does.
+  syncPlayerVolumeControl();
   send("volumeSet", localVolume);
   noteChromeActivity(true);
 });
 playerVolumeSlider.addEventListener("click", event => event.stopPropagation());
+// The minimal layout only reveals the slider on hover; a drag that wanders off the control must
+// not collapse it mid-gesture, so the pointer's hold is mirrored as a class the CSS also honours.
+playerVolumeSlider.addEventListener("pointerdown", () => {
+  playerVolumeControl?.classList.add("dragging");
+});
+["pointerup", "pointercancel"].forEach(type => window.addEventListener(type, () => {
+  playerVolumeControl?.classList.remove("dragging");
+}));
+
+// Wiggle room for the volume bar: it is a few pixels tall, so a press a little above or below it
+// (or just past either end) counts as a press on it and drags from there, as a press on the bar does.
+// Caught before anything else sees it, so the near miss does not also pause or show the chrome.
+const VOLUME_SLOP_PX = 10;
+let suppressClickAfterVolumeSlop = false;
+const volumeValueAt = clientX => {
+  const rect = playerVolumeSlider.getBoundingClientRect();
+  const scale = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--user-scale")) || 1;
+  // The thumb's centre travels from half a thumb in from each end, as the range input itself maps it.
+  const thumb = Math.min(rect.width / 4, 13 * scale);
+  const fraction = (clientX - rect.left - thumb / 2) / Math.max(1, rect.width - thumb);
+  return Math.round(Math.max(0, Math.min(1, fraction)) * Number(playerVolumeSlider.max || 200));
+};
+const setVolumeFromPointer = clientX => {
+  const value = String(volumeValueAt(clientX));
+  if (playerVolumeSlider.value === value) return;
+  playerVolumeSlider.value = value;
+  playerVolumeSlider.dispatchEvent(new Event("input", { bubbles: true }));
+};
+document.addEventListener("pointerdown", event => {
+  if (event.button !== 0 || event.target === playerVolumeSlider) return;
+  if (!(event.target instanceof Element) || event.target.closest("button, input, select, textarea, [role='menu']")) return;
+  const rect = playerVolumeSlider.getBoundingClientRect();
+  // Only while the bar is on screen: not with the chrome faded out (a click there shows it), nor in the
+  // minimal layout before the control's hover has opened the slider.
+  if (root.classList.contains("chrome-hidden") || activeModal || contextMenuOpen) return;
+  const sliderStyle = getComputedStyle(playerVolumeSlider);
+  if (rect.width <= 0 || rect.height <= 0 || sliderStyle.visibility === "hidden" ||
+      sliderStyle.pointerEvents === "none" || Number(sliderStyle.opacity) < 0.5) return;
+  const middle = rect.top + rect.height / 2;
+  const reach = rect.height / 2 + VOLUME_SLOP_PX;
+  if (event.clientX < rect.left - VOLUME_SLOP_PX || event.clientX > rect.right + VOLUME_SLOP_PX) return;
+  if (Math.abs(event.clientY - middle) > reach) return;
+  event.preventDefault();
+  event.stopPropagation();
+  suppressClickAfterVolumeSlop = true;
+  playerVolumeControl?.classList.add("dragging");
+  setVolumeFromPointer(event.clientX);
+  const move = moveEvent => {
+    moveEvent.preventDefault();
+    moveEvent.stopPropagation();
+    setVolumeFromPointer(moveEvent.clientX);
+  };
+  const end = () => {
+    window.removeEventListener("pointermove", move, true);
+    window.removeEventListener("pointerup", end, true);
+    window.removeEventListener("pointercancel", end, true);
+    playerVolumeControl?.classList.remove("dragging");
+    // The click that follows the release is part of this press, not a click on what lies under it.
+    window.setTimeout(() => { suppressClickAfterVolumeSlop = false; }, 0);
+  };
+  window.addEventListener("pointermove", move, true);
+  window.addEventListener("pointerup", end, true);
+  window.addEventListener("pointercancel", end, true);
+}, true);
+document.addEventListener("click", event => {
+  if (!suppressClickAfterVolumeSlop) return;
+  suppressClickAfterVolumeSlop = false;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
 
 timeline.addEventListener("pointermove", showSeekThumbnailAt);
 timeline.addEventListener("pointerleave", () => {
@@ -5523,6 +9371,11 @@ window.playerUpdate = update => {
   const subtitleTracks = normalizeTracks(update.subtitleTracks);
   const audioTracksChanged = trackListSignature(audioTracks) !== trackListSignature(state.audioTracks);
   const subtitleTracksChanged = trackListSignature(subtitleTracks) !== trackListSignature(state.subtitleTracks);
+  const displayScale = Number(update.displayScale);
+  if (Number.isFinite(displayScale) && displayScale > 0 && displayScale !== hostDisplayScale) {
+    hostDisplayScale = displayScale;
+    updateViewportUiScale();
+  }
   state = {
     ...state,
     durationMs,
@@ -5533,6 +9386,7 @@ window.playerUpdate = update => {
     audioTracks,
     subtitleTracks,
   };
+  nativeIsLoading = state.isLoading;
   setContextMenuDynamicItems("subtitleTracks", subtitleTracks);
   setContextMenuDynamicItems("audioTracks", visibleAudioTracks());
   renderChrome();
@@ -5544,11 +9398,20 @@ window.playerUpdate = update => {
 
 window.playerControls = nextState => {
   const previousCloseToken = Number(state.closeModalsToken) || 0;
+  const previousPartyPanelToken = Number(currentParty().openPanelToken) || 0;
   const previousOpenSourcesToken = Number(state.openSourcesToken) || 0;
+  const previousHudLabels = state.hudLabels;
   state = { ...state, ...nextState };
+  if (state.hudLabels && state.hudLabels !== previousHudLabels) {
+    applyHudLabels();
+    refreshSeekStepLabels();
+  }
+  reconcileOptimisticSubtitleStyle();
   applyUiFontFamily(state.uiFontFamily);
+  syncSeekrTrack();
   if (!state.seekThumbnailsEnabled) {
-    hideSeekThumbnail();
+    // A live Seekr track keeps the card: it draws sprites with the native decoder off.
+    if (!seekrTrackUrl) hideSeekThumbnail();
     seekThumbnailCache.clear();
     seekThumbnailImage.removeAttribute("src");
   }
@@ -5578,6 +9441,14 @@ window.playerControls = nextState => {
     sourceFilterId = "";
     openPlayerModal("sources");
   }
+  // Kotlin asking for the party panel (the party moved to something this player cannot follow by
+  // itself). A token for the same reason as openSourcesToken.
+  const partyPanelToken = Number(currentParty().openPanelToken) || 0;
+  // A stream swap rebuilds this HUD with every panel closed; let Kotlin stop building stream info.
+  if (state.streamInfo && activeModal !== "streamInfo" && !menuStreamInfoOpen()) send("streamInfoClosed", 0);
+  if (!isFirstPlayerControls && partyPanelToken !== previousPartyPanelToken && activeModal !== "party") {
+    openPartyModal();
+  }
   // A stream swap rebuilds the native bridge and with it this whole HUD, so a Sources sheet that
   // was open when the user picked a stream is gone by the time the new stream opens. Kotlin keeps
   // the record (sourcesPanelOpen); honour it once, on this HUD's first push, so the sheet is back
@@ -5599,14 +9470,14 @@ const beginPipPointerInteraction = (event, mode) => {
     // Pointer capture can fail if WebView has already cancelled the pointer. The native side
     // still receives the initial interaction and any subsequent events that remain in-view.
   }
-  send("beginPictureInPictureInteraction", mode);
+  send(isMiniPlayerUi() ? "beginMiniPlayerInteraction" : "beginPictureInPictureInteraction", mode);
 };
 
 const endPipPointerInteraction = event => {
   if (activePipPointerId === null || (event && event.pointerId !== activePipPointerId)) return;
   const pointerId = activePipPointerId;
   activePipPointerId = null;
-  send("endPictureInPictureInteraction", 0);
+  send(isMiniPlayerUi() ? "endMiniPlayerInteraction" : "endPictureInPictureInteraction", 0);
   try {
     if (root.hasPointerCapture(pointerId)) root.releasePointerCapture(pointerId);
   } catch (_) {}
@@ -5615,31 +9486,161 @@ const endPipPointerInteraction = event => {
 root.addEventListener("pointermove", event => {
   if (event.pointerId !== activePipPointerId) return;
   event.preventDefault();
-  send("updatePictureInPictureInteraction", 0);
+  send(isMiniPlayerUi() ? "updateMiniPlayerInteraction" : "updatePictureInPictureInteraction", 0);
 }, true);
 
 root.addEventListener("pointerup", endPipPointerInteraction, true);
 root.addEventListener("pointercancel", endPipPointerInteraction, true);
 root.addEventListener("lostpointercapture", endPipPointerInteraction, true);
 
+// Every press on the PiP picture (or the corner box) starts moving it. A double-click - back to the
+// mode PiP was entered from, or the corner box back to filling the window - is spotted by Kotlin from
+// two of these presses in a row (NativePlayerController.compactDoublePress), against the OS's own
+// double-click time and the pointer's real position, so it does not depend on this page's timestamps.
+// A press that comes up where it went down is a click: play/pause, as the full player's click is. Held
+// back a moment, as there, so the second press of a double-click (Kotlin's) cancels it.
+const PipClickSlopPx = 5;
+const PipClickMaxMs = 400;
+const PipClickDelayMs = 260;
+let pipPress = null;
+let pipTapTimer = 0;
+// When the last press on the compact player came: the browser's own dblclick follows the second
+// release, by which time PiP may already have been left; it must not count as one on the full video.
+let lastCompactPressAt = -Infinity;
+
 root.addEventListener("pointerdown", event => {
-  if (!state.pictureInPictureActive || event.button !== 0) return;
+  if (!isCompactPlayerUi() || event.button !== 0) return;
   if (event.target.closest("button,input,.pip-resize-handle")) return;
   event.preventDefault();
   event.stopImmediatePropagation();
+  window.clearTimeout(pipTapTimer);
+  lastCompactPressAt = event.timeStamp;
+  pipPress = { pointerId: event.pointerId, x: event.screenX, y: event.screenY, time: event.timeStamp };
   beginPipPointerInteraction(event, 1);
+}, true);
+
+root.addEventListener("pointerup", event => {
+  const press = pipPress;
+  if (!press || event.pointerId !== press.pointerId) return;
+  pipPress = null;
+  const moved = Math.hypot(event.screenX - press.x, event.screenY - press.y) >= PipClickSlopPx;
+  if (moved || event.timeStamp - press.time > PipClickMaxMs || !isCompactPlayerUi()) return;
+  pipTapTimer = window.setTimeout(() => {
+    if (!isCompactPlayerUi()) return;
+    send("toggle", 0);
+  }, PipClickDelayMs);
 }, true);
 
 pictureInPictureResizeHandles.forEach(handleElement => {
   handleElement.addEventListener("pointerdown", event => {
-    if (!state.pictureInPictureActive || event.button !== 0) return;
+    if (!isCompactPlayerUi() || event.button !== 0) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     beginPipPointerInteraction(event, (Number(handleElement.dataset.pipResize) || 0) + 1);
   }, true);
 });
 
+// Hold left mouse on the bare video surface = temporary 2x (upstream parity). A press that
+// outlives HoldSpeedDelayMs switches to 2x; release restores the speed from before the hold and
+// swallows the click that follows, so the gesture never also toggles pause. A shorter press is
+// an ordinary click and falls through to the tapTimer path below untouched.
+const HoldSpeedDelayMs = 400;
+const HoldSpeedValue = 2;
+let holdSpeedTimer = 0;
+let holdSpeedPointerId = null;
+let holdSpeedRestoreValue = null;
+let holdSpeedButton = -1;
+let consumeHoldSpeedClick = false;
+let consumeZoneContextMenu = false;
+
+// Player zones can be driven by a drag with the left (drag), right (rmb) or a side button (xb1 /
+// xb2): the zone input's event.button, or -1 for the wheel and off.
+const ZONE_INPUT_BUTTONS = { drag: 0, rmb: 2, xb1: 3, xb2: 4 };
+const zoneButton = () => ZONE_INPUT_BUTTONS[state.zoneInput] ?? -1;
+// event.buttons bit for an event.button: left 1, middle 4, right 2, back 8, forward 16.
+const mouseButtonMask = button => [1, 4, 2, 8, 16][button] ?? 0;
+
+// A press of a zone button that did something (a drag, a 2x hold) must not also do the button's own
+// job when it comes up: the left button's click (pause), the right button's context menu.
+const swallowZoneButtonRelease = button => {
+  if (button === 0) {
+    consumeHoldSpeedClick = true;
+    window.setTimeout(() => { consumeHoldSpeedClick = false; }, 500);
+  } else if (button === 2) {
+    consumeZoneContextMenu = true;
+    window.setTimeout(() => { consumeZoneContextMenu = false; }, 500);
+  }
+};
+
+// The other half: a zone press that came up unused does the button's own job after all. Only Back
+// needs this; it normally acts on press, so while it drives the zones it waits for the release.
+const zoneButtonReleasedUnused = button => {
+  if (button === 3) handleMouseBack();
+};
+
+// Capture phase on window, so it runs before the context menu's own listener on root.
+window.addEventListener("contextmenu", event => {
+  if (!consumeZoneContextMenu) return;
+  consumeZoneContextMenu = false;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
+
+const endHoldSpeed = (released = false) => {
+  window.clearTimeout(holdSpeedTimer);
+  holdSpeedTimer = 0;
+  holdSpeedPointerId = null;
+  const button = holdSpeedButton;
+  holdSpeedButton = -1;
+  if (holdSpeedRestoreValue === null) {
+    if (released) zoneButtonReleasedUnused(button);
+    return;
+  }
+  const restore = holdSpeedRestoreValue;
+  holdSpeedRestoreValue = null;
+  swallowZoneButtonRelease(button);
+  send("setPlaybackSpeed", restore);
+  window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), `${restore.toFixed(2).replace(/\.?0+$/, "")}x`);
+};
+
+root.addEventListener("pointerdown", event => {
+  if (event.pointerType === "touch") return;
+  // A fast-forward zone gives the hold to the zone button, whichever it is. With left-button zones
+  // the left hold belongs to the zones, so a press that rests before it starts dragging can't also
+  // switch to 2x; with any other zone input the left button keeps its usual hold.
+  const zoneHold = event.button === zoneButton() && zoneActionAt(event.clientX) === "fastforward";
+  if (!zoneHold && (event.button !== 0 || state.zoneInput === "drag")) return;
+  if (isHeroTrailerSurface || state.heroTrailerMode || isCompactPlayerUi()) return;
+  if (state.isLocked || !state.isPlaying || contextMenuOpen || activeModal || playbackErrorText()) return;
+  if (event.target.closest("button,input") || isChromeInteractionTarget(event.target)) return;
+  endHoldSpeed();
+  holdSpeedPointerId = event.pointerId;
+  holdSpeedButton = event.button;
+  holdSpeedTimer = window.setTimeout(() => {
+    holdSpeedTimer = 0;
+    // Re-check: the press may have outlived playback (end of file, pause from a key).
+    if (holdSpeedPointerId === null || !state.isPlaying) return;
+    holdSpeedRestoreValue = parsedPlaybackSpeed();
+    send("setPlaybackSpeed", HoldSpeedValue);
+    // Pinned for the whole hold; endHoldSpeed replaces it with the restored speed.
+    window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), `${HoldSpeedValue}x`, 24 * 60 * 60 * 1000);
+  }, HoldSpeedDelayMs);
+});
+["pointerup", "pointercancel"].forEach(type => window.addEventListener(type, event => {
+  if (holdSpeedPointerId === null || event.pointerId !== holdSpeedPointerId) return;
+  endHoldSpeed(type === "pointerup");
+}, true));
+// Losing focus mid-hold (alt-tab, a native dialog) never delivers the pointerup.
+window.addEventListener("blur", () => endHoldSpeed());
+
 root.addEventListener("click", event => {
+  if (consumeHoldSpeedClick) {
+    consumeHoldSpeedClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    return;
+  }
   if (consumeContextMenuDismissalClick) {
     consumeContextMenuDismissalClick = false;
     window.clearTimeout(contextMenuDismissalClickTimer);
@@ -5648,7 +9649,9 @@ root.addEventListener("click", event => {
     window.clearTimeout(tapTimer);
     return;
   }
-  if (state.pictureInPictureActive) return;
+  // fork:pip-browse - a click that began on PiP or the corner box (they pause on their own release),
+  // landing after a double-click took the video back to full size.
+  if (isCompactPlayerUi() || event.timeStamp - lastCompactPressAt < 1000) return;
   if (playbackErrorText()) return;
   if (event.target.closest("button,input")) return;
   const onVideoSurface = !isChromeInteractionTarget(event.target);
@@ -5677,36 +9680,255 @@ root.addEventListener("click", event => {
   }, 220);
 });
 
-root.addEventListener("wheel", event => {
-  if (state.pictureInPictureActive) return;
-  if (playbackErrorText()) return;
-  if (state.isLocked) return;
-  if (isChromeInteractionTarget(event.target)) return;
-  event.preventDefault();
+// The nearest element from [target] up that scrolls with the wheel (a list or panel body with overflow).
+const wheelScrollableAncestor = target => {
+  for (let el = target instanceof Element ? target : null; el && el !== root && el !== document.body; el = el.parentElement) {
+    if (el.scrollHeight <= el.clientHeight + 1) continue;
+    const overflow = getComputedStyle(el).overflowY;
+    if (overflow === "auto" || overflow === "scroll") return el;
+  }
+  return null;
+};
+
+// An open panel's main list: the largest element in it that scrolls, down or (the Episodes rail) across.
+const panelWheelScroller = panel => {
+  let best = null;
+  let bestArea = 0;
+  for (const el of panel.querySelectorAll("*")) {
+    const vertical = el.scrollHeight > el.clientHeight + 1;
+    const horizontal = el.scrollWidth > el.clientWidth + 1;
+    if (!vertical && !horizontal) continue;
+    const style = getComputedStyle(el);
+    const scrolls = (vertical && (style.overflowY === "auto" || style.overflowY === "scroll"))
+      || (horizontal && (style.overflowX === "auto" || style.overflowX === "scroll"));
+    if (!scrolls) continue;
+    const area = el.clientWidth * el.clientHeight;
+    if (area > bestArea) {
+      best = el;
+      bestArea = area;
+    }
+  }
+  return best;
+};
+
+const stepVolumeFromWheel = event => {
   const direction = event.deltaY > 0 ? -1 : event.deltaY < 0 ? 1 : 0;
   if (direction === 0) return;
   adjustLocalVolume(direction * 5);
   send("volumeDelta", direction * 0.05);
+};
+
+// Player zones: the third of the window under the pointer picks the action, each third's set in
+// Settings (zoneActions, left to right: none / speed / seek / volume / fastforward).
+const zoneActionAt = clientX => {
+  const bounds = root.getBoundingClientRect();
+  const fraction = bounds.width > 0 ? (clientX - bounds.left) / bounds.width : 0.5;
+  const index = fraction < 1 / 3 ? 0 : fraction < 2 / 3 ? 1 : 2;
+  return String(state.zoneActions || "").split(",")[index]?.trim().toLowerCase() || "none";
+};
+
+// One step of a zone action, +1 up / faster / forward. volumeStep is the percent per step: a wheel
+// notch moves 5, a drag step (a few pixels) less, so dragging feels continuous.
+const applyZoneStep = (action, direction, volumeStep) => {
+  if (action === "volume") {
+    adjustLocalVolume(direction * volumeStep);
+    send("volumeDelta", direction * volumeStep / 100);
+    return;
+  }
+  // Live TV arrives in real time, so a faster speed would only run out of buffer.
+  if (action === "speed") {
+    if (!state.iptv) stepPlaybackSpeed(direction);
+    return;
+  }
+  if (action === "seek") {
+    // The seek buttons are hidden while a title opens; a stray step must not move its start point.
+    if (root.classList.contains("opening-active")) return;
+    revealChromeForPlaybackInteraction();
+    send(direction > 0 ? "seekForward" : "seekBack", 0);
+  }
+};
+
+// A mouse notch reads 120 / page zoom in wheelDeltaY, and the native side sets that zoom to
+// (192 / dpi) * UI scale, so a notch can be anything from 40 to several hundred and this page can't
+// tell which. The threshold sits just under the smallest, so every notch is exactly one step, while
+// a touchpad's smaller deltas add up first. Partial travel is dropped when the pointer changes
+// zone, the direction flips, or the wheel rests, so leftovers can't fire a step later.
+const WHEEL_UNITS_PER_STEP = 36;
+const WHEEL_REST_MS = 300;
+const createWheelStepCounter = () => {
+  let zone = "";
+  let units = 0;
+  let lastAt = 0;
+  return (nextZone, wheelUnits, now) => {
+    if (nextZone !== zone || now - lastAt > WHEEL_REST_MS || units * wheelUnits < 0) units = 0;
+    zone = nextZone;
+    lastAt = now;
+    units += wheelUnits;
+    if (Math.abs(units) < WHEEL_UNITS_PER_STEP) return 0;
+    const direction = Math.sign(units);
+    units = 0;
+    return direction;
+  };
+};
+const countWheelSteps = createWheelStepCounter();
+
+// Panels and text fields keep the wheel for themselves. Every other control follows its zone, so
+// the seek reveal can't put a dead spot under the pointer between two notches.
+const scrollZoneExcludedSelector = [
+  ".modal-layer",
+  ".locked-overlay",
+  "#actionOverflowMenu",
+  "#playlistPeek",
+  "input:not([type='range'])",
+  "textarea",
+  "select",
+  "[contenteditable='true']",
+].join(",");
+
+const handleScrollZoneWheel = event => {
+  if (activeModal || contextMenuOpen) return;
+  if (event.target.closest(scrollZoneExcludedSelector) || wheelScrollableAncestor(event.target)) return;
+  event.preventDefault();
+  const zone = event.target.closest("#playerVolumeControl") ? "volume" : zoneActionAt(event.clientX);
+  if (zone === "volume") {
+    stepVolumeFromWheel(event);
+    return;
+  }
+  // Nothing, or the drag-only fast-forward: the wheel does nothing here.
+  if (zone !== "speed" && zone !== "seek") return;
+  const direction = countWheelSteps(zone, event.wheelDeltaY, event.timeStamp);
+  if (direction !== 0) applyZoneStep(zone, direction, 5);
+};
+
+// Drag input: hold the zone button (left, right or a side button) on the bare video and move up or down. Up is louder / faster /
+// forward. A press that never travels ZONE_DRAG_START_PX stays an ordinary click (pause), and one
+// that does swallows that click. The wheel is left alone, so this works on the YouTube watch page,
+// where the wheel scrolls the page. Fast-forward zones are the hold-for-2x gesture further down.
+const ZONE_DRAG_START_PX = 8;
+const ZONE_DRAG_STEP_PX = { volume: 6, seek: 28, speed: 40 };
+const ZONE_DRAG_VOLUME_STEP = 2;
+let zoneDrag = null;
+
+const zoneDragEligible = event =>
+  event.button === zoneButton() && event.pointerType !== "touch" &&
+  !isHeroTrailerSurface && !state.heroTrailerMode && !isCompactPlayerUi() && !state.pictureInPictureActive &&
+  !state.isLocked && !contextMenuOpen && !activeModal && !playbackErrorText() &&
+  !event.target.closest("button,input") && !isChromeInteractionTarget(event.target);
+
+const endZoneDrag = (released = false) => {
+  if (!zoneDrag) return;
+  const { pointerId, active, button } = zoneDrag;
+  zoneDrag = null;
+  try {
+    if (root.hasPointerCapture(pointerId)) root.releasePointerCapture(pointerId);
+  } catch (_) {}
+  if (active) {
+    swallowZoneButtonRelease(button);
+  } else if (released) {
+    zoneButtonReleasedUnused(button);
+  }
+};
+
+root.addEventListener("pointerdown", event => {
+  if (!zoneDragEligible(event)) return;
+  const action = zoneActionAt(event.clientX);
+  if (action !== "speed" && action !== "seek" && action !== "volume") return;
+  endZoneDrag();
+  zoneDrag = {
+    pointerId: event.pointerId,
+    button: event.button,
+    action,
+    startY: event.clientY,
+    anchorY: event.clientY,
+    active: false,
+  };
+});
+
+window.addEventListener("pointermove", event => {
+  if (!zoneDrag || event.pointerId !== zoneDrag.pointerId) return;
+  // The button came up somewhere this page never heard about.
+  if ((event.buttons & mouseButtonMask(zoneDrag.button)) === 0) {
+    endZoneDrag();
+    return;
+  }
+  if (!zoneDrag.active) {
+    if (Math.abs(event.clientY - zoneDrag.startY) < ZONE_DRAG_START_PX) return;
+    zoneDrag.active = true;
+    zoneDrag.anchorY = event.clientY;
+    window.clearTimeout(tapTimer);
+    try { root.setPointerCapture(event.pointerId); } catch (_) {}
+  }
+  event.preventDefault();
+  const stepPx = ZONE_DRAG_STEP_PX[zoneDrag.action];
+  while (Math.abs(zoneDrag.anchorY - event.clientY) >= stepPx) {
+    const direction = event.clientY < zoneDrag.anchorY ? 1 : -1;
+    zoneDrag.anchorY -= direction * stepPx;
+    applyZoneStep(zoneDrag.action, direction, ZONE_DRAG_VOLUME_STEP);
+  }
+}, true);
+["pointerup", "pointercancel"].forEach(type => window.addEventListener(type, event => {
+  if (zoneDrag && event.pointerId === zoneDrag.pointerId) endZoneDrag(type === "pointerup");
+}, true));
+window.addEventListener("blur", () => endZoneDrag());
+
+root.addEventListener("wheel", event => {
+  if (state.pictureInPictureActive) return;
+  // The YouTube watch page: the wheel scrolls the page around the video (volume stays on the controls).
+  // An open panel or menu has it instead: over a list it scrolls that list as anywhere else, and over
+  // the rest of the video it scrolls the open panel's list, so the page never moves under a panel.
+  if (state.watchPage) {
+    if (event.defaultPrevented) return; // a list's own handler (the Episodes rail) took it
+    if (wheelScrollableAncestor(event.target)) return;
+    const panel = activeModal ? modalByName[activeModal] : null;
+    if (panel || contextMenuOpen) {
+      event.preventDefault();
+      const scroller = panel ? panelWheelScroller(panel) : null;
+      if (!scroller) return;
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      if (scroller.scrollHeight > scroller.clientHeight + 1) scroller.scrollTop += delta;
+      else scroller.scrollLeft += Math.sign(delta) * 240;
+      return;
+    }
+    event.preventDefault();
+    if (event.deltaY !== 0) send("watchPageScroll", event.deltaY);
+    return;
+  }
+  if (playbackErrorText()) return;
+  if (state.isLocked) return;
+  if (state.zoneInput === "wheel" && !isHeroTrailerSurface && !state.heroTrailerMode) {
+    handleScrollZoneWheel(event);
+    return;
+  }
+  if (isChromeInteractionTarget(event.target)) return;
+  event.preventDefault();
+  stepVolumeFromWheel(event);
 }, { passive: false });
 
 root.addEventListener("dblclick", event => {
   if (playbackErrorText()) return;
   if (event.target.closest("button,input")) return;
-  // Only the bare video surface toggles fullscreen — double-clicking the control bar or the top
-  // navbar band shouldn't fling in/out of fullscreen.
+  // Only the bare video surface takes a double-click — double-clicking the control bar or the top
+  // navbar band shouldn't fling the window about.
   if (isChromeInteractionTarget(event.target)) return;
   event.preventDefault();
   window.clearTimeout(tapTimer);
-  send("toggleFullscreen", 0);
+  if (isHeroTrailerSurface || state.heroTrailerMode) {
+    send("toggleFullscreen", 0);
+    return;
+  }
+  // PiP's and the corner box's double-clicks are spotted by Kotlin from their presses. This dblclick
+  // comes after the second release, often once PiP has already been left: still theirs, not the video's.
+  if (isCompactPlayerUi() || event.timeStamp - lastCompactPressAt < 1000) return;
+  // As on most video sites: the YouTube watch page goes to theater, anything else to PiP (Kotlin decides).
+  send("videoDoubleClick", 0);
 });
 
 // Mouse "Back" side button (X1 / button 3) closes the player, mirroring Esc. WebView2 mouse events
 // don't reach the app-level AWT listener that handles Back on every other screen, so the button is
 // wired here in the HUD instead. (Button 4 / Forward is intentionally left alone.)
-document.addEventListener("mousedown", event => {
-  if (isHeroTrailerSurface || state.heroTrailerMode) return;
-  if (event.button !== 3) return;
-  event.preventDefault();
+// When Back drives the player zones, a press on the video belongs to them (pointerdown, which runs
+// first, has claimed it), and Back runs on a release that neither dragged nor held.
+function handleMouseBack() {
   if (contextMenuOpen) {
     closeContextMenu();
     return;
@@ -5717,6 +9939,14 @@ document.addEventListener("mousedown", event => {
     return;
   }
   send("back", 0);
+}
+
+document.addEventListener("mousedown", event => {
+  if (isHeroTrailerSurface || state.heroTrailerMode) return;
+  if (event.button !== 3) return;
+  event.preventDefault();
+  if (zoneDrag?.button === 3 || (holdSpeedPointerId !== null && holdSpeedButton === 3)) return;
+  handleMouseBack();
 });
 
 document.addEventListener("keydown", event => {
@@ -5727,6 +9957,21 @@ document.addEventListener("keydown", event => {
   // the full-screen player key logic below for this surface.
   if (isHeroTrailerSurface || state.heroTrailerMode) {
     return;
+  }
+  // Post-show cards are up and the video is in a corner box: the D-pad drives the cards, which Kotlin
+  // draws, so the keys they use are forwarded instead of seeking or showing the controls. Anything
+  // else (volume, fullscreen, ...) keeps working.
+  if (state.postShowInput) {
+    const postShowCodes = {
+      ArrowLeft: 1, ArrowRight: 2, ArrowUp: 3, ArrowDown: 4, Enter: 5, " ": 5,
+      Escape: 6, Backspace: 6, "1": 11, "2": 12, "3": 13, "4": 14,
+    };
+    const postShowCode = postShowCodes[event.key];
+    if (postShowCode) {
+      event.preventDefault();
+      send("postShowKey", postShowCode);
+      return;
+    }
   }
   // The hex prompt is its own layer rather than an activeModal, so the modal branches below would
   // otherwise close the panel underneath it and leave the prompt stranded.
@@ -5757,6 +10002,11 @@ document.addEventListener("keydown", event => {
     send("back", 0);
     return;
   }
+  if (event.key === "Escape" && keyboardPanelMode === "controls") {
+    event.preventDefault();
+    handleBarNavKey("Escape");
+    return;
+  }
   if (event.key === "Escape" && activeModal) {
     event.preventDefault();
     closePlayerModal(true);
@@ -5765,7 +10015,8 @@ document.addEventListener("keydown", event => {
   }
   if (event.key === "Escape") {
     event.preventDefault();
-    send("back", 0);
+    // Not "back": Kotlin may turn this into "leave fullscreen" (Escape goes windowed first).
+    send("escapeBack", 0);
     return;
   }
   if (playbackErrorText()) return;
@@ -5777,7 +10028,24 @@ document.addEventListener("keydown", event => {
     send("toggleFullscreen", 0);
     return;
   }
-  if (keyboardPanelMode && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "NumpadEnter"].includes(event.code)) {
+  // Voice control's push-to-talk key. Once the HUD is clicked it holds the keyboard and the app's own
+  // key handler never sees the key, so it is forwarded here (Kotlin sends 0 when a player action
+  // owns that key). Not while typing in a box, and not for auto-repeat: a held key is one press.
+  const voiceKey = Math.max(0, Number(state.voiceKeyCode) || 0);
+  if (voiceKey > 0 && awtKeyCodeForEvent(event) === voiceKey && !isTextEntryTarget(event.target)) {
+    event.preventDefault();
+    if (!event.repeat) send("voiceCommand", 0);
+    return;
+  }
+  // While the keys drive a panel or the player menu, Space (a pad's A in the player) picks, as Enter does.
+  if (keyboardPanelMode && event.code === "Space" && !isTextEntryTarget(event.target)) {
+    event.preventDefault();
+    if (!event.repeat) window.nuvioHandleKeyboardPanelKey("Enter");
+    return;
+  }
+  // In the channel search box Left/Right move the caret; Up/Down/Enter still walk the list.
+  const caretKey = isTextEntryTarget(event.target) && (event.code === "ArrowLeft" || event.code === "ArrowRight");
+  if (keyboardPanelMode && !caretKey && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "NumpadEnter"].includes(event.code)) {
     event.preventDefault();
     window.nuvioHandleKeyboardPanelKey(event.code === "NumpadEnter" ? "Enter" : event.code);
     return;
@@ -5786,7 +10054,48 @@ document.addEventListener("keydown", event => {
     return;
   }
   const command = shortcutCommandForEvent(event);
+  // Enter no longer starts walking the control bar (2026-11-15): the player menu (P, a pad's View) reaches everything.
+  // Live TV: a digit with no binding of its own starts or extends a channel number.
+  const digitMatch = /^(?:Digit|Numpad)([0-9])$/.exec(event.code);
+  if (state.iptv && !command && digitMatch && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    event.preventDefault();
+    window.nuvioIptvDigit(Number(digitMatch[1]));
+    return;
+  }
   if (!command) {
+    return;
+  }
+  if (command === "iptvChannelUp" || command === "iptvChannelDown") {
+    event.preventDefault();
+    if (state.iptv) send("iptvChannel", command === "iptvChannelUp" ? 1 : -1);
+    return;
+  }
+  // Live TV has no sources or episodes panels; their keys open the channel switcher instead.
+  if (state.iptv && (command === "keyboardOpenSources" || command === "keyboardOpenEpisodes")) {
+    event.preventDefault();
+    openIptvPanel(true);
+    return;
+  }
+  // Holding play/pause while playing plays at 2x until it is let go; a tap still pauses, on release.
+  // Paused, it plays at once. The AWT dispatcher does the same when the app has the keyboard.
+  if (command === "keyboardToggle") {
+    event.preventDefault();
+    if (event.repeat || playHoldCode) return;
+    focusShortcutRoot();
+    noteChromeActivity();
+    if (state.isPlaying && !state.isLocked) {
+      const code = event.code;
+      playHoldCode = code;
+      playHoldActive = false;
+      clearTimeout(playHoldTimer);
+      playHoldTimer = setTimeout(() => {
+        if (playHoldCode !== code) return;
+        playHoldActive = true;
+        send("holdSpeedStart", 0);
+      }, PLAY_HOLD_DELAY_MS);
+      return;
+    }
+    send(command, 0);
     return;
   }
   event.preventDefault();
@@ -5816,18 +10125,45 @@ document.addEventListener("keydown", event => {
     window.nuvioOpenKeyboardPanel("episodes");
     return;
   } else if (command === "keyboardSkipInterval") {
-    if (skipPrompt.classList.contains("visible")) {
-      send("skipInterval", 0);
-    } else if (state.nextEpisodeVisible && state.nextEpisodePlayable) {
-      send("playNextEpisode", 0);
-    }
+    // Kotlin resolved what the skip key means right now (skip, next episode, or a step of the
+    // SkipDB submission toast); the AWT dispatcher reads the same field.
+    const action = String(state.skipKeyAction || "");
+    if (action) send(action, 0);
     return;
   } else if (command === "keyboardToggleMpvDiagnostics") {
     window.nuvioToggleMpvDiagnostics();
     return;
+  } else if (command === "keyboardOpenPlayerMenu") {
+    if (!event.repeat) window.nuvioOpenPlayerMenu();
+    return;
   }
   send(command, 0);
 });
+
+// The play/pause hold (see the keydown handler): let go of the key, or lose the keyboard mid-hold.
+const PLAY_HOLD_DELAY_MS = 350;
+let playHoldCode = "";
+let playHoldActive = false;
+let playHoldTimer = null;
+const finishPlayHold = tapped => {
+  if (!playHoldCode) return;
+  clearTimeout(playHoldTimer);
+  playHoldTimer = null;
+  playHoldCode = "";
+  if (playHoldActive) {
+    playHoldActive = false;
+    send("holdSpeedEnd", 0);
+  } else if (tapped) {
+    send("keyboardToggle", 0);
+  }
+};
+document.addEventListener("keyup", event => {
+  if (playHoldCode && event.code === playHoldCode) {
+    event.preventDefault();
+    finishPlayHold(true);
+  }
+});
+window.addEventListener("blur", () => finishPlayHold(false));
 
 setProgress(0, 0);
 window.addEventListener("resize", updateViewportUiScale, { passive: true });

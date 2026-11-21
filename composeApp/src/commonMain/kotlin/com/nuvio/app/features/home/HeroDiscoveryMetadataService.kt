@@ -13,6 +13,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 object HeroDiscoveryMetadataService {
     const val CACHE_VERSION = 18
@@ -61,15 +63,43 @@ object HeroDiscoveryMetadataService {
         }
         if (!ownsRequest) return pending.await()
 
+        // Kept between launches (see HeroBundleCache): a warm launch shows the badges without a hero summary fetch.
+        val bundleSerializer = kotlinx.serialization.builtins.ListSerializer(HeroDiscoveryFact.serializer())
+        val fromDisk = try {
+            HeroBundleCache.get("badges", cacheKey, bundleSerializer)
+        } catch (e: CancellationException) {
+            cacheMutex.withLock { inFlightRequests.remove(cacheKey)?.completeExceptionally(e) }
+            throw e
+        }
+        if (fromDisk != null) {
+            cacheMutex.withLock { inFlightRequests.remove(cacheKey)?.complete(fromDisk) }
+            return fromDisk
+        }
+
+        val startedMs = now
+        var failed = false
         val facts = try {
             // Summary rather than the details-screen record. The badges that count seasons and
             // episodes read `meta.videos`, which comes from the addon and is unaffected by dropping
             // TMDB's per-episode decoration - see MetaDetailsRepository.fetchHeroSummary.
-            val meta = MetaDetailsRepository.peek(type = type, id = id)
-                ?: MetaDetailsRepository.fetchHeroSummary(type = type, id = id)
+            val peeked = MetaDetailsRepository.peek(type = type, id = id)
+            val meta = peeked ?: MetaDetailsRepository.fetchHeroSummary(type = type, id = id)
+            val metaMs = elapsedSince(startedMs)
             if (meta != null) {
                 val enrichedMeta = enrichDiscoveryMeta(meta = meta, fallbackItemId = id)
-                computeFacts(enrichedMeta, priority, releaseStatusUnavailableOnly)
+                val enrichMs = elapsedSince(startedMs) - metaMs
+                computeFacts(enrichedMeta, priority, releaseStatusUnavailableOnly).also { result ->
+                    val totalMs = elapsedSince(startedMs)
+                    // Which step holds the badges back; only slow lookups, so a scroll stays readable.
+                    if (totalMs >= SLOW_FETCH_LOG_MS) {
+                        log.i {
+                            "Slow badges $type:$id ${totalMs}ms: meta=${metaMs}ms " +
+                                "(${if (peeked != null) "cached" else "summary"}) " +
+                                "mdblist+tmdbId=${enrichMs}ms facts=${totalMs - metaMs - enrichMs}ms " +
+                                "-> ${result.size} badges"
+                        }
+                    }
+                }
             } else {
                 emptyList()
             }
@@ -78,14 +108,21 @@ object HeroDiscoveryMetadataService {
             throw e
         } catch (e: Throwable) {
             log.w(e) { "Discovery request failed for $cacheKey" }
+            failed = true
             emptyList()
         }
 
+        if (!failed) {
+            HeroBundleCache.put("badges", cacheKey, facts, bundleSerializer, isEmpty = facts.isEmpty(), isSeries = type.isSeriesType())
+        }
         cacheMutex.withLock {
             inFlightRequests.remove(cacheKey)?.complete(facts)
         }
         return facts
     }
+
+    private fun elapsedSince(startedMs: Long): Long =
+        com.nuvio.app.features.watchprogress.WatchProgressClock.nowEpochMs() - startedMs
 
     private suspend fun enrichDiscoveryMeta(
         meta: MetaDetails,
@@ -407,7 +444,7 @@ object HeroDiscoveryMetadataService {
                 else "${lang.languageDisplayName()} Film"
             }
             "studio" -> meta.matchedStudios.firstOrNull()?.label
-            "director" -> meta.matchedDirectors.firstOrNull()?.let { "Directed by $it" }
+            "director" -> meta.matchedDirectors.firstOrNull()?.let { localizedString(Res.string.hero_badge_label_directed_by, it) }
             "trending" -> if (meta.isTrending) "Trending" else null
             "new_release", "digital_release" -> if (meta.isNewRelease) "New" else null
             "metacritic" -> if (meta.isMetacriticMustSee) "Must-See" else null
@@ -549,6 +586,7 @@ object HeroDiscoveryMetadataService {
     private const val NEW_RELEASE_WINDOW_DAYS = 30
     private const val NEW_RELEASE_ORIGINAL_YEAR_LOOKBACK = 1
     private const val MDBLIST_DISCOVERY_TIMEOUT_MS = 6_000L
+    private const val SLOW_FETCH_LOG_MS = 400L
     private const val METACRITIC_MUST_SEE_MIN_SCORE = 81.0
     private const val BINGE_READY_MAX_SEASONS = 3
     private val BINGE_READY_EPISODE_RANGE = 2..30
@@ -658,6 +696,7 @@ data class MatchedStudio(
     val tmdbId: Int?,
 )
 
+@kotlinx.serialization.Serializable
 data class HeroDiscoveryFact(
     val label: String,
     val type: String,
@@ -667,3 +706,5 @@ data class HeroDiscoveryFact(
     /** Set on the `director` slot only: the matched director's name as written in hero_discovery.json. */
     val directorName: String? = null,
 )
+
+private fun String.isSeriesType(): Boolean = equals("series", ignoreCase = true) || equals("tv", ignoreCase = true)

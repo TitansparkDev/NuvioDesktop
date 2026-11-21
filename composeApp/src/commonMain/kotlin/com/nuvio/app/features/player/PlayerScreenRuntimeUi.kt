@@ -9,7 +9,14 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.watched.WatchedRepository
+import com.nuvio.app.features.preroll.postShowScopeFor
+import com.nuvio.app.features.preroll.PostShowScope
+import com.nuvio.app.features.preroll.PostShowEpisode
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
@@ -29,6 +36,7 @@ import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
 import com.nuvio.app.core.ui.appFontFamilyName
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.debrid.DebridSettingsRepository
+import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.playbackEpisodeNumber
@@ -40,10 +48,16 @@ import com.nuvio.app.features.p2p.P2pStreamingState
 import com.nuvio.app.features.p2p.formatP2pMegabytes
 import com.nuvio.app.features.p2p.formatP2pSpeed
 import com.nuvio.app.features.player.skip.SKIP_SEGMENT_TYPES
+import com.nuvio.app.features.player.skip.SkipKeyActions
 import com.nuvio.app.features.player.skip.SkipIntroRepository
+import com.nuvio.app.features.playlist.displayTitle
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
+import com.nuvio.app.features.streams.badgeFillCssColorOrNull
+import com.nuvio.app.features.streams.toBadgeCssColorOrNull
+import com.nuvio.app.features.streams.StreamListSort
+import com.nuvio.app.features.streams.StreamListSortOrder
 import com.nuvio.app.features.streams.StreamScore
 import com.nuvio.app.features.streams.StreamScoreContext
 import com.nuvio.app.features.streams.StreamScoreContexts
@@ -60,11 +74,68 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
+import com.nuvio.app.core.i18n.localizedString
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val runtime = this
+    // Compose's own back on desktop: Escape reaching the window (keyboard focus in Compose rather than
+    // the HUD - the YouTube watch page or mini player clicked, or the tab a video was just opened from)
+    // pops the route straight away, past the player's Back. Taken here so it is the player's Back:
+    // the mini player for a YouTube video (Nov 4: Escape sometimes closed one outright), and the
+    // progress flushed before leaving for anything else.
+    @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+    @Suppress("DEPRECATION")
+    androidx.compose.ui.backhandler.BackHandler(enabled = true) {
+        co.touchlab.kermit.Logger.withTag("YouTubeMiniPlayer").i { "window back in the player: taken as the player's Back" }
+        handlePlayerControlsAction(PlayerControlsAction.Back)
+    }
+    // Tells the post-show what is playing and where its credits are: a film, or the finale of a
+    // season or series that the viewer has watched their way to (see postShowScopeFor).
+    val postShowTitle = title
+    LaunchedEffect(
+        parentMetaType, parentMetaId, skipIntervals, postShowTitle,
+        activeSeasonNumber, activeEpisodeNumber, activeEpisodeTitle, playerMetaVideos,
+    ) {
+        val scope: PostShowScope? = when (parentMetaType) {
+            "movie" -> PostShowScope.Film
+            "series" -> {
+                val season = activeSeasonNumber
+                val episode = activeEpisodeNumber
+                if (season == null || episode == null) {
+                    null
+                } else {
+                    postShowScopeFor(
+                        status = MetaDetailsRepository.peekAny(parentMetaType, parentMetaId)?.status,
+                        episodes = playerMetaVideos.mapNotNull { video ->
+                            val s = video.playbackSeasonNumber()
+                            val e = video.playbackEpisodeNumber()
+                            if (s == null || e == null) {
+                                null
+                            } else {
+                                // Only this season's earlier episodes decide the gate, so only those are looked up.
+                                val needed = s == season && e < episode
+                                PostShowEpisode(
+                                    season = s,
+                                    episode = e,
+                                    watched = needed && WatchedRepository.isWatched(parentMetaId, parentMetaType, s, e),
+                                )
+                            }
+                        },
+                        currentSeason = season,
+                        currentEpisode = episode,
+                        episodeTitle = activeEpisodeTitle,
+                    )
+                }
+            }
+            else -> null
+        }
+        PostShowController.setFilm(
+            scope?.let { PostShowController.Film(parentMetaType, parentMetaId, postShowTitle, skipIntervals, it) },
+        )
+    }
+    DisposableEffect(Unit) { onDispose { PostShowController.setFilm(null) } }
     val playbackFailedToast = stringResource(Res.string.player_error_playback_failed)
     val unableToPlayStreamMessage = stringResource(Res.string.player_error_unable_to_play_stream)
     val debridRateLimitedToast = stringResource(Res.string.player_error_debrid_rate_limited)
@@ -182,8 +253,32 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         allLabel = allFilterLabel,
         selectedFilter = null,
     )
-    val sourceItems = buildPlayerControlSourceItems()
-    val episodeItems = buildPlayerControlEpisodeItems()
+    // fork:youtube-mode - a YouTube tab video's Sources panel holds its comments, its Episodes its related videos.
+    val youTubeVideo = isYouTubeVideoPlayback
+    // YouTube's own seek previews, unless previews are off or the connection is metered.
+    val youTubeStoryboardShown = youTubeStoryboard?.takeIf {
+        youTubeVideo &&
+            playerSettingsUiState.desktopSeekThumbnailMode != DesktopSeekThumbnailMode.Off &&
+            playerSettingsUiState.desktopBufferPreset != DesktopBufferPreset.Metered
+    }
+    val sourceItems = if (youTubeVideo) {
+        youTubeCommentSourceItems()
+    } else {
+        buildPlayerControlSourceItems(
+            sortOrder = streamBadgeSettings.listSortOrder,
+            cachedFirst = streamBadgeSettings.listCachedFirst,
+        )
+    }
+    val sourceSortOptions = remember(streamBadgeSettings.listSortOrder) {
+        StreamListSortOrder.entries.map { order ->
+            PlayerControlFilterItem(
+                id = order.ordinal.toString(),
+                label = order.label,
+                isSelected = order == streamBadgeSettings.listSortOrder,
+            )
+        }
+    }
+    val episodeItems = if (youTubeVideo) youTubeRelatedEpisodeItems() else buildPlayerControlEpisodeItems()
     // Same fallback chain the details screen's episode cards use, so an episode whose still is
     // missing or unreachable shows the show's artwork instead of an empty card.
     val episodeFallbackThumbnail = (
@@ -242,10 +337,30 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     // keeps its Play button (skip countdown / play now).
     val manualSwitchIsNonSequential = manualEpisodeSwitchInfo != null &&
         manualEpisodeSwitchInfo?.videoId != nextEpisodeInfo?.videoId
-    val nextEpisodeStatus = when {
-        nextEpisodeForControls == null -> ""
-        !nextEpisodeForControls.hasAired && !nextEpisodeForControls.unairedMessage.isNullOrBlank() ->
-            nextEpisodeForControls.unairedMessage.orEmpty()
+    // The playlist's up-next prompt borrows the next-episode card. Next-episode resolution is off in
+    // playlist mode, so the two only meet when the viewer switches episode by hand from the panel —
+    // that loading feedback wins, since it is about what is happening right now.
+    val playlistCardEntry = playlistUpNext.takeIf {
+        isPlaylistPlayback && (showPlaylistUpNextCard || playlistHandoffRequested) &&
+            nextEpisodeForControls == null && !isProviderDiagnosticVideoPlayback
+    }
+    val peekPlaylists by com.nuvio.app.features.playlist.PlaylistRepository.playlists.collectAsState()
+    val peekActive by com.nuvio.app.features.playlist.PlaylistPlaybackSession.active.collectAsState()
+    val playlistPeek = remember(isPlaylistPlayback, peekPlaylists, peekActive, playlistUpNext) {
+        if (!isPlaylistPlayback) {
+            "" to emptyList()
+        } else {
+            buildPlaylistPeek(
+                playlist = peekActive?.let { active -> peekPlaylists.firstOrNull { it.id == active.playlistId } },
+                currentEntryId = peekActive?.entryId,
+                upNext = playlistUpNext,
+            )
+        }
+    }
+    val playlistPreparedSource = (playlistPrepared as? com.nuvio.app.features.playlist.PlaylistHandoff.Stream)
+        ?.stream?.addonName
+    val playlistStatus = when {
+        playlistCardEntry == null -> ""
         nextEpisodeAutoPlaySearching -> stringResource(Res.string.player_next_episode_finding_source)
         !nextEpisodeAutoPlaySourceName.isNullOrBlank() && nextEpisodeAutoPlayCountdown != null ->
             stringResource(
@@ -253,7 +368,47 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                 nextEpisodeAutoPlaySourceName.orEmpty(),
                 nextEpisodeAutoPlayCountdown ?: 0,
             )
+        playlistHandedOff -> localizedString(Res.string.playlist_player_starting)
+        playlistPreparedSource != null -> localizedString(Res.string.playlist_player_ready_source, playlistPreparedSource)
+        playlistPrepared is com.nuvio.app.features.playlist.PlaylistHandoff.Downloaded -> localizedString(Res.string.playlist_player_ready_downloaded)
         else -> ""
+    }
+    val nextEpisodeStatus = when {
+        nextEpisodeForControls == null -> ""
+        !nextEpisodeForControls.hasAired && !nextEpisodeForControls.unairedMessage.isNullOrBlank() ->
+            nextEpisodeForControls.unairedMessage.orEmpty()
+        nextEpisodeAutoPlaySearching -> stringResource(Res.string.player_next_episode_finding_source)
+        !nextEpisodeAutoPlaySourceName.isNullOrBlank() && nextEpisodeAutoPlayCountdown != null ->
+            nextEpisodeAutoPlaySourceName.orEmpty()
+        else -> ""
+    }
+    val nextEpisodeCardVisible = (nextEpisodeForControls != null || playlistCardEntry != null) && !playerControlsLocked
+    val nextEpisodeCardPlayable = playlistCardEntry != null ||
+        (nextEpisodeForControls?.hasAired == true && !manualSwitchIsNonSequential)
+    val nextEpisodeCardKey = remember(activeVideoId, nextEpisodeForControls, playlistCardEntry) {
+        "${activeVideoId.orEmpty()}:${nextEpisodeForControls?.hashCode() ?: 0}:${playlistCardEntry?.hashCode() ?: 0}"
+    }
+    var nextEpisodeShownAtMs by remember(nextEpisodeCardKey) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(nextEpisodeCardVisible, nextEpisodeCardKey) {
+        if (nextEpisodeCardVisible && nextEpisodeShownAtMs == null) {
+            nextEpisodeShownAtMs = playbackSnapshot.positionMs
+        } else if (!nextEpisodeCardVisible) {
+            nextEpisodeShownAtMs = null
+        }
+    }
+    val nextEpisodeProgress = when {
+        !nextEpisodeCardVisible || !nextEpisodeCardPlayable -> -1f
+        nextEpisodeAutoPlayCountdown != null -> {
+            val remaining = (nextEpisodeAutoPlayCountdown ?: 0).coerceIn(0, 3)
+            ((4 - remaining).coerceIn(1, 3) / 3f)
+        }
+        nextEpisodeAutoPlaySearching -> 0f
+        playbackSnapshot.durationMs > 0L && nextEpisodeShownAtMs != null -> {
+            val start = nextEpisodeShownAtMs ?: 0L
+            val span = (playbackSnapshot.durationMs - start).coerceAtLeast(1_000L)
+            ((playbackSnapshot.positionMs - start).toFloat() / span.toFloat()).coerceIn(0f, 1f)
+        }
+        else -> -1f
     }
     var isAnimeContent by remember(args.parentMetaId) {
         mutableStateOf(
@@ -292,275 +447,400 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         }
     }
 
+    val iptvControlState = rememberIptvControlState()
+    val stableLabels = playerControlsLabelsStable(nextEpisodeForControls)
     val playerControlsState = PlayerControlsState(
-        title = title,
+        // Live TV: the playing channel, which channel up/down changes after launch.
+        title = iptvControlState?.channelLabel ?: title,
+        iptv = iptvControlState,
         episodeText = episodeText,
         streamTitle = activeStreamTitle,
+        streamFilename = activeStreamFilename.orEmpty(),
         providerName = activeProviderName,
-        pauseOverlayWatchingLabel = stringResource(Res.string.compose_player_youre_watching),
-        pauseOverlayLogo = logo,
-        pauseOverlayEpisodeInfo = if (seasonNumber != null && episodeNumber != null) {
-            stringResource(Res.string.compose_player_episode_code_full, seasonNumber, episodeNumber)
-        } else if (playerSettingsUiState.desktopPauseOverlaySourceEnabled) {
-            // Movies borrow this line for the provider name; the source row now says it better, so
-            // don't print it twice.
-            ""
-        } else {
-            activeProviderName
-        },
-        pauseOverlayEpisodeTitle = activeEpisodeTitle.orEmpty(),
-        // Only a real synopsis belongs here — the raw stream/release name (activeStreamSubtitle)
-        // reads as messy clutter in the pause card, so it is intentionally not used as a fallback.
-        pauseOverlayDescription = activePauseDescription.orEmpty(),
-        pauseOverlaySourceEnabled = playerSettingsUiState.desktopPauseOverlaySourceEnabled,
+        isYouTubeVideo = parentMetaType == com.nuvio.app.features.youtube.YOUTUBE_META_TYPE,
+        pauseOverlay = PlayerPauseOverlayState(
+            pauseOverlayWatchingLabel = stringResource(Res.string.compose_player_youre_watching),
+            pauseOverlayLogo = logo,
+            // The episode code, or nothing. Movies used to borrow this line for the provider name, which
+            // put the addon (AIOUmbra) on the pause card exactly when "Show source while paused" was
+            // off; the provider now only ever appears in the source row that setting controls.
+            pauseOverlayEpisodeInfo = if (seasonNumber != null && episodeNumber != null) {
+                stringResource(Res.string.compose_player_episode_code_full, seasonNumber, episodeNumber)
+            } else {
+                ""
+            },
+            pauseOverlayEpisodeTitle = activeEpisodeTitle.orEmpty(),
+            // Only a real synopsis belongs here — the raw stream/release name (activeStreamSubtitle)
+            // reads as messy clutter in the pause card, so it is intentionally not used as a fallback.
+            pauseOverlayDescription = activePauseDescription.orEmpty(),
+            pauseOverlaySourceEnabled = playerSettingsUiState.desktopPauseOverlaySourceEnabled,
+            pauseOverlayEnabled = playerSettingsUiState.desktopPauseOverlayEnabled,
+            pauseOverlayCast = remember(playerMetaCast) {
+                playerMetaCast
+                    .filter { it.name.isNotBlank() }
+                    .take(PauseOverlayCastLimit)
+                    .map { person ->
+                        PlayerControlCastItem(
+                            name = person.name,
+                            role = person.role.orEmpty(),
+                            photo = person.photo.orEmpty(),
+                        )
+                    }
+            },
+        ),
         resizeModeLabel = stringResource(resizeMode.labelRes),
         playbackSpeedLabel = formatPlaybackSpeedLabel(playbackSnapshot.playbackSpeed),
-        subtitlesLabel = stringResource(Res.string.compose_player_subs),
-        audioLabel = stringResource(Res.string.compose_player_audio),
-        sourcesLabel = stringResource(Res.string.compose_player_sources),
-        episodesLabel = stringResource(Res.string.compose_player_episodes),
-        externalPlayerLabel = stringResource(Res.string.streams_open_external_player),
-        playLabel = stringResource(Res.string.detail_btn_play),
-        pauseLabel = stringResource(Res.string.compose_action_pause),
-        closeLabel = stringResource(Res.string.compose_player_close),
-        lockLabel = stringResource(Res.string.compose_player_lock_controls),
-        unlockLabel = stringResource(Res.string.compose_player_unlock_controls),
-        submitIntroLabel = stringResource(Res.string.submit_intro_action),
-        videoSettingsLabel = stringResource(Res.string.player_action_video_settings),
-        pictureInPictureLabel = stringResource(Res.string.compose_player_picture_in_picture),
-        pictureInPictureActive = pictureInPictureActive,
-        desktopHdrModeLabel = playerSettingsUiState.desktopHdrMode.label,
-        desktopColorProfileLabel = playerSettingsUiState.desktopColorProfile.label,
-        desktopColorContrast = playerSettingsUiState.desktopColorContrast,
-        desktopColorBrightness = playerSettingsUiState.desktopColorBrightness,
-        desktopColorSaturation = playerSettingsUiState.desktopColorSaturation,
-        desktopColorGamma = playerSettingsUiState.desktopColorGamma,
-        // Shows what is actually in effect: a session force wins; otherwise the persisted preset
-        // only counts when it would auto-apply (auto-detect on + detected anime), else "Off".
-        desktopAnimeModeLabel = playerSettingsUiState.desktopAnimeSessionOverride?.label
-            ?: if (playerSettingsUiState.desktopAnimeModeAutoEnabled && isAnimeContent) {
-                playerSettingsUiState.desktopAnimeMode.label
+        labels = PlayerControlLabels(
+            subtitlesLabel = stringResource(Res.string.compose_player_subs),
+            audioLabel = stringResource(Res.string.compose_player_audio),
+            sourcesLabel = if (youTubeVideo) "Comments" else stringResource(Res.string.compose_player_sources),
+            episodesLabel = if (youTubeVideo) "Related" else stringResource(Res.string.compose_player_episodes),
+            externalPlayerLabel = stringResource(Res.string.streams_open_external_player),
+            playLabel = stringResource(Res.string.detail_btn_play),
+            pauseLabel = stringResource(Res.string.compose_action_pause),
+            closeLabel = stringResource(Res.string.compose_player_close),
+            lockLabel = stringResource(Res.string.compose_player_lock_controls),
+            unlockLabel = stringResource(Res.string.compose_player_unlock_controls),
+            submitIntroLabel = stringResource(Res.string.submit_intro_action),
+            videoSettingsLabel = stringResource(Res.string.player_action_video_settings),
+            pictureInPictureLabel = stringResource(Res.string.compose_player_picture_in_picture),
+            tapToUnlockLabel = stringResource(Res.string.compose_player_tap_to_unlock),
+            playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
+            playbackErrorActionLabel = stringResource(Res.string.compose_player_go_back),
+            sourcesPanelTitle = if (youTubeVideo) "Comments" else stableLabels.sourcesPanelTitle,
+            episodesPanelTitle = if (youTubeVideo) "Related videos" else stringResource(Res.string.compose_player_panel_episodes),
+            streamsPanelTitle = stringResource(Res.string.compose_player_panel_streams),
+            allFilterLabel = allFilterLabel,
+            reloadLabel = stringResource(Res.string.compose_action_reload),
+            backLabel = stringResource(Res.string.action_back),
+            panelCloseLabel = stringResource(Res.string.action_close),
+            cancelLabel = stringResource(Res.string.action_cancel),
+            playingLabel = playingLabel,
+            noStreamsLabel = if (youTubeVideo) {
+                "No comments, or comments are turned off for this video."
             } else {
-                DesktopAnimeMode.Off.label
+                stringResource(Res.string.compose_player_no_streams_found)
             },
-        desktopAnimeSvpEnabled = playerSettingsUiState.desktopAnimeSvpEnabled,
-        playbackInfoPanelEnabled = playerSettingsUiState.desktopPlaybackInfoPanelEnabled,
-        activeSubtitleLabel = activePlaybackSubtitleLabel(),
-        seekThumbnailsEnabled = playerSettingsUiState.desktopSeekThumbnailsEnabled &&
-            playerSettingsUiState.desktopBufferPreset != DesktopBufferPreset.Metered,
-        seekStepSeconds = playerSettingsUiState.seekStepSeconds,
-        tapToUnlockLabel = stringResource(Res.string.compose_player_tap_to_unlock),
-        playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
+            noEpisodesLabel = if (youTubeVideo) "No related videos." else stringResource(Res.string.compose_player_no_episodes_available),
+            p2pConsentTitle = stringResource(Res.string.p2p_consent_title),
+            p2pConsentBody = stringResource(Res.string.p2p_consent_body),
+            p2pConsentEnableLabel = stringResource(Res.string.p2p_consent_enable),
+            p2pConsentCancelLabel = stringResource(Res.string.p2p_consent_cancel),
+            onLabel = stringResource(Res.string.compose_action_on),
+            offLabel = stringResource(Res.string.compose_action_off),
+        ),
+        pictureInPictureActive = pictureInPictureActive,
+        video = PlayerControlVideoState(
+            desktopHdrModeLabel = stringResource(playerSettingsUiState.desktopHdrMode.labelRes),
+            desktopColorProfileLabel = stringResource(playerSettingsUiState.desktopColorProfile.labelRes),
+            desktopColorContrast = playerSettingsUiState.desktopColorContrast,
+            desktopColorBrightness = playerSettingsUiState.desktopColorBrightness,
+            desktopColorSaturation = playerSettingsUiState.desktopColorSaturation,
+            desktopColorGamma = playerSettingsUiState.desktopColorGamma,
+            // Shows what is actually in effect: a session force wins; otherwise the persisted preset
+            // only counts when it would auto-apply (auto-detect on + detected anime), else "Off".
+            // Both labels are looked up before choosing (see [playerControlsLabelsStable]): a lookup only
+            // when no session force is set made picking a shader shift every composable after it, the
+            // player surface among them, which restarted playback and dropped the force it was for.
+            desktopAnimeModeLabel = playerSettingsUiState.desktopAnimeSessionOverride?.label
+                ?: if (playerSettingsUiState.desktopAnimeModeAutoEnabled && isAnimeContent) {
+                    stableLabels.animeModePreset
+                } else {
+                    stableLabels.animeModeOff
+                },
+            desktopAnimeSvpEnabled = playerSettingsUiState.desktopAnimeSvpEnabled,
+            rtxVsrEnabled = playerSettingsUiState.effectiveRtxVsrEnabled,
+            rtxTrueHdrEnabled = playerSettingsUiState.effectiveRtxTrueHdrEnabled,
+        ),
+        hud = PlayerHudSettings(
+            playbackInfoPanelEnabled = playerSettingsUiState.desktopPlaybackInfoPanelEnabled,
+            seekStepSeconds = playerSettingsUiState.seekStepSeconds,
+            posterHighlightMode = posterCardStyle.posterHighlightMode.name,
+            mouseMoveRevealsControlsEnabled = playerSettingsUiState.mouseMoveRevealsControlsEnabled,
+            streamFailoverEnabled = playerSettingsUiState.streamFailoverEnabled,
+            legacyHudEnabled = playerSettingsUiState.desktopLegacyHudEnabled,
+            minimalHudEnabled = playerSettingsUiState.desktopMinimalHudEnabled,
+            minimalHudPillsEnabled = playerSettingsUiState.desktopMinimalHudPillsEnabled,
+            dockPanelFromBarEnabled = playerSettingsUiState.desktopDockPanelFromBarEnabled,
+            ultraHudEnabled = playerSettingsUiState.desktopUltraHudEnabled,
+            officialHudEnabled = playerSettingsUiState.desktopOfficialHudEnabled,
+            seekHandleEnabled = playerSettingsUiState.desktopSeekHandleEnabled,
+            hudVignetteEnabled = playerSettingsUiState.desktopHudVignetteEnabled,
+            hiddenHudButtons = playerSettingsUiState.desktopHiddenHudButtons.sorted().joinToString(","),
+            hudButtonOrder = playerSettingsUiState.desktopHudButtonOrder.joinToString(","),
+            alwaysShowClock = playerSettingsUiState.desktopAlwaysShowClockEnabled,
+            playbackSpeedFineIncrementsEnabled = playerSettingsUiState.desktopPlaybackSpeedFineIncrementsEnabled,
+            zoneInput = playerSettingsUiState.desktopPlayerZoneInput.hudKey,
+            zoneActions = playerSettingsUiState.desktopPlayerZoneActions.hudValue(
+                playerSettingsUiState.desktopPlayerZoneInput,
+            ),
+            playbackSpeedToggleLow = playerSettingsUiState.playbackSpeedToggleLow,
+            playbackSpeedToggleHigh = playerSettingsUiState.playbackSpeedToggleHigh,
+            uiScalePercent = playerSettingsUiState.desktopUiScalePercent,
+            controlIconScalePercent = playerSettingsUiState.desktopControlIconScalePercent,
+            uiFontFamily = MaterialTheme.appFontFamilyName,
+            sourceNotchPosition = playerSettingsUiState.desktopSourceNotchPosition.name.lowercase(),
+            sourceNotchHoverEnabled = playerSettingsUiState.desktopSourceNotchHoverEnabled,
+            notificationPosition = playerSettingsUiState.desktopPlayerNotificationPosition.webValue,
+        ),
+        subtitles = PlayerControlSubtitlesState(
+            activeSubtitleLabel = activePlaybackSubtitleLabel(),
+            assStyleModeValueLabel = subtitleStyle.assStyleMode.label,
+            subtitleActiveTab = activeSubtitleTab.name,
+            addonSubtitleItems = playerControlAddonSubtitles,
+            builtInSubtitleFilterActive = builtInSubtitleFilterActive,
+            builtInSubtitleItems = playerControlBuiltInSubtitles,
+            isLoadingAddonSubtitles = isLoadingAddonSubtitles,
+            selectedAddonSubtitleId = selectedAddonSubtitleId.orEmpty(),
+            useCustomSubtitles = useCustomSubtitles,
+            subtitleStyle = subtitleStyle,
+            subtitleFontFamilies = availableSubtitleFontFamilies(),
+            subtitleDelayMs = subtitleDelayMs,
+            hasSelectedAddonSubtitle = selectedAddonSubtitle != null,
+            subtitleAutoSyncCapturedPositionMs = subtitleAutoSyncState.capturedPositionMs ?: -1L,
+            subtitleAutoSyncCues = playerControlAutoSyncCues,
+            subtitleAutoSyncIsLoading = subtitleAutoSyncState.isLoading,
+            subtitleAutoSyncErrorMessage = subtitleAutoSyncState.errorMessage.orEmpty(),
+        ),
+        seekPreview = PlayerSeekPreviewState(
+            // The native decoder stands down while Seekr has (or is still fetching) this playback's
+            // sprites, and takes over again only if Seekr has nothing for it.
+            // Likewise for a YouTube video's storyboard, which comes from YouTube's image servers.
+            seekThumbnailsEnabled = seekrTrack == null && !seekrLookupPending &&
+                youTubeStoryboardShown == null && !(youTubeVideo && youTubeStoryboardPending) && seekThumbnailsAllowed(
+                mode = playerSettingsUiState.desktopSeekThumbnailMode,
+                bufferPreset = playerSettingsUiState.desktopBufferPreset,
+                sourceUrl = activeSourceUrl,
+                isTorrent = activeTorrentInfoHash != null,
+                seekrServiceOff = SeekrPreviews.serviceDisabled,
+            ),
+            seekrVttUrl = seekrTrack?.vttUrl.orEmpty(),
+            seekrScale = seekrTrack?.scale ?: 1.0,
+            storyboardUrl = youTubeStoryboardShown?.sheetUrl.orEmpty(),
+            storyboardWidth = youTubeStoryboardShown?.width ?: 0,
+            storyboardHeight = youTubeStoryboardShown?.height ?: 0,
+            storyboardColumns = youTubeStoryboardShown?.columns ?: 0,
+            storyboardRows = youTubeStoryboardShown?.rows ?: 0,
+            storyboardCount = youTubeStoryboardShown?.count ?: 0,
+            storyboardIntervalMs = youTubeStoryboardShown?.intervalMs ?: 0L,
+        ),
         playbackErrorMessage = errorMessage.orEmpty(),
-        playbackErrorActionLabel = stringResource(Res.string.compose_player_go_back),
-        sourcesPanelTitle = pendingSourcesEpisode?.let { pending ->
-            stringResource(
-                Res.string.compose_player_panel_sources_for_episode,
-                stringResource(
-                    Res.string.compose_player_episode_title_format,
-                    pending.playbackSeasonNumber() ?: 1,
-                    pending.playbackEpisodeNumber() ?: 0,
-                    pending.title.orEmpty(),
-                ),
-            )
-        } ?: stringResource(Res.string.compose_player_panel_sources),
-        episodesPanelTitle = stringResource(Res.string.compose_player_panel_episodes),
-        streamsPanelTitle = stringResource(Res.string.compose_player_panel_streams),
-        allFilterLabel = allFilterLabel,
-        reloadLabel = stringResource(Res.string.compose_action_reload),
-        backLabel = stringResource(Res.string.action_back),
-        panelCloseLabel = stringResource(Res.string.action_close),
-        cancelLabel = stringResource(Res.string.action_cancel),
-        playingLabel = playingLabel,
-        noStreamsLabel = stringResource(Res.string.compose_player_no_streams_found),
-        noEpisodesLabel = stringResource(Res.string.compose_player_no_episodes_available),
-        submitIntroPanelTitle = stringResource(Res.string.submit_intro_title),
-        submitIntroSegmentTypeLabel = stringResource(Res.string.submit_intro_segment_type_label),
-        submitIntroSegmentIntroLabel = stringResource(Res.string.submit_intro_segment_intro),
-        submitIntroSegmentRecapLabel = stringResource(Res.string.submit_intro_segment_recap),
-        submitIntroSegmentOutroLabel = stringResource(Res.string.submit_intro_segment_outro),
-        submitIntroSegmentPreviewLabel = stringResource(Res.string.submit_intro_segment_preview),
-        submitIntroStartTimeLabel = stringResource(Res.string.submit_intro_start_time_label),
-        submitIntroEndTimeLabel = stringResource(Res.string.submit_intro_end_time_label),
-        submitIntroCaptureLabel = stringResource(Res.string.submit_intro_capture_button),
-        submitIntroSubmitLabel = stringResource(Res.string.submit_intro_button_submit),
-        p2pConsentTitle = stringResource(Res.string.p2p_consent_title),
-        p2pConsentBody = stringResource(Res.string.p2p_consent_body),
-        p2pConsentEnableLabel = stringResource(Res.string.p2p_consent_enable),
-        p2pConsentCancelLabel = stringResource(Res.string.p2p_consent_cancel),
-        subtitlesPanelTitle = stringResource(Res.string.compose_player_subtitles),
-        subtitleBuiltInTabLabel = stringResource(Res.string.compose_player_built_in),
-        subtitleAddonsTabLabel = stringResource(Res.string.addon_title),
-        subtitleStyleTabLabel = stringResource(Res.string.compose_player_style),
-        noneLabel = stringResource(Res.string.compose_player_none),
-        fetchSubtitlesLabel = stringResource(Res.string.compose_player_fetch_subtitles),
-        downloadSubtitleLabel = stringResource(Res.string.compose_player_download_subtitle),
-        subtitleDelayLabel = stringResource(Res.string.compose_player_subtitle_delay),
-        resetLabel = stringResource(Res.string.compose_player_reset),
-        autoSyncLabel = stringResource(Res.string.compose_player_auto_sync),
-        reloadSmallLabel = stringResource(Res.string.compose_player_reload),
-        captureLineLabel = stringResource(Res.string.compose_player_capture_line),
-        selectAddonSubtitleFirstLabel = stringResource(Res.string.compose_player_select_addon_subtitle_first),
-        loadingSubtitleLinesLabel = stringResource(Res.string.compose_player_loading_lines),
-        fontSizeLabel = stringResource(Res.string.compose_player_font_size),
-        outlineLabel = stringResource(Res.string.compose_player_outline),
-        outlineWidthLabel = stringResource(Res.string.compose_player_outline_width),
-        shadowLabel = stringResource(Res.string.compose_player_shadow),
-        shadowOffsetLabel = stringResource(Res.string.compose_player_shadow_offset),
-        shadowColorLabel = stringResource(Res.string.compose_player_shadow_color),
-        shadowIntensityLabel = stringResource(Res.string.compose_player_shadow_intensity),
-        blurLabel = stringResource(Res.string.compose_player_blur),
-        boldLabel = stringResource(Res.string.compose_player_bold),
-        italicLabel = stringResource(Res.string.compose_player_italic),
-        bottomOffsetLabel = stringResource(Res.string.compose_player_bottom_offset),
-        assStyleModeLabel = stringResource(Res.string.player_subtitle_ass_mode),
-        assScaleLabel = stringResource(Res.string.player_subtitle_ass_scale),
-        assStyleModeValueLabel = subtitleStyle.assStyleMode.label,
-        colorLabel = stringResource(Res.string.compose_player_color),
-        textOpacityLabel = stringResource(Res.string.compose_player_text_opacity),
-        outlineColorLabel = stringResource(Res.string.compose_player_outline_color),
-        backgroundColorLabel = stringResource(Res.string.compose_player_background_color),
-        resetDefaultsLabel = stringResource(Res.string.compose_player_reset_defaults),
-        onLabel = stringResource(Res.string.compose_action_on),
-        offLabel = stringResource(Res.string.compose_action_off),
-        themeAccentColor = themeColors.accent.toCssColorString(),
-        posterHighlightMode = posterCardStyle.posterHighlightMode.name,
-        themeAccentStrongColor = themeColors.accentStrong.toCssColorString(),
-        // Angle and stops both come from the same place the Compose brush gets them, so the HUD
-        // turns with the rest of the app and shares its perceptual spacing rather than falling back
-        // to the browser's own two-stop sRGB ramp.
-        themeAccentFill = themeColors.accentGradientEnd
-            ?.let { end ->
-                val stops = accentGradientStops(themeColors.accent, end)
-                val css = stops.mapIndexed { index, color ->
-                    val percent = index * 100 / (stops.size - 1)
-                    "${color.toCssColorString()} $percent%"
-                }.joinToString()
-                "linear-gradient(${themeColors.accentGradientDirection.cssAngle}deg, $css)"
-            }
-            ?: themeColors.accent.toCssColorString(),
-        themeOnAccentColor = themeColors.onAccent.toCssColorString(),
-        themeFocusColor = themeColors.focusRing.toCssColorString(),
-        themeSelectedSurfaceColor = themeColors.accent.copy(alpha = 0.24f).toCssColorString(),
-        themeSelectedSurfaceHoverColor = themeColors.accent.copy(alpha = 0.34f).toCssColorString(),
-        themeSelectedRingColor = themeColors.accent.copy(alpha = 0.35f).toCssColorString(),
-        themeTimelineFillColor = themeColors.playerTimelineFill.toCssColorString(),
-        themeTimelineTrackColor = themeColors.playerTimelineTrack.toCssColorString(),
-        themeBufferingColor = themeColors.playerBuffering.toCssColorString(),
-        themeBufferingTrackColor = themeColors.playerBuffering.copy(alpha = 0.28f).toCssColorString(),
-        themeControlForegroundColor = themeColors.playerControlsForeground.toCssColorString(),
+        submitIntro = PlayerSubmitIntroState(
+            submitIntroPanelTitle = stringResource(Res.string.submit_intro_title),
+            submitIntroSegmentTypeLabel = stringResource(Res.string.submit_intro_segment_type_label),
+            submitIntroSegmentIntroLabel = stringResource(Res.string.submit_intro_segment_intro),
+            submitIntroSegmentRecapLabel = stringResource(Res.string.submit_intro_segment_recap),
+            submitIntroSegmentOutroLabel = stringResource(Res.string.submit_intro_segment_outro),
+            submitIntroSegmentPreviewLabel = stringResource(Res.string.submit_intro_segment_preview),
+            submitIntroStartTimeLabel = stringResource(Res.string.submit_intro_start_time_label),
+            submitIntroEndTimeLabel = stringResource(Res.string.submit_intro_end_time_label),
+            submitIntroCaptureLabel = stringResource(Res.string.submit_intro_capture_button),
+            submitIntroSubmitLabel = stringResource(Res.string.submit_intro_button_submit),
+            submitIntroSegmentType = submitIntroSegmentType,
+            submitIntroStartTime = submitIntroStartTimeStr,
+            submitIntroEndTime = submitIntroEndTimeStr,
+            isSubmitIntroSubmitting = isSubmitIntroSubmitting,
+            submitIntroStatusMessage = submitIntroStatusMessage.orEmpty(),
+        ),
+        subtitleLabels = PlayerControlSubtitleLabels(
+            subtitlesPanelTitle = stringResource(Res.string.compose_player_subtitles),
+            subtitleBuiltInTabLabel = stringResource(Res.string.compose_player_built_in),
+            subtitleAddonsTabLabel = stringResource(Res.string.addon_title),
+            subtitleStyleTabLabel = stringResource(Res.string.compose_player_style),
+            noneLabel = stringResource(Res.string.compose_player_none),
+            fetchSubtitlesLabel = stringResource(Res.string.compose_player_fetch_subtitles),
+            downloadSubtitleLabel = stringResource(Res.string.compose_player_download_subtitle),
+            autoSyncedSubtitleLabel = stringResource(Res.string.compose_player_subtitle_auto_synced),
+            subtitleDelayLabel = stringResource(Res.string.compose_player_subtitle_delay),
+            resetLabel = stringResource(Res.string.compose_player_reset),
+            autoSyncLabel = stringResource(Res.string.compose_player_auto_sync),
+            reloadSmallLabel = stringResource(Res.string.compose_player_reload),
+            captureLineLabel = stringResource(Res.string.compose_player_capture_line),
+            selectAddonSubtitleFirstLabel = stringResource(Res.string.compose_player_select_addon_subtitle_first),
+            loadingSubtitleLinesLabel = stringResource(Res.string.compose_player_loading_lines),
+            fontSizeLabel = stringResource(Res.string.compose_player_font_size),
+            outlineLabel = stringResource(Res.string.compose_player_outline),
+            outlineWidthLabel = stringResource(Res.string.compose_player_outline_width),
+            shadowLabel = stringResource(Res.string.compose_player_shadow),
+            shadowOffsetLabel = stringResource(Res.string.compose_player_shadow_offset),
+            shadowColorLabel = stringResource(Res.string.compose_player_shadow_color),
+            shadowIntensityLabel = stringResource(Res.string.compose_player_shadow_intensity),
+            blurLabel = stringResource(Res.string.compose_player_blur),
+            boldLabel = stringResource(Res.string.compose_player_bold),
+            italicLabel = stringResource(Res.string.compose_player_italic),
+            bottomOffsetLabel = stringResource(Res.string.compose_player_bottom_offset),
+            assStyleModeLabel = stringResource(Res.string.player_subtitle_ass_mode),
+            assScaleLabel = stringResource(Res.string.player_subtitle_ass_scale),
+            colorLabel = stringResource(Res.string.compose_player_color),
+            textOpacityLabel = stringResource(Res.string.compose_player_text_opacity),
+            outlineColorLabel = stringResource(Res.string.compose_player_outline_color),
+            backgroundColorLabel = stringResource(Res.string.compose_player_background_color),
+            resetDefaultsLabel = stringResource(Res.string.compose_player_reset_defaults),
+        ),
+        theme = PlayerControlTheme(
+            themeAccentColor = themeColors.accent.toCssColorString(),
+            themeAccentStrongColor = themeColors.accentStrong.toCssColorString(),
+            // Angle and stops both come from the same place the Compose brush gets them, so the HUD
+            // turns with the rest of the app and shares its perceptual spacing rather than falling back
+            // to the browser's own two-stop sRGB ramp.
+            themeAccentFill = themeColors.accentGradientEnd
+                ?.let { end ->
+                    val stops = accentGradientStops(themeColors.accent, end)
+                    val css = stops.mapIndexed { index, color ->
+                        val percent = index * 100 / (stops.size - 1)
+                        "${color.toCssColorString()} $percent%"
+                    }.joinToString()
+                    "linear-gradient(${themeColors.accentGradientDirection.cssAngle}deg, $css)"
+                }
+                ?: themeColors.accent.toCssColorString(),
+            themeOnAccentColor = themeColors.onAccent.toCssColorString(),
+            themeFocusColor = themeColors.focusRing.toCssColorString(),
+            themeSelectedSurfaceColor = themeColors.accent.copy(alpha = 0.24f).toCssColorString(),
+            themeSelectedSurfaceHoverColor = themeColors.accent.copy(alpha = 0.34f).toCssColorString(),
+            themeSelectedRingColor = themeColors.accent.copy(alpha = 0.35f).toCssColorString(),
+            themeTimelineFillColor = themeColors.playerTimelineFill.toCssColorString(),
+            themeTimelineTrackColor = themeColors.playerTimelineTrack.toCssColorString(),
+            themeBufferingColor = themeColors.playerBuffering.toCssColorString(),
+            themeBufferingTrackColor = themeColors.playerBuffering.copy(alpha = 0.28f).toCssColorString(),
+            themeControlForegroundColor = themeColors.playerControlsForeground.toCssColorString(),
+        ),
         isPlaying = playbackSnapshot.isPlaying,
         isLoading = playbackSnapshot.isLoading,
         isLocked = playerControlsLocked,
         lockedOverlayVisible = lockedOverlayVisible,
         controlsVisible = controlsVisible && !playerControlsLocked,
-        mouseMoveRevealsControlsEnabled = playerSettingsUiState.mouseMoveRevealsControlsEnabled,
-        streamFailoverEnabled = playerSettingsUiState.streamFailoverEnabled,
-        legacyHudEnabled = playerSettingsUiState.desktopLegacyHudEnabled,
-        alwaysShowClock = playerSettingsUiState.desktopAlwaysShowClockEnabled,
-        playbackSpeedFineIncrementsEnabled = playerSettingsUiState.desktopPlaybackSpeedFineIncrementsEnabled,
-        playbackSpeedToggleLow = playerSettingsUiState.playbackSpeedToggleLow,
-        playbackSpeedToggleHigh = playerSettingsUiState.playbackSpeedToggleHigh,
-        uiScalePercent = playerSettingsUiState.desktopUiScalePercent,
-        controlIconScalePercent = playerSettingsUiState.desktopControlIconScalePercent,
-        uiFontFamily = MaterialTheme.appFontFamilyName,
-        sourceNotchPosition = playerSettingsUiState.desktopSourceNotchPosition.name.lowercase(),
-        sourceNotchHoverEnabled = playerSettingsUiState.desktopSourceNotchHoverEnabled,
-        notificationPosition = playerSettingsUiState.desktopPlayerNotificationPosition.webValue,
         parentalWarnings = parentalWarnings,
         showParentalGuide = showParentalGuide,
         // Films are submittable too: SkipDB takes them with no season or episode, and holds opening
         // title sequences and end credits for them.
-        showSubmitIntro = playerSettingsUiState.introSubmitEnabled &&
+        // Not for a YouTube tab video: SponsorBlock has its segments, and no intro database holds it.
+        showSubmitIntro = !youTubeVideo && playerSettingsUiState.introSubmitEnabled &&
             (
                 playerSettingsUiState.skipDbApiKey.isNotBlank() ||
                     playerSettingsUiState.introDbApiKey.isNotBlank()
                 ) &&
             !activeSubmitIntroImdbId().isNullOrBlank(),
         showVideoSettings = isIos,
-        showSources = activeVideoId != null,
-        showEpisodes = isSeries,
-        showExternalPlayer = args.onOpenInExternalPlayer != null,
+        showSources = activeVideoId != null && !isIptvPlayback,
+        showEpisodes = (isSeries && !isIptvPlayback) || (youTubeVideo && youTubeRelated.isNotEmpty()),
+        // A YouTube tab video's picture and sound are two streams another player would not be handed together.
+        showExternalPlayer = args.onOpenInExternalPlayer != null && !youTubeVideo,
         durationMs = playbackSnapshot.durationMs,
         positionMs = displayedPositionMs,
-        chapters = playerChapters,
-        sourceIsLoading = sourceStreamsState.isAnyLoading,
-        sourceBadgePlacement = streamBadgeSettings.badgePlacement.name.lowercase(),
-        sourceFilters = sourceFilters,
-        sourceItems = sourceItems,
-        episodeItems = episodeItems,
-        episodeFallbackThumbnail = episodeFallbackThumbnail,
-        episodeSeasons = episodeSeasons,
-        episodeStreamsVisible = episodeStreamsPanelState.showStreams,
-        episodeStreamsIsLoading = episodeStreamsRepoState.isAnyLoading,
-        selectedEpisodeLabel = selectedEpisodeLabel,
-        episodeStreamFilters = episodeStreamFilters,
-        episodeStreamItems = episodeStreamItems,
-        submitIntroSegmentType = submitIntroSegmentType,
-        submitIntroStartTime = submitIntroStartTimeStr,
-        submitIntroEndTime = submitIntroEndTimeStr,
-        isSubmitIntroSubmitting = isSubmitIntroSubmitting,
-        submitIntroStatusMessage = submitIntroStatusMessage.orEmpty(),
+        // A YouTube video's sponsors and self-promotion: coloured on the bar and named as chapters.
+        seekBar = if (youTubeVideo) {
+            PlayerSeekBarState(
+                chapters = com.nuvio.app.features.youtube.withSponsorChapters(playerChapters, communitySkipIntervals),
+                segments = com.nuvio.app.features.youtube.sponsorSeekSegments(communitySkipIntervals),
+            )
+        } else {
+            PlayerSeekBarState(chapters = playerChapters)
+        },
+        sources = PlayerControlSourcesState(
+            sourceIsLoading = if (youTubeVideo) youTubeCommentsLoading else sourceStreamsState.isAnyLoading,
+            sourceBadgePlacement = streamBadgeSettings.badgePlacement.name.lowercase(),
+            // Comments have no addons to filter by and nothing to sort.
+            sourceFilters = if (youTubeVideo) emptyList() else sourceFilters,
+            sourceItems = sourceItems,
+            sourceSortOptions = if (youTubeVideo) emptyList() else sourceSortOptions,
+            sourceSortLabel = if (streamBadgeSettings.listSortOrder == StreamListSortOrder.DEFAULT) {
+                "Sort"
+            } else {
+                streamBadgeSettings.listSortOrder.label
+            },
+            sourceCachedFirst = streamBadgeSettings.listCachedFirst,
+        ),
+        episodes = PlayerControlEpisodesState(
+            episodeItems = episodeItems,
+            episodeFallbackThumbnail = episodeFallbackThumbnail,
+            episodeSeasons = if (youTubeVideo) emptyList() else episodeSeasons,
+            episodeStreamsVisible = episodeStreamsPanelState.showStreams,
+            episodeStreamsIsLoading = episodeStreamsRepoState.isAnyLoading,
+            selectedEpisodeLabel = selectedEpisodeLabel,
+            episodeStreamFilters = episodeStreamFilters,
+            episodeStreamItems = episodeStreamItems,
+        ),
         showP2pConsent = playerControlsPendingP2pSwitch != null,
-        subtitleActiveTab = activeSubtitleTab.name,
-        addonSubtitleItems = playerControlAddonSubtitles,
-        builtInSubtitleFilterActive = builtInSubtitleFilterActive,
-        builtInSubtitleItems = playerControlBuiltInSubtitles,
-        audioTrackFilterActive = audioTrackFilterActive,
-        audioTrackItems = playerControlAudioTracks,
-        isLoadingAddonSubtitles = isLoadingAddonSubtitles,
-        selectedAddonSubtitleId = selectedAddonSubtitleId.orEmpty(),
-        useCustomSubtitles = useCustomSubtitles,
-        subtitleStyle = subtitleStyle,
-        subtitleFontFamilies = availableSubtitleFontFamilies(),
-        subtitleDelayMs = subtitleDelayMs,
-        hasSelectedAddonSubtitle = selectedAddonSubtitle != null,
-        subtitleAutoSyncCapturedPositionMs = subtitleAutoSyncState.capturedPositionMs ?: -1L,
-        subtitleAutoSyncCues = playerControlAutoSyncCues,
-        subtitleAutoSyncIsLoading = subtitleAutoSyncState.isLoading,
-        subtitleAutoSyncErrorMessage = subtitleAutoSyncState.errorMessage.orEmpty(),
+        audioTracks = PlayerControlAudioTracksState(
+            audioTrackFilterActive = audioTrackFilterActive,
+            audioTrackItems = playerControlAudioTracks,
+        ),
         closeModalsToken = playerControlsCloseModalsToken,
         openSourcesToken = playerControlsOpenSourcesToken,
         sourcesPanelOpen = showSourcesPanel,
-        showOpeningOverlay = openingOverlayWanted,
-        openingArtwork = background ?: poster,
+        opening = PlayerOpeningOverlayState(
+            showOpeningOverlay = openingOverlayWanted,
+            openingArtwork = background ?: poster,
+            openingLogo = logo,
+            openingTitle = title,
+            openingMessage = p2pInitialLoadingMessage,
+            openingProgress = p2pInitialLoadingProgress,
+        ),
         // Poster first here, unlike openingArtwork: the flyout thumbnail is a small near-square
         // tile, which a portrait poster survives better than a cropped 16:9 backdrop.
         mediaSessionArtwork = poster ?: background ?: "",
-        openingLogo = logo,
-        openingTitle = title,
-        openingMessage = p2pInitialLoadingMessage,
-        openingProgress = p2pInitialLoadingProgress,
-        skipPromptVisible = nativeSkipInterval != null && !playerControlsLocked,
-        skipPromptLabel = skipPromptLabel(nativeSkipInterval?.type),
-        skipPromptStartMs = ((nativeSkipInterval?.startTime ?: 0.0) * 1000).toLong().coerceAtLeast(0L),
-        skipPromptEndMs = ((nativeSkipInterval?.endTime ?: 0.0) * 1000).toLong().coerceAtLeast(0L),
-        skipPromptDismissed = skipIntervalDismissed,
-        nextEpisodeVisible = nextEpisodeForControls != null && !playerControlsLocked,
-        nextEpisodeHeaderLabel = stringResource(Res.string.player_next_episode),
-        nextEpisodeTitle = nextEpisodeForControls?.let {
-            stringResource(
-                Res.string.compose_player_episode_title_format,
-                it.season,
-                it.episode,
-                it.title,
-            )
-        }.orEmpty(),
-        nextEpisodeThumbnail = nextEpisodeForControls?.thumbnail.orEmpty(),
-        nextEpisodeStatus = nextEpisodeStatus,
-        nextEpisodeActionLabel = if (nextEpisodeForControls?.hasAired == true) {
-            stringResource(Res.string.detail_btn_play)
-        } else {
-            stringResource(Res.string.player_next_episode_unaired)
-        },
-        nextEpisodePlayable = nextEpisodeForControls?.hasAired == true && !manualSwitchIsNonSequential,
+        skipPrompt = PlayerSkipPromptState(
+            skipPromptVisible = nativeSkipInterval != null && !playerControlsLocked,
+            skipPromptLabel = skipPromptLabel(
+                type = nativeSkipInterval?.type,
+                landsOnPostCredits = nativeSkipInterval?.let { activeSkipLanding(it).landsOnPostCredits } == true,
+                isMovie = !isSeries,
+            ),
+            skipPromptStartMs = ((nativeSkipInterval?.startTime ?: 0.0) * 1000).toLong().coerceAtLeast(0L),
+            skipPromptEndMs = ((nativeSkipInterval?.endTime ?: 0.0) * 1000).toLong().coerceAtLeast(0L),
+            skipPromptDismissed = skipIntervalDismissed,
+        ),
+        skipKeyAction = resolveSkipKeyAction(
+            skipPromptActionable = nativeSkipInterval != null && !playerControlsLocked && !skipIntervalDismissed,
+            nextEpisodeActionable = !playerControlsLocked && (
+                (
+                    nextEpisodeForControls != null &&
+                        nextEpisodeForControls.hasAired && !manualSwitchIsNonSequential
+                    ) || playlistCardEntry != null
+                ),
+        ),
+        skipSubmitToast = skipSubmitToastCopy(),
+        skipSubmitToastDismissible = isSkipSubmitToastDismissible(),
+        nextEpisode = PlayerNextEpisodeState(
+            nextEpisodeVisible = nextEpisodeCardVisible,
+            nextEpisodeHeaderLabel = if (playlistCardEntry != null) {
+                playlistUpNextHeader
+            } else {
+                stableLabels.nextEpisodeHeader
+            },
+            nextEpisodeTitle = if (playlistCardEntry != null) {
+                playlistCardEntry.displayTitle()
+            } else {
+                stableLabels.nextEpisodeTitle
+            },
+            nextEpisodeThumbnail = if (playlistCardEntry != null) {
+                (playlistCardEntry.episodeThumbnail ?: playlistCardEntry.background ?: playlistCardEntry.poster).orEmpty()
+            } else {
+                nextEpisodeForControls?.thumbnail.orEmpty()
+            },
+            nextEpisodeStatus = if (playlistCardEntry != null) playlistStatus else nextEpisodeStatus,
+            nextEpisodeActionLabel = if (playlistCardEntry != null || nextEpisodeForControls?.hasAired == true) {
+                stableLabels.nextEpisodePlay
+            } else {
+                stableLabels.nextEpisodeUnaired
+            },
+            nextEpisodePlayable = nextEpisodeCardPlayable,
+            nextEpisodeProgress = nextEpisodeProgress,
+            nextEpisodeSearching = nextEpisodeAutoPlaySearching,
+        ),
+        playlistPeekTitle = playlistPeek.first,
+        playlistPeekItems = playlistPeek.second,
+        party = rememberPartyControlsState(),
+        streamInfo = rememberStreamInfoState(),
     )
 
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
 
+    // fork:youtube-watch-page - the player as one piece, so a YouTube video's watch page can size and
+    // place it (YouTubeWatchFrame) without it leaving the composition.
+    val playerBox: @Composable (Modifier) -> Unit = { frameModifier ->
     Box(
-        modifier = Modifier
-            .fillMaxSize()
+        modifier = frameModifier
             .onSizeChanged { layoutSize = it }
             .then(
                 if (isDesktop && playerSettingsUiState.mouseMoveRevealsControlsEnabled) {
@@ -662,6 +942,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                         providerDiagnosticVideoSourceUrl = activeSourceUrl
                         providerDiagnosticProbePendingSourceUrl = null
                         lastTrustedPlaybackPositionMs = 0L
+                        initialResumeReached = false
                         lastMeaningfulPlaybackSnapshot = null
                         hasRequestedScrobbleStartForCurrentItem = false
                         scrobbleStartRequestGeneration += 1L
@@ -687,6 +968,17 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                         snapshot.positionMs in 1 until snapshot.durationMs
                     ) {
                         lastTrustedPlaybackPositionMs = snapshot.positionMs
+                        if (
+                            !initialResumeReached &&
+                            isResumeReached(
+                                trustedPositionMs = snapshot.positionMs,
+                                durationMs = snapshot.durationMs,
+                                initialPositionMs = activeInitialPositionMs,
+                                initialProgressFraction = activeInitialProgressFraction,
+                            )
+                        ) {
+                            initialResumeReached = true
+                        }
                     }
                     if (
                         !isProviderDiagnosticVideoPlayback &&
@@ -696,7 +988,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     ) {
                         lastMeaningfulPlaybackSnapshot = snapshot
                     }
-                    playbackSnapshot = snapshot
+                    // While the party sync nudges the speed by a few percent, report the party's
+                    // rate so the HUD and the party never see the nudge as a speed change.
+                    playbackSnapshot = if (partyRateNudge != null) snapshot.copy(playbackSpeed = partyBaseRate()) else snapshot
+                    playbackSnapshotMark = kotlin.time.TimeSource.Monotonic.markNow()
                     if (!snapshot.isLoading) initialLoadCompleted = true
                     if (!snapshot.isLoading && !defaultPlaybackSpeedApplied && !isProviderDiagnosticVideoPlayback) {
                         defaultPlaybackSpeedApplied = true
@@ -720,6 +1015,11 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     // Stop completion persistence/scrobbling before mpv's failed seek can expose
                     // its synthetic last-frame position to the EOF/autoplay effects.
                     playbackSourceFailureActive = true
+                    PlaybackErrorLog.error(playbackAttemptId, activeSourceUrl, message)
+                    if (isIptvPlayback) {
+                        handleIptvPlaybackError(message, playbackFailedToast)
+                        return@PlatformPlayerSurface
+                    }
 
                     val isRateLimited =
                         playbackErrorFailure(message) == PlaybackSourceFailure.DebridRateLimited
@@ -741,6 +1041,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
 
                     providerDiagnosticRecoveryAttemptedSourceUrl = failedUrl
                     controlsVisible = !playerControlsLocked
+                    PlaybackErrorLog.decision(playbackAttemptId, "provider diagnostic probe")
                     scope.launch {
                         val diagnostic = resolveProviderDiagnosticVideo(
                             sourceUrl = failedUrl,
@@ -755,6 +1056,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                             return@launch
                         }
 
+                        PlaybackErrorLog.decision(playbackAttemptId, "provider diagnostic video")
                         activateProviderDiagnosticVideo(diagnostic)
                     }
                 },
@@ -783,7 +1085,12 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             )
         }
 
-        RenderPlayerControls(displayedPositionMs = displayedPositionMs, isEpisode = isEpisode)
+        // Desktop playback always draws the native HTML HUD over the mpv surface. These Compose
+        // controls only ever sat underneath it, and showed through for the frame or two before
+        // the surface and its launch shield went up (seen on Continue Watching's last-link launch).
+        if (!isDesktop) {
+            RenderPlayerControls(displayedPositionMs = displayedPositionMs, isEpisode = isEpisode)
+        }
         RenderPlaybackOverlays(
             runtime = runtime,
             displayedPositionMs = displayedPositionMs,
@@ -797,6 +1104,53 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         )
         RenderPlayerModals(displayedPositionMs = displayedPositionMs)
     }
+    }
+    if (isYouTubeVideoPlayback) YouTubeWatchFrame(playerBox) else playerBox(Modifier.fillMaxSize())
+}
+
+internal class PlayerControlsStableLabels(
+    val animeModePreset: String,
+    val animeModeOff: String,
+    val nextEpisodeHeader: String,
+    val nextEpisodeTitle: String,
+    val nextEpisodePlay: String,
+    val nextEpisodeUnaired: String,
+    val sourcesPanelTitle: String,
+)
+
+/**
+ * The HUD labels whose choice changes while a file plays (a shader picked, the next episode found,
+ * the sources panel opened for another episode). Every lookup here runs on every composition, and
+ * only the chosen value differs: a `stringResource` inside one branch of an `?:` or `?.let` added or
+ * removed a composable call in RenderPlayerRuntimeUi, which shifted the groups after it and made
+ * Compose rebuild the player surface (playback restarting from the launch position).
+ */
+@Composable
+private fun PlayerScreenRuntime.playerControlsLabelsStable(nextEpisode: com.nuvio.app.features.player.skip.NextEpisodeInfo?): PlayerControlsStableLabels {
+    val pending = pendingSourcesEpisode
+    val pendingEpisodeTitle = stringResource(
+        Res.string.compose_player_episode_title_format,
+        pending?.playbackSeasonNumber() ?: 1,
+        pending?.playbackEpisodeNumber() ?: 0,
+        pending?.title.orEmpty(),
+    )
+    val sourcesForEpisode = stringResource(Res.string.compose_player_panel_sources_for_episode, pendingEpisodeTitle)
+    val sourcesDefault = stringResource(Res.string.compose_player_panel_sources)
+    val nextEpisodeTitle = stringResource(
+        Res.string.compose_player_episode_title_format,
+        nextEpisode?.season ?: 0,
+        nextEpisode?.episode ?: 0,
+        nextEpisode?.title.orEmpty(),
+    )
+    return PlayerControlsStableLabels(
+        animeModePreset = stringResource(playerSettingsUiState.desktopAnimeMode.labelRes),
+        animeModeOff = stringResource(DesktopAnimeMode.Off.labelRes),
+        nextEpisodeHeader = stringResource(Res.string.player_next_episode),
+        nextEpisodeTitle = if (nextEpisode != null) nextEpisodeTitle else "",
+        nextEpisodePlay = stringResource(Res.string.detail_btn_play),
+        nextEpisodeUnaired = stringResource(Res.string.player_next_episode_unaired),
+        sourcesPanelTitle = if (pending != null) sourcesForEpisode else sourcesDefault,
+    )
 }
 
 private fun PlayerScreenRuntime.presentUnrecoverablePlaybackError(
@@ -807,7 +1161,10 @@ private fun PlayerScreenRuntime.presentUnrecoverablePlaybackError(
     val isRateLimited = playbackErrorFailure(message) == PlaybackSourceFailure.DebridRateLimited
     // A provider-side rate limit is not an expired credential. Refreshing a signed URL here can
     // silently retry the same throttled provider and leave the user on the failed player longer.
-    if (!isRateLimited && tryRefreshCredentialedSourceAfterError(message)) return
+    if (!isRateLimited && tryRefreshCredentialedSourceAfterError(message)) {
+        PlaybackErrorLog.decision(playbackAttemptId, "refresh credentialed source")
+        return
+    }
     // Failover carries the same hazard on a rate limit: any hop onto the SAME throttled provider
     // just earns another 429 and deepens the throttle (rapid episode-switching walked the whole
     // list this way). Passing rateLimited scopes the walk to the failed source's provider — it
@@ -819,8 +1176,13 @@ private fun PlayerScreenRuntime.presentUnrecoverablePlaybackError(
             rateLimited = isRateLimited,
         )
     ) {
+        PlaybackErrorLog.decision(playbackAttemptId, "failover (see StreamFailover)")
         return
     }
+    PlaybackErrorLog.decision(
+        playbackAttemptId,
+        if (playerSettingsUiState.streamFailoverEnabled) "exit (failover did not apply)" else "exit (failover off)",
+    )
     exitAfterPlaybackFailure(message, playbackFailedToast)
 }
 
@@ -897,35 +1259,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             onSourcesClick = if (activeVideoId != null) { { openSourcesPanel() } } else null,
             onEpisodesClick = if (isSeries) { { openEpisodesPanel() } } else null,
-            onOpenInExternalPlayer = args.onOpenInExternalPlayer?.let { openExternal ->
-                {
-                    val loadedSubtitles = addonSubtitles
-                        .takeIf { it.isNotEmpty() }
-                        ?.map { sub ->
-                            SubtitleInput(
-                                url = sub.url,
-                                name = buildString {
-                                    if (!sub.addonName.isNullOrBlank()) append("[${sub.addonName}] ")
-                                    append(sub.display)
-                                },
-                                lang = sub.language,
-                            )
-                        }
-                    openExternal(
-                        ExternalPlayerPlaybackRequest(
-                            sourceUrl = activeSourceUrl,
-                            title = title,
-                            streamTitle = activeStreamTitle,
-                            sourceHeaders = activeSourceHeaders,
-                            resumePositionMs = playbackSnapshot.positionMs,
-                            subtitles = loadedSubtitles,
-                            season = activeSeasonNumber,
-                            episode = activeEpisodeNumber,
-                            episodeTitle = activeEpisodeTitle,
-                        ),
-                    )
-                }
-            },
+            onOpenInExternalPlayer = args.onOpenInExternalPlayer?.let { { openInExternalPlayer() } },
             onSubmitIntroClick = if (
                 isSeries &&
                 playerSettingsUiState.introSubmitEnabled &&
@@ -955,6 +1289,11 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
 }
 
 private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControlsAction): Boolean {
+    if (handleIptvControlsAction(action)) return true
+    if (handleYouTubeControlsAction(action)) return true
+    // Playback and seek actions normally fall through to mpv (return false). In a watch party they
+    // run here instead, so they can be shared with the party, or refused when only the host
+    // controls playback.
     when (action) {
         PlayerControlsAction.ToggleChrome -> {
             if (playerControlsLocked) {
@@ -965,32 +1304,53 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
         }
         PlayerControlsAction.RevealLockedOverlay -> revealLockedOverlay()
         PlayerControlsAction.Back -> {
+            // Escape with a submission toast asking something closes the toast, not the player.
+            if (isSkipSubmitToastDismissible()) {
+                dismissSkipSubmitToast()
+                return true
+            }
+            // fork:pip-browse - in the corner box Back belongs to the app around it; the box's X closes it.
+            if (PlayerBrowsePip.active.value) return true
+            // fork:youtube-mini-player - a YouTube tab video goes to the corner, the tab around it.
+            if (handleYouTubeMiniPlayerBack()) return true
             flushWatchProgress()
             args.onBack()
         }
         PlayerControlsAction.TogglePlayback -> {
-            prepareTogglePlaybackForNativeFallback()
-            return false
+            if (isPartySynced) togglePlayback() else {
+                prepareTogglePlaybackForNativeFallback()
+                return false
+            }
         }
         PlayerControlsAction.KeyboardTogglePlayback -> {
-            prepareTogglePlaybackForNativeFallback(revealControls = false)
-            return false
+            if (isPartySynced) togglePlayback(revealControls = false) else {
+                prepareTogglePlaybackForNativeFallback(revealControls = false)
+                return false
+            }
         }
         PlayerControlsAction.SeekBack -> {
-            prepareSeekByForNativeFallback(-seekStepMs)
-            return false
+            if (isPartySynced) seekBy(-seekStepMs) else {
+                prepareSeekByForNativeFallback(-seekStepMs)
+                return false
+            }
         }
         PlayerControlsAction.KeyboardSeekBack -> {
-            prepareSeekByForNativeFallback(-seekStepMs, revealControls = false)
-            return false
+            if (isPartySynced) seekBy(-seekStepMs, revealControls = false) else {
+                prepareSeekByForNativeFallback(-seekStepMs, revealControls = false)
+                return false
+            }
         }
         PlayerControlsAction.SeekForward -> {
-            prepareSeekByForNativeFallback(seekStepMs)
-            return false
+            if (isPartySynced) seekBy(seekStepMs) else {
+                prepareSeekByForNativeFallback(seekStepMs)
+                return false
+            }
         }
         PlayerControlsAction.KeyboardSeekForward -> {
-            prepareSeekByForNativeFallback(seekStepMs, revealControls = false)
-            return false
+            if (isPartySynced) seekBy(seekStepMs, revealControls = false) else {
+                prepareSeekByForNativeFallback(seekStepMs, revealControls = false)
+                return false
+            }
         }
         PlayerControlsAction.ResizeMode -> cycleResizeMode()
         PlayerControlsAction.Speed -> cyclePlaybackSpeed()
@@ -1028,24 +1388,39 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
             }
         }
         PlayerControlsAction.PictureInPicture -> {
-            pictureInPictureActive = !pictureInPictureActive
+            // fork:pip-browse - PiP is always the classic one over Windows (its Browse button goes on to the
+            // corner box over the app); in the box, the same action brings the video back to fill the window.
+            if (PlayerBrowsePip.active.value) {
+                PlayerBrowsePip.requestExpand()
+            } else {
+                pictureInPictureActive = !pictureInPictureActive
+            }
             controlsVisible = false
         }
         PlayerControlsAction.HeroTrailerMute -> Unit
         PlayerControlsAction.DoubleTapSeekBack -> {
-            prepareDoubleTapSeekForNativeFallback(PlayerSeekDirection.Backward)
-            return false
+            if (isPartySynced) partyDoubleTapSeek(PlayerSeekDirection.Backward) else {
+                prepareDoubleTapSeekForNativeFallback(PlayerSeekDirection.Backward)
+                return false
+            }
         }
         PlayerControlsAction.DoubleTapSeekForward -> {
-            prepareDoubleTapSeekForNativeFallback(PlayerSeekDirection.Forward)
-            return false
+            if (isPartySynced) partyDoubleTapSeek(PlayerSeekDirection.Forward) else {
+                prepareDoubleTapSeekForNativeFallback(PlayerSeekDirection.Forward)
+                return false
+            }
         }
     }
     return true
 }
 
 private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: Double): Boolean {
+    if (handlePartyControlsEvent(type, value)) return true
+    if (handleIptvControlsEvent(type, value)) return true
+    if (handleYouTubeControlsEvent(type, value)) return true
     when (type) {
+        "streamInfoOpened" -> showStreamInfo = true
+        "streamInfoClosed" -> showStreamInfo = false
         "revealChrome" -> {
             if (!playerControlsLocked) {
                 controlsVisible = true
@@ -1073,6 +1448,14 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         "reloadSources" -> {
             prepareSourcesForPlayerControls(forceRefresh = true)
         }
+        // The streams screen's Sort chip setting, so the panel and the picker always agree.
+        "setSourceSort" -> {
+            StreamListSortOrder.entries.getOrNull(value.toInt())
+                ?.let(StreamBadgeSettingsRepository::setListSortOrder)
+        }
+        "setSourceCachedFirst" -> {
+            StreamBadgeSettingsRepository.setListCachedFirst(value > 0.5)
+        }
         "sourcesPanelClosed" -> {
             pendingSourcesEpisode = null
             showSourcesPanel = false
@@ -1095,6 +1478,7 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
                 switchToSource(stream, keepSourcesPanelOpen = true)
             }
         }
+        "playlistJump" -> if (isPlaylistPlayback) jumpToPlaylistEntry(value.toInt())
         "selectEpisode" -> {
             val episode = playerMetaVideos.getOrNull(value.toInt()) ?: return true
             if (selectDownloadedEpisodeForPlayback(
@@ -1142,6 +1526,11 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             submitIntroStatusMessage = null
         }
         "submitIntroCommit" -> submitIntroFromPlayerControls()
+        SkipKeyActions.SUBMIT_OFFER,
+        SkipKeyActions.CAPTURE_START,
+        SkipKeyActions.CAPTURE_MARK_END,
+        SkipKeyActions.CAPTURE_SUBMIT,
+        "skipSubmitDismiss" -> handleSkipSubmitEvent(type)
         "skipInterval" -> {
             val interval = activeSkipInterval ?: return true
             acceptSkipInterval(interval)
@@ -1149,14 +1538,13 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         // Right-click on the HUD prompt: hide it for this segment without seeking. Cleared again by
         // the position effect when playback enters the next segment.
         "dismissSkipInterval" -> skipIntervalDismissed = true
-        "playNextEpisode" -> {
-            if (nextEpisodeInfo?.hasAired == true) {
-                nextEpisodeAutoPlayJob?.cancel()
+        "playNextEpisode", "nextEpisode" -> {
+            if (isPlaylistPlayback && playlistUpNext != null) {
+                advancePlaylist()
+            } else if (nextEpisodeInfo?.hasAired == true) {
+                if (type == "playNextEpisode") nextEpisodeAutoPlayJob?.cancel()
                 playNextEpisode()
             }
-        }
-        "nextEpisode" -> {
-            if (nextEpisodeInfo?.hasAired == true) playNextEpisode()
         }
         "previousEpisode" -> {
             val previous = PlayerNextEpisodeRules.resolvePreviousEpisode(
@@ -1168,11 +1556,39 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             ) ?: return true
             autoPlaySelectedEpisode(previous)
         }
+        // fork:voice-control - "skip forward 30 seconds": any distance, not the seek step.
+        "voiceSeekBy" -> seekBy(value.toLong())
+        // fork:voice-control - "go to 20 minutes", "start over": as a jump from here, so a watch party
+        // follows it the way it follows any other seek.
+        "voiceSeekTo" -> {
+            val durationMs = playbackSnapshot.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+            val target = value.toLong().coerceIn(0L, durationMs)
+            seekBy(target - playbackSnapshot.positionMs.coerceAtLeast(0L))
+        }
+        // "stop playback": the player goes. Back would send a YouTube video to the mini player, so a
+        // YouTube video is closed the way the corner box's X closes it.
+        "voiceClosePlayer" -> {
+            if (isYouTubeVideoPlayback) {
+                com.nuvio.app.features.youtube.YouTubeWatchLayout.closeFromCorner()
+                PlayerHandoff.coverClose()
+                flushWatchProgress()
+                args.onBack()
+            } else {
+                handlePlayerControlsAction(PlayerControlsAction.Back)
+            }
+        }
+        // "skip the intro": the skip prompt's own action, or why there is nothing to skip.
+        "voiceSkipSegment" -> {
+            val interval = activeSkipInterval
+            if (interval == null) {
+                com.nuvio.app.features.voice.VoiceControlRepository.showOutcome("Nothing to skip right now")
+            } else {
+                acceptSkipInterval(interval)
+            }
+        }
         "setPlaybackSpeed" -> {
-            val speed = value.toFloat().coerceIn(0.5f, 4f)
-            playerController?.setPlaybackSpeed(speed)
-            sessionPlaybackSpeed = speed
-            playbackSnapshot = playbackSnapshot.copy(playbackSpeed = speed)
+            if (partyBlocksControl()) return true
+            applyUserPlaybackSpeed(value.toFloat().coerceIn(0.5f, 4f))
         }
         "enableP2pForPlayerControls" -> enableP2pForPlayerControls()
         "cancelP2pForPlayerControls" -> {
@@ -1216,7 +1632,7 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             useCustomSubtitles = true
             markSubtitleChosenByViewer()
             persistAddonSubtitlePreference(addon)
-            playerController?.setSubtitleUri(addon.url)
+            loadAddonSubtitle(addon)
             secondarySubtitleSelectionApplied = false
             applySecondarySubtitleSelectionIfNeeded()
         }
@@ -1232,59 +1648,61 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             val cue = playerControlsNearestSubtitleCues().getOrNull(value.toInt()) ?: return true
             applySubtitleAutoSyncCue(cue)
         }
+        // The style events below build on the stored style and apply through updateSubtitleStyle,
+        // never on the last-composed one: see liveSubtitleStyle.
         "subtitleFontSizeDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(fontSizeSp = (subtitleStyle.fontSizeSp + value.toInt()).coerceIn(6, 40)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(fontSizeSp = (liveSubtitleStyle.fontSizeSp + value.toInt()).coerceIn(6, 40)),
             )
         }
         "subtitleFontDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(fontFamily = cycleSubtitleFontFamily(subtitleStyle.fontFamily, value.toInt())),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(fontFamily = cycleSubtitleFontFamily(liveSubtitleStyle.fontFamily, value.toInt())),
             )
         }
         "subtitleFontIndex" -> {
             availableSubtitleFontFamilies().getOrNull(value.toInt())?.let { family ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(fontFamily = family))
+                updateSubtitleStyle(liveSubtitleStyle.copy(fontFamily = family))
             }
         }
         "subtitleOutlineToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(outlineEnabled = !subtitleStyle.outlineEnabled))
+            updateSubtitleStyle(liveSubtitleStyle.copy(outlineEnabled = !liveSubtitleStyle.outlineEnabled))
         }
         "subtitleShadowToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(shadowEnabled = !subtitleStyle.shadowEnabled))
+            updateSubtitleStyle(liveSubtitleStyle.copy(shadowEnabled = !liveSubtitleStyle.shadowEnabled))
         }
         "subtitleShadowOffsetDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    shadowOffset = (subtitleStyle.shadowOffset + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    shadowOffset = (liveSubtitleStyle.shadowOffset + value.toInt())
                         .coerceIn(SUBTITLE_SHADOW_OFFSET_MIN, SUBTITLE_SHADOW_OFFSET_MAX),
                 ),
             )
         }
         "subtitleShadowOpacity" -> {
             val alpha = (value.toFloat() / 100f).coerceIn(0f, 1f)
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(shadowColor = subtitleStyle.shadowColor.copy(alpha = alpha)))
+            updateSubtitleStyle(liveSubtitleStyle.copy(shadowColor = liveSubtitleStyle.shadowColor.copy(alpha = alpha)))
         }
         "subtitleOutlineWidthDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    outlineWidth = (subtitleStyle.outlineWidth + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    outlineWidth = (liveSubtitleStyle.outlineWidth + value.toInt())
                         .coerceIn(SUBTITLE_OUTLINE_WIDTH_MIN, SUBTITLE_OUTLINE_WIDTH_MAX),
                 ),
             )
         }
         "subtitleBlurDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    blur = (subtitleStyle.blur + value.toInt()).coerceIn(SUBTITLE_BLUR_MIN, SUBTITLE_BLUR_MAX),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    blur = (liveSubtitleStyle.blur + value.toInt()).coerceIn(SUBTITLE_BLUR_MIN, SUBTITLE_BLUR_MAX),
                 ),
             )
         }
         "subtitleBoldToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(bold = !subtitleStyle.bold))
+            updateSubtitleStyle(liveSubtitleStyle.copy(bold = !liveSubtitleStyle.bold))
         }
         "subtitleItalicToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(italic = !subtitleStyle.italic))
+            updateSubtitleStyle(liveSubtitleStyle.copy(italic = !liveSubtitleStyle.italic))
         }
         // ASS/SSA tracks: how much of the styling above reaches them, and their own size factor.
         //
@@ -1294,71 +1712,71 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         // the user had to cycle blind and read the result somewhere else.
         "subtitleAssStyleMode" -> {
             SubtitleAssStyleMode.entries.getOrNull(value.toInt())?.let { mode ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(assStyleMode = mode))
+                updateSubtitleStyle(liveSubtitleStyle.copy(assStyleMode = mode))
             }
         }
         "subtitleAssScaleDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    assScalePercent = (subtitleStyle.assScalePercent + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    assScalePercent = (liveSubtitleStyle.assScalePercent + value.toInt())
                         .coerceIn(SUBTITLE_ASS_SCALE_MIN, SUBTITLE_ASS_SCALE_MAX),
                 ),
             )
         }
         "subtitleBottomOffsetDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(bottomOffset = (subtitleStyle.bottomOffset + value.toInt()).coerceIn(0, 200)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(bottomOffset = (liveSubtitleStyle.bottomOffset + value.toInt()).coerceIn(0, 200)),
             )
         }
         "subtitleTextColor" -> {
             SubtitleColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(textColor = color.copy(alpha = subtitleStyle.textColor.alpha)))
+                updateSubtitleStyle(liveSubtitleStyle.copy(textColor = color.copy(alpha = liveSubtitleStyle.textColor.alpha)))
             }
         }
         "subtitleOutlineColor" -> {
             SubtitleColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(outlineColor = color.copy(alpha = subtitleStyle.outlineColor.alpha)))
+                updateSubtitleStyle(liveSubtitleStyle.copy(outlineColor = color.copy(alpha = liveSubtitleStyle.outlineColor.alpha)))
             }
         }
         "subtitleBackgroundColor" -> {
             SubtitleBackgroundColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(backgroundColor = color))
+                updateSubtitleStyle(liveSubtitleStyle.copy(backgroundColor = color))
             }
         }
         "subtitleShadowColor" -> {
             SubtitleShadowColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(
-                    subtitleStyle.copy(shadowColor = color.copy(alpha = subtitleStyle.shadowColor.alpha)),
+                updateSubtitleStyle(
+                    liveSubtitleStyle.copy(shadowColor = color.copy(alpha = liveSubtitleStyle.shadowColor.alpha)),
                 )
             }
         }
         // Custom colours from the HUD's hex prompt. It resolves alpha before sending (it knows the
         // current style and the opacity steppers), so these apply the packed value as it arrives.
         "subtitleTextColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(textColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(textColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleOutlineColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(outlineColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(outlineColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleBackgroundColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(backgroundColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(backgroundColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleShadowColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(shadowColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(shadowColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleTextOpacity" -> {
             val alpha = (value.toFloat() / 100f).coerceIn(0f, 1f)
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(textColor = subtitleStyle.textColor.copy(alpha = alpha)))
+            updateSubtitleStyle(liveSubtitleStyle.copy(textColor = liveSubtitleStyle.textColor.copy(alpha = alpha)))
         }
-        "subtitleStyleReset" -> PlayerSettingsRepository.setSubtitleStyle(SubtitleStyleState.DEFAULT)
+        "subtitleStyleReset" -> updateSubtitleStyle(SubtitleStyleState.DEFAULT)
         "parentalGuideComplete" -> {
             showParentalGuide = false
         }
@@ -1368,17 +1786,23 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         "volumeSet" -> playerController?.setVolume((value.toFloat() / 100f).coerceIn(0f, playerController?.maxVolumeFraction ?: 1f))
         "keyboardSpeedStep" -> adjustPlaybackSpeedStep(if (value < 0.0) -1 else 1, showFeedback = false)
         "keyboardSpeedToggle" -> togglePlaybackSpeed(showFeedback = false)
+        "holdSpeedStart" -> startHeldSpeed()
+        "holdSpeedEnd" -> endHeldSpeed()
         "keyboardNextSubtitle" -> cycleSubtitleTrackFromKeyboard()
         "keyboardNextAudio" -> cycleAudioTrackFromKeyboard()
         "selectResizeMode" -> setPlayerResizeMode(
             when (value.toInt()) {
                 1 -> PlayerResizeMode.Fill
                 2 -> PlayerResizeMode.Zoom
+                3 -> PlayerResizeMode.AutoCrop
                 else -> PlayerResizeMode.Fit
             },
         )
-        "copyStreamUrl" -> activeSourceUrl.takeIf { it.isNotBlank() }?.let(::copyPlainTextToClipboard)
+        // A YouTube tab video copies its public watch link, to share; the stream URL is ours, long-winded and short-lived.
+        "copyStreamUrl" -> (if (isYouTubeVideoPlayback) "https://www.youtube.com/watch?v=$youTubeVideoId" else activeSourceUrl)
+            .takeIf { it.isNotBlank() }?.let(::copyPlainTextToClipboard)
         "toggleMpvDiagnostics" -> playerController?.setDiagnosticsOverlayEnabled(value != 0.0)
+        "togglePauseOverlay" -> PlayerSettingsRepository.setDesktopPauseOverlayEnabled(value != 0.0)
         "toggleStreamFailover" -> {
             val enabled = value != 0.0
             PlayerSettingsRepository.setStreamFailoverEnabled(enabled)
@@ -1394,6 +1818,9 @@ private fun PlayerScreenRuntime.requestP2pConsentForPlayerControls(
     episode: MetaVideo?,
 ): Boolean {
     if (!isP2pStream(stream)) return false
+    // A torrent the debrid service resolves (TorBox and the others with link resolving on) plays
+    // from the service, not peer to peer: switchToSource resolves it, no P2P warning.
+    if (DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream)) return false
     if (!P2pSettingsRepository.isVisible) return false
     if (P2pSettingsRepository.uiState.value.p2pEnabled) return false
     playerControlsPendingP2pSwitch = PendingPlayerP2pSwitch(
@@ -1479,32 +1906,18 @@ private fun PlayerScreenRuntime.requestEpisodeStreamsForPlayerControls(
 private fun PlayerScreenRuntime.submitIntroFromPlayerControls() {
     if (isSubmitIntroSubmitting) return
     val imdbId = activeSubmitIntroImdbId()
-    val season = activeSeasonNumber
-    val episode = activeEpisodeNumber
     val start = submitIntroStartTimeSec
     val end = submitIntroEndTimeSec
     // A null season/episode is a film, which SkipDB accepts — only the timings have to be valid.
     if (imdbId.isNullOrBlank() || start == null || end == null || end <= start) {
-        submitIntroStatusMessage = "Check the start and end times."
+        submitIntroStatusMessage = localizedString(Res.string.skip_submit_check_the_start_and_end_times)
         return
     }
     isSubmitIntroSubmitting = true
     submitIntroStatusMessage = null
-    // The runtime is what lets SkipDB match these timings to the right cut later, so it is sent
-    // with the submission exactly as it is sent with a lookup.
-    val durationSeconds = playbackSnapshot.durationMs.takeIf { it > 0L }?.let { it / 1000L }
-    scope.launch {
-        val outcome = SkipIntroRepository.submitSegment(
-            imdbId = imdbId,
-            season = season,
-            episode = episode,
-            startSec = start,
-            endSec = end,
-            segmentType = submitIntroSegmentType,
-            durationSeconds = durationSeconds,
-        )
+    submitSkipSegment(start, end, submitIntroSegmentType) { accepted, message ->
         isSubmitIntroSubmitting = false
-        if (outcome.accepted) {
+        if (accepted) {
             submitIntroStartTimeSec = 0.0
             submitIntroEndTimeSec = 0.0
             submitIntroStartTimeStr = "00:00"
@@ -1515,26 +1928,38 @@ private fun PlayerScreenRuntime.submitIntroFromPlayerControls() {
         } else {
             // SkipDB explains itself — an overlap, a failed validation, a rate limit — and that is
             // far more actionable than a generic failure line.
-            submitIntroStatusMessage = outcome.message
+            submitIntroStatusMessage = message
         }
     }
 }
 
-private fun PlayerScreenRuntime.activeSubmitIntroImdbId(): String? =
+internal fun PlayerScreenRuntime.activeSubmitIntroImdbId(): String? =
     activeVideoId?.split(":")?.firstOrNull()?.takeIf { it.startsWith("tt") }
         ?: parentMetaId.takeIf { it.startsWith("tt") }
         ?: metaUiState.meta?.id?.takeIf { it.startsWith("tt") }
 
 @Composable
-private fun skipPromptLabel(type: String?): String =
+private fun skipPromptLabel(type: String?, landsOnPostCredits: Boolean, isMovie: Boolean): String =
     when (type?.lowercase()) {
         "intro", "op", "mixed-op" -> stringResource(Res.string.player_skip_intro)
-        "outro", "ed", "mixed-ed", "credits" -> stringResource(Res.string.player_skip_outro)
+        "outro", "ed", "mixed-ed", "credits" -> stringResource(
+            when {
+                landsOnPostCredits -> Res.string.player_skip_to_post_credits
+                isMovie -> Res.string.player_skip_credits
+                else -> Res.string.player_skip_outro
+            },
+        )
         "recap" -> stringResource(Res.string.player_skip_recap)
+        // SponsorBlock's own categories (YouTube tab videos).
+        "sponsor" -> stringResource(Res.string.player_skip_sponsor)
+        "selfpromo" -> stringResource(Res.string.player_skip_self_promotion)
+        "interaction" -> stringResource(Res.string.player_skip_reminder)
+        "filler" -> stringResource(Res.string.player_skip_filler)
+        "music_offtopic" -> stringResource(Res.string.player_skip_non_music)
         else -> stringResource(Res.string.player_skip)
     }
 
-private fun formatPlayerControlsSeconds(seconds: Double): String {
+internal fun formatPlayerControlsSeconds(seconds: Double): String {
     val totalSeconds = seconds
         .takeIf { it.isFinite() && it >= 0.0 }
         ?.toLong()
@@ -1552,34 +1977,62 @@ private fun PlayerScreenRuntime.handlePlayerControlsScrubChange(positionMs: Long
 private fun PlayerScreenRuntime.handlePlayerControlsScrubFinished(positionMs: Long) {
     isScrubbingTimeline = false
     scrubbingPositionMs = null
-    playerController?.seekTo(positionMs)
+    val targetMs = if (isPartyControlLocked) ownSeekTarget(positionMs) ?: return else positionMs
+    playerController?.seekTo(targetMs)
     scheduleProgressSyncAfterSeek()
+    publishPartyPlayback(positionMs = targetMs)
 }
 
 private fun PlayerScreenRuntime.openInExternalPlayer() {
     val openExternal = args.onOpenInExternalPlayer ?: return
-    val loadedSubtitles = addonSubtitles
-        .takeIf { it.isNotEmpty() }
-        ?.map { sub ->
-            SubtitleInput(
-                url = sub.url,
-                name = buildString {
-                    if (!sub.addonName.isNullOrBlank()) append("[${sub.addonName}] ")
-                    append(sub.display)
-                },
-                lang = sub.language,
-            )
-        }
-    openExternal(
-        ExternalPlayerPlaybackRequest(
-            sourceUrl = activeSourceUrl,
-            title = title,
-            streamTitle = activeStreamTitle,
-            sourceHeaders = activeSourceHeaders,
-            resumePositionMs = playbackSnapshot.positionMs,
-            subtitles = loadedSubtitles,
-        ),
+    if (externalHandoffInProgress) return
+    externalHandoffInProgress = true
+    val request = ExternalPlayerPlaybackRequest(
+        sourceUrl = activeSourceUrl,
+        title = title,
+        streamTitle = activeStreamTitle,
+        sourceHeaders = activeSourceHeaders,
+        resumePositionMs = playbackSnapshot.positionMs,
+        season = activeSeasonNumber,
+        episode = activeEpisodeNumber,
+        episodeTitle = activeEpisodeTitle,
     )
+    scope.launch {
+        // Same filtering, cap and local caching as a direct external launch. The loaded list used
+        // to be handed over raw: nothing at all under fast startup (no automatic addon fetch),
+        // otherwise every addon subtitle in every language as remote URLs, which MPC-HC and
+        // PotPlayer cannot open. The forwarding switch only exists in External mode, so from the
+        // internal player it counts as on.
+        val prepared = try {
+            prepareExternalPlayerLaunch(
+                request = request,
+                type = activeAddonSubtitleType,
+                videoId = activeVideoId.orEmpty(),
+                forwardSubtitles = !playerSettingsUiState.externalPlayerEnabled ||
+                    playerSettingsUiState.externalPlayerForwardSubtitles,
+                settings = playerSettingsUiState,
+                originalLanguage = OriginalLanguageCache.languageFor(args.parentMetaId),
+                loadedSubtitles = addonSubtitles,
+                pinnedSubtitle = selectedAddonSubtitle.takeIf { useCustomSubtitles },
+                onOverlayMessage = { message ->
+                    playerNoticeSerial += 1
+                    playerNoticeToast = message?.let {
+                        SkipSubmitToastCopy(
+                            visible = true,
+                            phase = "submitting",
+                            title = localizedString(Res.string.player_external_opening),
+                            detail = it,
+                            key = "external-handoff:$playerNoticeSerial",
+                        )
+                    }
+                },
+            )
+        } finally {
+            playerNoticeToast = playerNoticeToast?.takeUnless { it.key.startsWith("external-handoff:") }
+            externalHandoffInProgress = false
+        }
+        openExternal(prepared)
+    }
 }
 
 private fun PlayerScreenRuntime.buildPlayerControlFilters(
@@ -1650,9 +2103,10 @@ private fun playerControlSourceItem(
         PlayerControlStreamBadge(
             name = badge.name,
             imageUrl = badge.imageURL,
-            backgroundColor = badge.tagColor,
-            textColor = badge.textColor,
-            borderColor = badge.borderColor,
+            // As CSS for the HUD, and the fill only for a "filled" tag, as StreamBadgeChip does.
+            backgroundColor = badgeFillCssColorOrNull(badge.tagColor, badge.tagStyle).orEmpty(),
+            textColor = badge.textColor.toBadgeCssColorOrNull().orEmpty(),
+            borderColor = badge.borderColor.toBadgeCssColorOrNull().orEmpty(),
         )
     },
     isCurrent = isCurrent,
@@ -1671,7 +2125,10 @@ private fun playerControlSourceItem(
  * and then stayed that way until playback ended.
  */
 @Composable
-private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerControlSourceItem> {
+private fun PlayerScreenRuntime.buildPlayerControlSourceItems(
+    sortOrder: StreamListSortOrder,
+    cachedFirst: Boolean,
+): List<PlayerControlSourceItem> {
     val canResolveDebrid = DebridSettingsRepository.uiState.value.canResolvePlayableLinks
     val scoreProfile = StreamScoreRepository.profile
     val groups = sourceStreamsState.groups
@@ -1681,6 +2138,9 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
     val isEpisode = activeEpisodeNumber != null
     val metaId = parentMetaId
     val metaType = contentType ?: parentMetaType
+    val useUsenetFormatter = StreamBadgeSettingsRepository.uiState.value.useUsenetFormatterForAll
+    val showUsenetReleaseName = com.nuvio.app.features.usenet.UsenetSettingsRepository.uiState.value.sources.showReleaseNames
+    val mediaTitle = title
     return remember(
         groups,
         scoreProfile,
@@ -1691,7 +2151,17 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
         isEpisode,
         metaId,
         metaType,
+        sortOrder,
+        cachedFirst,
+        useUsenetFormatter,
+        showUsenetReleaseName,
+        mediaTitle,
     ) {
+        val usenetSubject = com.nuvio.app.features.usenet.UsenetStreamFormat.Subject(
+            title = mediaTitle,
+            year = null,
+            series = isEpisode,
+        )
         val scoreContext = StreamScoreContexts.forPlayback(
             isEpisode = isEpisode,
             contentId = metaId,
@@ -1704,11 +2174,18 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
         // The desktop sources panel is the HTML overlay, so it cannot reuse the Compose picker's
         // sorting — apply the same score ordering here. The index stays the repository's original
         // one because selection events are dispatched by it.
-        val ordered = if (!scoreProfile.enabled || !scoreProfile.sortStreamList) {
+        val scoreOrdered = if (!scoreProfile.enabled || !scoreProfile.sortStreamList) {
             indexedStreams
         } else {
             indexedStreams.sortedByDescending { (index, _) -> scores[index]?.total ?: 0 }
         }
+        // Then the Sort chip's order on top, exactly as the streams screen layers it over scoring.
+        val ordered = StreamListSort.sortFlat(
+            entries = scoreOrdered,
+            order = sortOrder,
+            cachedFirst = cachedFirst,
+            streamOf = { it.value.second },
+        )
         val current = findCurrentPlayerControlStream(
             entries = ordered,
             identityKey = identityKey,
@@ -1718,10 +2195,19 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
         prioritizeCurrentItem(ordered) { it === current }.map { entry ->
             val (originalIndex, item) = entry
             val (filterId, stream) = item
+            val displayStream = if (useUsenetFormatter) {
+                com.nuvio.app.features.usenet.UsenetStreamFormat.formatForAllResults(
+                    stream = stream,
+                    subject = usenetSubject,
+                    showReleaseName = showUsenetReleaseName,
+                )
+            } else {
+                stream
+            }
             playerControlSourceItem(
                 originalIndex = originalIndex,
                 filterId = filterId,
-                stream = stream,
+                stream = displayStream,
                 // Identity alone cannot decide this: one file offered by two providers — or listed
                 // twice by one — gives both rows the same key, and asking each row on its own
                 // painted "Playing" on every copy.
@@ -1741,7 +2227,24 @@ private fun PlayerScreenRuntime.buildPlayerControlEpisodeStreamItems(): List<Pla
     val groups = episodeStreamsRepoState.groups
     val metaId = parentMetaId
     val metaType = contentType ?: parentMetaType
-    return remember(groups, scoreProfile, canResolveDebrid, metaId, metaType) {
+    val useUsenetFormatter = StreamBadgeSettingsRepository.uiState.value.useUsenetFormatterForAll
+    val showUsenetReleaseName = com.nuvio.app.features.usenet.UsenetSettingsRepository.uiState.value.sources.showReleaseNames
+    val mediaTitle = title
+    return remember(
+        groups,
+        scoreProfile,
+        canResolveDebrid,
+        metaId,
+        metaType,
+        useUsenetFormatter,
+        showUsenetReleaseName,
+        mediaTitle,
+    ) {
+        val usenetSubject = com.nuvio.app.features.usenet.UsenetStreamFormat.Subject(
+            title = mediaTitle,
+            year = null,
+            series = true,
+        )
         val scoreContext = StreamScoreContexts.forPlayback(
             isEpisode = true,
             contentId = metaId,
@@ -1753,10 +2256,19 @@ private fun PlayerScreenRuntime.buildPlayerControlEpisodeStreamItems(): List<Pla
         val scores = scorePlayerControlStreams(indexedStreams, scoreProfile, scoreContext)
         indexedStreams.map { (index, item) ->
             val (filterId, stream) = item
+            val displayStream = if (useUsenetFormatter) {
+                com.nuvio.app.features.usenet.UsenetStreamFormat.formatForAllResults(
+                    stream = stream,
+                    subject = usenetSubject,
+                    showReleaseName = showUsenetReleaseName,
+                )
+            } else {
+                stream
+            }
             playerControlSourceItem(
                 originalIndex = index,
                 filterId = filterId,
-                stream = stream,
+                stream = displayStream,
                 isCurrent = false,
                 canResolveDebrid = canResolveDebrid,
                 score = scores[index]?.takeIf { scoreProfile.showScoreOnStreams },
@@ -1802,7 +2314,7 @@ private fun <T> findCurrentPlayerControlStream(
  * set, because that is the flag mpv's own track selection is turned off by.
  */
 @Composable
-private fun PlayerScreenRuntime.activePlaybackSubtitleLabel(): String = if (useCustomSubtitles) {
+internal fun PlayerScreenRuntime.activePlaybackSubtitleLabel(): String = if (useCustomSubtitles) {
     visibleAddonSubtitles.firstOrNull { subtitle ->
         subtitle.id == selectedAddonSubtitleId || subtitle.url == selectedAddonSubtitleId
     }?.display.orEmpty()
@@ -1846,6 +2358,7 @@ private fun PlayerScreenRuntime.buildPlayerControlAddonSubtitleItems(): List<Pla
             addonName = subtitle.addonName.orEmpty(),
             isSelected = subtitle.id == selectedAddonSubtitleId || subtitle.url == selectedAddonSubtitleId,
             isDownloading = subtitle.id.ifBlank { subtitle.url } == downloadingAddonSubtitleId,
+            isAutoSynced = automaticallySyncedSubtitle?.first == subtitle.url,
         )
     }
 
@@ -1862,6 +2375,9 @@ private fun PlayerScreenRuntime.buildPlayerControlSubtitleCueItems(): List<Playe
 // Cues delivered to the scrollable HUD list: enough to recover from heavy desync (±30 lines
 // around the capture point is minutes of dialogue) while keeping the controls JSON small.
 private const val PLAYER_CONTROLS_SUBTITLE_CUE_WINDOW = 60
+
+// Top-billed names on the pause overlay, laid out as a two-column grid of five rows.
+private const val PauseOverlayCastLimit = 10
 
 private fun PlayerScreenRuntime.playerControlsNearestSubtitleCues(): List<SubtitleSyncCue> {
     val capturedPositionMs = subtitleAutoSyncState.capturedPositionMs ?: return emptyList()
@@ -1883,6 +2399,10 @@ private fun formatPlayerControlsCueTimestamp(timeMs: Long): String {
 @Composable
 private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(): List<PlayerControlEpisodeItem> {
     val items = mutableListOf<PlayerControlEpisodeItem>()
+    val fillerSettings by com.nuvio.app.features.details.filler.AnimeFillerSettings.state.collectAsState()
+    val fillerKinds = if (fillerSettings.showBadges) playerFillerKinds else emptyMap()
+    val fillerText = stringResource(Res.string.anime_episode_badge_filler)
+    val mixedText = stringResource(Res.string.anime_episode_badge_mixed)
     val current = playerMetaVideos.resolveSeriesEpisodePosition(
         parentMetaId = parentMetaId,
         videoId = activeVideoId,
@@ -1917,10 +2437,20 @@ private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(): List<PlayerCon
                 episode = episode,
                 isCurrent = current?.video == video,
                 isWatched = isWatched,
-            ),
+            ).withFillerKind(fillerKinds[video.id], fillerText, mixedText),
         )
     }
     return items
+}
+
+private fun PlayerControlEpisodeItem.withFillerKind(
+    kind: com.nuvio.app.features.details.filler.AnimeEpisodeKind?,
+    fillerText: String,
+    mixedText: String,
+): PlayerControlEpisodeItem = when (kind) {
+    com.nuvio.app.features.details.filler.AnimeEpisodeKind.Filler -> copy(fillerKind = "filler", fillerLabel = fillerText)
+    com.nuvio.app.features.details.filler.AnimeEpisodeKind.MixedCanonFiller -> copy(fillerKind = "mixed", fillerLabel = mixedText)
+    else -> this
 }
 
 @Composable
@@ -2016,6 +2546,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             activeSkipInterval = activeSkipInterval.takeUnless {
                 isDesktop || isProviderDiagnosticVideoPlayback
             },
+            skipLandsOnPostCredits = activeSkipInterval?.let { activeSkipLanding(it).landsOnPostCredits } == true,
             skipIntervalDismissed = skipIntervalDismissed,
             controlsVisible = controlsVisible,
             onSkipInterval = { interval -> acceptSkipInterval(interval) },
@@ -2103,31 +2634,8 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
         selectedAddonSubtitle = selectedAddonSubtitle,
         subtitleAutoSyncState = subtitleAutoSyncState,
         onSubtitleTabSelected = { activeSubtitleTab = it },
-        onBuiltInSubtitleTrackSelected = { index ->
-            val wasCustom = useCustomSubtitles
-            selectedSubtitleIndex = index
-            selectedAddonSubtitleId = null
-            useCustomSubtitles = false
-            markSubtitleChosenByViewer()
-            persistInternalSubtitlePreference(subtitleTracks.firstOrNull { it.index == index })
-            if (wasCustom) {
-                playerController?.clearExternalSubtitleAndSelect(index)
-            } else {
-                playerController?.selectSubtitleTrack(index)
-            }
-            secondarySubtitleSelectionApplied = false
-            applySecondarySubtitleSelectionIfNeeded()
-        },
-        onAddonSubtitleSelected = { addon ->
-            selectedAddonSubtitleId = addon.id.ifBlank { addon.url }
-            selectedSubtitleIndex = -1
-            useCustomSubtitles = true
-            markSubtitleChosenByViewer()
-            persistAddonSubtitlePreference(addon)
-            playerController?.setSubtitleUri(addon.url)
-            secondarySubtitleSelectionApplied = false
-            applySecondarySubtitleSelectionIfNeeded()
-        },
+        onBuiltInSubtitleTrackSelected = { index -> selectBuiltInSubtitle(index) },
+        onAddonSubtitleSelected = { addon -> selectAddonSubtitle(addon) },
         onAddonSubtitleDownload = ::downloadAddonSubtitle,
         downloadingAddonSubtitleId = downloadingAddonSubtitleId,
         downloadSubtitleLabel = downloadSubtitleLabel,
@@ -2284,19 +2792,23 @@ private fun PlayerScreenRuntime.downloadAddonSubtitle(addon: AddonSubtitle) {
             AddonSubtitleDownloadResult.Failed(error.message ?: subtitleSaveFailedLabel)
         }
         if (downloadingAddonSubtitleId == downloadKey) downloadingAddonSubtitleId = null
-        when (result) {
-            is AddonSubtitleDownloadResult.Saved -> NuvioToastController.show(
-                message = result.path,
-                title = subtitleSavedLabel,
-                durationMillis = 4_000L,
-            )
-            is AddonSubtitleDownloadResult.Failed -> NuvioToastController.show(
-                message = result.reason,
-                title = subtitleSaveFailedLabel,
-                durationMillis = 4_000L,
-            )
-            AddonSubtitleDownloadResult.Cancelled -> Unit
+        val (accepted, noticeTitle, noticeDetail) = when (result) {
+            is AddonSubtitleDownloadResult.Saved -> Triple(true, subtitleSavedLabel, result.path)
+            is AddonSubtitleDownloadResult.Failed -> Triple(false, subtitleSaveFailedLabel, result.reason)
+            AddonSubtitleDownloadResult.Cancelled -> return@launch
         }
+        NuvioToastController.show(message = noticeDetail, title = noticeTitle, durationMillis = 4_000L)
+        // The Compose toast above is hidden under the native player surface, so the HUD gets
+        // the same notice.
+        playerNoticeSerial += 1
+        playerNoticeToast = SkipSubmitToastCopy(
+            visible = true,
+            phase = "result",
+            title = noticeTitle,
+            detail = noticeDetail,
+            accepted = accepted,
+            key = "subtitle-save:$playerNoticeSerial",
+        )
     }
 }
 

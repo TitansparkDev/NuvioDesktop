@@ -1,5 +1,6 @@
 package com.nuvio.app.features.debrid
 
+import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.httpRequestRaw
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -7,6 +8,7 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 
 internal data class DebridApiResponse<T>(
     val status: Int,
@@ -134,28 +136,27 @@ internal object TorboxApiClient {
         )
 
     suspend fun listCloudTorrents(apiKey: String): DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>> =
-        request(
-            method = "GET",
-            url = "$BASE_URL/v1/api/torrents/mylist",
-            apiKey = apiKey,
-            allowLargeResponse = true,
-        )
+        listCloudItems(apiKey, "torrents")
 
     suspend fun listCloudUsenet(apiKey: String): DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>> =
-        request(
-            method = "GET",
-            url = "$BASE_URL/v1/api/usenet/mylist",
-            apiKey = apiKey,
-            allowLargeResponse = true,
-        )
+        listCloudItems(apiKey, "usenet")
 
     suspend fun listCloudWebDownloads(apiKey: String): DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>> =
-        request(
-            method = "GET",
-            url = "$BASE_URL/v1/api/webdl/mylist",
-            apiKey = apiKey,
-            allowLargeResponse = true,
-        )
+        listCloudItems(apiKey, "webdl")
+
+    // mylist stops at 1,000 items per call, so larger libraries are read page by page.
+    private suspend fun listCloudItems(
+        apiKey: String,
+        kind: String,
+    ): DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>> =
+        fetchTorboxCloudPages(pageSize = 1000) { offset, limit ->
+            request(
+                method = "GET",
+                url = "$BASE_URL/v1/api/$kind/mylist?offset=$offset&limit=$limit",
+                apiKey = apiKey,
+                allowLargeResponse = true,
+            )
+        }
 
     suspend fun requestDownloadLink(
         apiKey: String,
@@ -567,14 +568,46 @@ object DebridCredentialValidator {
     }
 }
 
+internal suspend fun fetchTorboxCloudPages(
+    pageSize: Int,
+    fetchPage: suspend (offset: Int, limit: Int) -> DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>>,
+): DebridApiResponse<TorboxEnvelopeDto<List<TorboxCloudItemDto>>> {
+    val items = mutableListOf<TorboxCloudItemDto>()
+    var offset = 0
+    while (true) {
+        val response = fetchPage(offset, pageSize)
+        val envelope = response.body
+        if (!response.isSuccessful || envelope == null || envelope.success == false) return response
+        val page = envelope.data.orEmpty()
+        items.addAll(page)
+        if (page.size < pageSize) {
+            return response.copy(body = envelope.copy(data = items), rawBody = "")
+        }
+        offset += page.size
+    }
+}
+
+internal val DebridApiLog = Logger.withTag("DebridApi")
+
+// A body that doesn't decode comes back as null, which callers read as "nothing there". Logged,
+// because one unexpected field type in a long list otherwise empties it without a trace.
 private inline fun <reified T> RawHttpResponse.decodeBody(): T? {
     if (body.isBlank() || T::class == Unit::class) return null
     return try {
         DebridApiJson.json.decodeFromString<T>(body)
-    } catch (_: SerializationException) {
+    } catch (error: SerializationException) {
+        logUndecodedBody(error)
         null
-    } catch (_: IllegalArgumentException) {
+    } catch (error: IllegalArgumentException) {
+        logUndecodedBody(error)
         null
+    }
+}
+
+private fun RawHttpResponse.logUndecodedBody(error: Exception) {
+    DebridApiLog.w {
+        "response from ${url.substringBefore('?')} did not decode (HTTP $status, ${body.length} chars): " +
+            error.message.orEmpty().take(400)
     }
 }
 

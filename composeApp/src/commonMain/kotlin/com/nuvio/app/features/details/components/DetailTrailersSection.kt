@@ -142,6 +142,7 @@ fun DetailTrailersSection(
                                 expanded = menuExpanded,
                                 onDismissRequest = { menuExpanded = false },
                             ) {
+                                com.nuvio.app.core.ui.KeyRouteLayer("trailers menu") // the focus router leaves an open menu alone
                                 grouped.keys.forEach { category ->
                                     val count = grouped[category]?.size ?: 0
                                     DropdownMenuItem(
@@ -225,8 +226,8 @@ private fun TrailerCard(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(cornerRadius))
                 .nuvioCardDepth(RoundedCornerShape(cornerRadius), NuvioCardDepthSurface.Trailers)
+                .clip(RoundedCornerShape(cornerRadius))
                 .clickable(onClick = onClick),
         ) {
             AsyncImage(

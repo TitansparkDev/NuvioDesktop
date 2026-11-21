@@ -8,8 +8,10 @@ import com.nuvio.app.features.cloud.CloudLibraryUiState
 import com.nuvio.app.features.cloud.playbackVideoId
 import com.nuvio.app.features.debrid.DebridProviders
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
+import com.nuvio.app.features.watchprogress.ContinueWatchingSortMode
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watched.WatchedItem
+import com.nuvio.app.features.watching.domain.WatchingCompletedEpisode
 import com.nuvio.app.features.tracking.ContinueWatchingSource
 import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.trakt.TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL
@@ -145,6 +147,31 @@ class HomeScreenTest {
 
         assertEquals(listOf(resumeOne, resumeTwo), continueWatching)
         assertEquals(listOf(nextOne, nextTwo), nextUp)
+    }
+
+    @Test
+    fun `upcoming row takes only unaired next up episodes, soonest first, independent of next up split`() {
+        val now = requireNotNull(com.nuvio.app.features.watchprogress.parseReleaseDateToEpochMs("2026-09-27T12:30:00Z"))
+        val resume = continueWatchingItem("resume:1:4", "S1E4").copy(isNextUp = false, released = "2099-01-01T00:00:00Z")
+        val aired = continueWatchingItem("aired:1:5", "Up Next - S1E5").copy(released = "2026-09-27T11:00:00Z")
+        val unknown = continueWatchingItem("unknown:1:5", "Up Next - S1E5")
+        val later = continueWatchingItem("later:1:5", "Up Next - S1E5").copy(released = "2026-10-05T00:00:00Z")
+        val sooner = continueWatchingItem("sooner:1:5", "Up Next - S1E5").copy(released = "2026-09-28T00:00:00Z")
+        val items = listOf(later, resume, aired, unknown, sooner)
+
+        val upcomingOnly = splitContinueWatchingRows(items, separateNextUpRow = false, separateUpcomingRow = true, nowEpochMs = now)
+        assertEquals(listOf(resume, aired, unknown), upcomingOnly.continueWatching)
+        assertTrue(upcomingOnly.nextUp.isEmpty())
+        assertEquals(listOf(sooner, later), upcomingOnly.upcoming)
+
+        val both = splitContinueWatchingRows(items, separateNextUpRow = true, separateUpcomingRow = true, nowEpochMs = now)
+        assertEquals(listOf(resume), both.continueWatching)
+        assertEquals(listOf(aired, unknown), both.nextUp)
+        assertEquals(listOf(sooner, later), both.upcoming)
+
+        val nextUpOnly = splitContinueWatchingRows(items, separateNextUpRow = true, separateUpcomingRow = false, nowEpochMs = now)
+        assertEquals(listOf(later, aired, unknown, sooner), nextUpOnly.nextUp)
+        assertTrue(nextUpOnly.upcoming.isEmpty())
     }
 
     @Test
@@ -356,6 +383,36 @@ class HomeScreenTest {
     }
 
     @Test
+    fun `home next up seed follows an active rewatch instead of the watched finale`() {
+        val finale = watchedItem(id = "show", season = 4, episode = 14, markedAtEpochMs = 1_000L)
+        val otherShow = watchedItem(id = "other", season = 1, episode = 3, markedAtEpochMs = 1_500L)
+        val rewatch = WatchingCompletedEpisode(seasonNumber = 1, episodeNumber = 2, markedAtEpochMs = 2_000L)
+
+        val duringRewatch = buildHomeNextUpSeedCandidates(
+            progressEntries = emptyList(),
+            watchedItems = listOf(finale, otherShow),
+            isTraktProgressActive = false,
+            preferFurthestEpisode = true,
+            nowEpochMs = 3_000L,
+            rewatchSeedFor = { contentId -> rewatch.takeIf { contentId == "show" } },
+        )
+        // Session completed or deleted: the lookup answers nothing and the history seeds again.
+        val afterRewatch = buildHomeNextUpSeedCandidates(
+            progressEntries = emptyList(),
+            watchedItems = listOf(finale, otherShow),
+            isTraktProgressActive = false,
+            preferFurthestEpisode = true,
+            nowEpochMs = 3_000L,
+        )
+
+        val show = duringRewatch.single { it.content.id == "show" }
+        assertEquals(1 to 2, show.seasonNumber to show.episodeNumber)
+        assertEquals(2_000L, show.markedAtEpochMs)
+        assertEquals(1 to 3, duringRewatch.single { it.content.id == "other" }.let { it.seasonNumber to it.episodeNumber })
+        assertEquals(4 to 14, afterRewatch.single { it.content.id == "show" }.let { it.seasonNumber to it.episodeNumber })
+    }
+
+    @Test
     fun `home next up seed uses furthest watched item when progress is older`() {
         val olderCompletedProgress = progressEntry(
             videoId = "show:4:10",
@@ -401,6 +458,70 @@ class HomeScreenTest {
         )
 
         assertTrue(result.isEmpty())
+    }
+
+    private fun rotationFixture(): List<ContinueWatchingItem> {
+        val recentPartial = progressEntry(videoId = "a:1:4", title = "A", lastUpdatedEpochMs = 300L)
+        val olderPartial = progressEntry(videoId = "b:1:4", title = "B", lastUpdatedEpochMs = 100L)
+        val partialMovie = progressEntry(
+            videoId = "movie",
+            title = "Movie",
+            lastUpdatedEpochMs = 150L,
+            seasonNumber = null,
+            episodeNumber = null,
+            episodeTitle = null,
+        )
+        val newEpisode = continueWatchingItem(videoId = "c:2:1", subtitle = "Up Next • S2E1 • New")
+            .copy(isReleaseAlert = true, isNewSeasonRelease = true, released = "2026-10-20")
+        val staleNextUp = continueWatchingItem(videoId = "d:1:5", subtitle = "Up Next • S1E5 • Stale")
+            .copy(released = "2026-01-01")
+        val justFinishedNextUp = continueWatchingItem(videoId = "e:1:5", subtitle = "Up Next • S1E5 • Fresh")
+            .copy(released = "2026-02-01")
+        val unairedLater = continueWatchingItem(videoId = "f:1:5", subtitle = "Up Next • S1E5 • Later")
+            .copy(released = "2099-01-01")
+        val unairedSooner = continueWatchingItem(videoId = "g:1:5", subtitle = "Up Next • S1E5 • Sooner")
+            .copy(released = "2098-01-01")
+
+        return buildHomeContinueWatchingItems(
+            visibleEntries = listOf(recentPartial, olderPartial, partialMovie),
+            nextUpItemsBySeries = mapOf(
+                "c" to (200L to newEpisode),
+                "d" to (50L to staleNextUp),
+                "e" to (400L to justFinishedNextUp),
+                "f" to (10L to unairedLater),
+                "g" to (20L to unairedSooner),
+            ),
+            sortMode = ContinueWatchingSortMode.ROTATION,
+            todayIsoDate = ROTATION_TODAY_ISO_DATE,
+        )
+    }
+
+    @Test
+    fun `rotation keeps partly watched and new episodes in front then least recently watched then unaired`() {
+        assertEquals(
+            listOf("a:1:4", "c:2:1", "movie", "b:1:4", "d:1:5", "e:1:5", "g:1:5", "f:1:5"),
+            rotationFixture().map(ContinueWatchingItem::videoId),
+        )
+    }
+
+    @Test
+    fun `rotation order carries into separated rows`() {
+        val rows = splitContinueWatchingRows(
+            items = rotationFixture(),
+            separateNextUpRow = true,
+            separateUpcomingRow = true,
+            nowEpochMs = ROTATION_NOW_EPOCH_MS,
+        )
+
+        assertEquals(listOf("a:1:4", "movie", "b:1:4"), rows.continueWatching.map(ContinueWatchingItem::videoId))
+        assertEquals(listOf("c:2:1", "d:1:5", "e:1:5"), rows.nextUp.map(ContinueWatchingItem::videoId))
+        assertEquals(listOf("g:1:5", "f:1:5"), rows.upcoming.map(ContinueWatchingItem::videoId))
+    }
+
+    @Test
+    fun `rotation is stored as last watched for builds that do not know it`() {
+        assertEquals(ContinueWatchingSortMode.DEFAULT, ContinueWatchingSortMode.ROTATION.legacyValue)
+        assertEquals(ContinueWatchingSortMode.STREAMING_STYLE, ContinueWatchingSortMode.STREAMING_STYLE.legacyValue)
     }
 
     private fun progressEntry(
@@ -494,5 +615,10 @@ class HomeScreenTest {
 
     private companion object {
         const val MILLIS_PER_DAY = 24L * 60L * 60L * 1000L
+
+        // The rotation fixture's "today": the sort reads the date, the row split reads the
+        // instant. They must name the same day, or aired episodes land in the Upcoming row.
+        const val ROTATION_TODAY_ISO_DATE = "2026-10-28"
+        const val ROTATION_NOW_EPOCH_MS = 1_793_188_800_000L // 2026-10-28T12:00:00Z
     }
 }

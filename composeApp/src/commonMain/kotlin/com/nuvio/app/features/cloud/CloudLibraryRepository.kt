@@ -1,5 +1,7 @@
 package com.nuvio.app.features.cloud
 
+import co.touchlab.kermit.Logger
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.catalog.FilenameMetaResolver
 import com.nuvio.app.features.catalog.ResolvedName
 import com.nuvio.app.features.debrid.DebridCloudLibraryWindow
@@ -8,6 +10,7 @@ import com.nuvio.app.features.debrid.DebridProviders
 import com.nuvio.app.features.debrid.DebridServiceCredential
 import com.nuvio.app.features.debrid.DebridSettingsRepository
 import com.nuvio.app.features.debrid.supports
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +24,10 @@ import nuvio.composeapp.generated.resources.cloud_library_playback_disabled
 import nuvio.composeapp.generated.resources.cloud_library_provider_unavailable
 import org.jetbrains.compose.resources.getString
 
+// Info and warnings only: user logs have debug lines off, and this is how a missing cloud row is
+// diagnosed from one.
+internal val CloudLibraryLog = Logger.withTag("CloudLibrary")
+
 internal class CloudLibraryStore(
     private val credentialsProvider: suspend () -> List<DebridServiceCredential>,
     private val providerApis: List<CloudLibraryProviderApi>,
@@ -30,9 +37,13 @@ internal class CloudLibraryStore(
     fun window(): DebridCloudLibraryWindow = windowProvider()
 
     suspend fun refresh(window: DebridCloudLibraryWindow = windowProvider()): CloudLibraryUiState {
+        PerfTelemetry.count("CloudLibraryRepository.refresh")
         val credentials = credentialsProvider()
             .filter { credential -> credential.provider.supports(DebridProviderCapability.CloudLibrary) }
         val now = nowEpochMs()
+        if (credentials.isEmpty()) {
+            CloudLibraryLog.i { "refresh: no connected service offers a cloud library" }
+        }
 
         val providerStates = credentials.map { credential ->
             val api = providerApis.firstOrNull { it.provider.id == credential.provider.id }
@@ -49,12 +60,22 @@ internal class CloudLibraryStore(
             api.listItems(credential.apiKey)
                 .fold(
                     onSuccess = { items ->
+                        val windowed = items.withinWindow(window = window, nowEpochMs = now)
+                        CloudLibraryLog.i {
+                            "refresh ${credential.provider.displayName}: ${items.size} items, " +
+                                "${windowed.size} within ${window.name}, " +
+                                "${windowed.count { it.playableFiles.isNotEmpty() }} playable " +
+                                "(the Library row shows only playable ones)"
+                        }
                         CloudLibraryProviderState(
                             provider = credential.provider,
-                            items = items.withinWindow(window = window, nowEpochMs = now),
+                            items = windowed,
                         )
                     },
                     onFailure = { error ->
+                        CloudLibraryLog.w(error) {
+                            "refresh ${credential.provider.displayName} failed: ${error.message}"
+                        }
                         CloudLibraryProviderState(
                             provider = credential.provider,
                             errorMessage = error.message,
@@ -130,6 +151,7 @@ object CloudLibraryRepository {
     fun ensureLoaded() {
         DebridSettingsRepository.ensureLoaded()
         if (!DebridSettingsRepository.snapshot().cloudLibraryEnabled) {
+            if (_uiState.value.isEnabled) CloudLibraryLog.i { "cloud library is turned off in Debrid settings" }
             loadedConnectionKeys = emptyList()
             loadedWindow = null
             _uiState.value = CloudLibraryUiState(isLoaded = true, isEnabled = false)
@@ -145,6 +167,7 @@ object CloudLibraryRepository {
     }
 
     fun refresh() {
+        PerfTelemetry.count("CloudLibraryRepository.refresh")
         DebridSettingsRepository.ensureLoaded()
         if (!DebridSettingsRepository.snapshot().cloudLibraryEnabled) {
             loadedConnectionKeys = emptyList()
@@ -160,10 +183,33 @@ object CloudLibraryRepository {
             )
         }
         scope.launch {
-            val refreshed = store.refresh().carryResolvedNamesFrom(_uiState.value)
-            loadedConnectionKeys = connectedCloudConnectionKeys()
-            loadedWindow = DebridSettingsRepository.snapshot().cloudLibraryWindow
+            // A throw here used to leave isRefreshing set for good, and ensureLoaded never retries
+            // while it is.
+            // The connections this refresh is for, read before it runs: read afterwards, a key that arrived during the
+            // refresh was recorded as loaded and the library never refreshed for it.
+            val keysForThisRefresh = connectedCloudConnectionKeys()
+            val windowForThisRefresh = DebridSettingsRepository.snapshot().cloudLibraryWindow
+            val refreshed = try {
+                store.refresh().carryResolvedNamesFrom(_uiState.value)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                CloudLibraryLog.e(error) { "refresh failed" }
+                _uiState.update { current ->
+                    current.copy(
+                        isRefreshing = false,
+                        providers = current.providers.map { it.copy(isLoading = false, errorMessage = error.message) },
+                    )
+                }
+                return@launch
+            }
+            loadedConnectionKeys = keysForThisRefresh
+            loadedWindow = windowForThisRefresh
             _uiState.value = refreshed
+            if (connectedCloudConnectionKeys() != keysForThisRefresh) {
+                CloudLibraryLog.i { "connections changed during refresh; refreshing again" }
+                refresh()
+                return@launch
+            }
             resolveDisplayNames(refreshed)
         }
     }

@@ -1,0 +1,254 @@
+package com.nuvio.app.features.music
+
+import co.touchlab.kermit.Logger
+import com.metrolist.innertubex.InnerTube
+import com.metrolist.innertubex.InnerTubeLogLevel
+import com.metrolist.innertubex.InnerTubeLogger
+import com.metrolist.innertubex.cipher.PlayerConfigRepository
+import com.metrolist.innertubex.cipher.RemotePlayerConfigStore
+import com.metrolist.innertubex.cipher.YouTubeCipherService
+import com.metrolist.innertubex.extraction.AudioQuality
+import com.metrolist.innertubex.extraction.ContentHints
+import com.metrolist.innertubex.extraction.InnerTubeExtractor
+import com.metrolist.innertubex.extraction.YtConfigParserImpl
+import com.metrolist.innertubex.extraction.generateClientPlaybackNonce
+import com.metrolist.innertubex.models.YouTubeLocale
+import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.features.trailer.TrailerPlaybackResolver
+import com.nuvio.app.features.trailer.TrailerPlaybackSource
+import com.nuvio.app.features.youtubemusic.YouTubeMusicAuth
+import io.ktor.client.HttpClient
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.statement.bodyAsText
+import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import java.io.File
+
+/**
+ * fork:innertubex — stream lookup through InnerTubeX, the library BitChord resolves with: a catalog
+ * of YouTube clients picked by what each can currently play, plus cipher / `n`-parameter decoding
+ * that the in-app extractor does not have, with the signed-in Google account's cookies, so an
+ * age-gated track opens the way it does in BitChord. Asked first for a track's audio while PO tokens
+ * can be minted ([preferred], as BitChord resolves InnerTubeX first), otherwise only after the
+ * extractor has failed the track. Written against the shape of BitChord's `InnerTubeXResolver` (GPL-3.0).
+ *
+ * PoTokens come from [BrowserPoTokens]: BotGuard run in a headless Edge / Chrome, as BitChord does in a
+ * WebView, so the web clients that need one are in the catalog. With no browser installed, or with
+ * `-Dnuvio.potoken=off`, none are and the catalog is as it was; the log says which client opened the track.
+ *
+ * Compiled in only with `-Pnuvio.innertubex=true`; found by name by [MusicStreamFallbacks].
+ */
+internal object InnerTubeXFallback : MusicStreamFallback {
+    override val name = "InnerTubeX"
+
+    /** fork:potoken-first — asked before the in-app extractor while a BotGuard browser can mint tokens. */
+    override val preferred: Boolean get() = BrowserPoTokens.ready
+
+    private val log = Logger.withTag("InnerTubeX")
+
+    private val resolverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val dir: File by lazy { DesktopStorage.rootDir.resolve("innertubex").toFile().apply { mkdirs() } }
+
+    /** The remote player config's cache: small files next to each other, written whole. */
+    private fun read(key: String): String? = File(dir, key).takeIf { it.isFile }?.readText()
+
+    private fun write(key: String, value: String) {
+        val tmp = File(dir, "$key.tmp")
+        tmp.writeText(value)
+        tmp.renameTo(File(dir, key))
+    }
+
+    private val http = HttpClient(OkHttp) {
+        install(ContentNegotiation) {
+            json(Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true })
+        }
+        install(HttpTimeout) {
+            requestTimeoutMillis = 30_000
+            connectTimeoutMillis = 15_000
+            socketTimeoutMillis = 20_000
+        }
+        expectSuccess = false
+    }
+
+    private val logger = InnerTubeLogger { event ->
+        val details = if (event.details.isEmpty()) "" else
+            event.details.entries.joinToString(prefix = " [", postfix = "]") { "${it.key}=${it.value}" }
+        val line = "${event.tag}: ${event.message}$details"
+        if (event.level == InnerTubeLogLevel.INFO || event.level == InnerTubeLogLevel.DEBUG) log.i { line } else log.w { line }
+    }
+
+    /**
+     * No remote player-config table. It only ever named cipher functions in YouTube's own player script
+     * (the library checks each entry against a strict pattern, so it cannot carry code), and the cipher is
+     * solved from that script directly anyway. Off, nothing about the cipher comes from anywhere but
+     * youtube.com. (v0.11 also only accepts MetrolistGroup's own table; the ZemerTeam one once set here
+     * was already being refused.)
+     */
+    private val repository = object : PlayerConfigRepository {
+        override val enabled: Boolean get() = false
+        override val sourceUrl: String = ""
+        override val defaultSourceUrl: String = ""
+        override var cachedJson: String
+            get() = read("config.json").orEmpty()
+            set(value) { write("config.json", value) }
+        override var cachedAtMs: Long
+            get() = read("cached_at_ms")?.trim()?.toLongOrNull() ?: 0L
+            set(value) { write("cached_at_ms", value.toString()) }
+        override var cachedSourceUrl: String
+            get() = read("source_url").orEmpty()
+            set(value) { write("source_url", value) }
+        override var cachedEtag: String
+            get() = read("etag").orEmpty()
+            set(value) { write("etag", value) }
+    }
+
+    private val innerTube = InnerTube(http, logger = logger)
+    private val remoteStore = RemotePlayerConfigStore(http, repository, logger)
+    private val cipherService = YouTubeCipherService(http, remoteStore, logger)
+    private val extractor = InnerTubeExtractor(
+        configParser = YtConfigParserImpl(http, innerTube, remoteStore, logger),
+        cipherService = cipherService,
+        innerTube = innerTube,
+        tokenProvider = BrowserPoTokens.provider,
+        logger = logger,
+    )
+
+    private class AccountSession(val cookie: String, val visitorData: String?, val loggedIn: Boolean, val atMs: Long)
+
+    @Volatile
+    private var account: AccountSession? = null
+
+    /**
+     * The visitor data YouTube issues to the signed-in account. The in-app extractor's visitor data
+     * belongs to an anonymous session, and pairing it with the account's cookies is a mismatch
+     * YouTube can answer with a refusal, so for a signed-in request it is read from the account's own
+     * page. The same fetch tells the log whether the saved cookies are still a live session.
+     */
+    private suspend fun accountSession(cookie: String): AccountSession {
+        account?.takeIf { it.cookie == cookie && System.currentTimeMillis() - it.atMs < SESSION_TTL_MS }?.let { return it }
+        val names = cookie.split(';').map { it.substringBefore('=').trim() }.filter { it.isNotEmpty() }
+        val session = try {
+            val response = http.get("https://www.youtube.com/") {
+                header("cookie", cookie)
+                header("user-agent", BROWSER_UA)
+                header("accept-language", "en-US,en;q=0.9")
+            }
+            // fork:youtube-cookie-upkeep — keep the cookies Google refreshes, as the YouTube tab does.
+            YouTubeMusicAuth.absorbSetCookies(response.headers.getAll("Set-Cookie").orEmpty())
+            val html = response.bodyAsText()
+            val loggedIn = Regex(""""LOGGED_IN":\s*(true|false)""").find(html)?.groupValues?.get(1) == "true"
+            val visitor = Regex(""""VISITOR_DATA":\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+            log.i { "account check: loggedIn=$loggedIn visitorData=${visitor != null} cookies=${names.sorted()}" }
+            AccountSession(cookie, visitor, loggedIn, System.currentTimeMillis())
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            log.i { "account check failed: ${error.message}" }
+            AccountSession(cookie, null, false, System.currentTimeMillis())
+        }
+        account = session
+        return session
+    }
+
+    private const val SESSION_TTL_MS = 30 * 60 * 1000L
+    // fork:youtube-web — the same browser as every other signed request (one session, one device).
+    private const val BROWSER_UA = com.nuvio.app.features.youtube.YouTubeWebClient.USER_AGENT
+
+    /**
+     * Points the library at the signed-in account (its cookies and the visitor data its own page issues)
+     * or, signed out, at the in-app extractor's anonymous session. Before every lookup: a sign-in can
+     * change between them.
+     */
+    private suspend fun prepareSession() {
+        // Start the browser now if it is not up: it takes a few seconds the first time, and the library
+        // gives a token request 18 s before it does without one.
+        resolverScope.launch { runCatching { BrowserPoTokens.prewarm() } }
+        val cookie = YouTubeMusicAuth.authHeaders("https://www.youtube.com")["cookie"]
+        innerTube.cookie = cookie
+        val signedIn = cookie?.let { accountSession(it) }
+        innerTube.visitorData = signedIn?.visitorData?.takeIf { signedIn.loggedIn }
+            ?: TrailerPlaybackResolver.visitorData().orEmpty()
+        innerTube.locale = YouTubeLocale(gl = "US", hl = "en")
+    }
+
+    override suspend fun resolveVideo(videoId: String, maxShortSide: Int?): TrailerPlaybackSource? {
+        prepareSession()
+        val stream = try {
+            extractor.extract(
+                videoId = videoId,
+                // Age-gated (the only kind sent here), video wanted. No SABR, which the player cannot open, and
+                // no client whose URLs only answer bounded ranges: mpv asks for open-ended ones. HLS is fine.
+                hints = ContentHints(isAgeRestricted = true, wantVideo = true, maxVideoHeight = maxShortSide)
+                    .withStreamCapabilities(allowHls = true, allowSabr = false, allowBoundedRange = false),
+                excludedClients = emptySet(),
+                audioQuality = AudioQuality.AUTO,
+                clientPlaybackNonce = generateClientPlaybackNonce(),
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            log.i { "no video stream for $videoId: ${error.message}" }
+            return null
+        } ?: return null
+        val videoUrl = stream.videoUrl
+        if (stream.sabrBootstrap != null || videoUrl == null || !videoUrl.startsWith("http")) {
+            log.i { "$videoId: no video stream the player can open (SABR or audio only)" }
+            return null
+        }
+        // An HLS manifest carries its own audio; an adaptive pair plays the audio beside the video.
+        val manifest = videoUrl.contains(".m3u8") || videoUrl.contains("/manifest/hls")
+        val audioUrl = stream.audioUrl.takeIf { !manifest && it.startsWith("http") && it != videoUrl }
+        log.i {
+            "$videoId: video through ${stream.clientName} (${stream.profileId}), " +
+                "${stream.videoWidth ?: 0}x${stream.videoHeight ?: 0}${if (manifest) ", HLS" else ""}"
+        }
+        com.nuvio.app.features.preroll.StreamLoudnessBook.record(listOfNotNull(videoUrl, audioUrl), stream.loudnessDb)
+        return TrailerPlaybackSource(
+            videoUrl = videoUrl,
+            audioUrl = audioUrl,
+            headers = stream.headers,
+            heightPx = listOfNotNull(stream.videoWidth, stream.videoHeight).filter { it > 0 }.minOrNull() ?: 0,
+        )
+    }
+
+    override suspend fun resolve(videoId: String): TrailerPlaybackSource? {
+        prepareSession()
+        val stream = try {
+            extractor.extract(
+                videoId = videoId,
+                hints = ContentHints(isUploaded = null)
+                    .withStreamCapabilities(allowHls = false, allowSabr = false, allowBoundedRange = true),
+                excludedClients = emptySet(),
+                audioQuality = AudioQuality.AUTO,
+                clientPlaybackNonce = generateClientPlaybackNonce(),
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            log.i { "no stream for $videoId: ${error.message}" }
+            return null
+        } ?: return null
+        if (stream.sabrBootstrap != null) {
+            log.i { "$videoId only offers SABR, which the player cannot open" }
+            return null
+        }
+        log.i {
+            "$videoId: ${stream.clientName} (${stream.profileId}), ${(stream.bitrate ?: 0) / 1000} kbps, " +
+                "loudness ${stream.loudnessDb?.let { "$it dB" } ?: "not given"}"
+        }
+        // fork:loudness - YouTube's loudness figure for the stream, so the player plans its gain from it (it was dropped
+        // here, and every track opened this way started from a guess and was corrected part way in).
+        com.nuvio.app.features.preroll.StreamLoudnessBook.record(listOf(stream.audioUrl), stream.loudnessDb)
+        return TrailerPlaybackSource(videoUrl = stream.audioUrl, headers = stream.headers)
+    }
+}

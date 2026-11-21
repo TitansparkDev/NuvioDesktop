@@ -9,8 +9,23 @@ internal expect object StreamBadgeSettingsStorage {
     fun saveShowFileSizeBadges(enabled: Boolean)
     fun loadShowAddonLogo(): Boolean?
     fun saveShowAddonLogo(enabled: Boolean)
+    fun loadUseUsenetFormatterForAll(): Boolean?
+    fun saveUseUsenetFormatterForAll(enabled: Boolean)
+    fun loadShowInPlayer(): Boolean?
+    fun saveShowInPlayer(enabled: Boolean)
+    fun loadPlayerBadgeSource(): String?
+    fun savePlayerBadgeSource(source: String)
     fun loadStreamBadgePlacement(): String?
     fun saveStreamBadgePlacement(placement: String)
+    fun loadStreamListSortOrder(): String?
+    fun saveStreamListSortOrder(order: String)
+    fun loadStreamListCachedFirst(): Boolean?
+    fun saveStreamListCachedFirst(enabled: Boolean)
+    fun loadStreamListTwoColumns(): Boolean?
+    fun saveStreamListTwoColumns(enabled: Boolean)
+    /** The user-resized modal picker, "widthFraction,heightFraction" of the window; null = default. */
+    fun loadStreamPickerModalSize(): String?
+    fun saveStreamPickerModalSize(size: String?)
     fun loadLegacyDebridStreamBadgeRules(): String?
     fun clearLegacyDebridStreamBadgeRules()
     fun exportToSyncPayload(): JsonObject

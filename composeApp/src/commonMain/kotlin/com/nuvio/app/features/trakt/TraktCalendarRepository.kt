@@ -1,6 +1,7 @@
 package com.nuvio.app.features.trakt
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.addons.httpRequestRaw
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,8 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 private const val BASE_URL = "https://api.trakt.tv"
 
@@ -38,6 +41,10 @@ data class TraktCalendarEntry(
     val seasonNumber: Int? = null,
     val episodeNumber: Int? = null,
     val episodeTitle: String? = null,
+    /** The exact airing instant as the source gives it (ISO-8601 with offset), when it has one. */
+    val airAt: String? = null,
+    /** A season, mid-season or series finale, where the source says so (Trakt's episode_type). */
+    val isFinale: Boolean = false,
 )
 
 data class TraktCalendarUiState(
@@ -103,6 +110,7 @@ object TraktCalendarRepository {
     }
 
     fun refreshAsync() {
+        PerfTelemetry.count("TraktCalendarRepository.refreshAsync")
         scope.launch {
             mutex.withLock {
                 entriesByDate.clear()
@@ -174,7 +182,7 @@ object TraktCalendarRepository {
                         _uiState.value = TraktCalendarUiState(
                             isLoading = false,
                             isAuthenticated = true,
-                            errorMessage = "Failed to load calendar",
+                            errorMessage = localizedString(Res.string.calendar_failed_to_load_calendar_4),
                             hasLoaded = true,
                         )
                     }
@@ -239,6 +247,8 @@ object TraktCalendarRepository {
                 seasonNumber = item.episode?.season,
                 episodeNumber = item.episode?.number,
                 episodeTitle = item.episode?.title,
+                airAt = item.firstAired?.takeIf { it.length > 10 },
+                isFinale = item.episode?.episodeType?.contains("finale", ignoreCase = true) == true,
             )
         }
     }
@@ -374,6 +384,7 @@ private data class TraktCalendarEpisodeDto(
     @SerialName("season") val season: Int? = null,
     @SerialName("number") val number: Int? = null,
     @SerialName("title") val title: String? = null,
+    @SerialName("episode_type") val episodeType: String? = null,
 )
 
 @Serializable

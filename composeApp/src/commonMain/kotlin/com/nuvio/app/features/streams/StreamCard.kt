@@ -1,5 +1,6 @@
 package com.nuvio.app.features.streams
 
+import com.nuvio.app.core.ui.smoothBorder
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
@@ -10,7 +11,11 @@ import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,13 +37,23 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.isOutOfBounds
+import androidx.compose.ui.input.pointer.isPrimaryPressed
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,12 +62,65 @@ import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.ui.nuvio
+import com.nuvio.app.core.ui.nuvioGlassHoverSheen
 import com.nuvio.app.features.debrid.DebridProviders
 import kotlin.math.round
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.streams_score_rejected
 import nuvio.composeapp.generated.resources.streams_season_pack_indicator
 import org.jetbrains.compose.resources.stringResource
+
+internal enum class StreamCardStyle {
+    /** Dark card that holds up over any backdrop: the full-screen list and the player's lists. */
+    Solid,
+
+    /** Docked in the details hero over an already darkened, frosted backdrop: barely a card. */
+    Glass,
+}
+
+internal val LocalStreamCardStyle = staticCompositionLocalOf { StreamCardStyle.Solid }
+
+/** The picker's controls after the addon chips, reached with Right from the last chip. */
+internal enum class StreamPickerHeaderControl { Sort, Layout, Refresh, Close }
+
+/**
+ * Which header control the keyboard (or pad) is on, and a counter bumped to open the sort menu. The picker keeps
+ * keyboard focus on itself and draws its own highlights, so the header controls are told rather than focused.
+ */
+internal data class StreamPickerHeaderFocus(
+    val control: StreamPickerHeaderControl? = null,
+    val openSortTick: Int = 0,
+)
+
+internal val LocalStreamPickerHeaderFocus = compositionLocalOf { StreamPickerHeaderFocus() }
+
+/**
+ * The glass surface levels, shared by the cards and everything around them in the docked picker
+ * (chips, sort, buttons) so the whole panel reads as one material: a faint lift at rest, brighter
+ * with a light edge when selected or focused.
+ */
+internal object StreamGlass {
+    val Rest = Color.White.copy(alpha = 0.045f)
+    val Raised = Color.White.copy(alpha = 0.13f)
+    val Edge = Color.White.copy(alpha = 0.7f)
+}
+
+/**
+ * Watch party: a label for streams to mark like the playing one ("Party's source"), or null. Set
+ * by the picker session while the party watches the title being picked for.
+ */
+internal val LocalStreamHighlight = staticCompositionLocalOf<(StreamItem) -> String?> { { null } }
+
+/** Watch party: the host's shared stream, offered above the list (see [LocalSharedStream]). */
+internal data class SharedStream(
+    val label: String,
+    val stream: StreamItem,
+)
+
+internal val LocalSharedStream = staticCompositionLocalOf<SharedStream?> { null }
+
+/** Subject metadata for applying the built-in Usenet formatter to all stream results. */
+internal val LocalUsenetFormatSubject = staticCompositionLocalOf<com.nuvio.app.features.usenet.UsenetStreamFormat.Subject?> { null }
 
 @Composable
 internal fun StreamCard(
@@ -70,6 +138,9 @@ internal fun StreamCard(
     focused: Boolean = false,
     scoreContext: StreamScoreContext,
 ) {
+    val highlightLabel = if (isCurrent) null else LocalStreamHighlight.current(stream)
+    val marked = isCurrent || highlightLabel != null
+    val markedLabel = if (isCurrent) currentLabel else highlightLabel
     val cardShape = RoundedCornerShape(12.dp)
     // Diagnostic overlay, opt-in from the scoring settings page. Computed here rather than passed
     // in so all three source lists (picker, player sources, player episodes) get it for free.
@@ -102,30 +173,51 @@ internal fun StreamCard(
     }
     val badgeImages = stream.badges.filter { it.imageURL.isNotBlank() }
     val hasBadges = badgeImages.isNotEmpty() || (showFileSizeBadges && stream.behaviorHints.videoSize != null)
+    val glass = LocalStreamCardStyle.current == StreamCardStyle.Glass
+    val cardInteraction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val cardHovered by cardInteraction.collectIsHoveredAsState()
+    val cardBackground by androidx.compose.animation.animateColorAsState(
+        targetValue = when {
+            !glass -> if (enabled && cardHovered) Color.Black.copy(alpha = 0.50f) else Color.Black.copy(alpha = 0.42f)
+            focused -> StreamGlass.Raised
+            enabled && cardHovered -> StreamGlass.Raised.copy(alpha = StreamGlass.Raised.alpha * 0.85f)
+            else -> StreamGlass.Rest
+        },
+        animationSpec = androidx.compose.animation.core.tween(120),
+        label = "stream_card_bg",
+    )
     Row(
         modifier = modifier
             .fillMaxWidth()
             .heightIn(min = 68.dp)
-            .shadow(
-                elevation = 2.dp,
-                shape = cardShape,
-                ambientColor = Color.Black.copy(alpha = 0.04f),
-                spotColor = Color.Black.copy(alpha = 0.04f),
+            .then(
+                if (glass) {
+                    Modifier
+                } else {
+                    Modifier.shadow(
+                        elevation = 2.dp,
+                        shape = cardShape,
+                        ambientColor = Color.Black.copy(alpha = 0.04f),
+                        spotColor = Color.Black.copy(alpha = 0.04f),
+                    )
+                },
             )
             .clip(cardShape)
-            // Opaque-enough dark scrim so the light card text stays legible even when the card sits
-            // over a busy, blurred backdrop (the near-transparent white tint used previously washed
-            // out against bright artwork). The current-item highlight is layered on top of it.
-            .background(Color.Black.copy(alpha = 0.42f))
+            // Solid: an opaque-enough dark scrim so the light card text stays legible even when the
+            // card sits over a busy, blurred backdrop (a near-transparent white tint washed out
+            // against bright artwork). Glass only sits on a backdrop that is already frosted and
+            // dimmed, where that scrim turned the list into a stack of boxes: a faint lift instead,
+            // brighter on the focused row. The current-item highlight is layered on top either way.
+            .background(cardBackground)
             .then(
-                if (isCurrent) {
+                if (marked) {
                     Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
                 } else {
                     Modifier
                 },
             )
             .then(
-                if (isCurrent) {
+                if (marked) {
                     Modifier.border(
                         width = 1.dp,
                         color = MaterialTheme.colorScheme.primary.copy(alpha = 0.52f),
@@ -136,8 +228,15 @@ internal fun StreamCard(
                 },
             )
             .then(
-                if (focused) {
-                    Modifier.border(
+                if (focused && glass) {
+                    // The episode cards' focus treatment rather than the accent ring.
+                    Modifier.smoothBorder(
+                        width = 1.5.dp,
+                        color = StreamGlass.Edge,
+                        shape = cardShape,
+                    )
+                } else if (focused) {
+                    Modifier.smoothBorder(
                         width = 2.dp,
                         color = MaterialTheme.colorScheme.primary,
                         shape = cardShape,
@@ -146,7 +245,17 @@ internal fun StreamCard(
                     Modifier
                 },
             )
+            .then(
+                if (glass) {
+                    Modifier.nuvioGlassHoverSheen(cornerRadius = 12.dp, peakAlpha = 0.22f)
+                } else {
+                    Modifier
+                },
+            )
+            .clickSwallowedByScrollingList(enabled = enabled, onClick = onClick)
             .combinedClickable(
+                interactionSource = cardInteraction,
+                indication = androidx.compose.foundation.LocalIndication.current,
                 enabled = enabled,
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -164,17 +273,38 @@ internal fun StreamCard(
                 Spacer(modifier = Modifier.height(6.dp))
             }
 
-            StreamNameWithInstantService(
-                stream = stream,
-                appendInstantServiceToDefaultName = appendInstantServiceToDefaultName,
+            val badgeSettings by StreamBadgeSettingsRepository.uiState.collectAsState()
+            val usenetSettings by com.nuvio.app.features.usenet.UsenetSettingsRepository.uiState.collectAsState()
+            val usenetSubject = LocalUsenetFormatSubject.current
+            val useUsenetFormatter = badgeSettings.useUsenetFormatterForAll
+            val displayStream = remember(
+                stream,
+                useUsenetFormatter,
+                usenetSubject,
+                usenetSettings.sources.showReleaseNames,
             ) {
-                if (isCurrent && !currentLabel.isNullOrBlank()) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    CurrentStreamBadge(label = currentLabel)
+                if (useUsenetFormatter) {
+                    com.nuvio.app.features.usenet.UsenetStreamFormat.formatForAllResults(
+                        stream = stream,
+                        subject = usenetSubject ?: com.nuvio.app.features.usenet.UsenetStreamFormat.Subject(),
+                        showReleaseName = usenetSettings.sources.showReleaseNames,
+                    )
+                } else {
+                    stream
                 }
             }
 
-            val subtitle = stream.streamSubtitle
+            StreamNameWithInstantService(
+                stream = displayStream,
+                appendInstantServiceToDefaultName = appendInstantServiceToDefaultName && !useUsenetFormatter,
+            ) {
+                if (marked && !markedLabel.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    CurrentStreamBadge(label = markedLabel)
+                }
+            }
+
+            val subtitle = displayStream.streamSubtitle
             if (!subtitle.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
@@ -446,4 +576,36 @@ private fun StreamItem.instantServiceLabel(): String? {
         .ifBlank { status.providerName.trim() }
         .ifBlank { DebridProviders.displayName(status.providerId) }
     return "- $providerLabel Instant"
+}
+
+/**
+ * A lazy list that is still scrolling (the desktop wheel animates each notch for a few hundred ms)
+ * consumes the next press on the Initial pass to "catch" the fling — before it checks whether a
+ * mouse can drag it at all, which it can't. The card's own clickable then sees a consumed down and
+ * ignores it, so a click made right after scrolling did nothing and needed a second one. This picks
+ * up exactly those presses (already consumed when they reach the card, primary button) and clicks on
+ * release inside the card. A normal press arrives unconsumed and is left to [combinedClickable].
+ */
+private fun Modifier.clickSwallowedByScrollingList(
+    enabled: Boolean,
+    onClick: () -> Unit,
+): Modifier = if (!enabled) this else composed {
+    val currentOnClick by rememberUpdatedState(onClick)
+    pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            if (!down.isConsumed) return@awaitEachGesture
+            if (down.type == PointerType.Mouse && !currentEvent.buttons.isPrimaryPressed) return@awaitEachGesture
+            while (true) {
+                val change = awaitPointerEvent(PointerEventPass.Initial).changes
+                    .firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+                if (change.isOutOfBounds(size, extendedTouchPadding)) return@awaitEachGesture
+                if (!change.pressed) {
+                    change.consume()
+                    currentOnClick()
+                    return@awaitEachGesture
+                }
+            }
+        }
+    }
 }

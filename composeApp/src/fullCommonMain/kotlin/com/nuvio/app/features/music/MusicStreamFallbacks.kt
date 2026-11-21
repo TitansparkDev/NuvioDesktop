@@ -1,0 +1,56 @@
+package com.nuvio.app.features.music
+
+import co.touchlab.kermit.Logger
+import com.nuvio.app.features.trailer.TrailerPlaybackSource
+
+/**
+ * fork:innertubex — a second way to find a track's audio stream, tried only after the in-app
+ * extractor has given up on it. The implementation lives in its own source folder that is compiled
+ * in only with `-Pnuvio.innertubex=true` (it needs a library from JitPack), so [MusicResolver] reaches
+ * it through this interface and finds it by name at runtime. A build without it simply has none.
+ */
+internal interface MusicStreamFallback {
+    /** Shown in the log. */
+    val name: String
+
+    /** An audio stream for [videoId], or null when this resolver cannot find one either. */
+    suspend fun resolve(videoId: String): TrailerPlaybackSource?
+
+    /**
+     * fork:youtube-age-gate - a video stream (video and audio apart, or an HLS manifest) for [videoId], signed
+     * in where the account allows, for a video the in-app extractor cannot open: an age-gated one. At most
+     * [maxShortSide] pixels on the short side (null: the resolver's own ceiling). Null when this resolver
+     * cannot open it either, or does not do video.
+     */
+    suspend fun resolveVideo(videoId: String, maxShortSide: Int?): TrailerPlaybackSource? = null
+
+    /**
+     * fork:potoken-first — true while this resolver can do what the in-app extractor cannot (mint PO
+     * tokens), so [MusicResolver] asks it first for audio, as BitChord does, and lets a track the person
+     * chose ask it once even while YouTube is refusing the in-app extractor.
+     */
+    val preferred: Boolean get() = false
+}
+
+internal object MusicStreamFallbacks {
+    private const val IMPLEMENTATION = "com.nuvio.app.features.music.InnerTubeXFallback"
+
+    val active: MusicStreamFallback? by lazy {
+        load(IMPLEMENTATION).also {
+            Logger.withTag("MusicStreamFallbacks").i {
+                if (it == null) "no fallback resolver in this build (built without -Pnuvio.innertubex=true)"
+                else "fallback resolver: ${it.name}"
+            }
+        }
+    }
+
+    internal fun load(className: String): MusicStreamFallback? =
+        try {
+            Class.forName(className).getField("INSTANCE").get(null) as? MusicStreamFallback
+        } catch (_: ClassNotFoundException) {
+            null
+        } catch (error: Throwable) {
+            Logger.withTag("MusicStreamFallbacks").w { "could not load $className: ${error.message}" }
+            null
+        }
+}

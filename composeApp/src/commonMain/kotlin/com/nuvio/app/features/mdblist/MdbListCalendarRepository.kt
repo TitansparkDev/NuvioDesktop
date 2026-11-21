@@ -1,6 +1,7 @@
 package com.nuvio.app.features.mdblist
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.perf.PerfTelemetry
 import com.nuvio.app.features.addons.httpRequestRaw
 import com.nuvio.app.features.trakt.TraktCalendarEntry
 import com.nuvio.app.features.trakt.TraktCalendarUiState
@@ -20,6 +21,8 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 /**
  * Calendar data backed by MDBList's authenticated `/calendar/events` endpoint.
@@ -60,6 +63,7 @@ internal object MdbListCalendarRepository {
     }
 
     fun refreshAsync() {
+        PerfTelemetry.count("MdbListCalendarRepository.refreshAsync")
         scope.launch {
             resetState()
             ensureLoaded()
@@ -127,7 +131,7 @@ internal object MdbListCalendarRepository {
                         _uiState.value = TraktCalendarUiState(
                             isLoading = false,
                             isAuthenticated = true,
-                            errorMessage = "Failed to load calendar",
+                            errorMessage = localizedString(Res.string.calendar_failed_to_load_calendar_2),
                             hasLoaded = true,
                         )
                     }
@@ -227,6 +231,7 @@ private fun MdbListCalendarEvent.toCalendarEntry(): TraktCalendarEntry? {
         seasonNumber = seasonNumber.takeIf { isEpisode },
         episodeNumber = episodeNumber.takeIf { isEpisode },
         episodeTitle = episodeTitle?.trim()?.takeIf(String::isNotBlank).takeIf { isEpisode },
+        airAt = start?.trim()?.takeIf { it.length > 10 && 'T' in it },
     )
 }
 

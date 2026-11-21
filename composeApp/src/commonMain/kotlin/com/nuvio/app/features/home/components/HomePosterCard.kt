@@ -8,6 +8,7 @@ import com.nuvio.app.core.ui.NuvioPosterHoverTooltip
 import com.nuvio.app.core.ui.NuvioPosterShape
 import com.nuvio.app.core.ui.PosterRatingBadgeScale
 import com.nuvio.app.core.ui.rememberHomePosterCardStyleUiState
+import com.nuvio.app.core.ui.rememberPosterWatchlistMembership
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
 import com.nuvio.app.features.home.randomPlayCategoryOrNull
@@ -24,6 +25,7 @@ fun HomePosterCard(
     onLongClick: (() -> Unit)? = null,
 ) {
     val posterCardStyle = rememberHomePosterCardStyleUiState()
+    val watchlist = rememberPosterWatchlistMembership()
     val isLandscapeMode = useLandscapeBackdropMode || posterCardStyle.catalogLandscapeModeEnabled
     val titleOverlay = landscapeCardTitleOverlay(
         isLandscapeMode = isLandscapeMode,
@@ -41,13 +43,19 @@ fun HomePosterCard(
         landscapePosterUrl = item.landscapePoster,
     )
     val isRandomPlayCard = item.randomPlayCategoryOrNull() != null
-    val ratingBadgeText = if (isLandscapeMode && !isRandomPlayCard) {
-        posterRatingBadgeText(
+    val ratingBadgeText = when {
+        isRandomPlayCard -> null
+        isLandscapeMode -> posterRatingBadgeText(
             rawRating = item.imdbRating,
             scale = posterCardStyle.landscapeRatingBadgeScale,
         )
-    } else {
-        null
+        // A custom poster service (RPDB-style templates) swaps `poster` and keeps the original in
+        // posterFallback; its art usually prints ratings already, so a second badge would double up.
+        item.posterFallback != null && item.posterFallback != item.poster -> null
+        else -> posterRatingBadgeText(
+            rawRating = item.imdbRating,
+            scale = posterCardStyle.portraitRatingBadgeScale,
+        )
     }
 
     // Plan §5/§18: an AI row's per-item reason is the whole reason that row exists, and until now
@@ -88,6 +96,7 @@ fun HomePosterCard(
                     null
                 },
                 isWatched = isWatched,
+                isInWatchlist = watchlist.contains(item),
                 onClick = onClick,
                 onLongClick = onLongClick,
             )

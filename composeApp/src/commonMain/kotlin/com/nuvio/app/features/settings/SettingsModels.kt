@@ -1,5 +1,6 @@
 package com.nuvio.app.features.settings
 
+import nuvio.composeapp.generated.resources.compose_settings_page_music
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.Info
@@ -9,6 +10,7 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.ui.graphics.vector.ImageVector
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.collections_header
+import nuvio.composeapp.generated.resources.party_title
 import nuvio.composeapp.generated.resources.compose_settings_category_about
 import nuvio.composeapp.generated.resources.compose_settings_category_general
 import nuvio.composeapp.generated.resources.compose_settings_page_account
@@ -19,20 +21,23 @@ import nuvio.composeapp.generated.resources.compose_settings_page_content_discov
 import nuvio.composeapp.generated.resources.compose_settings_page_debrid
 import nuvio.composeapp.generated.resources.compose_settings_page_continue_watching
 import nuvio.composeapp.generated.resources.compose_settings_page_games
+import nuvio.composeapp.generated.resources.iptv_settings_page
 import nuvio.composeapp.generated.resources.compose_settings_page_homescreen
 import nuvio.composeapp.generated.resources.compose_settings_page_integrations
 import nuvio.composeapp.generated.resources.compose_settings_page_keyboard_shortcuts
 import nuvio.composeapp.generated.resources.compose_settings_page_local_library
-import nuvio.composeapp.generated.resources.compose_settings_page_auto_downloads
+import nuvio.composeapp.generated.resources.compose_settings_page_media_server
+import nuvio.composeapp.generated.resources.compose_settings_page_media_servers
+import nuvio.composeapp.generated.resources.compose_settings_page_usenet
 import nuvio.composeapp.generated.resources.compose_settings_root_downloads_title
 import nuvio.composeapp.generated.resources.compose_settings_page_licenses_attributions
 import nuvio.composeapp.generated.resources.compose_settings_page_mdblist_ratings
 import nuvio.composeapp.generated.resources.compose_settings_page_meta_screen
 import nuvio.composeapp.generated.resources.compose_settings_page_notifications
 import nuvio.composeapp.generated.resources.compose_settings_page_discover
-import nuvio.composeapp.generated.resources.compose_settings_page_playback
 import nuvio.composeapp.generated.resources.random_play_title
 import nuvio.composeapp.generated.resources.compose_settings_page_qualicache
+import nuvio.composeapp.generated.resources.compose_settings_page_poster_service
 import nuvio.composeapp.generated.resources.compose_settings_page_plugins
 import nuvio.composeapp.generated.resources.compose_settings_page_root
 import nuvio.composeapp.generated.resources.compose_settings_page_streams
@@ -42,10 +47,16 @@ import nuvio.composeapp.generated.resources.compose_settings_page_tmdb_enrichmen
 import nuvio.composeapp.generated.resources.compose_settings_page_trakt
 import nuvio.composeapp.generated.resources.compose_settings_page_simkl
 import nuvio.composeapp.generated.resources.compose_settings_page_yamtrack
+import nuvio.composeapp.generated.resources.compose_settings_page_youtube
 import nuvio.composeapp.generated.resources.compose_settings_page_lights
+import nuvio.composeapp.generated.resources.compose_settings_page_seekr
 import nuvio.composeapp.generated.resources.compose_settings_page_discord_presence
 import nuvio.composeapp.generated.resources.compose_settings_page_screensaver
+import nuvio.composeapp.generated.resources.compose_settings_page_voice_control
+import nuvio.composeapp.generated.resources.compose_settings_page_preshow
 import nuvio.composeapp.generated.resources.settings_account
+import nuvio.composeapp.generated.resources.compose_settings_page_video_audio
+import nuvio.composeapp.generated.resources.compose_settings_page_player
 import org.jetbrains.compose.resources.StringResource
 
 internal enum class SettingsCategory(
@@ -83,8 +94,20 @@ internal enum class SettingsPage(
         category = SettingsCategory.About,
         parentPage = Root,
     ),
+    WatchParty(
+        titleRes = Res.string.party_title,
+        category = SettingsCategory.Account,
+        parentPage = Root,
+    ),
+    // Shown as "Video & Audio": the technical half of what used to be one long Playback page.
+    // Name kept so saved favourites, category order and anchors still resolve.
     Playback(
-        titleRes = Res.string.compose_settings_page_playback,
+        titleRes = Res.string.compose_settings_page_video_audio,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
+    Player(
+        titleRes = Res.string.compose_settings_page_player,
         category = SettingsCategory.General,
         parentPage = Root,
     ),
@@ -108,13 +131,35 @@ internal enum class SettingsPage(
         category = SettingsCategory.General,
         parentPage = Root,
     ),
+    /** Jellyfin, Emby, Plex and Silo connections (upstream's servers feature). */
+    MediaServers(
+        titleRes = Res.string.compose_settings_page_media_servers,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
+    MediaServer(
+        titleRes = Res.string.compose_settings_page_media_server,
+        category = SettingsCategory.General,
+        parentPage = MediaServers,
+    ),
+    /** Built-in Usenet: providers, indexers and the engine (NuvioTV PR 4679). */
+    Usenet(
+        titleRes = Res.string.compose_settings_page_usenet,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
     Games(
         titleRes = Res.string.compose_settings_page_games,
         category = SettingsCategory.General,
         parentPage = Root,
     ),
+    Iptv(
+        titleRes = Res.string.iptv_settings_page,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
     AutoDownloads(
-        titleRes = Res.string.compose_settings_page_auto_downloads,
+        titleRes = Res.string.compose_settings_root_downloads_title,
         category = SettingsCategory.General,
         parentPage = Root,
     ),
@@ -140,6 +185,21 @@ internal enum class SettingsPage(
     ),
     Screensaver(
         titleRes = Res.string.compose_settings_page_screensaver,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
+    VoiceControl( // fork:voice-control
+        titleRes = Res.string.compose_settings_page_voice_control,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
+    Preshow(
+        titleRes = Res.string.compose_settings_page_preshow,
+        category = SettingsCategory.General,
+        parentPage = Root,
+    ),
+    Music( // fork:music
+        titleRes = Res.string.compose_settings_page_music,
         category = SettingsCategory.General,
         parentPage = Root,
     ),
@@ -208,6 +268,11 @@ internal enum class SettingsPage(
         category = SettingsCategory.General,
         parentPage = Integrations,
     ),
+    PosterService(
+        titleRes = Res.string.compose_settings_page_poster_service,
+        category = SettingsCategory.General,
+        parentPage = Integrations,
+    ),
     Debrid(
         titleRes = Res.string.compose_settings_page_debrid,
         category = SettingsCategory.General,
@@ -225,6 +290,16 @@ internal enum class SettingsPage(
     ),
     YamtrackAuthentication(
         titleRes = Res.string.compose_settings_page_yamtrack,
+        category = SettingsCategory.General,
+        parentPage = Integrations,
+    ),
+    YouTubeAccount(
+        titleRes = Res.string.compose_settings_page_youtube,
+        category = SettingsCategory.General,
+        parentPage = Integrations,
+    ),
+    Seekr(
+        titleRes = Res.string.compose_settings_page_seekr,
         category = SettingsCategory.General,
         parentPage = Integrations,
     ),

@@ -1,5 +1,9 @@
 package com.nuvio.app.features.setup
 
+import com.nuvio.app.core.ui.CompactPosterCardWidthDp
+import com.nuvio.app.core.ui.ExtraLargePosterCardWidthDp
+import com.nuvio.app.core.ui.LargePosterCardWidthDp
+import com.nuvio.app.features.home.HomeDisplayMode
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -8,27 +12,52 @@ import kotlin.test.assertTrue
 class FirstRunWizardDraftTest {
 
     @Test
-    fun `steps are ordered and indexed consistently`() {
-        assertEquals(FirstRunWizardStep.entries.size, FirstRunWizardStep.count)
-        FirstRunWizardStep.ordered.forEachIndexed { index, step ->
-            assertEquals(index, step.index)
+    fun `layout comes first and metadata finishes setup`() {
+        val steps = FirstRunWizardStep.visibleSteps(FirstRunWizardDraft())
+        assertEquals(FirstRunWizardStep.Layout, steps.first())
+        assertEquals(FirstRunWizardStep.Metadata, steps.last())
+    }
+
+    @Test
+    fun `basic mode has no trailer step`() {
+        val basic = FirstRunWizardDraft(displayMode = HomeDisplayMode.Basic)
+        assertFalse(FirstRunWizardStep.Trailers in FirstRunWizardStep.visibleSteps(basic))
+        HomeDisplayMode.entries.filter { it != HomeDisplayMode.Basic }.forEach { mode ->
+            val draft = FirstRunWizardDraft(displayMode = mode)
+            assertTrue(FirstRunWizardStep.Trailers in FirstRunWizardStep.visibleSteps(draft), mode.name)
         }
     }
 
     @Test
-    fun `the experience step comes first and metadata finishes setup`() {
-        assertEquals(FirstRunWizardStep.Experience, FirstRunWizardStep.ordered.first())
-        assertEquals(FirstRunWizardStep.Metadata, FirstRunWizardStep.ordered.last())
+    fun `step position counts only the steps shown`() {
+        val draft = FirstRunWizardDraft(displayMode = HomeDisplayMode.Basic)
+        val metadata = FirstRunWizardUiState(step = FirstRunWizardStep.Metadata, draft = draft)
+        assertEquals(FirstRunWizardStep.entries.size - 1, metadata.steps.size)
+        assertEquals(metadata.steps.lastIndex, metadata.stepIndex)
+        assertTrue(metadata.isLastStep)
+        assertFalse(metadata.isFirstStep)
+        val first = FirstRunWizardUiState(step = FirstRunWizardStep.Layout, draft = draft)
+        assertTrue(first.isFirstStep)
+        assertFalse(first.isLastStep)
     }
 
     @Test
-    fun `first and last step flags match the ordering`() {
-        val first = FirstRunWizardUiState(step = FirstRunWizardStep.ordered.first())
-        val last = FirstRunWizardUiState(step = FirstRunWizardStep.ordered.last())
-        assertTrue(first.isFirstStep)
-        assertFalse(first.isLastStep)
-        assertTrue(last.isLastStep)
-        assertFalse(last.isFirstStep)
+    fun `hero steppers stay on their grid and inside their range`() {
+        assertEquals(1.05f, stepHeight(1.0f, 1), 0.0001f)
+        assertEquals(1.75f, stepHeight(1.75f, 1), 0.0001f)
+        assertEquals(0.75f, stepHeight(0.75f, -1), 0.0001f)
+        // An off-grid value from Settings snaps to the grid on its first step.
+        assertEquals(1.1f, stepHeight(1.07f, 1), 0.0001f)
+        assertEquals(-0.25f, stepBias(0f, -1), 0.0001f)
+        assertEquals(1f, stepBias(1f, 1), 0.0001f)
+        assertEquals(-1f, stepBias(-1f, -1), 0.0001f)
+    }
+
+    @Test
+    fun `poster width steps from the nearest preset`() {
+        assertEquals(0, nearestPosterPresetIndex(CompactPosterCardWidthDp))
+        assertEquals(6, nearestPosterPresetIndex(ExtraLargePosterCardWidthDp))
+        assertEquals(5, nearestPosterPresetIndex(LargePosterCardWidthDp + 3))
     }
 
     @Test
@@ -39,5 +68,24 @@ class FirstRunWizardDraftTest {
         assertEquals(0, draft.trailerDelaySeconds)
         assertFalse(draft.trailerSoundEnabled)
         assertFalse(draft.trailerFullscreen)
+    }
+
+    @Test
+    fun `size and panels are offered in every layout`() {
+        HomeDisplayMode.entries.forEach { mode ->
+            val steps = FirstRunWizardStep.visibleSteps(FirstRunWizardDraft(displayMode = mode))
+            assertTrue(FirstRunWizardStep.Scale in steps, mode.name)
+            assertTrue(FirstRunWizardStep.Panels in steps, mode.name)
+        }
+    }
+
+    @Test
+    fun `ui scale steps by five within settings range`() {
+        assertEquals(5, stepUiScale(0, 1))
+        assertEquals(-5, stepUiScale(0, -1))
+        assertEquals(50, stepUiScale(50, 1))
+        assertEquals(-50, stepUiScale(-50, -1))
+        // A value nudged off the grid elsewhere snaps back onto it.
+        assertEquals(10, stepUiScale(7, 1))
     }
 }

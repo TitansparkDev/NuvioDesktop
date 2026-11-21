@@ -13,6 +13,22 @@ class SeriesContinuityTest {
     )
 
     @Test
+    fun resumeProgressForSeries_ignores_a_row_with_no_episode_for_the_bare_show_id() {
+        val episodeRow = WatchingProgressRecord(
+            content = show, videoId = "show:1:2", seasonNumber = 1, episodeNumber = 2,
+            lastUpdatedEpochMs = 100L, lastPositionMs = 1_000L,
+        )
+        val bareShowRow = WatchingProgressRecord(
+            content = show, videoId = "show", seasonNumber = null, episodeNumber = null,
+            lastUpdatedEpochMs = 200L, lastPositionMs = 1_000L,
+        )
+
+        val resume = resumeProgressForSeries(content = show, progressRecords = listOf(episodeRow, bareShowRow))
+
+        assertEquals("show:1:2", resume?.videoId)
+    }
+
+    @Test
     fun decideSeriesPrimaryAction_prefers_up_next_when_completed_is_newer_than_resume() {
         val action = decideSeriesPrimaryAction(
             content = show,
@@ -137,6 +153,35 @@ class SeriesContinuityTest {
 
         assertNotNull(action)
         assertEquals("Play S0E1", action.label)
+    }
+
+    @Test
+    fun decideSeriesPrimaryAction_continues_an_active_rewatch_after_a_watched_finale() {
+        // The original watch reached the finale; the rewatch has just finished S1E2.
+        val finaleWatched = listOf(
+            WatchingWatchedRecord(content = show, seasonNumber = 1, episodeNumber = 3, markedAtEpochMs = 100L),
+        )
+
+        val withoutRewatch = decideSeriesPrimaryAction(
+            content = show,
+            episodes = episodes,
+            progressRecords = emptyList(),
+            watchedRecords = finaleWatched,
+            todayIsoDate = "2026-03-30",
+        )
+        val duringRewatch = decideSeriesPrimaryAction(
+            content = show,
+            episodes = episodes,
+            progressRecords = emptyList(),
+            watchedRecords = finaleWatched,
+            todayIsoDate = "2026-03-30",
+            rewatchSeed = WatchingCompletedEpisode(seasonNumber = 1, episodeNumber = 2, markedAtEpochMs = 500L),
+        )
+
+        assertEquals(null, withoutRewatch)
+        assertNotNull(duringRewatch)
+        assertEquals("Up Next • S1E3", duringRewatch.label)
+        assertEquals("show:1:3", duringRewatch.videoId)
     }
 
     @Test

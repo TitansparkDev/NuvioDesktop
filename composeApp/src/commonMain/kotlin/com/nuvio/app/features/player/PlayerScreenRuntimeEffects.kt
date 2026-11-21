@@ -1,5 +1,7 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.details.filler.isSkippableFiller
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
@@ -23,17 +25,19 @@ import com.nuvio.app.features.discord.DiscordRichPresenceActivity
 import com.nuvio.app.features.discord.DiscordRichPresenceController
 import com.nuvio.app.features.discord.DiscordRichPresenceActivityType
 import com.nuvio.app.features.discord.DiscordRichPresenceImageFit
+import com.nuvio.app.features.discord.fitsDiscordAssetLimit
 import com.nuvio.app.features.discord.isExternallyFetchableArtworkUrl
 import com.nuvio.app.features.lights.LightsController
 import com.nuvio.app.features.lights.LightsPlaybackSource
-import com.nuvio.app.features.mdblist.MdbListSettingsRepository
 import com.nuvio.app.features.metadata.AnimeArtworkService
 import com.nuvio.app.features.metadata.hasAnimeNamespacePrefix
 import com.nuvio.app.features.metadata.isAnimeNativeId
-import com.nuvio.app.features.tmdb.TmdbSettingsRepository
-import com.nuvio.app.features.tmdb.customPosterTemplateUsesNativeAnimeId
-import com.nuvio.app.features.tmdb.customPosterUrl
-import com.nuvio.app.features.tmdb.resolveCustomPosterIds
+import com.nuvio.app.features.posterservice.CustomPosterKeys
+import com.nuvio.app.features.posterservice.CustomPosterSettingsRepository
+import com.nuvio.app.features.posterservice.CustomPosterShape
+import com.nuvio.app.features.posterservice.customPosterTemplateUsesNativeAnimeId
+import com.nuvio.app.features.posterservice.customPosterUrl
+import com.nuvio.app.features.posterservice.resolveCustomPosterIds
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamRequest
 import com.nuvio.app.features.p2p.P2pStreamingEngine
@@ -46,13 +50,26 @@ import com.nuvio.app.features.player.skip.SkipIntroRepository
 import com.nuvio.app.features.player.skip.SkipLookupTarget
 import com.nuvio.app.features.player.skip.resolveSkipLookupTarget
 import com.nuvio.app.features.player.skip.identityKey
+import com.nuvio.app.features.player.skip.isOutroKind
+import com.nuvio.app.features.player.skip.isPostCreditsScene
+import com.nuvio.app.features.player.skip.SKIP_CAPTURE_MAX_OPEN_MS
+import com.nuvio.app.features.player.skip.SKIP_SUBMIT_OFFER_BACKWARD_TOLERANCE_SEC
+import com.nuvio.app.features.player.skip.SKIP_SUBMIT_OFFER_FORWARD_TOLERANCE_SEC
+import com.nuvio.app.features.player.skip.SKIP_SUBMIT_OFFER_TIMEOUT_MS
+import com.nuvio.app.features.player.skip.SKIP_SUBMIT_RESULT_TIMEOUT_MS
+import com.nuvio.app.features.player.skip.SkipSubmitToastPhase
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
 import com.nuvio.app.features.plugins.PluginRepository
+import com.nuvio.app.features.streams.mediaFilename
 import com.nuvio.app.features.streams.StreamPrefetchService
 import com.nuvio.app.features.streams.BingeGroupCacheRepository
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.hasLikelyExpiringPlaybackCredentials
+import com.nuvio.app.features.debrid.DirectDebridPlayableResult
+import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
+import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.isDesktop
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.buildJsonObject
@@ -60,10 +77,12 @@ import kotlinx.serialization.json.put
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.random.Random
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
+import com.nuvio.app.core.i18n.localizedString
 
 /**
  * How long a community skip lookup waits for the player to report a runtime before giving up and
@@ -81,9 +100,15 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     LaunchedEffect(parentMetaType, parentMetaId) {
-        playerMetaVideos = MetaDetailsRepository.peek(parentMetaType, parentMetaId)?.videos ?: emptyList()
-        if (playerMetaVideos.isEmpty()) {
-            playerMetaVideos = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.videos ?: emptyList()
+        // A live channel has no addon metadata; asking for it is a wasted round of addon requests.
+        if (isIptvPlayback) return@LaunchedEffect
+        val peeked = MetaDetailsRepository.peek(parentMetaType, parentMetaId)
+        playerMetaVideos = peeked?.videos ?: emptyList()
+        playerMetaCast = peeked?.cast ?: emptyList()
+        if (playerMetaVideos.isEmpty() || playerMetaCast.isEmpty()) {
+            val fetched = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)
+            if (playerMetaVideos.isEmpty()) playerMetaVideos = fetched?.videos ?: emptyList()
+            if (playerMetaCast.isEmpty()) playerMetaCast = fetched?.cast ?: emptyList()
         }
     }
 
@@ -91,13 +116,42 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         val currentMeta = metaUiState.meta ?: return@LaunchedEffect
         if (currentMeta.type == parentMetaType && currentMeta.id == parentMetaId) {
             playerMetaVideos = currentMeta.videos
+            if (currentMeta.cast.isNotEmpty()) playerMetaCast = currentMeta.cast
         }
     }
 
-    LaunchedEffect(currentStreamBingeGroup, parentMetaId) {
+    val animeFillerSettings by com.nuvio.app.features.details.filler.AnimeFillerSettings.state.collectAsState()
+    LaunchedEffect(parentMetaType, parentMetaId, playerMetaVideos, animeFillerSettings) {
+        if (!isSeries || playerMetaVideos.isEmpty() ||
+            !com.nuvio.app.features.details.filler.AnimeFillerSettings.lookupWanted()
+        ) {
+            playerFillerKinds = emptyMap()
+            return@LaunchedEffect
+        }
+        val meta = MetaDetailsRepository.peek(parentMetaType, parentMetaId)
+        val trusted = meta?.imdbTmdbIdentityTrusted ?: true
+        playerFillerKinds = com.nuvio.app.features.details.filler.AnimeFillerRepository.episodeKinds(
+            lookup = com.nuvio.app.features.details.filler.AnimeFillerLookup(
+                metaId = parentMetaId,
+                imdbId = meta?.imdbId?.takeIf { trusted },
+                tmdbId = meta?.tmdbId?.takeIf { trusted },
+                malId = meta?.malId,
+            ),
+            videos = playerMetaVideos,
+        )
+    }
+
+    LaunchedEffect(currentStreamBingeGroup, activeStream, parentMetaId) {
         val bg = currentStreamBingeGroup
         if (bg != null && parentMetaId.isNotBlank()) {
-            BingeGroupCacheRepository.save(parentMetaId, bg)
+            // The release too, when the stream on screen is the one that set this group.
+            val release = activeStream?.takeIf { it.behaviorHints.bingeGroup == bg }
+            BingeGroupCacheRepository.save(
+                contentId = parentMetaId,
+                bingeGroup = bg,
+                filename = release?.behaviorHints?.filename,
+                infoHash = release?.p2pInfoHash,
+            )
         }
     }
 
@@ -136,6 +190,12 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         WatchProgressRepository.ensureLoaded()
 
         providerDiagnosticProbePendingSourceUrl = activeSourceUrl.takeIf(::isProviderPlaybackEndpoint)
+        // A placeholder that reached the player (an older cache entry, or a reuse path that saved
+        // before this guard existed) must not survive to replay on the next open of this title.
+        // The cache would refuse it on read anyway; evicting here also clears the entry now.
+        if (isPlaybackPlaceholderUrl(activeSourceUrl)) {
+            removeFailedStreamFromCache()
+        }
         if (playbackSourceFailure(activeSourceUrl) == PlaybackSourceFailure.DebridRateLimited) {
             val message = getString(Res.string.player_error_debrid_rate_limited)
             providerDiagnosticVideoSourceUrl = activeSourceUrl
@@ -302,6 +362,18 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         subtitleAutoSyncState = SubtitleAutoSyncUiState()
     }
 
+    LaunchedEffect(activeSourceUrl, activeSourceHeaders, playerSettingsUiState.automaticSubtitleSyncEnabled) {
+        automaticallySyncedSubtitle = null
+        val sourceUrl = activeSourceUrl ?: return@LaunchedEffect
+        // Live TV has no fixed timeline to sync against, and each read would take one of the
+        // provider's few connections.
+        if (playerSettingsUiState.automaticSubtitleSyncEnabled && !isIptvPlayback &&
+            (sourceUrl.startsWith("http://", ignoreCase = true) || sourceUrl.startsWith("https://", ignoreCase = true))
+        ) {
+            prefetchAutomaticSubtitleSyncIndex(sourceUrl, activeSourceHeaders)
+        }
+    }
+
     LaunchedEffect(playerController, subtitleStyle) {
         playerController?.applySubtitleStyle(subtitleStyle)
     }
@@ -418,6 +490,11 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
             initialSeekApplied = true
             return@LaunchedEffect
         }
+        // A watch party with a running clock positions the player itself (BindPartyEffects).
+        if (isPartySynced && com.nuvio.app.features.party.PartyRepository.playback.value != null) {
+            initialSeekApplied = true
+            return@LaunchedEffect
+        }
         // Desktop mpv applies both absolute and percentage resume positions in its loadfile
         // command, before the first frame. Mobile engines still need this duration-based seek.
         if (isDesktop && (activeInitialPositionMs > 0L || progressFraction != null)) {
@@ -431,9 +508,15 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
 
     BindPlayerUiVisibilityEffects()
     BindPlayerMetadataAndSkipEffects()
+    BindPartyEffects()
     BindDiscordRichPresenceEffect()
+    BindPhoneRemoteNowPlayingEffect() // fork:phone-remote
     BindLightsEffect()
+    BindYouTubeWatchTimeEffect() // fork:youtube-mode
+    BindYouTubeRelatedEffect() // fork:youtube-mode
     BindStreamFailoverWatchdogEffect()
+    BindIptvLiveEffects()
+    BindServerPlaybackEffects()
 
     DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
         val effectVideoId = playbackSession.videoId
@@ -455,8 +538,10 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         // Speculative stream searching must not compete with the playback it exists to make feel
         // instant, so it stays parked for as long as the player owns the screen.
         StreamPrefetchService.setPlaybackActive(true)
+        com.nuvio.app.features.music.booklet.FilmPlaying.active.value = true // fork:facts-filler - the filler waits while the player is up
         onDispose {
             StreamPrefetchService.setPlaybackActive(false)
+            com.nuvio.app.features.music.booklet.FilmPlaying.active.value = false // fork:facts-filler
             PluginRepository.setPlaybackStartupHold(false)
             P2pStreamingEngine.stopStream()
             PlayerStreamsRepository.clearAll()
@@ -493,7 +578,8 @@ private enum class LightsPlaybackPhase { Idle, Loading, Playing, Paused, Ended }
 @Composable
 private fun PlayerScreenRuntime.BindLightsEffect() {
     // A trailer is a preview, not a screening; the room stays as it is.
-    val isTrailer = disableProgressTracking && providerName.equals("YouTube", ignoreCase = true)
+    val isTrailer = disableProgressTracking && providerName.equals("YouTube", ignoreCase = true) &&
+        parentMetaType != com.nuvio.app.features.youtube.YOUTUBE_META_TYPE // fork:youtube-mode - a video from the YouTube tab is a screening
     val phase = when {
         isTrailer || isProviderDiagnosticVideoPlayback || errorMessage != null -> LightsPlaybackPhase.Idle
         playbackSnapshot.isEnded -> LightsPlaybackPhase.Ended
@@ -571,6 +657,18 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
     // rather than settling for the still. `MetaDetailsRepository.fetch` is cached and
     // single-flighted, and the details screen that launched playback has almost always warmed it,
     // so this is usually free and never more than one request.
+    // A launch with no logo (a Continue Watching card whose enrichment never brought one, Random Play, a cloud row)
+    // takes the metadata record's, so the startup screen and pause overlay still show it. Peek first: usually free.
+    LaunchedEffect(parentMetaId, parentMetaType, args.logo) {
+        resolvedMetaLogo = null
+        if (!args.logo.isNullOrBlank()) return@LaunchedEffect
+        val metaId = parentMetaId.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        val metaType = parentMetaType.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        val found = MetaDetailsRepository.peekAny(type = metaType, id = metaId)?.logo
+            ?: runCatching { MetaDetailsRepository.fetch(type = metaType, id = metaId)?.logo }.getOrNull()
+        resolvedMetaLogo = found?.trim()?.takeIf { it.isNotBlank() }
+    }
+
     LaunchedEffect(parentMetaId, parentMetaType, poster, discordSettings.showPlaybackPresence) {
         discordMetaPosterUrl = null
         if (!discordSettings.showPlaybackPresence) return@LaunchedEffect
@@ -624,8 +722,8 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
     LaunchedEffect(parentMetaId, parentMetaType, discordSettings.showPlaybackPresence) {
         discordCustomPosterUrl = null
         if (!discordSettings.showPlaybackPresence) return@LaunchedEffect
-        val settings = TmdbSettingsRepository.snapshot()
-        if (!settings.libraryPosterEnabled || settings.libraryPosterUrlTemplate.isBlank()) return@LaunchedEffect
+        val settings = CustomPosterSettingsRepository.snapshot()
+        if (!settings.isActive(CustomPosterShape.Portrait)) return@LaunchedEffect
         val metaId = parentMetaId.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         val metaType = parentMetaType.trim().takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         if (metaId.isAnimeNativeId() && !settings.customPosterTemplateUsesNativeAnimeId()) return@LaunchedEffect
@@ -644,7 +742,7 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
             tmdbId = ids.tmdbId?.toString(),
             type = metaType,
             stremioId = metaId,
-            mdbListApiKey = MdbListSettingsRepository.snapshot().apiKey,
+            keys = CustomPosterKeys.snapshot(),
         )
         discordCustomPosterUrl = custom?.takeIf { isExternallyFetchableArtworkUrl(it) }
     }
@@ -711,7 +809,7 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
         if (playbackSnapshot.isLoading) {
             DiscordRichPresenceController.setPlaybackActivity(
                 DiscordRichPresenceActivity(
-                    title = "Starting stream",
+                    title = localizedString(Res.string.discord_presence_starting_stream),
                     subtitle = presenceTitle,
                     imageUrl = discordPresenceImageUrl(discordSettings.episodeArtwork),
                     fallbackImageUrl = discordPresenceFallbackImageUrl(discordSettings.episodeArtwork),
@@ -740,8 +838,11 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
                 activityStyle = discordSettings.activityStyle,
                 activityName = discordSettings.activityName,
                 isPlaying = playbackSnapshot.isPlaying,
-                positionMs = playbackSnapshot.positionMs.coerceAtLeast(0L),
-                durationMs = playbackSnapshot.durationMs.coerceAtLeast(0L),
+                // Live TV has no timeline: mpv's duration for an endless stream grows with every
+                // tick, and since it is part of the presence's dedupe key that re-sent the activity
+                // to Discord twice a second.
+                positionMs = if (isIptvPlayback) 0L else playbackSnapshot.positionMs.coerceAtLeast(0L),
+                durationMs = if (isIptvPlayback) 0L else playbackSnapshot.durationMs.coerceAtLeast(0L),
                 refreshNonce = presenceReconcileTick * 1_000_000L + pausedAnchorTick,
             ),
         )
@@ -755,6 +856,184 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
 }
 
 /**
+ * fork:phone-remote — tells the phone remote what this player is showing, and lets it seek, pause and set the volume
+ * directly (the phone's seek bar, the lock screen's buttons and its volume keys work even when Nuvio is not the
+ * focused window, which the keystroke path needs).
+ */
+@Composable
+private fun PlayerScreenRuntime.BindPhoneRemoteNowPlayingEffect() {
+    val runtime = this
+    DisposableEffect(Unit) {
+        val controls = object : com.nuvio.app.features.remote.RemoteFilmControls {
+            override fun seekTo(positionMs: Long) {
+                runtime.playerController?.seekTo(positionMs.coerceAtLeast(0L))
+            }
+            override fun seekBy(offsetMs: Long) {
+                runtime.playerController?.seekBy(offsetMs)
+            }
+            override fun play() {
+                runtime.playerController?.play()
+            }
+            override fun pause() {
+                runtime.playerController?.pause()
+            }
+            override fun setVolume(percent: Int) {
+                val controller = runtime.playerController ?: return
+                controller.setVolume((percent / 100f).coerceIn(0f, controller.maxVolumeFraction))
+            }
+            override fun subtitleChoices() = runtime.phoneRemoteSubtitleList()
+            override fun pickSubtitle(number: Int): Boolean {
+                val index = number - 1
+                val builtIn = runtime.visibleSubtitleTracks
+                val addons = runtime.visibleAddonSubtitles
+                if (index < 0 || index > builtIn.size + addons.size) return false
+                runtime.scope.launch {
+                    when {
+                        index == 0 -> runtime.selectBuiltInSubtitle(-1)
+                        index <= builtIn.size -> runtime.selectBuiltInSubtitle(builtIn[index - 1].index)
+                        else -> runtime.selectAddonSubtitle(addons[index - 1 - builtIn.size])
+                    }
+                }
+                return true
+            }
+            override fun audioChoices() = runtime.phoneRemoteAudioList()
+            override fun pickAudio(number: Int): Boolean {
+                val track = runtime.visibleAudioTracks.getOrNull(number - 1) ?: return false
+                runtime.scope.launch { runtime.selectAudioTrackFromList(track.index) }
+                return true
+            }
+            override fun fetchSubtitles() {
+                runtime.scope.launch { runtime.fetchAddonSubtitlesForActiveItem() }
+            }
+            override fun setSpeedPercent(percent: Int) {
+                runtime.applyUserPlaybackSpeed((percent / 100f).coerceIn(0.5f, 4f))
+            }
+            override fun skipSegment(): Boolean {
+                val interval = runtime.activeSkipInterval ?: return false
+                runtime.acceptSkipInterval(interval)
+                return true
+            }
+            override fun nextEpisode(): Boolean {
+                if (runtime.nextEpisodeInfo?.hasAired != true) return false
+                runtime.playNextEpisode()
+                return true
+            }
+        }
+        com.nuvio.app.features.remote.RemotePlayerHub.publishFilm(null, controls)
+        onDispose { com.nuvio.app.features.remote.RemotePlayerHub.publishFilm(null, null) }
+    }
+    LaunchedEffect(Unit) {
+        androidx.compose.runtime.snapshotFlow { phoneRemoteNowPlaying() }.collect { state ->
+            com.nuvio.app.features.remote.RemotePlayerHub.filmControls?.let { controls ->
+                com.nuvio.app.features.remote.RemotePlayerHub.publishFilm(state, controls)
+            }
+        }
+    }
+}
+
+private fun PlayerScreenRuntime.phoneRemoteNowPlaying(): com.nuvio.app.features.remote.RemoteNowPlaying? {
+    val snapshot = playbackSnapshot
+    if (snapshot.isEnded || isProviderDiagnosticVideoPlayback) return null
+    val youTube = if (isYouTubeVideoPlayback) youTubeDetails else null
+    val shownTitle = youTube?.title?.takeIf { it.isNotBlank() }
+        ?: discordPresenceTitle()
+        ?: title.takeIf { it.isNotBlank() }
+        ?: return null
+    val episodeLine = listOfNotNull(
+        discordPresenceEpisodeLabel(),
+        activeEpisodeTitle?.trim()?.takeIf { it.isNotBlank() },
+    ).joinToString(" · ").takeIf { it.isNotBlank() }
+    val level = playerController?.getVolume()
+    val max = ((playerController?.maxVolumeFraction ?: 1f) * 100f).toInt().coerceAtLeast(100)
+    return com.nuvio.app.features.remote.RemoteNowPlaying(
+        kind = "film",
+        title = shownTitle,
+        subtitle = youTube?.channelName ?: episodeLine,
+        imageUrl = listOf(poster, adHocArtworkImageUrl, background).firstOrNull { !it.isNullOrBlank() },
+        isPlaying = snapshot.isPlaying && !snapshot.isLoading,
+        positionMs = if (isIptvPlayback) 0L else snapshot.positionMs.coerceAtLeast(0L),
+        durationMs = if (isIptvPlayback) 0L else snapshot.durationMs.coerceAtLeast(0L),
+        volume = level?.let { if (it.isMuted) 0 else (it.fraction * 100f).toInt().coerceIn(0, max) },
+        volumeMax = max,
+        canSkip = false,
+        subtitleTrack = phoneRemoteSubtitleName(),
+        audioTrack = audioTracks.firstOrNull { it.index == selectedAudioIndex }?.label?.takeIf { it.isNotBlank() },
+        speedPercent = (snapshot.playbackSpeed * 100f).toInt().coerceIn(50, 400),
+        skipLabel = activeSkipInterval?.takeUnless { skipIntervalDismissed }?.let { phoneRemoteSkipLabel(it.type) },
+        canNextEpisode = isSeries && nextEpisodeInfo?.hasAired == true,
+    )
+}
+
+/** What the phone's skip button says for a skippable part of this type (the TV's own prompt uses string resources). */
+internal fun phoneRemoteSkipLabel(type: String?): String = when (type?.lowercase()) {
+    "intro", "op", "mixed-op" -> "Skip intro"
+    "outro", "ed", "mixed-ed", "credits" -> "Skip credits"
+    "recap" -> "Skip recap"
+    "sponsor", "selfpromo", "interaction", "filler", "music_offtopic" -> "Skip this part"
+    else -> "Skip"
+}
+
+/** The phone's audio list: the tracks the player's panel offers (commentary and audio description left out), in its order. */
+private fun PlayerScreenRuntime.phoneRemoteAudioList(): com.nuvio.app.features.remote.RemoteSubtitleList {
+    val tracks = visibleAudioTracks
+    val on = tracks.firstOrNull { it.index == selectedAudioIndex || it.isSelected }
+    return com.nuvio.app.features.remote.RemoteSubtitleList(
+        loading = false,
+        choices = tracks.map { track ->
+            com.nuvio.app.features.remote.RemoteSubtitleChoice(
+                label = track.label.ifBlank { track.language ?: "Track ${track.index + 1}" },
+                detail = track.language?.takeIf { it.isNotBlank() && !track.label.contains(it, ignoreCase = true) },
+                group = "",
+                selected = on?.index == track.index,
+            )
+        },
+    )
+}
+
+/**
+ * What the phone's subtitle list shows: Off, then the file's own tracks, then the add-ons' subtitles, the same lists
+ * (and order) the player's panel offers, so a number the phone sends means the same row here.
+ */
+private fun PlayerScreenRuntime.phoneRemoteSubtitleList(): com.nuvio.app.features.remote.RemoteSubtitleList {
+    val builtIn = visibleSubtitleTracks
+    val addons = visibleAddonSubtitles
+    val addonOn = if (useCustomSubtitles) selectedAddonSubtitle else null
+    val builtInOn = if (addonOn == null) builtIn.firstOrNull { it.index == selectedSubtitleIndex || it.isSelected } else null
+    val choices = buildList {
+        add(com.nuvio.app.features.remote.RemoteSubtitleChoice("Off", null, "Off", selected = addonOn == null && builtInOn == null))
+        builtIn.forEach { track ->
+            add(
+                com.nuvio.app.features.remote.RemoteSubtitleChoice(
+                    label = track.label.ifBlank { track.language ?: "Track ${track.index + 1}" },
+                    detail = listOfNotNull(track.language?.takeIf { it.isNotBlank() }, "forced".takeIf { track.isForced }).joinToString(" · ").ifBlank { null },
+                    group = "Built-in",
+                    selected = builtInOn?.index == track.index,
+                ),
+            )
+        }
+        addons.forEach { sub ->
+            add(
+                com.nuvio.app.features.remote.RemoteSubtitleChoice(
+                    label = sub.display.ifBlank { sub.language },
+                    detail = sub.language.takeIf { it.isNotBlank() && it != sub.display },
+                    group = sub.addonName?.takeIf { it.isNotBlank() } ?: "Add-on",
+                    selected = addonOn != null && (sub.id == addonOn.id && sub.url == addonOn.url),
+                ),
+            )
+        }
+    }
+    return com.nuvio.app.features.remote.RemoteSubtitleList(loading = isLoadingAddonSubtitles, choices = choices)
+}
+
+/** What the phone's Subtitles tile shows: an addon subtitle by its name, a built-in one by its label, else Off. */
+private fun PlayerScreenRuntime.phoneRemoteSubtitleName(): String? {
+    selectedAddonSubtitle?.let { addon -> return addon.display.ifBlank { addon.language } }
+    // Add-on subtitles count too: a file with no built-in tracks still has something to cycle to once they are found.
+    if (subtitleTracks.isEmpty()) return if (visibleAddonSubtitles.isNotEmpty()) "Off" else null
+    return subtitleTracks.firstOrNull { it.index == selectedSubtitleIndex }?.label?.takeIf { it.isNotBlank() } ?: "Off"
+}
+
+/**
  * Load-timeout half of stream failover: when a source is active but never starts playing within the
  * configured timeout (a stream that "connects but never buffers", which raises no error), treat it as
  * a failed start and fail over to the next source. Initial-start only — mid-playback rebuffering must
@@ -762,6 +1041,8 @@ private fun PlayerScreenRuntime.BindDiscordRichPresenceEffect() {
  * it clears the failover tried-set so a later, unrelated mid-playback failure gets a fresh budget.
  */
 private const val STREAM_FAILOVER_WATCHDOG_STEP_MS = 500L
+private const val USENET_DECODE_PROBE_MS = 2_000L
+private const val IPTV_STARTUP_TIMEOUT_MS = 45_000L
 private const val STREAM_FAILOVER_SUSTAINED_PLAYBACK_RESET_MS = 30_000L
 private const val INITIAL_TRACK_RESTORE_POLL_INTERVAL_MS = 250L
 private const val INITIAL_TRACK_RESTORE_POLL_ATTEMPTS = 60
@@ -779,7 +1060,12 @@ private fun PlayerScreenRuntime.BindStreamFailoverWatchdogEffect() {
         if (activeSourceUrl.isBlank() || isProviderDiagnosticVideoPlayback) return@LaunchedEffect
         val watchedUrl = activeSourceUrl
         val watchedAttemptId = playbackAttemptId
-        val timeoutMs = playerSettingsUiState.streamFailoverTimeoutSeconds.coerceAtLeast(1) * 1000L
+        val settingTimeoutMs = playerSettingsUiState.streamFailoverTimeoutSeconds.coerceAtLeast(1) * 1000L
+        // Live HLS starts slowly: FFmpeg opens and probes every variant and audio rendition before
+        // the first frame, 15-30 s on Pluto TV, so the usual allowance failed working channels over
+        // to a format that does not exist. A dead live source still fails fast: mpv's network
+        // timeout and any HTTP error end it long before this.
+        val timeoutMs = if (isIptvPlayback) maxOf(settingTimeoutMs, IPTV_STARTUP_TIMEOUT_MS) else settingTimeoutMs
         // The desktop controller is created before its native Canvas has received a full-size
         // paint. Do not count that UI lifecycle wait against the source: no loadfile request exists
         // until the platform surface reports that this exact URL is being attached.
@@ -799,6 +1085,12 @@ private fun PlayerScreenRuntime.BindStreamFailoverWatchdogEffect() {
         }
         var elapsed = 0L
         var started = false
+        // A compressed 7z decodes everything before a resume point first (it cannot jump): as
+        // long as the engine reports the decoder moving towards it, the start is not stuck, and
+        // the wait shows how far it is instead of failing over a release that is playing.
+        val usenetSession = com.nuvio.app.features.usenet.UsenetEngine.isSessionUrl(watchedUrl)
+        var sinceDecodeProbe = 0L
+        var lastDecoded = -1L
         while (elapsed < timeoutMs) {
             // A debrid URL can open and publish duration/position while waiting for the actual
             // torrent. Only mpv's first rendered-frame event proves this source really started.
@@ -818,6 +1110,23 @@ private fun PlayerScreenRuntime.BindStreamFailoverWatchdogEffect() {
             ) return@LaunchedEffect
             delay(STREAM_FAILOVER_WATCHDOG_STEP_MS)
             elapsed += STREAM_FAILOVER_WATCHDOG_STEP_MS
+            if (usenetSession) {
+                sinceDecodeProbe += STREAM_FAILOVER_WATCHDOG_STEP_MS
+                if (sinceDecodeProbe >= USENET_DECODE_PROBE_MS) {
+                    sinceDecodeProbe = 0L
+                    val progress = com.nuvio.app.features.usenet.usenetDecodeProgress(
+                        com.nuvio.app.features.usenet.UsenetEngine.diagnostics(watchedUrl),
+                    )
+                    if (progress != null && progress.decodedBytes > lastDecoded) {
+                        lastDecoded = progress.decodedBytes
+                        elapsed = 0L
+                        playerController?.showTransientMessage(
+                            getString(Res.string.usenet_unpacking_7z),
+                            com.nuvio.app.features.usenet.usenetDecodeProgressLabel(progress),
+                        )
+                    }
+                }
+            }
         }
         if (!started &&
             playbackAttemptId == watchedAttemptId &&
@@ -964,7 +1273,7 @@ private fun PlayerScreenRuntime.discordPresenceArtworkCandidates(
     }
     return ordered
         .mapNotNull { it?.trim() }
-        .filter { isExternallyFetchableArtworkUrl(it) }
+        .filter { isExternallyFetchableArtworkUrl(it) && fitsDiscordAssetLimit(it) }
         .distinct()
 }
 
@@ -1011,7 +1320,7 @@ private fun PlayerScreenRuntime.discordPresenceEpisodeLabel(): String? {
     val episodeNumber = activeEpisodeNumber ?: return null
     return activeSeasonNumber?.let { seasonNumber ->
         "S${seasonNumber.toString().padStart(2, '0')}E${episodeNumber.toString().padStart(2, '0')}"
-    } ?: "Episode $episodeNumber"
+    } ?: localizedString(Res.string.discord_presence_episode, episodeNumber)
 }
 
 /** Leading four-digit release year from the loaded meta (e.g. "2021" from "2021" or "2019–2023"). */
@@ -1139,6 +1448,9 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         } else if (!previousIsPlaying && playbackSnapshot.isPlaying) {
             emitTrackingScrobbleStart()
         }
+        if (!previousIsPlaying && playbackSnapshot.isPlaying) {
+            emitAddonPlayerEvent(AddonPlayerAction.START)
+        }
 
         if (!playbackSnapshot.isLoading) {
             previousIsPlaying = playbackSnapshot.isPlaying
@@ -1151,6 +1463,7 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
 
 @Composable
 private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
+    val animeFillerSettings by com.nuvio.app.features.details.filler.AnimeFillerSettings.state.collectAsState()
     LaunchedEffect(activeVideoId, activeSeasonNumber, activeEpisodeNumber, parentMetaId, parentMetaType) {
         parentalWarnings = emptyList()
         showParentalGuide = false
@@ -1172,6 +1485,47 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         }
     }
 
+    val seekrEligible = seekrPreviewsEligible(
+        mode = playerSettingsUiState.desktopSeekThumbnailMode,
+        bufferPreset = playerSettingsUiState.desktopBufferPreset,
+        sourceUrl = activeSourceUrl,
+        isTorrent = activeTorrentInfoHash != null,
+        apiKey = playerSettingsUiState.seekrApiKey,
+        seekrServiceOff = SeekrPreviews.serviceDisabled,
+    )
+    LaunchedEffect(
+        activeVideoId,
+        activeSeasonNumber,
+        activeEpisodeNumber,
+        parentMetaId,
+        activeSourceUrl,
+        seekrEligible,
+        playerSettingsUiState.seekrApiKey,
+    ) {
+        seekrTrack = null
+        seekrLookupPending = seekrEligible
+        if (!seekrEligible) return@LaunchedEffect
+        try {
+            val target = resolveSkipLookupTarget(
+                videoId = activeVideoId,
+                parentMetaId = parentMetaId,
+                contentType = contentType ?: parentMetaType,
+                season = activeSeasonNumber,
+                episode = activeEpisodeNumber,
+            ) ?: return@LaunchedEffect
+            // Seekr matches the cut by runtime, so the lookup has to wait for the player's.
+            val durationMs = withTimeoutOrNull(SKIP_LOOKUP_DURATION_TIMEOUT_MS) {
+                snapshotFlow { playbackSnapshot.durationMs }.first { it > 0L }
+            } ?: return@LaunchedEffect
+            val result = SeekrPreviews.lookup(playerSettingsUiState.seekrApiKey, target, durationMs)
+            SeekrLog.i { "lookup ${target::class.simpleName} duration=${durationMs}ms -> ${result::class.simpleName}" }
+            seekrTrack = (result as? SeekrLookupResult.Found)?.track
+        } finally {
+            // A cancelled run leaves the flag to its successor, which has already set its own.
+            if (isActive) seekrLookupPending = false
+        }
+    }
+
     LaunchedEffect(activeVideoId, activeSeasonNumber, activeEpisodeNumber, parentMetaId, parentMetaType) {
         skipIntervals = emptyList()
         playerChapters = emptyList()
@@ -1180,6 +1534,9 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         activeSkipInterval = null
         skipIntervalDismissed = false
         autoAcceptedSkipIntervals.clear()
+        skipSubmitOffer = null
+        skipCaptureSession = null
+        submittedSkipSegments.clear()
         showNextEpisodeCard = false
         nextEpisodeThresholdStableSamples = 0
         nextEpisodeAutoPlayJob?.cancel()
@@ -1188,6 +1545,22 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         val season = activeSeasonNumber
         val episode = activeEpisodeNumber
         val vid = activeVideoId ?: return@LaunchedEffect
+        if (isIptvPlayback) return@LaunchedEffect // no intro/outro timings exist for live TV
+        // A YouTube tab video: SponsorBlock's segments, by the video's own id, in place of the
+        // title-based providers (which know nothing of it).
+        if (parentMetaType == com.nuvio.app.features.youtube.YOUTUBE_META_TYPE) {
+            launch {
+                val intervals = com.nuvio.app.features.youtube.YouTubeSponsorBlock.intervals(
+                    parentMetaId.removePrefix(com.nuvio.app.features.youtube.YOUTUBE_META_ID_PREFIX),
+                )
+                communitySkipIntervals = intervals
+                skipIntervals = mergeCommunityAndChapterSkipIntervals(
+                    communityIntervals = intervals,
+                    chapterIntervals = chapterSkipIntervals,
+                )
+            }
+            return@LaunchedEffect
+        }
 
         launch {
             // Which provider chain this playback belongs to is decided by its id, before anything
@@ -1249,10 +1622,13 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerController,
         playerControllerSourceUrl,
         playbackSnapshot.durationMs,
+        youTubeChapters,
     ) {
         if (playbackSnapshot.durationMs <= 0L) return@LaunchedEffect
         if (playerControllerSourceUrl != activeSourceUrl) return@LaunchedEffect
-        val chapters = playerController?.getChapters().orEmpty()
+        // A YouTube video: its own chapters from the watch page, never mpv's, which for YouTube's
+        // streams are the stream's parts, named by their URLs (the seek preview showed those).
+        val chapters = if (isYouTubeVideoPlayback) youTubeChapters else playerController?.getChapters().orEmpty()
         playerChapters = chapters
         val intervals = ChapterSkipDetector.findIntervals(
             chapters = chapters,
@@ -1271,12 +1647,57 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             return@LaunchedEffect
         }
         val positionSec = playbackSnapshot.positionMs / 1000.0
+        // A post-credits scene is where skipping the credits lands, never a prompt of its own.
         val current = skipIntervals.firstOrNull { interval ->
-            positionSec >= interval.startTime && positionSec < interval.endTime
+            positionSec >= interval.startTime && positionSec < interval.endTime &&
+                !interval.isPostCreditsScene()
         }
         if (current != activeSkipInterval) {
             activeSkipInterval = current
             if (current != null) skipIntervalDismissed = false
+        }
+    }
+
+    // Submission toast lifetimes. The offer and a result are short-lived; a capture stays open
+    // for as long as marking takes, with only a forgotten-session cap.
+    LaunchedEffect(skipSubmitOffer?.interval, skipSubmitOffer?.phase) {
+        val offer = skipSubmitOffer ?: return@LaunchedEffect
+        val timeout = when (offer.phase) {
+            SkipSubmitToastPhase.OFFER -> SKIP_SUBMIT_OFFER_TIMEOUT_MS
+            SkipSubmitToastPhase.RESULT -> SKIP_SUBMIT_RESULT_TIMEOUT_MS
+            else -> return@LaunchedEffect
+        }
+        delay(timeout)
+        val current = skipSubmitOffer
+        if (current?.interval == offer.interval && current.phase == offer.phase) skipSubmitOffer = null
+    }
+    LaunchedEffect(playerNoticeToast?.key) {
+        val notice = playerNoticeToast ?: return@LaunchedEffect
+        delay(SKIP_SUBMIT_RESULT_TIMEOUT_MS)
+        if (playerNoticeToast?.key == notice.key) playerNoticeToast = null
+    }
+    LaunchedEffect(skipCaptureSession?.startSec, skipCaptureSession?.phase) {
+        val session = skipCaptureSession ?: return@LaunchedEffect
+        val timeout = when (session.phase) {
+            SkipSubmitToastPhase.CAPTURING, SkipSubmitToastPhase.CAPTURED -> SKIP_CAPTURE_MAX_OPEN_MS
+            SkipSubmitToastPhase.RESULT -> SKIP_SUBMIT_RESULT_TIMEOUT_MS
+            else -> return@LaunchedEffect
+        }
+        delay(timeout)
+        if (skipCaptureSession == session) skipCaptureSession = null
+    }
+    // The offer follows the landing point: seeking back into the segment (it landed wrong) or
+    // well past it withdraws the offer before its timer would.
+    LaunchedEffect(playbackSnapshot.positionMs, skipSubmitOffer?.interval) {
+        val offer = skipSubmitOffer ?: return@LaunchedEffect
+        if (offer.phase != SkipSubmitToastPhase.OFFER) return@LaunchedEffect
+        val positionSec = playbackSnapshot.positionMs / 1000.0
+        val landing = offer.interval.endTime
+        val behind = positionSec < landing - SKIP_SUBMIT_OFFER_BACKWARD_TOLERANCE_SEC
+        val ahead = positionSec > landing + SKIP_SUBMIT_OFFER_FORWARD_TOLERANCE_SEC
+        when {
+            !offer.landed && !behind && !ahead -> skipSubmitOffer = offer.copy(landed = true)
+            offer.landed && (behind || ahead) -> skipSubmitOffer = null
         }
     }
 
@@ -1297,18 +1718,47 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         if (!initialLoadCompleted || !playbackSnapshot.isPlaying || pausedOverlayVisible) {
             return@LaunchedEffect
         }
-        if (!playerSettingsUiState.skipAutoAcceptMode.accepts(interval)) return@LaunchedEffect
+        // Outros are otherwise never auto-accepted (skipping one usually ends the file). A film's
+        // credits are the one exception, opted into, and only when the landing is a scene after
+        // them — there skipping keeps the viewer in the film rather than ending it.
+        val acceptsCreditsToScene = playerSettingsUiState.skipMovieCreditsToPostCredits &&
+            !isSeries && interval.isOutroKind() && activeSkipLanding(interval).landsOnPostCredits
+        // SponsorBlock's sponsors and reminders are skipped on their own setting, as its extension does.
+        val acceptsSponsor = interval.provider == com.nuvio.app.features.youtube.SPONSORBLOCK_SKIP_PROVIDER &&
+            interval.type in com.nuvio.app.features.youtube.YOUTUBE_AUTO_SKIP_TYPES &&
+            com.nuvio.app.features.youtube.YouTubeFeedRepository.sponsorAutoSkip.value
+        // Outros too when opted in, from the same sources the mode trusts (user report, Nov 16: anime endings).
+        val acceptsOutro = playerSettingsUiState.skipAutoAcceptOutros && interval.isOutroKind() &&
+            playerSettingsUiState.skipAutoAcceptMode.acceptsSource(interval)
+        if (!acceptsSponsor && !acceptsCreditsToScene && !acceptsOutro &&
+            !playerSettingsUiState.skipAutoAcceptMode.accepts(interval)
+        ) {
+            return@LaunchedEffect
+        }
+        // A host-only party member follows the host's skips instead of making their own.
+        if (isPartyControlLocked) return@LaunchedEffect
         if (!autoAcceptedSkipIntervals.add(interval.identityKey())) return@LaunchedEffect
         acceptSkipInterval(interval)
     }
 
-    LaunchedEffect(playerMetaVideos, activeVideoId, activeSeasonNumber, activeEpisodeNumber) {
-        if (!isSeries || playerMetaVideos.isEmpty()) {
+    LaunchedEffect(
+        playerMetaVideos,
+        activeVideoId,
+        activeSeasonNumber,
+        activeEpisodeNumber,
+        playerFillerKinds,
+        animeFillerSettings.skipFiller,
+    ) {
+        // A playlist decides what plays next, not the show: binge would otherwise carry on into
+        // the following episode instead of the playlist's next entry.
+        if (!isSeries || playerMetaVideos.isEmpty() || isPlaylistPlayback) {
             nextEpisodeInfo = null
             return@LaunchedEffect
         }
         val curSeason = activeSeasonNumber
         val curEpisode = activeEpisodeNumber ?: return@LaunchedEffect
+        val fillerKinds = playerFillerKinds
+        val skipFiller = animeFillerSettings.skipFiller && fillerKinds.isNotEmpty()
         val nextVideo = resolveAutoPlayEpisode(
             videos = playerMetaVideos,
             currentVideoId = activeVideoId,
@@ -1316,6 +1766,11 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             currentSeason = curSeason,
             currentEpisode = curEpisode,
             mode = autoPlayMode,
+            isSkipped = if (skipFiller) {
+                { video -> fillerKinds.isSkippableFiller(video.id) }
+            } else {
+                null
+            },
         )
         val nextEpisode = nextVideo?.playbackEpisodeNumber()
         nextEpisodeInfo = if (nextVideo != null && nextEpisode != null) {
@@ -1335,7 +1790,202 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         } else null
     }
 
+    if (isPlaylistPlayback) {
+        LaunchedEffect(Unit) {
+            val playlist = PlaylistPlaybackSession.currentPlaylist()
+            val entry = PlaylistPlaybackSession.currentEntry()
+            // A random-episode slot is picked now, so the up-next card names the episode and the
+            // prefetch searches for it.
+            playlistUpNext = PlaylistPlaybackSession.upNext()?.let { next ->
+                com.nuvio.app.features.playlist.PlaylistRandomEpisodes.resolve(next) ?: next
+            }
+            if (playlist != null && entry != null) {
+                val position = playlist.entries.indexOfFirst { it.entryId == entry.entryId } + 1
+                playlistUpNextHeader = localizedString(Res.string.playlist_player_up_next_header, playlist.name, position, playlist.entries.size)
+            }
+            PlaylistPlaybackSession.log.i {
+                "player opened in playlist mode entry=${entry?.entryId} upNext=${playlistUpNext?.entryId ?: "<end>"}"
+            }
+        }
+
+        // Same threshold rules as the next-episode card, so the prompt lands where the viewer is used
+        // to it. Advancing still waits for the end of the file (or a click): a playlist has no
+        // "binge early" setting, and cutting a film's credits short unasked would be a surprise.
+        LaunchedEffect(
+            playbackSnapshot.positionMs,
+            playbackSnapshot.durationMs,
+            playbackSnapshot.isEnded,
+            playlistUpNext,
+            isProviderDiagnosticVideoPlayback,
+            playbackSourceFailureActive,
+            errorMessage,
+            skipIntervals,
+            playerSettingsUiState.nextEpisodeThresholdMode,
+            playerSettingsUiState.nextEpisodeThresholdPercent,
+            playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
+        ) {
+            val blocked = playlistUpNext == null ||
+                isProviderDiagnosticVideoPlayback ||
+                playbackSourceFailureActive ||
+                errorMessage != null ||
+                playbackSnapshot.durationMs <= 0L
+            val atThreshold = !blocked && !playbackSnapshot.isEnded &&
+                PlayerNextEpisodeRules.shouldShowNextEpisodeCard(
+                    positionMs = playbackSnapshot.positionMs,
+                    durationMs = playbackSnapshot.durationMs,
+                    skipIntervals = skipIntervals,
+                    thresholdMode = playerSettingsUiState.nextEpisodeThresholdMode,
+                    thresholdPercent = playerSettingsUiState.nextEpisodeThresholdPercent,
+                    thresholdMinutesBeforeEnd = playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
+                )
+            showPlaylistUpNextCard = !blocked && (playbackSnapshot.isEnded || atThreshold)
+            if (!atThreshold) {
+                playlistThresholdStableSamples = 0
+                // Search ahead of the card: the threshold can sit seconds from the end, and some
+                // addons take 15-20s to answer, so waiting for it made every transition a stall.
+                // Held, never played: the card, the end of the file or Binge Mode decide that.
+                val remainingMs = playbackSnapshot.durationMs - playbackSnapshot.positionMs
+                if (
+                    !blocked && !playbackSnapshot.isEnded && !playbackSnapshot.isLoading &&
+                    remainingMs in 1..PLAYLIST_PREFETCH_LEAD_MS &&
+                    isPlaybackPositionSupportedByRecentProgress(
+                        positionMs = playbackSnapshot.positionMs,
+                        lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+                    )
+                ) {
+                    preparePlaylistAdvance(trigger = "lead", handOffWhenReady = false)
+                }
+                return@LaunchedEffect
+            }
+            // Same spike filter as binge: a refresh seek can briefly report a near-end position.
+            if (
+                !playbackSnapshot.isLoading &&
+                isPlaybackPositionSupportedByRecentProgress(
+                    positionMs = playbackSnapshot.positionMs,
+                    lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+                )
+            ) {
+                playlistThresholdStableSamples++
+            }
+            if (playlistThresholdStableSamples >= NEXT_EPISODE_THRESHOLD_STABLE_SAMPLES) {
+                // Prefetch always; Binge Mode also plays it as soon as it is found, exactly as it
+                // advances a show early. "Apply To Next Episode" never advances by itself.
+                preparePlaylistAdvance(
+                    trigger = "threshold",
+                    handOffWhenReady = playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
+                        !shouldOpenManualNextEpisodeSelection(
+                            mode = playerSettingsUiState.streamAutoPlayMode,
+                            manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                            sourceAffinity = sourceAffinity,
+                        ),
+                )
+            }
+        }
+
+        // The next entry opens in a fresh player; it starts at whatever speed this one ends at.
+        LaunchedEffect(sessionPlaybackSpeed) {
+            PlaylistPlaybackSession.playbackSpeed = sessionPlaybackSpeed
+        }
+
+        // Lets the session tell, once the player is left, whether the entry was watched far enough
+        // to move the playlist on. Sampled coarsely; only the last value matters.
+        LaunchedEffect(playbackSnapshot.positionMs / PLAYLIST_PROGRESS_SAMPLE_MS, isProviderDiagnosticVideoPlayback) {
+            if (isProviderDiagnosticVideoPlayback || playbackSnapshot.isLoading) return@LaunchedEffect
+            PlaylistPlaybackSession.reportProgress(
+                positionMs = playbackSnapshot.positionMs,
+                durationMs = playbackSnapshot.durationMs,
+            )
+        }
+    }
+
+    // Preload Next Episode Sources (upstream 22c9ab203): search the next episode a little before
+    // its card appears, through the prefetch service, so the binge pick that follows reads the
+    // answers instead of waiting on every provider. Asks once per next episode; the prefetch cache
+    // (with its in-flight sharing) is what next-episode autoplay then reads.
     LaunchedEffect(
+        playbackSnapshot.positionMs / NEXT_EPISODE_PRELOAD_SAMPLE_MS,
+        playbackSnapshot.durationMs,
+        nextEpisodeInfo,
+        playerSettingsUiState.preloadNextEpisodeSources,
+    ) {
+        val next = nextEpisodeInfo ?: return@LaunchedEffect
+        val settings = playerSettingsUiState
+        if (!settings.preloadNextEpisodeSources) return@LaunchedEffect
+        if (!next.hasAired || nextEpisodePreloadRequestedFor == next.videoId) return@LaunchedEffect
+        if (sourceAffinity == PlayerSourceAffinity.Local || isProviderDiagnosticVideoPlayback) return@LaunchedEffect
+        if (playbackSnapshot.isLoading || playbackSnapshot.isEnded || playbackSnapshot.durationMs <= 0L || errorMessage != null) {
+            return@LaunchedEffect
+        }
+        if (
+            !isPlaybackPositionSupportedByRecentProgress(
+                positionMs = playbackSnapshot.positionMs,
+                lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+            )
+        ) return@LaunchedEffect
+        val leadMs = nextEpisodePreloadLeadMs(settings.streamAutoPlayTimeoutSeconds)
+        val dueSoon = PlayerNextEpisodeRules.shouldShowNextEpisodeCard(
+            positionMs = playbackSnapshot.positionMs + leadMs,
+            durationMs = playbackSnapshot.durationMs,
+            skipIntervals = skipIntervals,
+            thresholdMode = settings.nextEpisodeThresholdMode,
+            thresholdPercent = settings.nextEpisodeThresholdPercent,
+            thresholdMinutesBeforeEnd = settings.nextEpisodeThresholdMinutesBeforeEnd,
+        )
+        if (!dueSoon) return@LaunchedEffect
+        nextEpisodePreloadRequestedFor = next.videoId
+        // The same identity launchPlayerNextEpisodeAutoPlay loads, or the cache key would differ.
+        val nextVideo = playerMetaVideos.firstOrNull { it.id == next.videoId }
+        BingeAdvanceLog.i { "preloading next episode sources for ${next.videoId} lead=${leadMs}ms" }
+        val nextSeason = nextVideo?.playbackSeasonNumber() ?: next.season
+        val nextEpisode = nextVideo?.playbackEpisodeNumber() ?: next.episode
+        // Captured now: the sweep answers on a background thread, after the player may have moved on.
+        val affinity = sourceAffinity
+        val pickerSettings = settings
+        val bingeGroup = currentStreamBingeGroup
+        val playingStream = activeStream
+        val metaId = parentMetaId
+        val type = contentType ?: parentMetaType
+        val warmPredictedPick = !shouldOpenManualNextEpisodeSelection(
+            mode = settings.streamAutoPlayMode,
+            manualNextEpisodeEnabled = settings.streamAutoPlayManualNextEpisode,
+            sourceAffinity = affinity,
+        )
+        StreamPrefetchService.request(
+            StreamPrefetchService.Target(
+                trigger = StreamPrefetchService.Trigger.NextEpisode,
+                type = type,
+                parentMetaId = metaId,
+                videoId = next.videoId,
+                season = nextSeason,
+                episode = nextEpisode,
+                // Autoplay will pick from these same answers: make its pick now and warm that
+                // stream's link, so the attach after this episode does not wait on it.
+                onSwept = if (!warmPredictedPick) null else { groups ->
+                    val streams = eligibleAutoPlayStreams(groups.flatMap { it.streams }, affinity)
+                    val predicted = nextEpisodeAutoPlayPicker(
+                        settings = pickerSettings,
+                        sourceAffinity = affinity,
+                        currentStreamBingeGroup = bingeGroup,
+                        currentStream = playingStream,
+                        nextSeasonNumber = nextSeason,
+                        nextEpisodeNumber = nextEpisode,
+                        parentMetaId = metaId,
+                        contentType = type,
+                    ).predict(streams)
+                    if (predicted != null && PlaybackSourceWarmup.warm(predicted)) {
+                        BingeAdvanceLog.i {
+                            "warming the predicted next-episode link for ${next.videoId} via ${predicted.addonName}"
+                        }
+                    }
+                },
+            ),
+        )
+    }
+
+    // A finale's post-show cards are still to come: hold the card and autoplay until they close.
+    val postShowHolding = PostShowController.pending
+    LaunchedEffect(
+        postShowHolding,
         playbackSnapshot.positionMs,
         playbackSnapshot.durationMs,
         playbackSnapshot.isEnded,
@@ -1349,23 +1999,29 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdPercent,
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
     ) {
-        val cardBlocked = isProviderDiagnosticVideoPlayback ||
+        val cardBlocked = postShowHolding ||
+            isProviderDiagnosticVideoPlayback ||
             playbackSourceFailureActive ||
             errorMessage != null ||
             nextEpisodeInfo == null ||
             playbackSnapshot.durationMs <= 0L
-        // "Apply To Next Episode" never advances on its own, so the card is the only control the
-        // user has left once the episode ends — and clearing it here (the card normally dies with
-        // playback, because something else was always about to advance) took it away at exactly the
-        // moment it was needed. Hold it instead, until they click it or dismiss it.
+        // Hold the card across EOF when manual selection is active OR when the card is already
+        // up / auto-advance is searching so it flows seamlessly from the outro progress bar into
+        // "Finding source..." instead of vanishing at 100% and popping back in a frame later.
         val holdCardAtEnd = !cardBlocked &&
             playbackSnapshot.isEnded &&
             nextEpisodeInfo?.hasAired == true &&
-            shouldOpenManualNextEpisodeSelection(
-                mode = playerSettingsUiState.streamAutoPlayMode,
-                manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
-                sourceAffinity = sourceAffinity,
-            )
+            (
+                showNextEpisodeCard ||
+                    nextEpisodeAutoPlaySearching ||
+                    nextEpisodeAutoPlayCountdown != null ||
+                    nextEpisodeAdvanceInProgress ||
+                    shouldOpenManualNextEpisodeSelection(
+                        mode = playerSettingsUiState.streamAutoPlayMode,
+                        manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                        sourceAffinity = sourceAffinity,
+                    )
+                )
         if (cardBlocked || (playbackSnapshot.isEnded && !holdCardAtEnd)) {
             showNextEpisodeCard = false
             nextEpisodeThresholdStableSamples = 0
@@ -1476,6 +2132,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         )
     }
 
+    // The post-show cards outlast the file: hold the end until they close, then act on it as usual.
+    val postShowShowing = PostShowController.showing
     LaunchedEffect(
         playbackSnapshot.isEnded,
         lastTrustedPlaybackPositionMs,
@@ -1483,8 +2141,10 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         isProviderDiagnosticVideoPlayback,
         playbackSourceFailureActive,
         errorMessage,
+        postShowShowing,
     ) {
         if (
+            !postShowShowing &&
             !isProviderDiagnosticVideoPlayback &&
             !playbackSourceFailureActive &&
             errorMessage == null &&
@@ -1498,6 +2158,9 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                 durationMs = durationMs,
                 positionMs = positionMs,
                 lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+                // A YouTube tab video is never a debrid placeholder, and many run under two minutes:
+                // taken for placeholders, their ends never exited, so autoplay sat at the end (Nov 3, a 1:44 video).
+                allowShortContent = isYouTubeVideoPlayback,
             )
             val nextVideoId = nextEpisodeInfo?.videoId
             val hasPlayableNextEpisode = nextEpisodeInfo?.hasAired == true &&
@@ -1533,6 +2196,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             }
             if (willTrigger) {
                 playNextEpisode()
+            } else if (willExit && isPlaylistPlayback && playlistUpNext != null) {
+                requestPlaylistAdvance(trigger = "eof")
             } else if (willExit) {
                 playbackEndExitRequested = true
                 flushWatchProgress()
@@ -1589,6 +2254,18 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
 
 private const val NEXT_EPISODE_ADVANCE_LATCH_SAFETY_TIMEOUT_MS = 150_000L
 private const val NEXT_EPISODE_THRESHOLD_STABLE_SAMPLES = 3
+private const val NEXT_EPISODE_PRELOAD_SAMPLE_MS = 1_000L
+
+/**
+ * How far ahead of the next-episode card the preload starts: the autoplay timeout, so a pick at
+ * the card can use full answers, but at least 10 s (slow addons) and at most 30 s (unlimited
+ * timeout), as upstream settled on in d2cc0fb8a.
+ */
+internal fun nextEpisodePreloadLeadMs(autoPlayTimeoutSeconds: Int): Long =
+    (autoPlayTimeoutSeconds.toLong().coerceIn(0L, 30L) * 1_000L).coerceIn(10_000L, 30_000L)
+
+/** How far before the end a playlist starts searching for its next entry's source. */
+private const val PLAYLIST_PREFETCH_LEAD_MS = 4 * 60_000L
 private const val NEXT_EPISODE_EOF_STABILITY_MS = 1_000L
 private const val NEXT_EPISODE_EOF_POSITION_TOLERANCE_MS = 5_000L
 private const val NEXT_EPISODE_TRUSTED_POSITION_TOLERANCE_MS = 30_000L
@@ -1605,9 +2282,13 @@ internal fun isTrustworthyPlaybackEnd(
     durationMs: Long,
     positionMs: Long,
     lastTrustedPositionMs: Long,
+    /** A source that cannot be a placeholder clip (a YouTube video): a short one's end is real. */
+    allowShortContent: Boolean = false,
 ): Boolean =
     isEnded &&
         durationMs > 0L &&
+        // An error clip or debrid placeholder ending is not the episode ending.
+        (allowShortContent || !com.nuvio.app.features.watching.domain.isShortPlaceholderDuration(durationMs)) &&
         positionMs >= (durationMs - NEXT_EPISODE_EOF_POSITION_TOLERANCE_MS).coerceAtLeast(0L) &&
         lastTrustedPositionMs > 0L &&
         lastTrustedPositionMs >=
@@ -1618,7 +2299,10 @@ internal fun isTrustworthyPlaybackEnd(
 // these snapshot-keyed effects) are hard to reproduce, so this traces every link in the chain —
 // threshold detection, the end-of-file fallback, the advance latch, and the actual advance call —
 // to pinpoint exactly where a stall happens the next time it's observed. Purely observational.
+private const val PLAYLIST_PROGRESS_SAMPLE_MS = 2_000L
+
 internal val BingeAdvanceLog = Logger.withTag("BingeAdvance")
+private val SeekrLog = Logger.withTag("Seekr")
 
 private fun resolveAutoPlayEpisode(
     videos: List<MetaVideo>,
@@ -1627,14 +2311,17 @@ private fun resolveAutoPlayEpisode(
     currentSeason: Int?,
     currentEpisode: Int?,
     mode: PlayerAutoPlayMode,
+    /** Episodes autoplay passes over (skip-filler); null skips nothing. */
+    isSkipped: ((MetaVideo) -> Boolean)? = null,
 ): MetaVideo? {
     if (mode != PlayerAutoPlayMode.RandomEpisode) {
-        return PlayerNextEpisodeRules.resolveNextEpisode(
+        return PlayerNextEpisodeRules.resolveNextEpisodeSkipping(
             videos = videos,
             currentSeason = currentSeason,
             currentEpisode = currentEpisode,
             currentVideoId = currentVideoId,
             parentMetaId = parentMetaId,
+            isSkipped = isSkipped,
         )
     }
 
@@ -1646,7 +2333,8 @@ private fun resolveAutoPlayEpisode(
     val mainSeasonEpisodes = airedEpisodes.filter { video ->
         video.playbackSeasonNumber()?.let { it > 0 } == true
     }
-    val randomPool = mainSeasonEpisodes.ifEmpty { airedEpisodes }
+    val unskipped = mainSeasonEpisodes.ifEmpty { airedEpisodes }
+    val randomPool = isSkipped?.let { skip -> unskipped.filterNot(skip).ifEmpty { unskipped } } ?: unskipped
     val currentVideo = videos.resolveSeriesEpisodePosition(
         parentMetaId = parentMetaId,
         videoId = currentVideoId,
@@ -1670,15 +2358,29 @@ internal fun PlayerScreenRuntime.removeFailedStreamFromCache() {
     StreamLinkCacheRepository.remove(cacheKey)
 }
 
+/**
+ * Fetches the playing source again from its add-on (re-resolving debrid) and continues from the
+ * same position when its link has likely expired (upstream 3d70db683):
+ * - a link reopened from the reuse-last-link cache, which may have expired since it was saved;
+ * - a link with expiring credentials in its URL, which may already be stale when picked from
+ *   warmed-up results or may expire during playback.
+ * Each failed URL is refreshed at most once.
+ */
 internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message: String?): Boolean {
-    val failedUrl = activeSourceUrl
-    if (!failedUrl.hasLikelyExpiringPlaybackCredentials()) return false
+    // A YouTube tab video has no addon to ask again: its streams are looked up again instead.
+    if (isYouTubeVideoPlayback) return tryReresolveYouTubeAfterError(message)
+    if (isServerSourcePlaying()) return retryServerSourceAfterError(message)
     if (credentialRefreshJob?.isActive == true) return true
+    val failedUrl = activeSourceUrl
+    if (failedUrl.isBlank()) return false
+    val fromLinkCache = failedUrl == linkCacheSourceUrl
+    if (!fromLinkCache && !failedUrl.hasLikelyExpiringPlaybackCredentials()) return false
     if (credentialRefreshAttemptedSourceUrl == failedUrl) return false
 
     val currentVideoId = activeVideoId ?: return false
     val failedAttemptId = playbackAttemptId
     credentialRefreshAttemptedSourceUrl = failedUrl
+    linkCacheSourceUrl = null
     removeFailedStreamFromCache()
 
     val savedPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
@@ -1686,6 +2388,8 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
     val expectedProviderName = activeProviderName
     val expectedStreamTitle = activeStreamTitle
     val expectedBingeGroup = currentStreamBingeGroup
+    val expectedInfoHash = activeStream?.infoHash
+    val expectedFilename = activeStream?.behaviorHints?.filename ?: activeStreamFilename
     val type = contentType ?: parentMetaType
     val season = activeSeasonNumber
     val episode = activeEpisodeNumber
@@ -1720,6 +2424,8 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
                 expectedProviderName = expectedProviderName,
                 expectedStreamTitle = expectedStreamTitle,
                 expectedBingeGroup = expectedBingeGroup,
+                expectedInfoHash = expectedInfoHash,
+                expectedFilename = expectedFilename,
             )
             if (
                 refreshedStream != null ||
@@ -1732,17 +2438,39 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
             pollCount++
         }
 
-        val stream = refreshedStream
+        val candidate = refreshedStream
         if (
             playbackAttemptId != failedAttemptId ||
             activeVideoId != currentVideoId ||
             activeSourceUrl != failedUrl
         ) return@launch
-        if (stream == null) {
+        if (candidate == null) {
             errorMessage = message
             controlsVisible = !playerControlsLocked
             return@launch
         }
+        // Debrid links are always requested anew; a prepared or in-memory one may be the expired link.
+        val unresolved = if (candidate.debridResolved) candidate.copy(url = null, debridResolved = false) else candidate
+        val stream = when (
+            val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
+                stream = unresolved,
+                season = season,
+                episode = episode,
+                forceRefresh = true,
+            )
+        ) {
+            is DirectDebridPlayableResult.Success -> resolved.stream
+            else -> {
+                errorMessage = message
+                controlsVisible = !playerControlsLocked
+                return@launch
+            }
+        }
+        if (
+            playbackAttemptId != failedAttemptId ||
+            activeVideoId != currentVideoId ||
+            activeSourceUrl != failedUrl
+        ) return@launch
 
         val refreshedUrl = stream.playableDirectUrl
         if (refreshedUrl.isNullOrBlank() || refreshedUrl == failedUrl) {
@@ -1751,6 +2479,16 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
             return@launch
         }
 
+        if (playerSettingsUiState.streamReuseLastLinkEnabled) {
+            saveDirectStreamForReuse(
+                stream = stream,
+                url = refreshedUrl,
+                videoId = currentVideoId,
+                season = season,
+                episode = episode,
+                sourceIdentityKey = stream.playerSourceIdentityKey(),
+            )
+        }
         flushWatchProgress()
         stopActiveP2pStream()
         activeSourceAudioUrl = null
@@ -1759,6 +2497,8 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
         activeStreamType = stream.streamType
         activeSourceIdentityKey = stream.playerSourceIdentityKey()
         activeStreamTitle = stream.streamLabel
+        activeStreamFilename = stream.mediaFilename
+        activeStream = stream
         activeStreamSubtitle = stream.streamSubtitle
         activeProviderName = stream.addonName
         activeProviderAddonId = stream.addonId
@@ -1773,19 +2513,22 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
     return true
 }
 
-private fun findCredentialRefreshCandidate(
+internal fun findCredentialRefreshCandidate(
     streams: List<StreamItem>,
     failedUrl: String,
     expectedProviderAddonId: String?,
     expectedProviderName: String,
     expectedStreamTitle: String,
     expectedBingeGroup: String?,
+    expectedInfoHash: String? = null,
+    expectedFilename: String? = null,
+    canResolveDebrid: (StreamItem) -> Boolean = DirectDebridPlaybackResolver::shouldResolveToPlayableStream,
 ): StreamItem? =
     streams
         .asSequence()
         .mapNotNull { stream ->
-            val refreshedUrl = stream.playableDirectUrl?.takeIf { it.isNotBlank() && it != failedUrl }
-                ?: return@mapNotNull null
+            val hasFreshUrl = stream.playableDirectUrl?.let { it.isNotBlank() && it != failedUrl } == true
+            if (!hasFreshUrl && !stream.debridResolved && !canResolveDebrid(stream)) return@mapNotNull null
             val providerMatches = if (!expectedProviderAddonId.isNullOrBlank()) {
                 stream.addonId == expectedProviderAddonId
             } else {
@@ -1794,11 +2537,15 @@ private fun findCredentialRefreshCandidate(
             if (!providerMatches) return@mapNotNull null
 
             var score = 100
+            if (!expectedInfoHash.isNullOrBlank() && stream.infoHash.equals(expectedInfoHash, ignoreCase = true)) {
+                score += 60
+            }
             if (stream.streamLabel == expectedStreamTitle) score += 40
+            if (!expectedFilename.isNullOrBlank() && stream.behaviorHints.filename == expectedFilename) score += 30
             if (!expectedBingeGroup.isNullOrBlank() && stream.behaviorHints.bingeGroup == expectedBingeGroup) {
                 score += 20
             }
-            if (refreshedUrl.hasLikelyExpiringPlaybackCredentials()) score += 5
+            if (stream.playableDirectUrl?.hasLikelyExpiringPlaybackCredentials() == true) score += 5
             score to stream
         }
         .maxByOrNull { (score, _) -> score }

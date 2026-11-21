@@ -11,12 +11,27 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 data class StreamBadgeSettingsUiState(
     val rules: StreamBadgeRules = StreamBadgeRules(),
     val showFileSizeBadges: Boolean = true,
     val showAddonLogo: Boolean = false,
+    /** Apply the built-in Usenet formatter layout to all stream results for display. */
+    val useUsenetFormatterForAll: Boolean = false,
+    /** Badges for the video and audio that is playing, under the player title. */
+    val showInPlayer: Boolean = false,
+    /** Which imported pack the player badges use; blank = the stream list's active pack. */
+    val playerBadgeSource: String = "",
     val badgePlacement: StreamBadgePlacement = StreamBadgePlacement.BOTTOM,
+    val listSortOrder: StreamListSortOrder = StreamListSortOrder.DEFAULT,
+    val listCachedFirst: Boolean = false,
+    /**
+     * The source picker's list in two columns. A preference rather than a fixed layout: compact
+     * stream formatters fit side by side, raw release filenames do not.
+     */
+    val listTwoColumns: Boolean = false,
 )
 
 enum class StreamBadgePlacement {
@@ -38,7 +53,13 @@ object StreamBadgeSettingsRepository {
     private var streamBadgeRules = StreamBadgeRules()
     private var showFileSizeBadges = true
     private var showAddonLogo = false
+    private var useUsenetFormatterForAll = false
+    private var showInPlayer = false
+    private var playerBadgeSource = ""
     private var badgePlacement = StreamBadgePlacement.BOTTOM
+    private var listSortOrder = StreamListSortOrder.DEFAULT
+    private var listCachedFirst = false
+    private var listTwoColumns = false
 
     fun ensureLoaded() {
         if (hasLoaded) return
@@ -54,7 +75,13 @@ object StreamBadgeSettingsRepository {
         streamBadgeRules = StreamBadgeRules()
         showFileSizeBadges = true
         showAddonLogo = false
+        useUsenetFormatterForAll = false
+        showInPlayer = false
+        playerBadgeSource = ""
         badgePlacement = StreamBadgePlacement.BOTTOM
+        listSortOrder = StreamListSortOrder.DEFAULT
+        listCachedFirst = false
+        listTwoColumns = false
         _uiState.value = StreamBadgeSettingsUiState()
     }
 
@@ -77,7 +104,7 @@ object StreamBadgeSettingsRepository {
         ensureLoaded()
         val normalizedUrl = url.trim()
         if (normalizedUrl.isBlank()) {
-            return StreamBadgeImportResult.Error("Enter a badge JSON URL.")
+            return StreamBadgeImportResult.Error(localizedString(Res.string.stream_badges_enter_a_badge_json_url))
         }
         if (!normalizedUrl.startsWith("https://", ignoreCase = true) &&
             !normalizedUrl.startsWith("http://", ignoreCase = true)
@@ -91,7 +118,7 @@ object StreamBadgeSettingsRepository {
                 import.sourceUrl.equals(normalizedUrl, ignoreCase = true)
             }
             if (!isExistingImport && currentRules.imports.size >= STREAM_BADGE_IMPORT_LIMIT) {
-                return StreamBadgeImportResult.Error("You can import up to $STREAM_BADGE_IMPORT_LIMIT badge URLs.")
+                return StreamBadgeImportResult.Error(localizedString(Res.string.stream_badges_import_limit, STREAM_BADGE_IMPORT_LIMIT))
             }
             val payload = httpGetText(normalizedUrl)
             val parsedImport = StreamBadgeRulesParser.parse(
@@ -104,7 +131,7 @@ object StreamBadgeSettingsRepository {
             StreamBadgeImportResult.Success(streamBadgeRules)
         } catch (error: Exception) {
             if (error is CancellationException) throw error
-            StreamBadgeImportResult.Error(error.message ?: "Badge import failed.")
+            StreamBadgeImportResult.Error(error.message ?: localizedString(Res.string.stream_badges_badge_import_failed))
         }
     }
 
@@ -144,12 +171,60 @@ object StreamBadgeSettingsRepository {
         StreamBadgeSettingsStorage.saveShowAddonLogo(enabled)
     }
 
+    fun setUseUsenetFormatterForAll(enabled: Boolean) {
+        ensureLoaded()
+        if (useUsenetFormatterForAll == enabled) return
+        useUsenetFormatterForAll = enabled
+        publish()
+        StreamBadgeSettingsStorage.saveUseUsenetFormatterForAll(enabled)
+    }
+
+    fun setShowInPlayer(enabled: Boolean) {
+        ensureLoaded()
+        if (showInPlayer == enabled) return
+        showInPlayer = enabled
+        publish()
+        StreamBadgeSettingsStorage.saveShowInPlayer(enabled)
+    }
+
+    fun setPlayerBadgeSource(source: String) {
+        ensureLoaded()
+        if (playerBadgeSource == source) return
+        playerBadgeSource = source
+        publish()
+        StreamBadgeSettingsStorage.savePlayerBadgeSource(source)
+    }
+
     fun setBadgePlacement(placement: StreamBadgePlacement) {
         ensureLoaded()
         if (badgePlacement == placement) return
         badgePlacement = placement
         publish()
         StreamBadgeSettingsStorage.saveStreamBadgePlacement(placement.name)
+    }
+
+    fun setListSortOrder(order: StreamListSortOrder) {
+        ensureLoaded()
+        if (listSortOrder == order) return
+        listSortOrder = order
+        publish()
+        StreamBadgeSettingsStorage.saveStreamListSortOrder(order.name)
+    }
+
+    fun setListCachedFirst(enabled: Boolean) {
+        ensureLoaded()
+        if (listCachedFirst == enabled) return
+        listCachedFirst = enabled
+        publish()
+        StreamBadgeSettingsStorage.saveStreamListCachedFirst(enabled)
+    }
+
+    fun setListTwoColumns(enabled: Boolean) {
+        ensureLoaded()
+        if (listTwoColumns == enabled) return
+        listTwoColumns = enabled
+        publish()
+        StreamBadgeSettingsStorage.saveStreamListTwoColumns(enabled)
     }
 
     private fun loadFromDisk() {
@@ -163,6 +238,9 @@ object StreamBadgeSettingsRepository {
         streamBadgeRules = storedRules ?: legacyRules ?: StreamBadgeRules()
         showFileSizeBadges = StreamBadgeSettingsStorage.loadShowFileSizeBadges() ?: true
         showAddonLogo = StreamBadgeSettingsStorage.loadShowAddonLogo() ?: false
+        useUsenetFormatterForAll = StreamBadgeSettingsStorage.loadUseUsenetFormatterForAll() ?: false
+        showInPlayer = StreamBadgeSettingsStorage.loadShowInPlayer() ?: false
+        playerBadgeSource = StreamBadgeSettingsStorage.loadPlayerBadgeSource().orEmpty()
         badgePlacement = StreamBadgeSettingsStorage.loadStreamBadgePlacement()
             ?.let { storedPlacement ->
                 StreamBadgePlacement.entries.firstOrNull { placement ->
@@ -170,6 +248,11 @@ object StreamBadgeSettingsRepository {
                 }
             }
             ?: StreamBadgePlacement.BOTTOM
+        listSortOrder = StreamBadgeSettingsStorage.loadStreamListSortOrder()
+            ?.let { stored -> StreamListSortOrder.entries.firstOrNull { it.name == stored } }
+            ?: StreamListSortOrder.DEFAULT
+        listCachedFirst = StreamBadgeSettingsStorage.loadStreamListCachedFirst() ?: false
+        listTwoColumns = StreamBadgeSettingsStorage.loadStreamListTwoColumns() ?: false
         if (legacyRules != null) {
             saveStreamBadgeRules()
             StreamBadgeSettingsStorage.clearLegacyDebridStreamBadgeRules()
@@ -182,7 +265,13 @@ object StreamBadgeSettingsRepository {
             rules = streamBadgeRules,
             showFileSizeBadges = showFileSizeBadges,
             showAddonLogo = showAddonLogo,
+            useUsenetFormatterForAll = useUsenetFormatterForAll,
+            showInPlayer = showInPlayer,
+            playerBadgeSource = playerBadgeSource,
             badgePlacement = badgePlacement,
+            listSortOrder = listSortOrder,
+            listCachedFirst = listCachedFirst,
+            listTwoColumns = listTwoColumns,
         )
     }
 

@@ -15,13 +15,17 @@ private data class StoredContinueWatchingPreferences(
     val style: ContinueWatchingSectionStyle = ContinueWatchingSectionStyle.Card,
     @SerialName("click_action")
     val clickAction: ContinueWatchingClickAction = ContinueWatchingClickAction.PLAY,
+    @SerialName("source_shortcut")
+    val sourceShortcut: ContinueWatchingSourceShortcut = ContinueWatchingSourceShortcut.CENTER,
     val upNextFromFurthestEpisode: Boolean = true,
     @SerialName("use_episode_thumbnails_in_cw")
     val useEpisodeThumbnails: Boolean = true,
     @SerialName("show_unaired_next_up")
     val showUnairedNextUp: Boolean = true,
     @SerialName("separate_next_up_row")
-    val separateNextUpRow: Boolean = false,
+    val separateNextUpRow: Boolean = true,
+    @SerialName("separate_upcoming_row")
+    val separateUpcomingRow: Boolean = true,
     val seedNextUpFromNuvioSync: Boolean = false,
     @SerialName("blur_continue_watching_next_up")
     val blurNextUp: Boolean = false,
@@ -29,12 +33,20 @@ private data class StoredContinueWatchingPreferences(
     val showResumePromptOnLaunch: Boolean = true,
     @SerialName("sort_mode")
     val sortMode: ContinueWatchingSortMode = ContinueWatchingSortMode.DEFAULT,
+    /** The full sort mode; `sort_mode` holds only values older builds can read (see legacyValue). */
+    @SerialName("sort_mode_v2")
+    val sortModeV2: ContinueWatchingSortMode? = null,
+    @SerialName("relative_air_countdown")
+    val relativeAirCountdown: Boolean = false,
 )
 
 object ContinueWatchingPreferencesRepository {
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
+        // An enum value from a newer build falls back to that field's default instead of failing
+        // the whole blob and resetting every Continue Watching setting.
+        coerceInputValues = true
     }
 
     private val _uiState = MutableStateFlow(ContinueWatchingPreferencesUiState())
@@ -73,10 +85,7 @@ object ContinueWatchingPreferencesRepository {
             useEpisodeThumbnails = useEpisodeThumbnails,
             showUnairedNextUp = showUnairedNextUp,
             blurNextUp = blurNextUp,
-            dismissedNextUpKeys = dismissedNextUpKeys
-                .map(String::trim)
-                .filter(String::isNotBlank)
-                .toSet(),
+            dismissedNextUpKeys = normalizeDismissedNextUpKeys(dismissedNextUpKeys),
         )
         persist()
     }
@@ -99,15 +108,18 @@ object ContinueWatchingPreferencesRepository {
                 isVisible = stored.isVisible,
                 style = stored.style,
                 clickAction = stored.clickAction,
+                sourceShortcut = stored.sourceShortcut,
                 upNextFromFurthestEpisode = stored.upNextFromFurthestEpisode,
                 useEpisodeThumbnails = stored.useEpisodeThumbnails,
                 showUnairedNextUp = stored.showUnairedNextUp,
                 separateNextUpRow = stored.separateNextUpRow,
+                separateUpcomingRow = stored.separateUpcomingRow,
                 seedNextUpFromNuvioSync = stored.seedNextUpFromNuvioSync,
                 blurNextUp = stored.blurNextUp,
-                dismissedNextUpKeys = stored.dismissedNextUpKeys,
+                dismissedNextUpKeys = normalizeDismissedNextUpKeys(stored.dismissedNextUpKeys),
                 showResumePromptOnLaunch = stored.showResumePromptOnLaunch,
-                sortMode = stored.sortMode,
+                sortMode = stored.sortModeV2 ?: stored.sortMode,
+                relativeAirCountdown = stored.relativeAirCountdown,
             )
         } else {
             ContinueWatchingPreferencesUiState()
@@ -130,6 +142,13 @@ object ContinueWatchingPreferencesRepository {
         ensureLoaded()
         if (_uiState.value.clickAction == action) return
         _uiState.value = _uiState.value.copy(clickAction = action)
+        persist()
+    }
+
+    fun setSourceShortcut(shortcut: ContinueWatchingSourceShortcut) {
+        ensureLoaded()
+        if (_uiState.value.sourceShortcut == shortcut) return
+        _uiState.value = _uiState.value.copy(sourceShortcut = shortcut)
         persist()
     }
 
@@ -164,6 +183,13 @@ object ContinueWatchingPreferencesRepository {
         persist()
     }
 
+    fun setSeparateUpcomingRow(enabled: Boolean) {
+        ensureLoaded()
+        if (_uiState.value.separateUpcomingRow == enabled) return
+        _uiState.value = _uiState.value.copy(separateUpcomingRow = enabled)
+        persist()
+    }
+
     fun setBlurNextUp(enabled: Boolean) {
         ensureLoaded()
         _uiState.value = _uiState.value.copy(blurNextUp = enabled)
@@ -172,7 +198,7 @@ object ContinueWatchingPreferencesRepository {
 
     fun addDismissedNextUpKey(key: String) {
         ensureLoaded()
-        val normalizedKey = key.trim()
+        val normalizedKey = key.trim().substringBefore("|")
         if (normalizedKey.isBlank()) return
         val current = _uiState.value.dismissedNextUpKeys
         if (normalizedKey in current) return
@@ -193,16 +219,35 @@ object ContinueWatchingPreferencesRepository {
         persist()
     }
 
+    fun setRelativeAirCountdown(enabled: Boolean) {
+        ensureLoaded()
+        if (_uiState.value.relativeAirCountdown == enabled) return
+        _uiState.value = _uiState.value.copy(relativeAirCountdown = enabled)
+        persist()
+    }
+
     fun removeDismissedNextUpKeysForContent(contentId: String) {
         ensureLoaded()
         val normalizedContentId = contentId.trim()
         if (normalizedContentId.isBlank()) return
         val prefix = "$normalizedContentId|"
-        val filtered = _uiState.value.dismissedNextUpKeys.filterNot { it.startsWith(prefix) }.toSet()
+        val filtered = _uiState.value.dismissedNextUpKeys.filterNot {
+            it == normalizedContentId || it.startsWith(prefix)
+        }.toSet()
         if (filtered == _uiState.value.dismissedNextUpKeys) return
         _uiState.value = _uiState.value.copy(dismissedNextUpKeys = filtered)
         persist()
     }
+
+    /**
+     * A dismissed Next Up show is stored by its content id alone (upstream 9da04b944); keys saved in
+     * the old "id|season|episode" form are read as their show, so a changed seed episode (anime
+     * remapping, progress from another device) no longer brings it back.
+     */
+    private fun normalizeDismissedNextUpKeys(keys: Set<String>): Set<String> =
+        keys.map { it.trim().substringBefore("|") }
+            .filter(String::isNotBlank)
+            .toSet()
 
     private fun persist() {
         ContinueWatchingPreferencesStorage.savePayload(
@@ -211,15 +256,19 @@ object ContinueWatchingPreferencesRepository {
                     isVisible = _uiState.value.isVisible,
                     style = _uiState.value.style,
                     clickAction = _uiState.value.clickAction,
+                    sourceShortcut = _uiState.value.sourceShortcut,
                     upNextFromFurthestEpisode = _uiState.value.upNextFromFurthestEpisode,
                     useEpisodeThumbnails = _uiState.value.useEpisodeThumbnails,
                     showUnairedNextUp = _uiState.value.showUnairedNextUp,
                     separateNextUpRow = _uiState.value.separateNextUpRow,
+                    separateUpcomingRow = _uiState.value.separateUpcomingRow,
                     seedNextUpFromNuvioSync = _uiState.value.seedNextUpFromNuvioSync,
                     blurNextUp = _uiState.value.blurNextUp,
                     dismissedNextUpKeys = _uiState.value.dismissedNextUpKeys,
                     showResumePromptOnLaunch = _uiState.value.showResumePromptOnLaunch,
-                    sortMode = _uiState.value.sortMode,
+                    sortMode = _uiState.value.sortMode.legacyValue,
+                    sortModeV2 = _uiState.value.sortMode,
+                    relativeAirCountdown = _uiState.value.relativeAirCountdown,
                 ),
             ),
         )

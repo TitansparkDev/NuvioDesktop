@@ -50,9 +50,20 @@ private val desktopHttpClient = OkHttpClient.Builder()
     .writeTimeout(60, TimeUnit.SECONDS)
     .followRedirects(true)
     .followSslRedirects(true)
+    .eventListenerFactory(com.nuvio.app.core.perf.PerfOkHttpEventListenerFactory("http"))
     .build()
 
 private const val MAX_RAW_RESPONSE_BODY_BYTES = 1024 * 1024
+
+/**
+ * Ceiling for a full response body. OkHttp inflates gzip transparently, so without one a small
+ * compressed response from a hostile or broken addon could inflate until the JVM runs out of heap.
+ * Generous: real manifests, catalogs and metas are well under a megabyte.
+ */
+private const val MAX_RESPONSE_BODY_BYTES = 64 * 1024 * 1024
+
+/** The SkipDB export is ~30 MB today and grows; the one download allowed past the general cap. */
+private const val MAX_FILE_RESPONSE_BODY_BYTES = 256 * 1024 * 1024
 private const val RAW_RESPONSE_TRUNCATION_SUFFIX = "\n$RAW_HTTP_TRUNCATION_MARKER"
 
 actual suspend fun httpGetText(url: String): String =
@@ -91,6 +102,8 @@ actual suspend fun httpRequestRaw(
     allowLargeResponse: Boolean,
     callTimeoutMs: Long,
     connectTimeoutMs: Long,
+    requestBodyBytes: ByteArray?,
+    keepResponseBytes: Boolean,
 ): RawHttpResponse = withContext(Dispatchers.IO) {
     val needsOwnClient = !followRedirects || callTimeoutMs > 0 || connectTimeoutMs > 0
     val client = if (!needsOwnClient) {
@@ -109,16 +122,29 @@ actual suspend fun httpRequestRaw(
             }
             .build()
     }
-    client.newCall(buildDesktopRequest(method, url, headers, body)).execute().use { response ->
-        RawHttpResponse(
-            status = response.code,
-            statusText = response.message,
-            url = response.request.url.toString(),
-            body = readRawResponseBody(response.body, allowLargeResponse),
-            headers = response.headers.toMultimap()
-                .mapValues { (_, values) -> values.joinToString(",") }
-                .mapKeys { (name, _) -> name.lowercase() },
-        )
+    client.newCall(buildDesktopRequest(method, url, headers, body, requestBodyBytes)).execute().use { response ->
+        val responseHeaders = response.headers.toMultimap()
+            .mapValues { (_, values) -> values.joinToString(",") }
+            .mapKeys { (name, _) -> name.lowercase() }
+        if (keepResponseBytes && !allowLargeResponse) {
+            val (text, bytes) = readResponseBodyLimitedWithBytes(response.body)
+            RawHttpResponse(
+                status = response.code,
+                statusText = response.message,
+                url = response.request.url.toString(),
+                body = text,
+                headers = responseHeaders,
+                bodyBytes = bytes,
+            )
+        } else {
+            RawHttpResponse(
+                status = response.code,
+                statusText = response.message,
+                url = response.request.url.toString(),
+                body = readRawResponseBody(response.body, allowLargeResponse),
+                headers = responseHeaders,
+            )
+        }
     }
 }
 
@@ -143,7 +169,7 @@ actual suspend fun httpGetFileRevalidated(
                 response.code == 304 -> RevalidatedFileResponse.NotModified
                 !response.isSuccessful -> RevalidatedFileResponse.Failed(response.code, response.message)
                 else -> RevalidatedFileResponse.Downloaded(
-                    body = readResponseBody(response.body),
+                    body = readResponseBody(response.body, MAX_FILE_RESPONSE_BODY_BYTES),
                     // The etag belongs to whatever actually served the bytes, which for a file
                     // parked behind a redirect is the storage host rather than the API.
                     etag = response.header("ETag"),
@@ -164,7 +190,12 @@ private suspend fun executeTextRequest(
     desktopHttpClient.newCall(buildDesktopRequest(method, url, headers, body)).execute().use { response ->
         val payload = readResponseBody(response.body)
         if (!response.isSuccessful) {
-            error(runBlocking { getString(Res.string.network_request_failed_http, response.code) })
+            // Same message as before, now carrying the status and Retry-After so a 429 can be waited out (RateLimitGate).
+            throw com.nuvio.app.core.network.HttpStatusException(
+                status = response.code,
+                retryAfterSeconds = com.nuvio.app.core.network.parseRetryAfterSeconds(response.header("Retry-After")),
+                message = runBlocking { getString(Res.string.network_request_failed_http, response.code) },
+            )
         }
         if (payload.isBlank()) {
             throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
@@ -178,6 +209,7 @@ private fun buildDesktopRequest(
     url: String,
     headers: Map<String, String>,
     body: String,
+    bodyBytes: ByteArray? = null,
 ): Request {
     val normalizedMethod = method.trim().uppercase().ifBlank { "GET" }
     val sanitizedHeaders = headers.filterKeys { !it.equals("Accept-Encoding", ignoreCase = true) }
@@ -193,7 +225,7 @@ private fun buildDesktopRequest(
             ?: if (normalizedMethod == "POST") "application/x-www-form-urlencoded" else "application/json"
         builder.method(
             normalizedMethod,
-            body.toByteArray(Charsets.UTF_8).toRequestBody(contentType.toMediaType()),
+            (bodyBytes ?: body.toByteArray(Charsets.UTF_8)).toRequestBody(contentType.toMediaType()),
         )
     } else {
         builder.method(normalizedMethod, null)
@@ -218,18 +250,26 @@ private fun readAtMostBytes(stream: InputStream, maxBytes: Int): LimitedReadResu
     )
 }
 
-private fun readResponseBodyLimited(body: ResponseBody?): String {
-    if (body == null) return ""
+private fun readResponseBodyLimited(body: ResponseBody?): String = readResponseBodyLimitedWithBytes(body).first
+
+/** [readResponseBodyLimited], also returning the bytes it decoded (cut at the same cap). */
+private fun readResponseBodyLimitedWithBytes(body: ResponseBody?): Pair<String, ByteArray> {
+    if (body == null) return "" to ByteArray(0)
     val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
     val readResult = body.byteStream().use { readAtMostBytes(it, MAX_RAW_RESPONSE_BODY_BYTES) }
     val decoded = runCatching { String(readResult.bytes, charset) }
         .getOrElse { String(readResult.bytes, Charsets.UTF_8) }
-    return if (readResult.truncated) decoded + RAW_RESPONSE_TRUNCATION_SUFFIX else decoded
+    val text = if (readResult.truncated) decoded + RAW_RESPONSE_TRUNCATION_SUFFIX else decoded
+    return text to readResult.bytes
 }
 
-private fun readResponseBody(body: ResponseBody?): String {
+private fun readResponseBody(body: ResponseBody?, maxBytes: Int = MAX_RESPONSE_BODY_BYTES): String {
     if (body == null) return ""
-    val bytes = body.bytes()
+    val readResult = body.byteStream().use { readAtMostBytes(it, maxBytes) }
+    if (readResult.truncated) {
+        throw java.io.IOException("Response body exceeds ${maxBytes / (1024 * 1024)} MB; refusing to read it")
+    }
+    val bytes = readResult.bytes
     return runCatching {
         String(bytes, body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
     }.getOrElse { String(bytes, Charsets.UTF_8) }

@@ -1,13 +1,21 @@
 package com.nuvio.app.core.ui
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.DefaultAlpha
 import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asComposeImageBitmap
 import androidx.compose.ui.graphics.asSkiaBitmap
@@ -30,12 +38,9 @@ import coil3.size.Size as CoilSize
 import coil3.size.SizeResolver
 import coil3.request.ImageRequest
 import coil3.request.NullRequestDataException
-import org.jetbrains.skia.Bitmap
-import org.jetbrains.skia.CubicResampler
 import org.jetbrains.skia.FilterMipmap
 import org.jetbrains.skia.FilterMode
 import org.jetbrains.skia.MipmapMode
-import org.jetbrains.skia.SamplingMode
 import org.jetbrains.skia.Image as SkiaImage
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -45,14 +50,14 @@ import kotlin.math.roundToInt
 /** Plain holder, not snapshot state: writing it must not invalidate the composition reading it. */
 private class ArtworkSizeBaseline {
     var size: CoilSize? = null
+    /** The size the request was last re-keyed to, held while the slot stays inside its bucket. */
+    var key: CoilSize? = null
 }
 
 // Below this ratio the draw path just blits, above it [ScaledBitmapPainter] resamples on the draw
-// thread. Now that requests are sized from the destination, artwork arrives at ~1.04-1.07x the draw
-// size (the focus headroom in [desktopArtworkDimension]), so this threshold deliberately sits above
-// that band and the painter no longer runs for normal artwork — the reduction happens in
-// [HighQualityBitmapDecoder] instead. What still reaches it: sources a fetcher sized itself, and
-// slots small enough that the 8 px quantum is a large fraction of the card.
+// thread. Requests are sized exactly from the destination, so normal artwork arrives at 1:1 and the
+// painter never resamples it — the reduction happens in [HighQualityBitmapDecoder] instead. What
+// still reaches it: sources a fetcher sized itself.
 private const val MinCustomDownscaleRatio = 1.20f
 private const val MaxScaledBitmapPixels = 1_250_000L
 
@@ -63,18 +68,8 @@ private const val MaxScaledBitmapPixels = 1_250_000L
 // mipmapped rescale is much cheaper than a full CPU resample per frame.
 private const val CachedBitmapReuseTolerance = 0.06f
 
-// Mitchell (b = c = 1/3) rather than Catmull-Rom (b = 0, c = 0.5): both are cubics, but
-// Catmull-Rom's much deeper negative lobes sharpen whatever survives the reduction — including the
-// aliasing the resample is supposed to suppress. That sharpening is why poster lettering came out
-// crunchy at 1080p, where a 500px source lands in a 210px card. Mitchell is the standard
-// minification cubic and leaves nothing to over-sharpen now that the pre-reduction below does the
-// heavy lifting.
-internal val HighQualityDesktopResampler = CubicResampler(b = 1f / 3f, c = 1f / 3f)
-
-// A cubic resampler reads a fixed 4x4 source neighbourhood no matter how far it is reducing, so
-// past ~2x minification it simply discards most of the source and aliases. Halving with a linear
-// filter is an exact 2x2 box average, so repeated halving is a correct (and cheap) way to get
-// within 2x of the target and leave the cubic only the last, well-conditioned step.
+// Halving with a linear filter is an exact 2x2 box average, so repeated halving is a correct (and
+// cheap) way to bring a large source near the target before the Lanczos pass in [reduceHighQuality].
 internal val BoxHalvingSampling = FilterMipmap(FilterMode.LINEAR, MipmapMode.NONE)
 
 private val IsWindowsDesktop: Boolean =
@@ -114,14 +109,17 @@ internal actual fun NuvioAsyncImage(
     val artworkSizeBaseline = remember(artworkSizeResolver) { ArtworkSizeBaseline() }
     val artworkSize = artworkSizeResolver.requestSize
     if (artworkSizeBaseline.size == null) artworkSizeBaseline.size = artworkSize
-    val artworkSizeKey = artworkSize?.takeIf { it != artworkSizeBaseline.size }
+    // Compared by bucket: the size itself is exact now, and a one-pixel drift is not worth a reload.
+    val artworkSizeKey = when {
+        artworkSize == null || artworkSize.sameArtworkBucketAs(artworkSizeBaseline.size) -> null
+        artworkSize.sameArtworkBucketAs(artworkSizeBaseline.key) -> artworkSizeBaseline.key
+        else -> artworkSize.also { artworkSizeBaseline.key = it }
+    }
     val requestModel = remember(context, model, effectiveDesktopImageScaling, artworkSizeKey) {
+        val sizeResolver = artworkSizeKey?.let { SizeResolver(it) } ?: artworkSizeResolver
         when {
             effectiveDesktopImageScaling != NuvioDesktopImageScaling.Disabled ->
-                model.withDesktopArtworkSize(
-                    context,
-                    artworkSizeKey?.let { SizeResolver(it) } ?: artworkSizeResolver,
-                )
+                model.withDesktopArtworkSize(context, sizeResolver)
             // Scaling "disabled" only ever meant "do not run the custom painter on this". It also
             // silently meant "send no size", which left the hero decoding backdrops at whatever the
             // source happened to be. It now takes its size from LAYOUT like every other surface -
@@ -129,7 +127,7 @@ internal actual fun NuvioAsyncImage(
             else ->
                 model.withDesktopArtworkSize(
                     context,
-                    artworkSizeKey?.let { SizeResolver(it) } ?: artworkSizeResolver,
+                    sizeResolver,
                     // The hero draws no custom painter, so nothing downstream needs a per-size cache
                     // key; and the backdrop is one image on screen at a time, not a grid of cards.
                     tagForCacheKey = false,
@@ -149,6 +147,17 @@ internal actual fun NuvioAsyncImage(
     // folder gets a different model, so the holder resets and cannot show the previous item's
     // artwork. Only a reload of *the same picture* keeps drawing it.
     val retained = remember(model) { RetainedArtwork() }
+    // First picture from the network fades in. The progress starts at 0, so the frame that flips
+    // the flag already draws transparent (no full-strength flash before the fade), and it is read
+    // only inside graphicsLayer, so the fade redraws the layer without recomposing the image.
+    var shouldFadeNetworkLoad by remember(model) { mutableStateOf(false) }
+    val networkFadeProgress = remember(model) { Animatable(0f) }
+    LaunchedEffect(model, shouldFadeNetworkLoad) {
+        if (shouldFadeNetworkLoad) {
+            UiMotion.markBusy(140L)
+            networkFadeProgress.animateTo(1f, tween(durationMillis = 140, easing = FastOutSlowInEasing))
+        }
+    }
     val transform: (AsyncImagePainter.State) -> AsyncImagePainter.State = remember(
         placeholder,
         error,
@@ -165,6 +174,10 @@ internal actual fun NuvioAsyncImage(
                 }
                 is AsyncImagePainter.State.Success -> {
                     val image = state.result.image
+                    val wasEmpty = retained.painter == null
+                    if (wasEmpty && state.result.dataSource == DataSource.NETWORK) {
+                        shouldFadeNetworkLoad = true
+                    }
                     DesktopArtworkTelemetry.recordLoad(
                         sourceUrl = state.result.memoryCacheKey?.key ?: state.result.diskCacheKey,
                         fromMemoryCache = state.result.dataSource == DataSource.MEMORY_CACHE,
@@ -219,7 +232,15 @@ internal actual fun NuvioAsyncImage(
         model = requestModel,
         contentDescription = contentDescription,
         // Attached for every path now: the hero sizes from layout as well.
-        modifier = modifier.then(artworkSizeResolver),
+        modifier = modifier
+            .then(artworkSizeResolver)
+            .then(
+                if (shouldFadeNetworkLoad) {
+                    Modifier.graphicsLayer { this.alpha = networkFadeProgress.value }
+                } else {
+                    Modifier
+                },
+            ),
         transform = transform,
         onState = onState,
         alignment = alignment,
@@ -310,6 +331,10 @@ internal object ScaledBitmapCache {
         maxBytes = if (restricted) PlaybackScaledCacheBytes else MaxBytes
         evictToBudget()
     }
+
+    /** Bytes held now, for the memory diagnostics. */
+    @Synchronized
+    fun sizeBytes(): Long = currentBytes
 
     fun key(sourceKey: String, size: IntSize): String = "$sourceKey|${size.width}x${size.height}"
 
@@ -449,6 +474,7 @@ private class ScaledBitmapPainter(
     }
 
     private fun DrawScope.drawSource(drawSize: IntSize) {
+        val exact = image.width == drawSize.width && image.height == drawSize.height
         drawImage(
             image = image,
             srcOffset = IntOffset.Zero,
@@ -457,7 +483,10 @@ private class ScaledBitmapPainter(
             dstSize = drawSize,
             alpha = alpha,
             colorFilter = colorFilter,
-            filterQuality = FilterQuality.High,
+            // An exact-size decode must be blitted, not re-filtered: High is a Mitchell cubic, whose
+            // centre tap is only 0.89 even at 1:1, so it softened every correctly sized card. Low
+            // rather than None for the ancestor-scale reason on the draw above.
+            filterQuality = if (exact) FilterQuality.Low else FilterQuality.High,
         )
     }
 
@@ -472,53 +501,13 @@ private class ScaledBitmapPainter(
     private fun IntSize.pixelCount(): Long =
         width.toLong() * height.toLong()
 
-    /**
-     * Box-halves the source until the remaining reduction is under 2x, then does one cubic pass.
-     *
-     * Doing the whole reduction in a single cubic pass is what made large minifications alias: the
-     * kernel's footprint does not grow with the ratio, so reducing a poster straight from a 1536px
-     * request down to a 210px card — what this path used to be handed — sampled a small fraction of
-     * the source. Each halving step is an exact box average
-     * and throws nothing away, so the cubic only ever sees a well-conditioned final step.
-     */
+    /** Same reduction the decoder performs; see [reduceHighQuality]. */
     private fun ImageBitmap.downscaleTo(target: IntSize): ImageBitmap {
-        var intermediate: Bitmap? = null
-        try {
-            while (true) {
-                val source = intermediate ?: asSkiaBitmap()
-                val halfWidth = source.width / 2
-                val halfHeight = source.height / 2
-                // Stop before either axis would undershoot; the cubic handles the remainder.
-                if (halfWidth < target.width || halfHeight < target.height) break
-                val halved = source.resampleTo(halfWidth, halfHeight, BoxHalvingSampling)
-                intermediate?.close()
-                intermediate = halved
-            }
-
-            val source = intermediate ?: asSkiaBitmap()
-            if (source.width == target.width && source.height == target.height) {
-                // Halving landed exactly on the target; a further cubic pass would only soften it.
-                // Ownership of the intermediate transfers to the returned ImageBitmap.
-                intermediate = null
-                return source.asComposeImageBitmap()
-            }
-            return source
-                .resampleTo(target.width, target.height, HighQualityDesktopResampler)
-                .asComposeImageBitmap()
-        } finally {
-            intermediate?.close()
-        }
-    }
-
-    private fun Bitmap.resampleTo(width: Int, height: Int, sampling: SamplingMode): Bitmap {
-        val image = SkiaImage.makeFromBitmap(this)
+        val source = SkiaImage.makeFromBitmap(asSkiaBitmap())
         return try {
-            val scaled = Bitmap()
-            scaled.allocN32Pixels(width, height)
-            image.scalePixels(scaled.peekPixels()!!, sampling, false)
-            scaled
+            source.reduceHighQuality(target.width, target.height).asComposeImageBitmap()
         } finally {
-            image.close()
+            source.close()
         }
     }
 }

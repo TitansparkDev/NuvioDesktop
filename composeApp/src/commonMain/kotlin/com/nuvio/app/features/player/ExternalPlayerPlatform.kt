@@ -12,6 +12,8 @@ data class SubtitleInput(
     val url: String,
     val name: String,
     val lang: String,
+    /** The addon URL [url] was downloaded from, when [url] is a local cached copy. */
+    val sourceUrl: String? = null,
 )
 
 data class ExternalPlayerPlaybackRequest(
@@ -24,6 +26,8 @@ data class ExternalPlayerPlaybackRequest(
     val season: Int? = null,
     val episode: Int? = null,
     val episodeTitle: String? = null,
+    /** Set when the launch's progress should be recorded; the platform reads the player for it. */
+    val tracking: ExternalPlaybackTracking? = null,
 ) {
     /**
      * Builds a display title for external players.

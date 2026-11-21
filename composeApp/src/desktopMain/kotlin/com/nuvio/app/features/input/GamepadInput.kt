@@ -1,9 +1,16 @@
 package com.nuvio.app.features.input
 
+import com.nuvio.app.features.voice.VoiceControlRepository
+
+import androidx.compose.ui.graphics.toArgb
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.ui.TextInputFocusTracker
+import com.nuvio.app.features.player.AppShortcutAction
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
+import com.nuvio.app.features.panelring.PanelRingController
+import com.nuvio.app.features.panelring.PanelRingMath
+import com.nuvio.app.features.panelring.PanelRingSource
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -11,6 +18,7 @@ import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.abs
+import kotlin.math.hypot
 
 /**
  * Whether the native player currently owns the screen. The player installs its own global
@@ -57,6 +65,7 @@ object GamepadInput {
     private const val BIT_RIGHT_THUMB = 0x0080
     private const val BIT_LEFT_SHOULDER = 0x0100
     private const val BIT_RIGHT_SHOULDER = 0x0200
+    private const val BIT_MIC = 0x0800 // DualSense only; see player_bridge.cpp kBtnMic
     private const val BIT_A = 0x1000
     private const val BIT_B = 0x2000
     private const val BIT_X = 0x4000
@@ -91,6 +100,12 @@ object GamepadInput {
      */
     private const val RIGHT_STICK_MIN_DEAD_ZONE = 0.55f
 
+    /**
+     * Stick travel that aims the panel ring. Higher than the navigation dead zone: aiming is a
+     * deliberate push, and a light one would pick a neighbour of the slot meant.
+     */
+    private const val RING_AIM_DEAD_ZONE = 0.45f
+
     private val buttonBits = listOf(
         GamepadButton.DpadUp to BIT_DPAD_UP,
         GamepadButton.DpadDown to BIT_DPAD_DOWN,
@@ -106,6 +121,7 @@ object GamepadInput {
         GamepadButton.B to BIT_B,
         GamepadButton.X to BIT_X,
         GamepadButton.Y to BIT_Y,
+        GamepadButton.Mic to BIT_MIC,
     )
 
     private val directions = setOf(
@@ -192,6 +208,8 @@ object GamepadInput {
         val state = IntArray(SLOT_COUNT * SLOT_STRIDE)
         var pressed = emptySet<GamepadButton>()
         val repeatDueAt = HashMap<GamepadButton, Long>()
+        // Buttons whose key press is still down, waiting for the button to come up to release it.
+        val heldKeys = HashMap<GamepadButton, Int>()
         var connectedMask = 0
         var nextRescanAt = 0L
 
@@ -200,6 +218,7 @@ object GamepadInput {
                 // Parked: no polling, no native call, no wakeups until the setting changes.
                 pressed = emptySet()
                 repeatDueAt.clear()
+                releaseHeldKeys(heldKeys)
                 connectedMask = 0
                 nextRescanAt = 0L
                 GamepadSettingsRepository.setConnected(false)
@@ -233,16 +252,26 @@ object GamepadInput {
                     .getOrDefault(0)
                 GamepadSettingsRepository.setConnected(connectedMask != 0)
             }
+            if (now >= nextPadConfigAt) {
+                nextPadConfigAt = now + PAD_CONFIG_INTERVAL_MS
+                syncPadConfig()
+            }
 
             val current = if (connectedMask == 0) emptySet() else readPressed(state, connectedMask)
-            dispatch(current, pressed, repeatDueAt, now)
+            dispatch(current, pressed, repeatDueAt, heldKeys, now)
             pressed = current
 
             // With nothing plugged in there is no input to miss, so idle until the next rescan
             // rather than waking sixty times a second on a machine that has no controller.
             sleep(if (connectedMask == 0) IDLE_POLL_INTERVAL_MS else POLL_INTERVAL_MS)
         }
+        releaseHeldKeys(heldKeys)
         GamepadSettingsRepository.setConnected(false)
+    }
+
+    private fun releaseHeldKeys(heldKeys: MutableMap<GamepadButton, Int>) {
+        heldKeys.values.forEach(GamepadKeyInjector::release)
+        heldKeys.clear()
     }
 
     /**
@@ -251,6 +280,44 @@ object GamepadInput {
      * [NativePlayerBridge.ensureNativeLibraryLoaded]. On a dev tree with no native build, or a
      * machine without the runtime, this fails once and parks the thread for good.
      */
+    /** When [syncPadConfig] next runs; the settings it reads change rarely, so twice a second is plenty. */
+    private var nextPadConfigAt = 0L
+    private const val PAD_CONFIG_INTERVAL_MS = 500L
+    private var lastPadConfig: List<Any>? = null
+    private var padConfigUnavailable = false
+
+    /**
+     * Tells the native side what the DualSense itself should do: send its full Bluetooth report only
+     * while voice control is on (the mic button lives in it; otherwise the lighter report saves a little
+     * battery), and the light bar / player light from Settings. Sent only when something changed.
+     */
+    private fun syncPadConfig() {
+        if (padConfigUnavailable) return
+        val fullReports = com.nuvio.app.features.voice.VoiceControlRepository.uiState.value.settings.enabled
+        val lightBar = GamepadSettingsRepository.lightBarState.value
+        val lightMode = when (lightBar) {
+            ControllerLightBar.LeaveAlone -> 0
+            ControllerLightBar.Off -> 1
+            ControllerLightBar.Accent -> 2
+        }
+        val rgb = if (lightBar == ControllerLightBar.Accent) {
+            val theme = com.nuvio.app.features.settings.ThemeSettingsRepository.selectedTheme.value
+            com.nuvio.app.core.ui.ThemeColors.getColorPalette(theme).secondary.toArgb() and 0xFFFFFF
+        } else {
+            0
+        }
+        val playerLight = GamepadSettingsRepository.playerLightState.value
+        val config = listOf(fullReports, lightMode, rgb, playerLight)
+        if (config == lastPadConfig) return
+        runCatching { NativePlayerBridge.configureGamepads(fullReports, lightMode, rgb, playerLight) }
+            .onSuccess { lastPadConfig = config }
+            .onFailure {
+                // An older player_bridge.dll without the call: input still works, the lights do not.
+                log.w(it) { "Controller lights and full reports unavailable in this build" }
+                padConfigUnavailable = true
+            }
+    }
+
     private fun ensureNativeReady(): Boolean {
         val loaded = runCatching { NativePlayerBridge.ensureNativeLibraryLoaded() }
             .onFailure { log.w(it) { "native bridge unavailable; gamepad input disabled for this session" } }
@@ -266,13 +333,45 @@ object GamepadInput {
     private fun readPressed(state: IntArray, connectedMask: Int): Set<GamepadButton> {
         val deadZone = GamepadSettingsRepository.deadZone
         val held = HashSet<GamepadButton>()
+        val dpad = HashSet<GamepadButton>()
+        var aimX = 0f
+        var aimY = 0f
+        var leftX = 0f
+        var leftY = 0f
+        var rightX = 0f
+        var rightY = 0f
+        // While the cursor is unlocked the sticks point and scroll instead of stepping focus.
+        val sticksAsCursor = GamepadCursor.isActive
         for (slot in 0 until SLOT_COUNT) {
             if (connectedMask and (1 shl slot) == 0) continue
             val base = slot * SLOT_STRIDE
             val buttons = state[base]
             buttonBits.forEach { (button, bit) -> if (buttons and bit != 0) held += button }
+            buttonBits.forEach { (button, bit) -> if (button in directions && buttons and bit != 0) dpad += button }
+            // The ring aims with whichever stick, on whichever pad, is pushed furthest.
+            for (stickBase in intArrayOf(base + 3, base + 5)) {
+                val x = state[stickBase] / THUMB_RANGE
+                val y = state[stickBase + 1] / THUMB_RANGE
+                if (hypot(x, y) > hypot(aimX, aimY)) {
+                    aimX = x
+                    aimY = y
+                }
+            }
+            val lx = state[base + 3] / THUMB_RANGE
+            val ly = state[base + 4] / THUMB_RANGE
+            if (hypot(lx, ly) > hypot(leftX, leftY)) {
+                leftX = lx
+                leftY = ly
+            }
+            val rx = state[base + 5] / THUMB_RANGE
+            val ry = state[base + 6] / THUMB_RANGE
+            if (hypot(rx, ry) > hypot(rightX, rightY)) {
+                rightX = rx
+                rightY = ry
+            }
             if (state[base + 1] >= TRIGGER_PRESS_THRESHOLD) held += GamepadButton.LeftTrigger
             if (state[base + 2] >= TRIGGER_PRESS_THRESHOLD) held += GamepadButton.RightTrigger
+            if (sticksAsCursor) continue
             stickDirection(state[base + 3], state[base + 4], deadZone)?.let { held += leftStickButton(it) }
             stickDirection(
                 state[base + 5],
@@ -280,8 +379,28 @@ object GamepadInput {
                 deadZone.coerceAtLeast(RIGHT_STICK_MIN_DEAD_ZONE),
             )?.let { held += rightStickButton(it) }
         }
+        dpadHeld = dpad
+        stickX = aimX
+        stickY = aimY
+        leftStickX = leftX
+        leftStickY = leftY
+        rightStickX = rightX
+        rightStickY = rightY
         return held
     }
+
+    // The last poll's D-pad (buttons only, no stick) and strongest stick, for the panel ring. Poll
+    // thread only.
+    private var dpadHeld: Set<GamepadButton> = emptySet()
+    private var previousDpad: Set<GamepadButton> = emptySet()
+    private var stickX = 0f
+    private var stickY = 0f
+
+    // Each stick on its own (strongest across pads), for the controller cursor. Poll thread only.
+    private var leftStickX = 0f
+    private var leftStickY = 0f
+    private var rightStickX = 0f
+    private var rightStickY = 0f
 
     private fun leftStickButton(direction: StickDirection): GamepadButton = when (direction) {
         StickDirection.Up -> GamepadButton.DpadUp
@@ -354,14 +473,260 @@ object GamepadInput {
         current: Set<GamepadButton>,
         previous: Set<GamepadButton>,
         repeatDueAt: MutableMap<GamepadButton, Long>,
+        heldKeys: MutableMap<GamepadButton, Int>,
         now: Long,
     ) {
+        previous.forEach { button ->
+            if (button !in current) heldKeys.remove(button)?.let(GamepadKeyInjector::release)
+        }
         val inPlayer = GamepadContext.playerActive
+        if (panelRing(current, previous, inPlayer, heldKeys, now)) {
+            GamepadCursor.setLeft(false)
+            return
+        }
+        val ringButton = ringDeciding
+        val cursorOwned = controllerCursor(current, previous, inPlayer, heldKeys, now)
+        // fork:voice-control - with voice control ready, View is held for push-to-talk, so its own
+        // action waits for the release instead of firing on the press.
+        val holdForVoice = VoiceControlRepository.uiState.value.ready || backHold.pending
+        if (holdForVoice) {
+            when (backHold.update(GamepadButton.Back in current, now)) {
+                BackHold.Result.Talk -> VoiceControlRepository.toggleListening()
+                BackHold.Result.Tap -> send(GamepadButton.Back, inPlayer, heldKeys)
+                BackHold.Result.None -> Unit
+            }
+        }
         resolveFiring(current, previous, repeatDueAt, now, GamepadSettingsRepository.repeatIntervalMs)
-            .forEach { button -> send(button, inPlayer) }
+            .forEach { button ->
+                if (holdForVoice && button == GamepadButton.Back) return@forEach
+                if (button == ringButton) return@forEach
+                if (button in cursorOwned) return@forEach
+                send(button, inPlayer, heldKeys)
+            }
     }
 
-    private fun send(button: GamepadButton, inPlayer: Boolean) {
+    private val ringHold = RingHold()
+    private val cursorHold = CursorHold()
+
+    /** Pointer by default, put away with the cursor button until it is held again. Poll thread only. */
+    private var cursorParked = false
+
+    /** Pointer by default, and the D-pad was used since the stick last moved: A and X keep their own actions. */
+    private var padNavigating = false
+
+    /** What the unlocked cursor does with A and X instead of their own actions. */
+    private val cursorButtons = setOf(GamepadButton.A, GamepadButton.X)
+
+    /**
+     * The controller cursor's share of a tick (see [GamepadCursor]). Holding the cursor button toggles it; a tap does
+     * the button's own action, or locks the cursor when it is unlocked. While unlocked: sticks point and scroll, A is
+     * the left button, X right-clicks, and the D-pad locks it again and then moves focus as usual. Only while Nuvio
+     * is the window in front and the on-screen keyboard is down (it owns the pad).
+     *
+     * Returns the buttons it used, so the ordinary dispatch leaves them alone.
+     */
+    private fun controllerCursor(
+        current: Set<GamepadButton>,
+        previous: Set<GamepadButton>,
+        inPlayer: Boolean,
+        heldKeys: MutableMap<GamepadButton, Int>,
+        now: Long,
+    ): Set<GamepadButton> {
+        val cursorButton = GamepadSettingsRepository.cursorButton?.takeIf { it != GamepadSettingsRepository.ringButton }
+        val byDefault = GamepadSettingsRepository.cursorByDefault
+        val canCursor = GamepadKeyInjector.appFocused() && !OnScreenKeyboard.visible.value
+        if (!canCursor || (cursorButton == null && !byDefault)) GamepadCursor.lock()
+        if (!byDefault) cursorParked = false
+        // Pointer by default: back on whenever Nuvio is in front again, unless put away with the button.
+        if (byDefault && canCursor && !cursorParked && !GamepadCursor.isActive) {
+            GamepadCursor.unlock()
+            padNavigating = false
+        }
+        val owned = HashSet<GamepadButton>()
+        if (cursorButton != null && (canCursor || cursorHold.pending)) {
+            when (cursorHold.update(cursorButton in current, now)) {
+                CursorHold.Result.Hold -> {
+                    lastInputAtMs = System.currentTimeMillis()
+                    if (canCursor) {
+                        GamepadCursor.toggle()
+                        cursorParked = byDefault && !GamepadCursor.isActive
+                        padNavigating = false
+                    }
+                }
+                CursorHold.Result.Tap -> {
+                    // Unlocked by hand, a tap locks it again; as the default, a tap keeps the button's own action.
+                    if (GamepadCursor.isActive && !byDefault) GamepadCursor.lock() else send(cursorButton, inPlayer, heldKeys)
+                }
+                CursorHold.Result.None -> Unit
+            }
+            // The button's own action waits for the release, which decides tap or hold.
+            owned += cursorButton
+        }
+        if (!GamepadCursor.isActive) return owned
+        val fresh = current - previous
+        if (fresh.any { it in directions }) {
+            if (!byDefault) {
+                // The D-pad means arrow navigation again; it goes through as usual below.
+                GamepadCursor.lock()
+                return owned
+            }
+            // As the default the pointer stays, and A selects what the D-pad reached until the stick moves again.
+            padNavigating = true
+        }
+        val pointed = GamepadCursor.tick(leftStickX, leftStickY, rightStickX, rightStickY)
+        if (pointed) padNavigating = false
+        if (pointed || fresh.isNotEmpty()) lastInputAtMs = System.currentTimeMillis()
+        if (padNavigating) {
+            GamepadCursor.setLeft(false)
+            return owned
+        }
+        owned += cursorButtons
+        GamepadCursor.setLeft(GamepadButton.A in current)
+        if (GamepadButton.X in fresh) GamepadCursor.rightClick()
+        return owned
+    }
+
+    /** The ring button while its press is being decided, so the ordinary dispatch skips it. */
+    private var ringDeciding: GamepadButton? = null
+
+    /**
+     * The panel ring's share of a tick. Holding the ring button ([GamepadSettingsRepository.ringButton],
+     * LB by default) opens it, tilting either stick aims, letting go switches; a tap does the
+     * button's own action instead. While the ring is open (from any input) the pad drives it: stick
+     * aims, D-pad steps round, A switches, B closes, and nothing else gets through.
+     *
+     * Returns true when the ring took the whole tick. Sets [ringDeciding].
+     */
+    private fun panelRing(
+        current: Set<GamepadButton>,
+        previous: Set<GamepadButton>,
+        inPlayer: Boolean,
+        heldKeys: MutableMap<GamepadButton, Int>,
+        now: Long,
+    ): Boolean {
+        val dpad = dpadHeld
+        val freshDpad = dpad - previousDpad
+        previousDpad = dpad
+        val ringButton = GamepadSettingsRepository.ringButton
+        // Not over the player (its native surface covers the app) or the on-screen keyboard, and
+        // not while another application is in front.
+        val canRing = !inPlayer && !OnScreenKeyboard.visible.value && GamepadKeyInjector.appFocused()
+        val aimDeadZone = GamepadSettingsRepository.deadZone.coerceAtLeast(RING_AIM_DEAD_ZONE)
+        // While pointing, the stick is nearly always pushed: that must not turn a tap of the ring
+        // button into opening the ring.
+        val stickPushed = !GamepadCursor.isActive && hypot(stickX, stickY) >= aimDeadZone
+        ringDeciding = null
+        if (ringButton != null && (canRing || ringHold.pending)) {
+            when (ringHold.update(ringButton in current, stickPushed, now)) {
+                RingHold.Result.Open -> {
+                    lastInputAtMs = System.currentTimeMillis()
+                    if (!PanelRingController.isOpen) PanelRingController.open(PanelRingSource.Gamepad)
+                }
+                RingHold.Result.Tap -> if (!PanelRingController.isOpen) send(ringButton, inPlayer, heldKeys)
+                RingHold.Result.Release -> PanelRingController.commit()
+                RingHold.Result.None -> Unit
+            }
+            if (ringHold.pending) ringDeciding = ringButton
+        }
+        if (!PanelRingController.isOpen) return false
+        if (inPlayer) {
+            PanelRingController.close()
+            return false
+        }
+        lastInputAtMs = System.currentTimeMillis()
+        val count = PanelRingController.slots.size
+        // The aim stays where it was when the stick springs back: letting go of the stick a moment
+        // before the button must still switch. B is the way out.
+        PanelRingMath.slotFor(
+            dx = stickX,
+            dy = -stickY, // XInput's y is up, the ring's is down
+            count = count,
+            deadZone = aimDeadZone,
+            current = PanelRingController.state.value?.hovered,
+        )?.let(PanelRingController::aim)
+        val fresh = current - previous
+        when {
+            GamepadButton.A in fresh -> PanelRingController.commit()
+            GamepadButton.B in fresh -> PanelRingController.close()
+            GamepadButton.DpadRight in freshDpad || GamepadButton.DpadDown in freshDpad -> PanelRingController.step(1)
+            GamepadButton.DpadLeft in freshDpad || GamepadButton.DpadUp in freshDpad -> PanelRingController.step(-1)
+        }
+        return true
+    }
+
+    /**
+     * The ring button's press: held [holdMs], or held with a stick pushed, it opens the ring
+     * ([Result.Open], once); let go after that it switches ([Result.Release]); let go sooner with no
+     * stick and it was an ordinary press ([Result.Tap]), sent on the release. Pure, for the test.
+     */
+    internal class RingHold(private val holdMs: Long = 220) {
+        enum class Result { None, Open, Tap, Release }
+
+        private var pressedAt = -1L
+        private var opened = false
+
+        val pending: Boolean get() = pressedAt >= 0
+
+        fun update(down: Boolean, stickPushed: Boolean, now: Long): Result {
+            if (down) {
+                if (pressedAt < 0) {
+                    pressedAt = now
+                    opened = false
+                }
+                if (!opened && (stickPushed || now - pressedAt >= holdMs)) {
+                    opened = true
+                    return Result.Open
+                }
+                return Result.None
+            }
+            if (pressedAt < 0) return Result.None
+            pressedAt = -1L
+            return if (opened) Result.Release else Result.Tap
+        }
+    }
+
+    private val backHold = BackHold()
+
+    /**
+     * View pressed and held [holdMs] is push-to-talk ([Result.Talk], once per press); let go sooner
+     * and it is an ordinary press of View ([Result.Tap]), sent on the release. Pure, for the test.
+     */
+    internal class BackHold(private val holdMs: Long = 600) {
+        enum class Result { None, Tap, Talk }
+
+        private var pressedAt = -1L
+        private var talked = false
+
+        /** True from the press until it is resolved, so a press in progress finishes the way it started. */
+        val pending: Boolean get() = pressedAt >= 0
+
+        fun update(down: Boolean, now: Long): Result {
+            if (down) {
+                if (pressedAt < 0) {
+                    pressedAt = now
+                    talked = false
+                }
+                if (!talked && now - pressedAt >= holdMs) {
+                    talked = true
+                    return Result.Talk
+                }
+                return Result.None
+            }
+            if (pressedAt < 0) return Result.None
+            pressedAt = -1L
+            return if (talked) Result.None else Result.Tap
+        }
+    }
+
+    /**
+     * Whether [target] keeps its key down for as long as the button is held, instead of a press and
+     * release on the same tick. Select needs that so holding A can mean hold-to-select, exactly as
+     * holding Enter does; every other button keeps the instant pair.
+     */
+    internal fun holdsUntilRelease(target: GamepadTarget): Boolean =
+        target is GamepadTarget.AppAction && target.action == AppShortcutAction.SelectFocused
+
+    private fun send(button: GamepadButton, inPlayer: Boolean, heldKeys: MutableMap<GamepadButton, Int>) {
         lastInputAtMs = System.currentTimeMillis()
         // Picking up the pad while a text field already holds focus summons the keyboard, for the
         // case where the field was reached with the mouse.
@@ -370,8 +735,29 @@ object GamepadInput {
         // not use. A press falling through to the screen behind would fire a browsing shortcut in
         // the middle of a word.
         if (OnScreenKeyboard.consume(button)) return
-        val binding = GamepadDefaults.binding(button)
-        GamepadKeyInjector.send(if (inPlayer) binding.player else binding.browsing)
+        val binding = GamepadSettingsRepository.binding(button)
+        val target = if (inPlayer) binding.player else binding.browsing
+        // A button bound to the ring's own shortcut opens it for the pad (no numbers), not as a key.
+        if (target == GamepadTarget.AppAction(AppShortcutAction.OpenPanelRing)) {
+            if (!inPlayer && !PanelRingController.isOpen) PanelRingController.open(PanelRingSource.Gamepad)
+            return
+        }
+        // fork:voice-control - straight to the voice session rather than a synthesized key, so it
+        // also works over the player, whose HUD has the keyboard.
+        if (target == GamepadTarget.AppAction(AppShortcutAction.VoiceCommand)) {
+            VoiceControlRepository.toggleListening()
+            return
+        }
+        // B over an open menu or dialog closes it: those close on Escape (the pad's View button), not on the Back key
+        // B sends while browsing, so B used to do nothing there (2026-11-15).
+        val sent = if (target == GamepadTarget.AppAction(AppShortcutAction.GoBack) &&
+            com.nuvio.app.core.ui.KeyRouteLog.layerOpen
+        ) GamepadTarget.AppAction(AppShortcutAction.DismissOverlay) else target
+        if (holdsUntilRelease(sent)) {
+            GamepadKeyInjector.press(sent)?.let { keyCode -> heldKeys[button] = keyCode }
+        } else {
+            GamepadKeyInjector.send(sent)
+        }
     }
 
     private fun sleep(millis: Long) {

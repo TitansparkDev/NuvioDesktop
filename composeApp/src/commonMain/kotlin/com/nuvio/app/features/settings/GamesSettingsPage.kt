@@ -19,6 +19,8 @@ import nuvio.composeapp.generated.resources.settings_games_backdrop_black_shelf
 import nuvio.composeapp.generated.resources.settings_games_backdrop_full
 import nuvio.composeapp.generated.resources.settings_games_backdrop_style
 import nuvio.composeapp.generated.resources.settings_games_backdrop_style_description
+import nuvio.composeapp.generated.resources.settings_games_close_after_launch
+import nuvio.composeapp.generated.resources.settings_games_close_after_launch_description
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_id
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_id_description
 import nuvio.composeapp.generated.resources.settings_games_igdb_client_secret
@@ -30,6 +32,7 @@ import nuvio.composeapp.generated.resources.settings_games_metadata_source_steam
 import nuvio.composeapp.generated.resources.settings_games_metadata_steam_hint
 import nuvio.composeapp.generated.resources.settings_games_missing_credentials
 import nuvio.composeapp.generated.resources.settings_games_section_artwork
+import nuvio.composeapp.generated.resources.settings_games_section_launching
 import nuvio.composeapp.generated.resources.settings_games_section_metadata
 import nuvio.composeapp.generated.resources.settings_games_section_presentation
 import nuvio.composeapp.generated.resources.settings_games_section_rows
@@ -37,6 +40,7 @@ import nuvio.composeapp.generated.resources.settings_games_shortcut_hint
 import nuvio.composeapp.generated.resources.settings_games_steamgriddb_key
 import nuvio.composeapp.generated.resources.settings_games_steamgriddb_key_description
 import nuvio.composeapp.generated.resources.settings_games_title
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.jetbrains.compose.resources.stringResource
 
 /**
@@ -46,6 +50,22 @@ import org.jetbrains.compose.resources.stringResource
  * settings page, so the credentials sit with every other API key the app holds and are covered by
  * settings search and backup like the rest.
  */
+/** Puts a Games entry in the navigation, after Music, that opens game mode; the same switch as in Navigation order. */
+@androidx.compose.runtime.Composable
+private fun GamesNavigationSwitch(isTablet: Boolean) {
+    val inNav = androidx.compose.runtime.remember { com.nuvio.app.features.navbar.NavBarLayoutRepository.gamesInNav }
+        .collectAsStateWithLifecycle().value
+    SettingsSwitchRow(
+        title = "Show in navigation",
+        description = "A Games button in the sidebar and top bar that opens game mode. Its place can be changed " +
+            "under Appearance > Navigation order.",
+        checked = inNav,
+        isTablet = isTablet,
+        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("games-in-navigation")),
+        onCheckedChange = com.nuvio.app.features.navbar.NavBarLayoutRepository::setGamesInNav,
+    )
+}
+
 internal fun LazyListScope.gamesSettingsContent(
     isTablet: Boolean,
     settings: GameLibrarySettings,
@@ -63,6 +83,8 @@ internal fun LazyListScope.gamesSettingsContent(
                     isTablet = isTablet,
                     text = stringResource(Res.string.settings_games_shortcut_hint),
                 )
+                SettingsGroupDivider(isTablet = isTablet)
+                GamesNavigationSwitch(isTablet = isTablet)
             }
         }
     }
@@ -165,6 +187,26 @@ internal fun LazyListScope.gamesSettingsContent(
                     selectedValue = settings.backdropStyle,
                     isTablet = isTablet,
                     onSelected = GameLibrarySettingsRepository::setBackdropStyle,
+                )
+            }
+        }
+    }
+
+    item {
+        SettingsSection(
+            title = stringResource(Res.string.settings_games_section_launching),
+            isTablet = isTablet,
+        ) {
+            SettingsGroup(
+                isTablet = isTablet,
+                modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("games-close-after-launch")),
+            ) {
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_games_close_after_launch),
+                    description = stringResource(Res.string.settings_games_close_after_launch_description),
+                    checked = settings.closeAfterLaunch,
+                    isTablet = isTablet,
+                    onCheckedChange = GameLibrarySettingsRepository::setCloseAfterLaunch,
                 )
             }
         }

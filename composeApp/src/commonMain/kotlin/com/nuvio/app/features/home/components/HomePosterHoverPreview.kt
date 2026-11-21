@@ -1,5 +1,6 @@
 package com.nuvio.app.features.home.components
 
+import com.nuvio.app.core.ui.LocalScreenCovered
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -14,6 +15,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.ui.graphics.graphicsLayer
+import com.nuvio.app.core.ui.nuvioGlassHoverSheen
+import com.nuvio.app.core.ui.smoothBorder
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -78,6 +83,7 @@ import com.nuvio.app.core.ui.secondaryClick
 import com.nuvio.app.features.details.components.DetailIconAction
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.playlist.isPlaylistPreview
 import com.nuvio.app.features.home.hoverPreviewEnabledFor
 import com.nuvio.app.features.library.LibraryRepository
 import com.nuvio.app.features.library.toLibraryItem
@@ -176,6 +182,16 @@ internal fun HomePosterHoverPreview(
         )
     }
 
+    // Home staying composed under a pushed screen: put the preview away as that screen opens, as
+    // leaving used to by disposing it, and wait for a fresh hover after.
+    val screenCovered = LocalScreenCovered.current
+    LaunchedEffect(screenCovered) {
+        if (!screenCovered) return@LaunchedEffect
+        previewVisible = false
+        popupMounted = false
+        previewDismissedByScroll = true
+    }
+
     LaunchedEffect(anchorHovered, previewHovered, previewDismissedByScroll) {
         if (previewDismissedByScroll) {
             if (!anchorHovered && !previewHovered) {
@@ -201,7 +217,7 @@ internal fun HomePosterHoverPreview(
     val onWatchedClick = remember(item) {
         {
             actionScope.launch {
-                WatchingActions.togglePosterWatched(item)
+                WatchingActions.togglePosterWatched(item, origin = "home hover preview")
             }
             Unit
         }
@@ -226,7 +242,8 @@ internal fun HomePosterHoverPreview(
     Box(modifier = modifier) {
         content(Modifier.hoverable(anchorInteractionSource))
 
-        if (popupMounted) {
+        // A popup is its own layer: Home staying composed under a pushed screen does not hide it.
+        if (popupMounted && !screenCovered) {
             Popup(
                 popupPositionProvider = positionProvider,
                 properties = PopupProperties(focusable = false),
@@ -310,9 +327,10 @@ private fun HomePosterPreviewCard(
         modifier = modifier
             .width(HoverPreviewWidth)
             .shadow(tokens.elevation.overlay, shape)
+            .smoothBorder(tokens.borders.hairline, tokens.colors.borderStrong, shape)
+            .nuvioGlassHoverSheen(cornerRadius = NuvioTokens.Radius.xl, peakAlpha = 0.18f)
             .clip(shape)
             .background(previewBackground)
-            .border(tokens.borders.hairline, tokens.colors.borderStrong, shape)
             .clickable(
                 interactionSource = clickInteractionSource,
                 indication = null,
@@ -434,10 +452,24 @@ private fun HomePosterPreviewCard(
                     horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s10),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    val ctaInteraction = remember { MutableInteractionSource() }
+                    val ctaPressed by ctaInteraction.collectIsPressedAsState()
+                    val ctaScale by androidx.compose.animation.core.animateFloatAsState(
+                        targetValue = if (ctaPressed) 0.975f else 1f,
+                        animationSpec = androidx.compose.animation.core.spring(
+                            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioNoBouncy,
+                            stiffness = androidx.compose.animation.core.Spring.StiffnessHigh,
+                        ),
+                        label = "hover_preview_cta_scale",
+                    )
                     Surface(
                         modifier = Modifier
                             .weight(1f)
-                            .height(NuvioTokens.Space.s40),
+                            .height(NuvioTokens.Space.s40)
+                            .graphicsLayer {
+                                scaleX = ctaScale
+                                scaleY = ctaScale
+                            },
                         color = tokens.colors.accent,
                         contentColor = tokens.colors.onAccent,
                         shape = tokens.shapes.button,
@@ -445,7 +477,11 @@ private fun HomePosterPreviewCard(
                         Row(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .clickable(onClick = onClick)
+                                .clickable(
+                                    interactionSource = ctaInteraction,
+                                    indication = androidx.compose.foundation.LocalIndication.current,
+                                    onClick = onClick,
+                                )
                                 .padding(horizontal = NuvioTokens.Space.s16),
                             horizontalArrangement = Arrangement.Center,
                             verticalAlignment = Alignment.CenterVertically,
@@ -509,7 +545,7 @@ private fun HomePosterPreviewCard(
 
 private fun MetaPreview.previewMetadataLine(): String =
     buildList {
-        add(type.replaceFirstChar(Char::uppercase))
+        if (!isPlaylistPreview()) add(type.replaceFirstChar(Char::uppercase))
         releaseInfo
             ?.takeIf { it.isNotBlank() }
             ?.let(::formatReleaseDateForDisplay)

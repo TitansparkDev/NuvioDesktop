@@ -1,5 +1,9 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.features.usenet.UsenetEngine
+import com.nuvio.app.features.usenet.UsenetFailedReleases
+import com.nuvio.app.features.usenet.usenetCompressedSkip
+import com.nuvio.app.features.usenet.usenetUnavailable
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.debrid.DirectDebridPlayableResult
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
@@ -14,6 +18,8 @@ import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
+import com.nuvio.app.features.streams.mediaFilename
 import com.nuvio.app.features.streams.StreamDebridCacheState
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamScorer
@@ -22,12 +28,37 @@ import com.nuvio.app.features.streams.StreamScoreProfile
 import com.nuvio.app.features.streams.StreamScoreContext
 import com.nuvio.app.features.streams.StreamScoreContexts
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
+import com.nuvio.app.features.streams.YouTubeStreamResolver
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.youtube_resolution_failed
+import nuvio.composeapp.generated.resources.usenet_compressed_skipped
+import org.jetbrains.compose.resources.getString
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+
+/**
+ * Resolves a stream that is only a YouTube id (upstream 94976222d) and hands the playable copy to
+ * [onResolved]. False when [stream] needs no YouTube resolve.
+ */
+internal fun PlayerScreenRuntime.resolveYouTubeForPlayer(
+    stream: StreamItem,
+    onResolved: (StreamItem) -> Unit,
+): Boolean {
+    if (stream.youTubeIdToResolve == null) return false
+    scope.launch {
+        val resolved = YouTubeStreamResolver.resolve(stream)
+        if (resolved == null) {
+            NuvioToastController.show(getString(Res.string.youtube_resolution_failed))
+            return@launch
+        }
+        onResolved(resolved)
+    }
+    return true
+}
 
 internal fun PlayerScreenRuntime.resolveDebridForPlayer(
     stream: StreamItem,
@@ -83,6 +114,12 @@ internal fun PlayerScreenRuntime.isP2pStream(stream: StreamItem): Boolean =
 internal fun StreamItem.playerSourceIdentityKey(): String? {
     p2pInfoHash?.trim()?.lowercase()?.takeIf { it.isNotBlank() }?.let { hash ->
         return "torrent:$hash:${p2pFileIdx ?: -1}"
+    }
+    // Usenet: indexers list one release several times, each its own upload with its own missing
+    // articles. Keyed by file name and size, one dead upload marked every copy as tried and
+    // failover skipped them all (FraMeSToR, Nov 17). The NZB link is the upload.
+    nzbUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { nzb ->
+        return "usenet:${stableLinkHash(nzb)}:${fileIdx ?: -1}:${fileMustInclude.orEmpty()}"
     }
 
     val raw = clientResolve?.stream?.raw
@@ -155,7 +192,7 @@ internal fun PlayerScreenRuntime.saveP2pStreamForReuse(
     season: Int?,
     episode: Int?,
 ) {
-    if (!playerSettingsUiState.streamReuseLastLinkEnabled || videoId == null) return
+    if (!StreamLinkCacheRepository.shouldSaveLinks(playerSettingsUiState.streamReuseLastLinkEnabled) || videoId == null) return
     val infoHash = stream.p2pInfoHash ?: return
     val cacheKey = StreamLinkCacheRepository.contentKey(
         type = contentType ?: parentMetaType,
@@ -174,6 +211,7 @@ internal fun PlayerScreenRuntime.saveP2pStreamForReuse(
         responseHeaders = emptyMap(),
         filename = stream.behaviorHints.filename,
         videoSize = stream.behaviorHints.videoSize,
+        videoHash = stream.behaviorHints.videoHash,
         infoHash = infoHash,
         fileIdx = stream.p2pFileIdx,
         sources = stream.sources,
@@ -210,6 +248,8 @@ internal fun PlayerScreenRuntime.switchToP2pSourceStream(
     activeTorrentTrackers = stream.p2pTrackers
     activeSourceIdentityKey = stream.playerSourceIdentityKey()
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
+    activeStream = stream
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId
@@ -268,7 +308,30 @@ internal fun PlayerScreenRuntime.switchToSource(
     // (the next-episode prewarm reads it), so it must survive the switch — including the deferred
     // one that follows a debrid resolve.
     keepSourcesPanelOpen: Boolean = false,
+    // Failover's: a Usenet release that cannot be opened hands on to the next source instead of
+    // leaving the failed player where it was.
+    onPreparationFailed: (suspend (Throwable) -> Unit)? = null,
 ) {
+    if (
+        resolveServerForPlayer(stream) {
+            switchToSource(it, sourceIdentityKey, resumePositionOverrideMs, keepSourcesPanelOpen)
+        }
+    ) return
+    if (
+        resolveUsenetForPlayer(
+            stream = stream,
+            season = activeSeasonNumber,
+            episode = activeEpisodeNumber,
+            onFailed = onPreparationFailed,
+        ) {
+            switchToSource(it, sourceIdentityKey, resumePositionOverrideMs, keepSourcesPanelOpen)
+        }
+    ) return
+    if (
+        resolveYouTubeForPlayer(stream) {
+            switchToSource(it, sourceIdentityKey, resumePositionOverrideMs, keepSourcesPanelOpen)
+        }
+    ) return
     if (
         resolveDebridForPlayer(
             stream = stream,
@@ -311,8 +374,13 @@ internal fun PlayerScreenRuntime.switchToSource(
     flushWatchProgress()
     stopActiveP2pStream()
     val currentVideoId = activeVideoId
-    if (playerSettingsUiState.streamReuseLastLinkEnabled && currentVideoId != null) {
-        saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber)
+    // A resolved YouTube URL expires after a few hours, so it is not kept for reuse.
+    if (StreamLinkCacheRepository.shouldSaveLinks(playerSettingsUiState.streamReuseLastLinkEnabled) && currentVideoId != null && stream.ytId.isNullOrBlank() && stream.serverTarget == null) {
+        if (stream.nzbUrl != null) {
+            saveUsenetStreamForReuse(stream, currentVideoId, activeSeasonNumber, activeEpisodeNumber, sourceIdentityKey)
+        } else {
+            saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber, sourceIdentityKey)
+        }
     }
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -320,6 +388,8 @@ internal fun PlayerScreenRuntime.switchToSource(
     activeStreamType = stream.streamType
     activeSourceIdentityKey = sourceIdentityKey
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
+    activeStream = stream
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId
@@ -328,6 +398,7 @@ internal fun PlayerScreenRuntime.switchToSource(
     activeInitialProgressFraction = null
     if (!keepSourcesPanelOpen) showSourcesPanel = false
     controlsVisible = true
+    externalSubtitles = stream.externalSubtitles
     beginPlaybackAttempt()
     activeSourceUrl = url
 }
@@ -343,15 +414,26 @@ internal fun PlayerScreenRuntime.resetFailoverBudget() {
     failoverJob = null
     failoverInProgress = false
     failoverTriedIdentityKeys.clear()
+    failoverSkipsUsenet = false
 }
 
 internal fun PlayerScreenRuntime.switchToEpisodeStream(
     stream: StreamItem,
     episode: MetaVideo,
     sourceIdentityKey: String? = stream.playerSourceIdentityKey(),
+    // Next-episode autoplay's: a Usenet release that cannot be opened hands on to its next pick
+    // instead of leaving the next-episode card up with nothing loading.
+    onPreparationFailed: (suspend (Throwable) -> Unit)? = null,
 ) {
     val seasonNumber = episode.playbackSeasonNumber()
     val episodeNumber = episode.playbackEpisodeNumber()
+    if (resolveServerForPlayer(stream) { switchToEpisodeStream(it, episode, sourceIdentityKey, onPreparationFailed) }) return
+    if (
+        resolveUsenetForPlayer(stream, seasonNumber, episodeNumber, onFailed = onPreparationFailed) {
+            switchToEpisodeStream(it, episode, sourceIdentityKey)
+        }
+    ) return
+    if (resolveYouTubeForPlayer(stream) { switchToEpisodeStream(it, episode, sourceIdentityKey) }) return
     if (
         resolveDebridForPlayer(
             stream = stream,
@@ -388,14 +470,19 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = resolveEpisodeResume(epVideoId, episode)
-    if (playerSettingsUiState.streamReuseLastLinkEnabled) {
-        saveDirectStreamForReuse(stream, url, epVideoId, seasonNumber, episodeNumber)
+    if (StreamLinkCacheRepository.shouldSaveLinks(playerSettingsUiState.streamReuseLastLinkEnabled) && stream.ytId.isNullOrBlank() && stream.serverTarget == null) {
+        if (stream.nzbUrl != null) {
+            saveUsenetStreamForReuse(stream, epVideoId, seasonNumber, episodeNumber, sourceIdentityKey)
+        } else {
+            saveDirectStreamForReuse(stream, url, epVideoId, seasonNumber, episodeNumber, sourceIdentityKey)
+        }
     }
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
     activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
     activeStreamType = stream.streamType
     applyEpisodeStreamMetadata(stream, episode, resume, sourceIdentityKey)
+    externalSubtitles = stream.externalSubtitles
     beginPlaybackAttempt()
     activeSourceUrl = url
 }
@@ -436,6 +523,8 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
         downloadedLabel = downloadedLabel,
     )
     activeStreamTitle = labels.streamTitle
+    activeStreamFilename = null
+    activeStream = null
     activeStreamSubtitle = labels.streamSubtitle
     activeProviderName = labels.providerName
     activeProviderAddonId = downloadItem.providerAddonId
@@ -472,6 +561,8 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
     trigger: StreamFailoverTrigger = StreamFailoverTrigger.PlaybackError,
     rateLimited: Boolean = false,
 ): Boolean {
+    // Live TV has no addon sources to fail over to, only the channel's other format.
+    if (isIptvPlayback) return tryNextIptvFormat(message)
     if (!playerSettingsUiState.streamFailoverEnabled) return false
     if (failoverInProgress) {
         StreamFailoverLog.event("trigger_ignored", buildJsonObject {
@@ -579,6 +670,29 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
                 episode = episode,
                 forceRefresh = false,
             )
+            fun pickNext(streams: List<StreamItem>): StreamItem? =
+                nextFailoverStream(
+                    streams = streams,
+                    activeIdentityKey = activeSourceIdentityKey,
+                    triedIdentityKeys = failoverTriedIdentityKeys,
+                    excludeScopeKey = rateLimitScopeKey,
+                    preferredAudioLanguages = resolvePreferredAudioLanguageTargets(
+                        preferredAudioLanguage = playerSettingsUiState.preferredAudioLanguage,
+                        secondaryPreferredAudioLanguage =
+                            playerSettingsUiState.secondaryPreferredAudioLanguage,
+                        deviceLanguages = DeviceLanguagePreferences.preferredLanguageCodes(),
+                        originalLanguage = OriginalLanguageCache.languageFor(parentMetaId),
+                    ),
+                    scoreProfile = StreamScoreRepository.profile,
+                    scoreContext = StreamScoreContexts.forPlayback(
+                        isEpisode = activeEpisodeNumber != null,
+                        contentId = parentMetaId,
+                        contentType = contentType ?: parentMetaType,
+                    ),
+                    excludeUsenet = failoverSkipsUsenet,
+                )
+
+            val waitForAllProviders = StreamScoreRepository.profile.appliesToFailover()
             var next: StreamItem? = null
             var poll = 0
             while (poll < STREAM_FAILOVER_POLL_COUNT && next == null) {
@@ -588,37 +702,37 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
                 val activeKey = activeSourceIdentityKey
                 val activeSourceLoaded = activeKey == null ||
                     streams.any { it.playerSourceIdentityKey() == activeKey }
-                // An early provider result can appear before the group containing the current
-                // source. Wait for that match (or load completion) so "next" is based on the
-                // Sources panel order instead of accidentally jumping back to its first item.
-                next = if (activeSourceLoaded || !state.isAnyLoading) {
-                    nextFailoverStream(
-                        streams = streams,
-                        activeIdentityKey = activeKey,
-                        triedIdentityKeys = failoverTriedIdentityKeys,
-                        excludeScopeKey = rateLimitScopeKey,
-                        preferredAudioLanguages = resolvePreferredAudioLanguageTargets(
-                            preferredAudioLanguage = playerSettingsUiState.preferredAudioLanguage,
-                            secondaryPreferredAudioLanguage =
-                                playerSettingsUiState.secondaryPreferredAudioLanguage,
-                            deviceLanguages = DeviceLanguagePreferences.preferredLanguageCodes(),
-                            originalLanguage = OriginalLanguageCache.languageFor(parentMetaId),
-                        ),
-                        scoreProfile = StreamScoreRepository.profile,
-                        scoreContext = StreamScoreContexts.forPlayback(
-                            isEpisode = activeEpisodeNumber != null,
-                            contentId = parentMetaId,
-                            contentType = contentType ?: parentMetaType,
-                        ),
-                    )
+                // When scoring is active, the highest-ranked stream can live in any provider
+                // (e.g. Built-in Usenet finishing slightly after the failed addon), so wait until
+                // all providers finish (or the poll window expires) before picking. Otherwise wait
+                // until the failed source's own group arrives so "next" follows panel order.
+                val readyToPick = if (waitForAllProviders) {
+                    !state.isAnyLoading
                 } else {
-                    null
+                    activeSourceLoaded || !state.isAnyLoading
                 }
+                next = if (readyToPick) pickNext(streams) else null
                 if (next != null || state.emptyStateReason != null || (!state.isAnyLoading && state.groups.isNotEmpty())) {
                     break
                 }
                 delay(STREAM_FAILOVER_POLL_INTERVAL_MS)
                 poll++
+            }
+            // The wait above is only for ordering. A dead source may never reappear in the reloaded
+            // list (its debrid link is minted per request), and slow plugin scrapers can keep the
+            // load open past the window. Giving up then threw away every source already loaded:
+            // One Piece 150, 2026-10-18, "sources_exhausted" with 35 AIOStreams rows waiting. After a
+            // playback error the failed source is dead and already in the tried set, so choose from
+            // what has loaded. A startup timeout keeps its wait: that source may still open.
+            if (next == null && trigger != StreamFailoverTrigger.StartupTimeout) {
+                val loaded = PlayerStreamsRepository.sourceState.value.groups.flatMap { it.streams }
+                next = pickNext(loaded)
+                if (next != null) {
+                    StreamFailoverLog.event("selected_before_load_complete", buildJsonObject {
+                        put("trigger", trigger.wireName)
+                        put("loadedSourceCount", loaded.size)
+                    })
+                }
             }
             if (cancelSupersededFailover()) return@launch
             // Source discovery is asynchronous. A slow stream can finish opening while providers
@@ -639,6 +753,22 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
                     StreamFailoverLog.event("attempt_cancelled", buildJsonObject {
                         put("trigger", trigger.wireName)
                         put("reason", "no_safe_fallback")
+                        put("triedSourceCount", failoverTriedIdentityKeys.size)
+                    })
+                    return@launch
+                }
+                // A rate limit with nothing else to try (one source, or only the throttled
+                // provider's): the stream itself is fine, so let the engine reconnect it if the
+                // user's Rate Limit Recovery mode allows, rather than closing the player.
+                if (rateLimited && failedAttemptStillCurrent() &&
+                    playerController?.reconnectAfterRateLimit(message) == true
+                ) {
+                    failedIdentityKey?.let(failoverTriedIdentityKeys::remove)
+                    // The engine keeps the dead demuxer stopped until the reopen renders, so the
+                    // synthetic-EOF guard can stand down just as on its own reconnect path.
+                    playbackSourceFailureActive = false
+                    StreamFailoverLog.event("sources_exhausted_reconnecting", buildJsonObject {
+                        put("trigger", trigger.wireName)
                         put("triedSourceCount", failoverTriedIdentityKeys.size)
                     })
                     return@launch
@@ -664,6 +794,22 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
                 put("attemptId", failedAttemptId)
                 put("trigger", trigger.wireName)
                 sourceFields.forEach { (key, value) -> put(key, value) }
+                put("label", chosen.streamLabel)
+                chosen.behaviorHints.filename?.let { put("release", it.take(120)) }
+                if (StreamScoreRepository.profile.appliesToFailover()) {
+                    put(
+                        "score",
+                        StreamScorer.score(
+                            chosen,
+                            StreamScoreRepository.profile,
+                            StreamScoreContexts.forPlayback(
+                                isEpisode = activeEpisodeNumber != null,
+                                contentId = parentMetaId,
+                                contentType = contentType ?: parentMetaType,
+                            ),
+                        ).total,
+                    )
+                }
                 put("triedSourceCount", failoverTriedIdentityKeys.size)
             })
             // The active-source effect clears the failure state after the URL changes. Keep it set
@@ -688,13 +834,47 @@ internal fun PlayerScreenRuntime.tryFailoverToNextSource(
             if (!rateLimited && trigger == StreamFailoverTrigger.StartupTimeout) {
                 removeFailedStreamFromCache()
             }
-            switchToSource(chosen, resumePositionOverrideMs = failoverResumePositionMs)
+            switchToSource(
+                chosen,
+                resumePositionOverrideMs = failoverResumePositionMs,
+                onPreparationFailed = { error ->
+                    // The chosen release never opened (it is already in the tried set and the
+                    // failed-release list), so the original failure still stands: walk on.
+                    val unavailable = usenetUnavailable(error)
+                    StreamFailoverLog.event("usenet_open_failed", buildJsonObject {
+                        put("attemptId", failedAttemptId)
+                        put("trigger", trigger.wireName)
+                        put("reason", error.message?.take(120) ?: error::class.simpleName.orEmpty())
+                        put("usenetUnavailable", unavailable)
+                        put("triedSourceCount", failoverTriedIdentityKeys.size)
+                    })
+                    if (unavailable) failoverSkipsUsenet = true
+                    if (playbackAttemptId == failedAttemptId && activeVideoId == currentVideoId) {
+                        // Say why when the engine skipped a compressed 7z, not just that it failed.
+                        val nextToast = if (usenetCompressedSkip(error)) {
+                            getString(Res.string.usenet_compressed_skipped)
+                        } else {
+                            tryingNextToast
+                        }
+                        tryFailoverToNextSource(message, playbackFailedToast, nextToast, trigger, rateLimited)
+                    }
+                },
+            )
         } finally {
             failoverInProgress = false
             failoverJob = null
         }
     }
     return true
+}
+
+/** A short, stable digest of a link (FNV-1a 64), so identity keys do not carry indexer keys. */
+private fun stableLinkHash(text: String): String {
+    var hash = -0x340d631b7bdddcdbL
+    for (c in text) {
+        hash = (hash xor c.code.toLong()) * 0x100000001b3L
+    }
+    return hash.toULong().toString(16)
 }
 
 internal fun nextFailoverStream(
@@ -705,6 +885,8 @@ internal fun nextFailoverStream(
     preferredAudioLanguages: List<String> = emptyList(),
     scoreProfile: StreamScoreProfile = StreamScoreProfile(),
     scoreContext: StreamScoreContext = StreamScoreContext.MOVIE,
+    // After an engine or provider failure no Usenet release can open; skip them all.
+    excludeUsenet: Boolean = false,
 ): StreamItem? {
     // The repository order is the quality/ranking order. Always restart at its top and exclude the
     // failed/tried identities, rather than starting after the failed stream's old index. Autoplay or
@@ -713,8 +895,11 @@ internal fun nextFailoverStream(
     val playableCandidates = streams.filter { stream ->
         val key = stream.playerSourceIdentityKey()
         if (key == null || key == activeIdentityKey || key in triedIdentityKeys) return@filter false
+        // A Usenet release has no URL until the engine opens it; one that already failed to open
+        // this run is not asked for again.
         val isPlayable = !stream.playableDirectUrl.isNullOrBlank() ||
-            (stream.needsLocalDebridResolve && stream.p2pInfoHash != null)
+            (stream.needsLocalDebridResolve && stream.p2pInfoHash != null) ||
+            (stream.needsUsenetPreparation && !excludeUsenet && !UsenetEngine.hasFailed(stream))
         if (!isPlayable) return@filter false
         if (!stream.isSafeAutomaticFailoverSource()) return@filter false
         // Rate-limit scoping: skip a candidate that resolves to the SAME provider as the throttled
@@ -888,7 +1073,16 @@ internal fun PlayerScreenRuntime.openSourcesPanelForEpisode(episode: MetaVideo) 
     playerControlsOpenSourcesToken += 1
 }
 
+/** The up-next card, next button or skip key in playlist mode. See PlayerPlaylistAdvance.kt. */
+internal fun PlayerScreenRuntime.advancePlaylist() {
+    PlaylistPlaybackSession.log.i { "advance requested from the player" }
+    requestPlaylistAdvance(trigger = "card")
+}
+
 internal fun PlayerScreenRuntime.playNextEpisode() {
+    // Watch party with host-only control: the host decides when the party moves on. Following the
+    // host is not blocked, because by then the party's media is no longer this episode.
+    if (partyBlocksControl()) return
     // Mirror launchPlayerNextEpisodeAutoPlay's own early-exit checks: when there's clearly no
     // episode to advance to, bail out before engaging the latch at all. Engaging it here and
     // relying on that function's early `return null` to release it doesn't work — those returns
@@ -936,8 +1130,11 @@ internal fun PlayerScreenRuntime.playNextEpisode() {
         settings = playerSettingsUiState,
         sourceAffinity = sourceAffinity,
         currentStreamBingeGroup = currentStreamBingeGroup,
+        currentStream = activeStream,
         onDownloadedEpisodeSelected = { item, episode -> switchToDownloadedEpisode(item, episode) },
-        onEpisodeStreamSelected = { stream, episode -> switchToEpisodeStream(stream, episode) },
+        onEpisodeStreamSelected = { stream, episode, onFailed ->
+            switchToEpisodeStream(stream, episode, onPreparationFailed = onFailed)
+        },
         onManualSelectionRequired = { nextVideo ->
             // Auto-select failed: the manual stream list is now the feedback, so drop the card.
             manualEpisodeSwitchInfo = null
@@ -992,8 +1189,11 @@ internal fun PlayerScreenRuntime.autoPlaySelectedEpisode(episode: MetaVideo) {
         settings = playerSettingsUiState,
         sourceAffinity = sourceAffinity,
         currentStreamBingeGroup = currentStreamBingeGroup,
+        currentStream = activeStream,
         onDownloadedEpisodeSelected = { item, video -> switchToDownloadedEpisode(item, video) },
-        onEpisodeStreamSelected = { stream, video -> switchToEpisodeStream(stream, video) },
+        onEpisodeStreamSelected = { stream, video, onFailed ->
+            switchToEpisodeStream(stream, video, onPreparationFailed = onFailed)
+        },
         onManualSelectionRequired = { video ->
             // Auto-select failed: the manual stream list is now the feedback, so drop the card.
             manualEpisodeSwitchInfo = null
@@ -1084,6 +1284,8 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     resetFailoverBudget()
     activeSourceIdentityKey = sourceIdentityKey
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
+    activeStream = stream
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId
@@ -1099,12 +1301,31 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     controlsVisible = true
 }
 
-private fun PlayerScreenRuntime.saveDirectStreamForReuse(
+/** A Usenet release is saved by its NZB: the engine URL it played from ends with its session. */
+internal fun PlayerScreenRuntime.saveUsenetStreamForReuse(
+    stream: StreamItem,
+    videoId: String,
+    season: Int?,
+    episode: Int?,
+    sourceIdentityKey: String?,
+) {
+    val cacheKey = StreamLinkCacheRepository.contentKey(
+        type = contentType ?: parentMetaType,
+        videoId = videoId,
+        parentMetaId = parentMetaId,
+        season = season,
+        episode = episode,
+    )
+    StreamLinkCacheRepository.saveUsenet(cacheKey, stream, sourceIdentityKey)
+}
+
+internal fun PlayerScreenRuntime.saveDirectStreamForReuse(
     stream: StreamItem,
     url: String,
     videoId: String,
     season: Int?,
     episode: Int?,
+    sourceIdentityKey: String?,
 ) {
     val cacheKey = StreamLinkCacheRepository.contentKey(
         type = contentType ?: parentMetaType,
@@ -1123,7 +1344,9 @@ private fun PlayerScreenRuntime.saveDirectStreamForReuse(
         responseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
         filename = stream.behaviorHints.filename,
         videoSize = stream.behaviorHints.videoSize,
+        videoHash = stream.behaviorHints.videoHash,
         bingeGroup = stream.behaviorHints.bingeGroup,
         streamType = stream.streamType,
+        sourceIdentityKey = sourceIdentityKey,
     )
 }

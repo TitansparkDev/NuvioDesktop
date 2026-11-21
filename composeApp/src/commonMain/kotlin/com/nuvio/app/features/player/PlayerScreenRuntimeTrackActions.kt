@@ -5,14 +5,37 @@ import com.nuvio.app.isDesktop
 internal val PlayerScreenRuntime.subtitleStyle: SubtitleStyleState
     get() = playerSettingsUiState.subtitleStyle
 
+/**
+ * The subtitle style as stored right now, rather than as of the last composition. The Style tab's
+ * events are deltas and toggles, so each has to build on the latest value: built on the composed
+ * snapshot, a burst of clicks (or any click while composition lagged, as it did with the video
+ * paused) kept starting from the same stale style, so most of them saved nothing new.
+ */
+internal val PlayerScreenRuntime.liveSubtitleStyle: SubtitleStyleState
+    get() = PlayerSettingsRepository.uiState.value.subtitleStyle
+
+/**
+ * Saves [style] and hands it to the player at once. The LaunchedEffect on the composed style still
+ * applies it too (the controller skips a repeat), but a change no longer waits on a recomposition
+ * to reach mpv, which with the video paused it could wait on indefinitely.
+ */
+internal fun PlayerScreenRuntime.updateSubtitleStyle(style: SubtitleStyleState) {
+    PlayerSettingsRepository.setSubtitleStyle(style)
+    playerController?.applySubtitleStyle(style)
+}
+
 internal val PlayerScreenRuntime.activeAddonSubtitleType: String
-    get() = contentType ?: parentMetaType
+    get() = if (isIptvPlayback) iptvSubtitleTarget?.type ?: parentMetaType else contentType ?: parentMetaType
+
+/** fork:live-tv-subtitles - what subtitle add-ons are asked for: on Live TV the programme TMDB found, else the item. */
+internal val PlayerScreenRuntime.addonSubtitleVideoId: String?
+    get() = if (isIptvPlayback) iptvSubtitleTarget?.videoId else activeVideoId
 
 internal val PlayerScreenRuntime.addonSubtitleFetchKey: String?
     get() = buildAddonSubtitleFetchKey(
         addons = addonsUiState.addons,
         type = activeAddonSubtitleType,
-        videoId = activeVideoId,
+        videoId = addonSubtitleVideoId,
     )
 
 internal val PlayerScreenRuntime.visibleAddonSubtitles: List<AddonSubtitle>
@@ -168,15 +191,20 @@ internal fun PlayerScreenRuntime.restorePersistedTrackPreferenceIfNeeded() {
             } else {
                 null
             }
-            if (restoredSubtitle != null) {
+            // An addon subtitle is added to the loaded file, so wait for the player to have one.
+            // A cached subtitle list can arrive before mpv has loaded the file (or before the
+            // controller exists); restoring then marked the row selected while the add went
+            // nowhere, and with the restore spent nothing retried it.
+            val playerReadyForSubtitle = playerController != null && !playbackSnapshot.isLoading
+            if (restoredSubtitle != null && playerReadyForSubtitle) {
                 selectedAddonSubtitleId = restoredSubtitle.id.ifBlank { restoredSubtitle.url }
                 selectedSubtitleIndex = -1
                 useCustomSubtitles = true
-                playerController?.setSubtitleUri(restoredSubtitle.url)
+                loadAddonSubtitle(restoredSubtitle)
                 preferredSubtitleSelectionApplied = true
             } else {
-                waitingForPersistedAddonSubtitle = fetchKey != null &&
-                    completedAutoAddonSubtitleFetchForKey != fetchKey
+                waitingForPersistedAddonSubtitle = (restoredSubtitle != null) ||
+                    (fetchKey != null && completedAutoAddonSubtitleFetchForKey != fetchKey)
             }
         }
     }
@@ -308,19 +336,46 @@ internal fun PlayerScreenRuntime.refreshTracks() {
                 selectedAddonSubtitleId = null
                 useCustomSubtitles = false
             }
-            // Built-in tracks win. If none match, keep the selection open until the automatic
-            // addon request finishes (unless fast startup explicitly opted out of that work).
-            preferredSubtitleSelectionApplied =
-                nativePreferredSelectionConfirmed ||
-                playerSettingsUiState.addonSubtitleStartupMode == AddonSubtitleStartupMode.FAST_STARTUP ||
-                addonSubtitleFetchKey == null
+            // Built-in tracks win by default. If none match, keep the selection open until the
+            // automatic addon request finishes (unless fast startup explicitly opted out of that
+            // work). With "Prefer Addon Subtitles" the pass stays open even after a built-in match:
+            // that track is selected now so subtitles show from the first frame, and the addon pass
+            // replaces it when a matching addon subtitle arrives.
+            preferredSubtitleSelectionApplied = builtInSubtitleSelectionSettlesAutoPass(
+                builtInMatchConfirmed = nativePreferredSelectionConfirmed,
+                preferAddonSubtitles = playerSettingsUiState.preferAddonSubtitles,
+                addonSubtitleStartupMode = playerSettingsUiState.addonSubtitleStartupMode,
+                addonFetchPossible = addonSubtitleFetchKey != null,
+            )
         }
     }
 
     applySecondarySubtitleSelectionIfNeeded()
 }
 
-/** Applies an addon subtitle only when no built-in track matches the preferred languages. */
+/**
+ * Whether the built-in pass has finished automatic subtitle selection, or must leave it open for
+ * the addon pass. The addon pass only ever runs when an automatic fetch is coming: fast startup
+ * skips it, and with no subtitle addon there is nothing to fetch.
+ */
+internal fun builtInSubtitleSelectionSettlesAutoPass(
+    builtInMatchConfirmed: Boolean,
+    preferAddonSubtitles: Boolean,
+    addonSubtitleStartupMode: AddonSubtitleStartupMode,
+    addonFetchPossible: Boolean,
+): Boolean {
+    val addonPassComing =
+        addonSubtitleStartupMode != AddonSubtitleStartupMode.FAST_STARTUP && addonFetchPossible
+    if (!addonPassComing) return true
+    return builtInMatchConfirmed && !preferAddonSubtitles
+}
+
+/**
+ * Applies a matching addon subtitle once the automatic fetch lands. By default this only fills the
+ * gap when no built-in track matches the preferred languages; with "Prefer Addon Subtitles" a
+ * matching addon replaces the built-in track selected meanwhile, so the embedded track is only
+ * kept when the addons have nothing in the preferred languages.
+ */
 internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
     // The addon fetch and the first native track refresh complete independently. Always let the
     // refresh restore a persisted built-in/addon choice first; otherwise a completed network fetch
@@ -352,8 +407,10 @@ internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
         return
     }
     // A late native track refresh may have discovered a matching built-in track; never let an
-    // addon replace it merely because the network response arrived afterward.
-    if (findPreferredSubtitleTrackIndex(
+    // addon replace it merely because the network response arrived afterward — unless the viewer
+    // asked for addon subtitles first, in which case the built-in track is exactly what to replace.
+    if (!playerSettingsUiState.preferAddonSubtitles &&
+        findPreferredSubtitleTrackIndex(
             tracks = subtitleTracks,
             targets = targets,
             isRejected = { track -> playerSettingsUiState.rejectsSubtitleTrack(track) },
@@ -373,7 +430,7 @@ internal fun PlayerScreenRuntime.applyPreferredAddonSubtitleIfReady() {
         selectedAddonSubtitleId = addon.id.ifBlank { addon.url }
         selectedSubtitleIndex = -1
         useCustomSubtitles = true
-        playerController?.setSubtitleUri(addon.url)
+        loadAddonSubtitle(addon, allowBetterMatch = true)
     }
     preferredSubtitleSelectionApplied = true
 }
@@ -419,6 +476,43 @@ internal fun PlayerScreenRuntime.applySecondarySubtitleSelectionIfNeeded() {
     val secondaryTrack = candidates.getOrNull(candidatePosition)
     controller.selectSecondarySubtitleTrack(secondaryTrack?.index ?: -1)
     secondarySubtitleSelectionApplied = true
+}
+
+/** The subtitle panel's pick of a built-in track ([index] -1 is Off); the phone remote's list picks the same way. */
+internal fun PlayerScreenRuntime.selectBuiltInSubtitle(index: Int) {
+    val wasCustom = useCustomSubtitles
+    selectedSubtitleIndex = index
+    selectedAddonSubtitleId = null
+    useCustomSubtitles = false
+    markSubtitleChosenByViewer()
+    persistInternalSubtitlePreference(subtitleTracks.firstOrNull { it.index == index })
+    if (wasCustom) {
+        playerController?.clearExternalSubtitleAndSelect(index)
+    } else {
+        playerController?.selectSubtitleTrack(index)
+    }
+    secondarySubtitleSelectionApplied = false
+    applySecondarySubtitleSelectionIfNeeded()
+}
+
+/** The subtitle panel's pick of an add-on subtitle; the phone remote's list picks the same way. */
+internal fun PlayerScreenRuntime.selectAddonSubtitle(addon: AddonSubtitle) {
+    selectedAddonSubtitleId = addon.id.ifBlank { addon.url }
+    selectedSubtitleIndex = -1
+    useCustomSubtitles = true
+    markSubtitleChosenByViewer()
+    persistAddonSubtitlePreference(addon)
+    loadAddonSubtitle(addon)
+    secondarySubtitleSelectionApplied = false
+    applySecondarySubtitleSelectionIfNeeded()
+}
+
+/** The audio panel's pick of a track; the phone remote's list picks the same way. False when the player refused. */
+internal fun PlayerScreenRuntime.selectAudioTrackFromList(index: Int): Boolean {
+    if (playerController?.selectAudioTrack(index) != true) return false
+    selectedAudioIndex = index
+    persistAudioPreference(audioTracks.firstOrNull { it.index == index })
+    return true
 }
 
 internal fun PlayerScreenRuntime.cycleAudioTrackFromKeyboard() {
@@ -487,7 +581,7 @@ internal fun PlayerScreenRuntime.cycleSubtitleTrackFromKeyboard() {
         useCustomSubtitles = true
         markSubtitleChosenByViewer()
         persistAddonSubtitlePreference(subtitle)
-        playerController?.setSubtitleUri(subtitle.url)
+        loadAddonSubtitle(subtitle)
         secondarySubtitleSelectionApplied = false
         applySecondarySubtitleSelectionIfNeeded()
         showGestureMessage("Subtitles: ${subtitle.display.ifBlank { subtitle.language }}")
