@@ -90,6 +90,8 @@ jobs:
           rm -f /c/nuvio-runtime/player_bridge.dll
           # The packaging task recreates this alias from libvapoursynth-script-0.dll.
           rm -f /c/nuvio-runtime/vsscript.dll
+          # These are built from source by this build; the prebuilt copies would collide.
+          rm -f /c/nuvio-runtime/nuvio_engine.dll /c/nuvio-runtime/nuvio_whisper.dll /c/nuvio-runtime/libquickjs.dll
           rm /c/Nuvio.zip
 
       - name: Build Windows MSI, EXE, and Distributable
