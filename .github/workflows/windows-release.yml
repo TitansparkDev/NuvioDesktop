@@ -71,7 +71,9 @@ jobs:
             git checkout -b nuvio-desktop-0.1.6 v0.1.6
             git am "$ENGINE_PATCHES"/*.patch
           )
-          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-ninja"
+          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja"
+          # libtorrent 2.x does not build against OpenSSL 4 (opaque ASN1_STRING); pin the last 3.x.
+          C:/msys64/usr/bin/bash.exe -lc "pacman -U --noconfirm https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.6.5-1-any.pkg.tar.zst"
           test -f C:/msys64/ucrt64/bin/g++.exe
           test -f C:/msys64/ucrt64/lib/libssl.a
           test -f C:/msys64/ucrt64/bin/ninja.exe
