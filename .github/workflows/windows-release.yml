@@ -62,9 +62,10 @@ jobs:
           # The in-process P2P engine DLL is built from NuvioMedia/nuvio-engine with MSYS2 UCRT64 GCC
           # and static OpenSSL; the build looks for the checkout beside this repository.
           git clone --depth 1 https://github.com/NuvioMedia/nuvio-engine.git ../nuvio-engine
-          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl"
+          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-ninja"
           test -f C:/msys64/ucrt64/bin/g++.exe
           test -f C:/msys64/ucrt64/lib/libssl.a
+          test -f C:/msys64/ucrt64/bin/ninja.exe
 
       - name: Download Nuvio Windows Runtime DLLs
         shell: bash
