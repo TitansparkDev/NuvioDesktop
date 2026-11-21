@@ -71,11 +71,15 @@ jobs:
             git checkout -b nuvio-desktop-0.1.6 v0.1.6
             git am "$ENGINE_PATCHES"/*.patch
           )
-          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja"
+          C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-go"
           # libtorrent 2.x does not build against OpenSSL 4 (opaque ASN1_STRING); pin the last 3.x.
           C:/msys64/usr/bin/bash.exe -lc "pacman -U --noconfirm https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.6.5-1-any.pkg.tar.zst"
           test -f C:/msys64/ucrt64/bin/g++.exe
           test -f C:/msys64/ucrt64/lib/libssl.a
+          # Voice control (whisper.cpp) and the built-in Usenet engine, at the versions build.gradle.kts expects.
+          git -c core.autocrlf=false clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp ../whisper.cpp
+          git -c core.autocrlf=false clone https://github.com/NuvioMedia/nuvio-usenet-engine ../nuvio-usenet-engine
+          git -C ../nuvio-usenet-engine checkout --detach e4b0717ae5bfe44e76ca8c7662022bff326f3806
           test -f C:/msys64/ucrt64/bin/ninja.exe
 
       - name: Download Nuvio Windows Runtime DLLs
