@@ -61,7 +61,16 @@ jobs:
         run: |
           # The in-process P2P engine DLL is built from NuvioMedia/nuvio-engine with MSYS2 UCRT64 GCC
           # and static OpenSSL; the build looks for the checkout beside this repository.
-          git clone --depth 1 https://github.com/NuvioMedia/nuvio-engine.git ../nuvio-engine
+          git clone https://github.com/NuvioMedia/nuvio-engine.git ../nuvio-engine
+          ENGINE_PATCHES="$(pwd)/composeApp/src/desktopMain/native/nuvio-engine/patches"
+          (
+            cd ../nuvio-engine
+            git config core.autocrlf false
+            git config user.name "Nuvio CI"
+            git config user.email "ci@localhost"
+            git checkout -b nuvio-desktop-0.1.6 v0.1.6
+            git am "$ENGINE_PATCHES"/*.patch
+          )
           C:/msys64/usr/bin/bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-ninja"
           test -f C:/msys64/ucrt64/bin/g++.exe
           test -f C:/msys64/ucrt64/lib/libssl.a
