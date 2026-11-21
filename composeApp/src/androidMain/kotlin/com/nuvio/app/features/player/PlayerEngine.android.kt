@@ -18,6 +18,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -276,6 +277,12 @@ private fun ExoPlayerSurface(
     val audioDelayUs = remember { AtomicLong(0L) }
     // Read by the playback thread's audio sink; every rebuilt player picks up the current gain.
     val audioAmplificationDb = remember { AtomicInteger(AUDIO_AMPLIFICATION_MIN_DB) }
+    val dialogueLevelerLevel = remember { AtomicInteger(playerSettings.dialogueLeveler) }
+    LaunchedEffect(Unit) {
+        PlayerSettingsRepository.uiState.collect { state ->
+            dialogueLevelerLevel.set(state.dialogueLeveler)
+        }
+    }
     val centerMixLevelDb = remember { AtomicInteger(0) }
     // The current player's FFmpeg audio renderer, for center mix changes during playback.
     val ffmpegAudioRenderer = remember { AtomicReference<FfmpegAudioRenderer?>(null) }
@@ -445,6 +452,7 @@ private fun ExoPlayerSurface(
             subtitleDelayUsProvider = { latestSubtitleDelayMs.value.toLong() * 1_000L },
             audioDelayUsProvider = audioDelayUs::get,
             audioAmplificationDbProvider = audioAmplificationDb::get,
+            dialogueLevelerLevelProvider = dialogueLevelerLevel::get,
             audioDownmix = audioDownmix,
             preferAppAudioDecoder = bluetoothOutput,
             centerMixLevelDbProvider = centerMixLevelDb::get,
@@ -1358,6 +1366,10 @@ private fun LibmpvPlayerSurface(
         preferredSubtitleLanguage = preferredSubtitleLanguage,
     )
     var playerViewRef by remember { mutableStateOf<NuvioLibmpvView?>(null) }
+    val currentDialogueLeveler by PlayerSettingsRepository.uiState.collectAsState()
+    LaunchedEffect(currentDialogueLeveler.dialogueLeveler, playerViewRef) {
+        playerViewRef?.applyDialogueLeveler(currentDialogueLeveler.dialogueLeveler)
+    }
     val nowPlayingController = remember(context, playerViewRef) {
         playerViewRef?.let { view ->
             AndroidPlayerNowPlayingController(
@@ -1829,8 +1841,20 @@ private class NuvioLibmpvView(
         fileLoaded = false
     }
 
+    fun applyDialogueLeveler(level: Int) {
+        executeMpv {
+            val drcFilter = buildMpvDialogueLevelerFilter(level)
+            if (drcFilter != null) {
+                mpv.setPropertyString("af", drcFilter)
+            } else {
+                mpv.setPropertyString("af", "")
+            }
+        }
+    }
+
     fun onFileLoaded() {
         fileLoaded = true
+        applyDialogueLeveler(PlayerSettingsRepository.uiState.value.dialogueLeveler)
     }
 
     fun attachStartupSubtitles() {
@@ -2899,6 +2923,7 @@ private class SubtitleOffsetRenderersFactory(
     private val subtitleDelayUsProvider: () -> Long,
     private val audioDelayUsProvider: () -> Long,
     private val audioAmplificationDbProvider: () -> Int,
+    private val dialogueLevelerLevelProvider: () -> Int,
     private val audioDownmix: FfmpegAudioDownmix?,
     private val preferAppAudioDecoder: Boolean,
     private val centerMixLevelDbProvider: () -> Int,
@@ -2916,7 +2941,7 @@ private class SubtitleOffsetRenderersFactory(
         return DefaultAudioSink.Builder(context)
             .setEnableFloatOutput(enableFloatOutput)
             .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-            .setAudioProcessors(arrayOf(GainAudioProcessor(audioAmplificationDbProvider)))
+            .setAudioProcessors(arrayOf(CompressorAudioProcessor(dialogueLevelerLevelProvider), GainAudioProcessor(audioAmplificationDbProvider)))
             .build()
     }
 

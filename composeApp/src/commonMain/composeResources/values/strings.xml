@@ -2574,4 +2574,11 @@
     <string name="subtitle_shadow_opacity">Shadow opacity</string>
     <string name="subtitle_shadow_size">Shadow size</string>
     <string name="subtitle_reset_appearance">Reset appearance</string>
+    <string name="settings_playback_dialogue_leveler">Dialogue Leveler</string>
+    <string name="settings_playback_dialogue_leveler_desc">Lifts quiet speech and tames loud effects</string>
+    <string name="dialogue_leveler_off">Off</string>
+    <string name="dialogue_leveler_light">Light</string>
+    <string name="dialogue_leveler_medium">Medium</string>
+    <string name="dialogue_leveler_strong">Strong</string>
+    <string name="dialogue_leveler_max">Max</string>
 </resources>

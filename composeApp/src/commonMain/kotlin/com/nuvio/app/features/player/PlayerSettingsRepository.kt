@@ -66,6 +66,7 @@ data class PlayerSettingsUiState(
     val rememberAudioDelayPerDevice: Boolean = true,
     val persistAudioAmplification: Boolean = false,
     val audioAmplificationDb: Int = 0,
+    val dialogueLeveler: Int = DIALOGUE_LEVELER_OFF,
     val downmixEnabled: Boolean = false,
     val audioOutputChannels: AudioOutputChannels = AudioOutputChannels.default,
     val maintainOriginalAudioOnDownmix: Boolean = true,
@@ -181,6 +182,7 @@ object PlayerSettingsRepository {
     private var rememberAudioDelayPerDevice = true
     private var persistAudioAmplification = false
     private var audioAmplificationDb = 0
+    private var dialogueLeveler = DIALOGUE_LEVELER_OFF
     private var downmixEnabled = false
     private var audioOutputChannels = AudioOutputChannels.default
     private var maintainOriginalAudioOnDownmix = true
@@ -283,6 +285,7 @@ object PlayerSettingsRepository {
         rememberAudioDelayPerDevice = true
         persistAudioAmplification = false
         audioAmplificationDb = 0
+        dialogueLeveler = DIALOGUE_LEVELER_OFF
         downmixEnabled = false
         audioOutputChannels = AudioOutputChannels.default
         maintainOriginalAudioOnDownmix = true
@@ -421,6 +424,7 @@ object PlayerSettingsRepository {
         persistAudioAmplification = PlayerSettingsStorage.loadPersistAudioAmplification() ?: false
         audioAmplificationDb = (PlayerSettingsStorage.loadAudioAmplificationDb() ?: 0)
             .coerceIn(AUDIO_AMPLIFICATION_MIN_DB, AUDIO_AMPLIFICATION_MAX_DB)
+        dialogueLeveler = PlayerSettingsStorage.loadDialogueLeveler() ?: DIALOGUE_LEVELER_OFF
         downmixEnabled = PlayerSettingsStorage.loadDownmixEnabled() ?: false
         audioOutputChannels = AudioOutputChannels.fromSettingValue(PlayerSettingsStorage.loadAudioOutputChannels())
         maintainOriginalAudioOnDownmix = PlayerSettingsStorage.loadMaintainOriginalAudioOnDownmix() ?: true
@@ -816,6 +820,15 @@ object PlayerSettingsRepository {
         persistAudioAmplification = enabled
         publish()
         PlayerSettingsStorage.savePersistAudioAmplification(enabled)
+    }
+
+    fun setDialogueLeveler(level: Int) {
+        ensureLoaded()
+        val clamped = level.coerceIn(DIALOGUE_LEVELER_OFF, DIALOGUE_LEVELER_MAX)
+        if (dialogueLeveler == clamped) return
+        dialogueLeveler = clamped
+        publish()
+        PlayerSettingsStorage.saveDialogueLeveler(clamped)
     }
 
     fun setAudioAmplificationDb(db: Int) {
@@ -1402,6 +1415,7 @@ object PlayerSettingsRepository {
             rememberAudioDelayPerDevice = rememberAudioDelayPerDevice,
             persistAudioAmplification = persistAudioAmplification,
             audioAmplificationDb = audioAmplificationDb,
+            dialogueLeveler = dialogueLeveler,
             downmixEnabled = downmixEnabled,
             audioOutputChannels = audioOutputChannels,
             maintainOriginalAudioOnDownmix = maintainOriginalAudioOnDownmix,

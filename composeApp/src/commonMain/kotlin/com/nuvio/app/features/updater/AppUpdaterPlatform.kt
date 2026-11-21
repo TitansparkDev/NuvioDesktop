@@ -3,6 +3,8 @@ package com.nuvio.app.features.updater
 expect object AppUpdaterPlatform {
     val isSupported: Boolean
     val isDebugBuild: Boolean
+    val githubRepo: String
+    val releaseTagPrefix: String?
 
     fun getSupportedAbis(): List<String>
 

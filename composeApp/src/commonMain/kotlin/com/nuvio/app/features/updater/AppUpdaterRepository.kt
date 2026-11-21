@@ -40,7 +40,7 @@ internal object AppUpdaterRepository {
     suspend fun getLatestChannelUpdate(channel: UpdateChannel): Result<AppUpdate> = runCatching {
         val response = httpRequestRaw(
             method = "GET",
-            url = "https://api.github.com/repos/NuvioMedia/NuvioMobile/${releasePath(channel)}",
+            url = "https://api.github.com/repos/${AppUpdaterPlatform.githubRepo}/${releasePath(channel)}",
             headers = mapOf(
                 "Accept" to "application/vnd.github+json",
                 "User-Agent" to "NuvioMobile",
@@ -57,7 +57,7 @@ internal object AppUpdaterRepository {
     }
 
     internal fun releasePath(channel: UpdateChannel): String = when (channel) {
-        UpdateChannel.STABLE -> "releases/latest"
+        UpdateChannel.STABLE -> if (AppUpdaterPlatform.releaseTagPrefix != null) "releases?per_page=100" else "releases/latest"
         UpdateChannel.BETA -> "releases?per_page=100"
     }
 
@@ -66,14 +66,21 @@ internal object AppUpdaterRepository {
         channel: UpdateChannel,
         supportedAbis: List<String>,
     ): AppUpdate? {
-        val releases = when (channel) {
-            UpdateChannel.STABLE -> listOf(json.decodeFromString<GitHubReleaseDto>(responseBody))
-            UpdateChannel.BETA -> json.decodeFromString<List<GitHubReleaseDto>>(responseBody)
+        val releases = if (responseBody.trim().startsWith("[")) {
+            json.decodeFromString<List<GitHubReleaseDto>>(responseBody)
+        } else {
+            listOf(json.decodeFromString<GitHubReleaseDto>(responseBody))
         }
         return ReleaseSelector.eligibleReleases(releases, channel).firstNotNullOfOrNull { release ->
             val asset = chooseBestApkAsset(release.assets, supportedAbis) ?: return@firstNotNullOfOrNull null
-            val tag = release.tagName?.takeIf { VersionUtils.parse(it) != null }
-                ?: release.name.orEmpty()
+            val prefix = AppUpdaterPlatform.releaseTagPrefix
+            val rawTag = release.tagName.orEmpty()
+            val parsedTag = if (prefix != null && rawTag.startsWith(prefix)) {
+                rawTag.removePrefix(prefix)
+            } else {
+                rawTag
+            }
+            val tag = if (VersionUtils.parse(parsedTag) != null) parsedTag else (VersionUtils.parse(rawTag)?.let { rawTag } ?: release.name.orEmpty())
             AppUpdate(
                 tag = tag,
                 title = release.name?.takeIf { it.isNotBlank() } ?: tag,

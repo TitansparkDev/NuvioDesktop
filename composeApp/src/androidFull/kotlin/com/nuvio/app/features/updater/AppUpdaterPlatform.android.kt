@@ -4,6 +4,8 @@ actual object AppUpdaterPlatform {
     actual val isSupported: Boolean = true
     actual val isDebugBuild: Boolean
         get() = AndroidAppUpdaterPlatform.isDebugBuild()
+    actual val githubRepo: String = AndroidAppUpdaterPlatform.GITHUB_REPO
+    actual val releaseTagPrefix: String? = AndroidAppUpdaterPlatform.RELEASE_TAG_PREFIX
 
     actual fun getSupportedAbis(): List<String> = AndroidAppUpdaterPlatform.getSupportedAbis()
 

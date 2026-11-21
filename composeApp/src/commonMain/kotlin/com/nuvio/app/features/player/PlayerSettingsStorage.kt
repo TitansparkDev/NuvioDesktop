@@ -95,6 +95,8 @@ internal expect object PlayerSettingsStorage {
     fun savePersistAudioAmplification(enabled: Boolean)
     fun loadAudioAmplificationDb(): Int?
     fun saveAudioAmplificationDb(db: Int)
+    fun loadDialogueLeveler(): Int?
+    fun saveDialogueLeveler(level: Int)
     fun loadDownmixEnabled(): Boolean?
     fun saveDownmixEnabled(enabled: Boolean)
     fun loadAudioOutputChannels(): String?

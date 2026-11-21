@@ -8,6 +8,8 @@ import org.jetbrains.compose.resources.getString
 actual object AppUpdaterPlatform {
     actual val isSupported: Boolean = false
     actual val isDebugBuild: Boolean = false
+    actual val githubRepo: String = "NuvioMedia/NuvioMobile"
+    actual val releaseTagPrefix: String? = null
 
     actual fun getSupportedAbis(): List<String> = emptyList()
 

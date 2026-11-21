@@ -63,6 +63,7 @@ actual object PlayerSettingsStorage {
     private const val rememberAudioDelayPerDeviceKey = "remember_audio_delay_per_device"
     private const val persistAudioAmplificationKey = "persist_audio_amplification"
     private const val audioAmplificationDbKey = "audio_amplification_db"
+    private const val dialogueLevelerKey = "dialogue_leveler"
     private const val downmixEnabledKey = "downmix_enabled"
     private const val audioOutputChannelsKey = "audio_output_channels"
     private const val maintainOriginalAudioOnDownmixKey = "maintain_original_audio_on_downmix"
@@ -164,6 +165,7 @@ actual object PlayerSettingsStorage {
         rememberAudioDelayPerDeviceKey,
         persistAudioAmplificationKey,
         audioAmplificationDbKey,
+        dialogueLevelerKey,
         downmixEnabledKey,
         audioOutputChannelsKey,
         maintainOriginalAudioOnDownmixKey,
@@ -758,6 +760,21 @@ actual object PlayerSettingsStorage {
         NSUserDefaults.standardUserDefaults.setInteger(db.toLong(), forKey = ProfileScopedKey.of(audioAmplificationDbKey))
     }
 
+    actual fun loadDialogueLeveler(): Int? {
+        val defaults = NSUserDefaults.standardUserDefaults
+        val key = ProfileScopedKey.of(dialogueLevelerKey)
+        return if (defaults.objectForKey(key) != null) {
+            defaults.integerForKey(key).toInt()
+        } else {
+            null
+        }
+    }
+
+    actual fun saveDialogueLeveler(level: Int) {
+        NSUserDefaults.standardUserDefaults.setInteger(level.toLong(), forKey = ProfileScopedKey.of(dialogueLevelerKey))
+    }
+
+
     actual fun loadDownmixEnabled(): Boolean? {
         val defaults = NSUserDefaults.standardUserDefaults
         val key = ProfileScopedKey.of(downmixEnabledKey)
@@ -1337,6 +1354,7 @@ actual object PlayerSettingsStorage {
         loadRememberAudioDelayPerDevice()?.let { put(rememberAudioDelayPerDeviceKey, encodeSyncBoolean(it)) }
         loadPersistAudioAmplification()?.let { put(persistAudioAmplificationKey, encodeSyncBoolean(it)) }
         loadAudioAmplificationDb()?.let { put(audioAmplificationDbKey, encodeSyncInt(it)) }
+        loadDialogueLeveler()?.let { put(dialogueLevelerKey, encodeSyncInt(it)) }
         loadDownmixEnabled()?.let { put(downmixEnabledKey, encodeSyncBoolean(it)) }
         loadAudioOutputChannels()?.let { put(audioOutputChannelsKey, encodeSyncString(it)) }
         loadMaintainOriginalAudioOnDownmix()?.let { put(maintainOriginalAudioOnDownmixKey, encodeSyncBoolean(it)) }
@@ -1432,6 +1450,7 @@ actual object PlayerSettingsStorage {
         payload.decodeSyncBoolean(rememberAudioDelayPerDeviceKey)?.let(::saveRememberAudioDelayPerDevice)
         payload.decodeSyncBoolean(persistAudioAmplificationKey)?.let(::savePersistAudioAmplification)
         payload.decodeSyncInt(audioAmplificationDbKey)?.let(::saveAudioAmplificationDb)
+        payload.decodeSyncInt(dialogueLevelerKey)?.let(::saveDialogueLeveler)
         payload.decodeSyncBoolean(downmixEnabledKey)?.let(::saveDownmixEnabled)
         payload.decodeSyncString(audioOutputChannelsKey)?.let(::saveAudioOutputChannels)
         payload.decodeSyncBoolean(maintainOriginalAudioOnDownmixKey)?.let(::saveMaintainOriginalAudioOnDownmix)

@@ -24,6 +24,8 @@ import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 object AndroidAppUpdaterPlatform {
+    const val GITHUB_REPO = "TitansparkDev/NuvioDesktop"
+    const val RELEASE_TAG_PREFIX = "android-v"
     private const val preferencesName = "nuvio_updater"
     private const val ignoredTagKey = "ignored_release_tag"
     private const val updateChannelKey = "update_channel"

@@ -20,6 +20,13 @@ import com.nuvio.app.isIos
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 import com.nuvio.app.features.player.PlayerSettingsUiState
+import com.nuvio.app.core.ui.Chip
+import com.nuvio.app.features.player.DIALOGUE_LEVELER_OFF
+import com.nuvio.app.features.player.DIALOGUE_LEVELER_LIGHT
+import com.nuvio.app.features.player.DIALOGUE_LEVELER_MEDIUM
+import com.nuvio.app.features.player.DIALOGUE_LEVELER_STRONG
+import com.nuvio.app.features.player.DIALOGUE_LEVELER_MAX
+
 
 @Composable
 internal fun PlaybackAudioSettings(
@@ -66,6 +73,27 @@ internal fun PlaybackAudioSettings(
                         isTablet = isTablet,
                         onCheckedChange = PlayerSettingsRepository::setRememberAudioDelayPerDevice,
                     )
+                }
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsChipRow(
+                    title = stringResource(Res.string.settings_playback_dialogue_leveler),
+                    description = stringResource(Res.string.settings_playback_dialogue_leveler_desc),
+                    isTablet = isTablet,
+                ) {
+                    val options = listOf(
+                        DIALOGUE_LEVELER_OFF to stringResource(Res.string.dialogue_leveler_off),
+                        DIALOGUE_LEVELER_LIGHT to stringResource(Res.string.dialogue_leveler_light),
+                        DIALOGUE_LEVELER_MEDIUM to stringResource(Res.string.dialogue_leveler_medium),
+                        DIALOGUE_LEVELER_STRONG to stringResource(Res.string.dialogue_leveler_strong),
+                        DIALOGUE_LEVELER_MAX to stringResource(Res.string.dialogue_leveler_max),
+                    )
+                    options.forEach { (level, label) ->
+                        Chip(
+                            label = label,
+                            selected = settings.dialogueLeveler == level,
+                            onClick = { PlayerSettingsRepository.setDialogueLeveler(level) },
+                        )
+                    }
                 }
             }
         }
