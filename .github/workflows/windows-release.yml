@@ -66,6 +66,8 @@ jobs:
           unzip -q -j /c/Nuvio.zip "Nuvio/lib/python3.14/*" -d /c/nuvio-python/ || true
           rm -f /c/nuvio-runtime/WebView2Loader.dll
           rm -f /c/nuvio-runtime/player_bridge.dll
+          # The packaging task recreates this alias from libvapoursynth-script-0.dll.
+          rm -f /c/nuvio-runtime/vsscript.dll
           rm /c/Nuvio.zip
 
       - name: Build Windows MSI, EXE, and Distributable
